@@ -1,4 +1,4 @@
-//! Frutiger Aero chrome, in Aperture colours.
+//! Constructivist chrome, in AUTARK's colours.
 //!
 //! One place that owns what the system looks like, so a widget is a few calls
 //! rather than a pile of rectangles, and so changing the look is changing this
@@ -7,23 +7,35 @@
 //! put an indirection in front of every chrome draw to serve a switch nobody
 //! has asked for twice.
 //!
-//! ### Warm for the machine, cool for the environment
+//! ### Red is signal, and nothing else is red
 //!
-//! Frutiger Aero is aqua, glass and saturation, and this machine's colour is
-//! orange. Rather than pick one, the rule is where each belongs: **the
-//! surfaces the machine speaks through are warm and the room it sits in is
-//! cool.** Captions, the selection bar, links and focus are Aperture amber,
-//! because those are the machine addressing an operator. The wallpaper, the
-//! taskbar glass and the fields are Aero's blue-green, because those are the
-//! space the windows are in.
+//! The obvious reading of "red for the machine, concrete for the room" was to
+//! do to red what the parent scheme did to amber -- captions, selection, links
+//! and focus all accent-coloured, because those are the machine addressing an
+//! operator. That collides on the first control it meets. **Close was already
+//! red, and red on Close is not decoration but meaning**, so an accent-coloured
+//! caption would have put the one control that says *stop* on a bar the same
+//! colour as itself, and the two reds would either read as one surface or fight.
 //!
-//! The wall is where they meet, and it meets honestly: a horizon, deep teal
-//! at the top falling through cyan to warm gold at the foot. A sunset over
-//! water is one of the style's own subjects, so this holds both colours in
-//! one surface rather than averaging them into mud.
+//! So the grammar is the one constructivism actually uses: **graphite for
+//! structure, concrete for the room, and red spent only where something is
+//! being signalled.** Captions and caption buttons are graphite. The wallpaper,
+//! taskbar, fields and menus are concrete. Red is left for the selection bar,
+//! focus, links, the mark, Start and Close -- which is to say, for the places a
+//! surface is claiming attention rather than merely being a surface.
 //!
-//! The Start button stays green. It was green in Luna, it was a green orb in
-//! Aero, and it is the one control here that has never followed an accent.
+//! That is a stricter rule than the one it replaces and it is cheaper to keep:
+//! "is this thing signalling?" has an answer, where "is this the machine or the
+//! room?" turned out to have two for every control that is both.
+//!
+//! The wall still meets at a horizon, and still holds both halves rather than
+//! averaging them into mud -- concrete falling through warm grey to oxblood at
+//! the foot, with the mark lit on it.
+//!
+//! Start follows the accent here, which the parent scheme deliberately refused
+//! for it. The refusal was historical: Start was green in Luna and a green orb
+//! in Aero, so it had a lineage to be loyal to. This fork has none, and a green
+//! button in a graphite-and-red scheme is loyal to somebody else's history.
 //!
 //! ### Why the bevel stopped being two pixels
 //!
@@ -66,7 +78,7 @@ use super::{Color, Framebuffer};
 
 /// The face of every raised control. XP's ButtonFace, and warm, which is the
 /// same family the orange is in.
-pub const FACE: Color = Color::new(0xEF, 0xF3, 0xF5);
+pub const FACE: Color = Color::new(0xED, 0xED, 0xE9);
 /// A white field. Not the light half of a bevel -- that is `EDGE_LIGHT` --
 /// but the fill behind text somebody types into, which is what the ten
 /// callers outside this file mean by it.
@@ -81,21 +93,21 @@ pub const DARKEDGE: Color = Color::new(0x00, 0x00, 0x00);
 /// The dark half of a one-pixel edge. XP's ButtonShadow. The light half is
 /// `HILIGHT`, which is white -- see the module note on what a screenshot said
 /// about trying to use the softer one here.
-pub const EDGE: Color = Color::new(0xA3, 0xB4, 0xBC);
+pub const EDGE: Color = Color::new(0xA8, 0xA8, 0xA2);
 /// The soft light half. Only the separators, where it sits against a line and
 /// not against the face.
-pub const EDGE_LIGHT: Color = Color::new(0xF6, 0xFA, 0xFC);
+pub const EDGE_LIGHT: Color = Color::new(0xF6, 0xF6, 0xF3);
 /// The border round a field. One colour all the way round rather than a
 /// light and dark pair: a well is a hole in the surface, and XP says so by
 /// outlining it in a desaturated accent instead of by lighting it.
-pub const WELL_EDGE: Color = Color::new(0x6E, 0x9E, 0xB4);
+pub const WELL_EDGE: Color = Color::new(0x76, 0x76, 0x6F);
 /// A selected row in a list that does not have focus. Was an anonymous
 /// 0xA8A8A8 written out three times in two files.
-pub const LIST_SEL_IDLE: Color = Color::new(0xD3, 0xE2, 0xE9);
+pub const LIST_SEL_IDLE: Color = Color::new(0xDC, 0xDC, 0xD6);
 /// The desktop behind everything.
 /// A representative mid-tone of the sky, for the few pictograms that fill a
 /// panel of their own against it. The wall itself is `WALL`.
-pub const DESKTOP: Color = Color::new(0x0E, 0x4A, 0x66);
+pub const DESKTOP: Color = Color::new(0x3A, 0x3A, 0x37);
 /// The wall: a horizon. Deep water at the top, through cyan, to warm gold at
 /// the foot where the two halves of this scheme meet.
 ///
@@ -103,12 +115,12 @@ pub const DESKTOP: Color = Color::new(0x0E, 0x4A, 0x66);
 /// near-black fill and reads as dirt against a sky, and Aero's own walls are
 /// gradients and photographs rather than lattices.
 pub const WALL: [(u8, Color); 6] = [
-    (0, Color::new(0x06, 0x1C, 0x2C)),
-    (64, Color::new(0x0C, 0x44, 0x60)),
-    (130, Color::new(0x1B, 0x82, 0xA2)),
-    (186, Color::new(0x53, 0xBE, 0xC6)),
-    (212, Color::new(0xC7, 0x9A, 0x55)),
-    (255, Color::new(0x7A, 0x4C, 0x1A)),
+    (0, Color::new(0x2A, 0x2A, 0x28)),
+    (64, Color::new(0x3E, 0x3E, 0x3A)),
+    (130, Color::new(0x5C, 0x5C, 0x56)),
+    (186, Color::new(0x8A, 0x88, 0x82)),
+    (212, Color::new(0xA8, 0x52, 0x48)),
+    (255, Color::new(0x62, 0x16, 0x16)),
 ];
 /// The Aperture mark on the wall. A muted orange rather than the title bar's:
 /// at a fifth of the screen it would otherwise be the brightest thing on the
@@ -160,7 +172,7 @@ pub const WALL_MAJOR_NUM: u32 = 34;
 pub const WALL_ORBIT_A: u32 = 236;
 pub const WALL_ORBIT_B: u32 = 76;
 pub const WALL_ORBIT_TILTS: u32 = 3;
-pub const WALL_ORBIT: Color = Color::new(0x8F, 0xDC, 0xF0);
+pub const WALL_ORBIT: Color = Color::new(0x9A, 0x9A, 0x93);
 /// Where on its orbit each electron sits, in sixty-fourths of a turn. Fixed,
 /// like the bubbles, because nothing in a paint path here is random.
 pub const WALL_ELECTRONS: [u32; 3] = [6, 27, 48];
@@ -190,10 +202,10 @@ pub const WALL_BUBBLES: [(u32, u32, u32); 7] = [
 /// How much of the sky a bubble keeps, the rim that catches the light, and
 /// the specular on it.
 pub const WALL_BUBBLE_NUM: u32 = 30;
-pub const WALL_RIM: Color = Color::new(0xBF, 0xEC, 0xF8);
+pub const WALL_RIM: Color = Color::new(0xC6, 0xC6, 0xBE);
 pub const WALL_SPEC: Color = Color::new(0xFF, 0xFF, 0xFF);
 pub const TEXT: Color = Color::new(0x00, 0x00, 0x00);
-pub const TEXT_DIM: Color = Color::new(0x76, 0x88, 0x90);
+pub const TEXT_DIM: Color = Color::new(0x78, 0x78, 0x72);
 /// The close button under the pointer.
 ///
 /// The one control on a window that cannot be undone, and the one an operator
@@ -212,16 +224,16 @@ pub const OK_TEXT: Color = Color::new(0x0A, 0x64, 0x0A);
 pub const WARN_TEXT: Color = Color::new(0x8A, 0x55, 0x00);
 pub const BAD_TEXT: Color = Color::new(0xA0, 0x1C, 0x1C);
 
-// --- Aperture ------------------------------------------------------------
+// --- signal --------------------------------------------------------------
 
-pub const APERTURE: Color = Color::new(0xF2, 0x8C, 0x1E);
-pub const APERTURE_DEEP: Color = Color::new(0x9A, 0x50, 0x0C);
+pub const SIGNAL: Color = Color::new(0xC8, 0x20, 0x1C);
+pub const SIGNAL_DEEP: Color = Color::new(0x76, 0x10, 0x12);
 pub const TITLE_TEXT: Color = Color::new(0xFF, 0xFF, 0xFF);
 /// Caption text on an unfocused bar. Near-white rather than grey: Luna dims
 /// the *bar* and leaves its title readable, so "which window has the
 /// keyboard" is answered by the surface behind the words instead of by the
 /// words going faint.
-pub const TITLE_IDLE: Color = Color::new(0x2E, 0x44, 0x50);
+pub const TITLE_IDLE: Color = Color::new(0x5A, 0x5A, 0x55);
 
 // --- ramps ---------------------------------------------------------------
 //
@@ -233,43 +245,43 @@ pub const TITLE_IDLE: Color = Color::new(0x2E, 0x44, 0x50);
 /// The focused caption: a gloss over the top third, the step, then a lift at
 /// the foot so the bar does not read as ending in mud.
 pub const TITLE_ON: [(u8, Color); 7] = [
-    (0, Color::new(0xFF, 0xDE, 0xAC)),
-    (8, Color::new(0xFF, 0xC5, 0x76)),
-    (120, Color::new(0xF5, 0x9C, 0x2B)),
-    (128, Color::new(0xE2, 0x81, 0x14)),
-    (129, Color::new(0xB0, 0x5D, 0x08)),
-    (246, Color::new(0xC9, 0x74, 0x14)),
-    (255, Color::new(0xF4, 0xA5, 0x36)),
+    (0, Color::new(0x6E, 0x6E, 0x68)),
+    (8, Color::new(0x4C, 0x4C, 0x48)),
+    (120, Color::new(0x33, 0x33, 0x30)),
+    (128, Color::new(0x2A, 0x2A, 0x27)),
+    (129, Color::new(0x18, 0x18, 0x16)),
+    (246, Color::new(0x22, 0x22, 0x20)),
+    (255, Color::new(0x3E, 0x3E, 0x3A)),
 ];
 /// The same shape in cool greys. Aero dims an unfocused caption toward the
 /// room rather than toward black, which is why these are blue-grey and not
 /// neutral.
 pub const TITLE_OFF: [(u8, Color); 6] = [
-    (0, Color::new(0xE8, 0xEF, 0xF3)),
-    (8, Color::new(0xD2, 0xDF, 0xE6)),
-    (128, Color::new(0xB4, 0xC6, 0xD0)),
-    (129, Color::new(0x94, 0xAB, 0xB8)),
-    (246, Color::new(0xA6, 0xBB, 0xC6)),
-    (255, Color::new(0xC8, 0xD8, 0xE0)),
+    (0, Color::new(0xEC, 0xEC, 0xE7)),
+    (8, Color::new(0xD8, 0xD8, 0xD2)),
+    (128, Color::new(0xBC, 0xBC, 0xB5)),
+    (129, Color::new(0x9E, 0x9E, 0x97)),
+    (246, Color::new(0xAE, 0xAE, 0xA7)),
+    (255, Color::new(0xCE, 0xCE, 0xC7)),
 ];
 /// The window border, which is the caption's colour carried round the outside.
-pub const BORDER_ON: Color = Color::new(0xC4, 0x72, 0x14);
-pub const BORDER_OFF: Color = Color::new(0xA6, 0xBB, 0xC6);
+pub const BORDER_ON: Color = Color::new(0x24, 0x24, 0x22);
+pub const BORDER_OFF: Color = Color::new(0xAE, 0xAE, 0xA7);
 
 /// Minimise and maximise.
 pub const CAP_BTN: [(u8, Color); 5] = [
-    (0, Color::new(0xFF, 0xD9, 0xA6)),
-    (30, Color::new(0xF6, 0xA9, 0x3E)),
-    (128, Color::new(0xE6, 0x8D, 0x1C)),
-    (129, Color::new(0xCE, 0x7A, 0x14)),
-    (255, Color::new(0xB4, 0x65, 0x0F)),
+    (0, Color::new(0x8A, 0x8A, 0x84)),
+    (30, Color::new(0x60, 0x60, 0x5B)),
+    (128, Color::new(0x45, 0x45, 0x41)),
+    (129, Color::new(0x35, 0x35, 0x32)),
+    (255, Color::new(0x28, 0x28, 0x25)),
 ];
 pub const CAP_BTN_HOT: [(u8, Color); 5] = [
-    (0, Color::new(0xFF, 0xF0, 0xD8)),
-    (30, Color::new(0xFF, 0xC8, 0x78)),
-    (128, Color::new(0xF6, 0xA9, 0x3E)),
-    (129, Color::new(0xE6, 0x8D, 0x1C)),
-    (255, Color::new(0xCE, 0x7A, 0x14)),
+    (0, Color::new(0xB2, 0xB2, 0xAB)),
+    (30, Color::new(0x88, 0x88, 0x82)),
+    (128, Color::new(0x60, 0x60, 0x5B)),
+    (129, Color::new(0x45, 0x45, 0x41)),
+    (255, Color::new(0x35, 0x35, 0x32)),
 ];
 /// Close. Red whether or not the pointer is on it -- see `CLOSE_HOT`.
 pub const CAP_CLOSE: [(u8, Color); 5] = [
@@ -289,7 +301,7 @@ pub const CAP_CLOSE_HOT: [(u8, Color); 5] = [
 ];
 /// The pale outline round a caption button, and the catchlight along the top
 /// row of the bar itself.
-pub const CAP_EDGE: Color = Color::new(0xFF, 0xE0, 0xBC);
+pub const CAP_EDGE: Color = Color::new(0xB4, 0xB4, 0xAE);
 /// The glyph on a caption button. White, because these sit on colour now.
 pub const CAP_INK: Color = Color::new(0xFF, 0xFF, 0xFF);
 
@@ -297,30 +309,30 @@ pub const CAP_INK: Color = Color::new(0xFF, 0xFF, 0xFF);
 /// looked at, which is why it is three stops and nearly flat by the foot.
 pub const BTN: [(u8, Color); 5] = [
     (0, Color::new(0xFF, 0xFF, 0xFF)),
-    (6, Color::new(0xF4, 0xFC, 0xFF)),
-    (128, Color::new(0xDF, 0xF1, 0xF9)),
-    (129, Color::new(0xBF, 0xE1, 0xEF)),
-    (255, Color::new(0xEA, 0xF7, 0xFC)),
+    (6, Color::new(0xF8, 0xF8, 0xF5)),
+    (128, Color::new(0xE6, 0xE6, 0xE1)),
+    (129, Color::new(0xD2, 0xD2, 0xCC)),
+    (255, Color::new(0xF0, 0xF0, 0xEC)),
 ];
 pub const BTN_DOWN: [(u8, Color); 5] = [
-    (0, Color::new(0xB4, 0xCE, 0xDA)),
-    (6, Color::new(0xC6, 0xDE, 0xE8)),
-    (128, Color::new(0xD6, 0xEA, 0xF2)),
-    (129, Color::new(0xE4, 0xF3, 0xF9)),
-    (255, Color::new(0xF2, 0xFA, 0xFD)),
+    (0, Color::new(0xC4, 0xC4, 0xBE)),
+    (6, Color::new(0xD2, 0xD2, 0xCC)),
+    (128, Color::new(0xDE, 0xDE, 0xD8)),
+    (129, Color::new(0xE8, 0xE8, 0xE3)),
+    (255, Color::new(0xF4, 0xF4, 0xF1)),
 ];
 /// Under the pointer. Aero's hover is a warm glow rather than a brighter
 /// grey, which is the one place the accent reaches a cool surface.
 pub const BTN_HOT: [(u8, Color); 5] = [
-    (0, Color::new(0xFF, 0xFF, 0xF4)),
-    (6, Color::new(0xFF, 0xF2, 0xCE)),
-    (128, Color::new(0xFF, 0xDF, 0x9C)),
-    (129, Color::new(0xFF, 0xC9, 0x6E)),
-    (255, Color::new(0xFF, 0xE6, 0xB4)),
+    (0, Color::new(0xFF, 0xF8, 0xF7)),
+    (6, Color::new(0xFF, 0xE4, 0xE1)),
+    (128, Color::new(0xFF, 0xC8, 0xC3)),
+    (129, Color::new(0xF6, 0xAA, 0xA4)),
+    (255, Color::new(0xFF, 0xD8, 0xD4)),
 ];
 /// The one-pixel outline XP puts round every button, and its lit form.
-pub const BTN_EDGE: Color = Color::new(0x6E, 0x9E, 0xB4);
-pub const BTN_EDGE_HOT: Color = APERTURE;
+pub const BTN_EDGE: Color = Color::new(0x76, 0x76, 0x6F);
+pub const BTN_EDGE_HOT: Color = SIGNAL;
 
 /// The taskbar's pane, and how solid it is from top to foot.
 ///
@@ -328,47 +340,47 @@ pub const BTN_EDGE_HOT: Color = APERTURE;
 /// the bar reads as a pane rather than as a painted strip. Most solid just
 /// under the gloss line and thinnest at the bottom, which is the shape every
 /// piece of Aero glass has.
-pub const GLASS: Color = Color::new(0x0E, 0x3E, 0x56);
+pub const GLASS: Color = Color::new(0x1E, 0x1E, 0x1C);
 pub const GLASS_STOPS: [(u8, u32); 5] = [(0, 148), (12, 190), (128, 176), (129, 158), (255, 128)];
 /// The white gloss along the top of a pane, and how far down it reaches.
 pub const GLOSS: Color = Color::new(0xFF, 0xFF, 0xFF);
 pub const GLOSS_STOPS: [(u8, u32); 3] = [(0, 150), (40, 46), (255, 0)];
 
 /// One bright line where the bar meets the desktop.
-pub const TASK_EDGE: Color = Color::new(0xBF, 0xE8, 0xF6);
+pub const TASK_EDGE: Color = Color::new(0xBE, 0xBE, 0xB6);
 /// The clock and battery recess. Darker than the bar, because a well on a
 /// coloured surface reads by being darker and not by being outlined.
-pub const TRAY: Color = Color::new(0x07, 0x2A, 0x3C);
-pub const TRAY_EDGE: Color = Color::new(0x9F, 0xCF, 0xE2);
+pub const TRAY: Color = Color::new(0x12, 0x12, 0x11);
+pub const TRAY_EDGE: Color = Color::new(0x8E, 0x8E, 0x88);
 
 /// Start. Green in every real XP scheme, including the blue one, which is why
 /// it stays green here rather than following the accent.
 pub const START: [(u8, Color); 7] = [
-    (0, Color::new(0xD6, 0xF0, 0xA8)),
-    (10, Color::new(0x9A, 0xDB, 0x62)),
-    (120, Color::new(0x62, 0xB0, 0x33)),
-    (128, Color::new(0x4E, 0x9A, 0x24)),
-    (129, Color::new(0x2F, 0x70, 0x14)),
-    (240, Color::new(0x3C, 0x84, 0x18)),
-    (255, Color::new(0x6F, 0xBE, 0x3A)),
+    (0, Color::new(0xF0, 0x8C, 0x86)),
+    (10, Color::new(0xDC, 0x44, 0x3C)),
+    (120, Color::new(0xC0, 0x22, 0x1E)),
+    (128, Color::new(0xA8, 0x1A, 0x18)),
+    (129, Color::new(0x74, 0x0E, 0x10)),
+    (240, Color::new(0x8E, 0x14, 0x14)),
+    (255, Color::new(0xC4, 0x30, 0x2A)),
 ];
 pub const START_HOT: [(u8, Color); 7] = [
-    (0, Color::new(0xEC, 0xFB, 0xD2)),
-    (10, Color::new(0xBC, 0xEE, 0x8C)),
-    (120, Color::new(0x82, 0xCE, 0x50)),
-    (128, Color::new(0x6A, 0xB8, 0x3A)),
-    (129, Color::new(0x46, 0x90, 0x22)),
-    (240, Color::new(0x54, 0xA4, 0x28)),
-    (255, Color::new(0x8E, 0xD8, 0x56)),
+    (0, Color::new(0xFF, 0xB4, 0xAE)),
+    (10, Color::new(0xEE, 0x64, 0x5C)),
+    (120, Color::new(0xD4, 0x34, 0x2E)),
+    (128, Color::new(0xBE, 0x26, 0x22)),
+    (129, Color::new(0x8C, 0x14, 0x14)),
+    (240, Color::new(0xA6, 0x1A, 0x18)),
+    (255, Color::new(0xD8, 0x44, 0x3C)),
 ];
-pub const START_EDGE: Color = Color::new(0x8E, 0xD4, 0x6A);
+pub const START_EDGE: Color = Color::new(0xE0, 0x6A, 0x64);
 pub const START_TEXT: Color = Color::new(0xFF, 0xFF, 0xFF);
 
 /// A popup menu. White with a face-coloured gutter down its left and one
 /// border, which is what every Windows menu has been since XP.
 pub const MENU_BG: Color = Color::new(0xFF, 0xFF, 0xFF);
-pub const MENU_GUTTER: Color = Color::new(0xE2, 0xEE, 0xF4);
-pub const MENU_EDGE: Color = Color::new(0x8F, 0xB2, 0xC2);
+pub const MENU_GUTTER: Color = Color::new(0xE6, 0xE6, 0xE1);
+pub const MENU_EDGE: Color = Color::new(0x9A, 0x9A, 0x93);
 /// How wide the gutter is. Nothing is drawn in it yet -- XP puts an icon or a
 /// tick there -- and it is here because a menu without one reads as a list
 /// box, which is a different control that does a different thing.
@@ -395,14 +407,14 @@ pub const SHADOW_NUM: u32 = 214;
 pub const SCREEN: Color = Color::new(0x0A, 0x0C, 0x10);
 
 /// Selection bar in a list, and the fill of a focused default button.
-pub const SELECT: Color = APERTURE;
-pub const SELECT_TEXT: Color = Color::new(0x00, 0x00, 0x00);
+pub const SELECT: Color = SIGNAL;
+pub const SELECT_TEXT: Color = Color::new(0xFF, 0xFF, 0xFF);
 
 /// Reading colours for a page drawn in a screen well. Body is not pure white:
 /// a wall of #FFF on near-black glares, and a browser is the one program here
 /// somebody reads for minutes at a time.
 pub const SCREEN_TEXT: Color = Color::new(0xC8, 0xC8, 0xC8);
-pub const LINK: Color = APERTURE;
+pub const LINK: Color = SIGNAL;
 pub const HEADING: Color = HILIGHT;
 
 pub const CHROME_SCALE: u32 = 2;
@@ -578,7 +590,7 @@ pub fn tail_chars(s: &str, n: usize) -> &str {
 
 /// The Aperture mark, small enough for a title bar.
 ///
-/// Not the full boot logo: at this size the six-slash aperture turns to mush,
+/// Not the full boot logo: at this size the six-slash mark turns to mush,
 /// so this is the ring and the hexagonal opening only, which is what stays
 /// legible when it is sixteen pixels across.
 fn mark(fb: &Framebuffer, cx: i32, cy: i32, r: i32, fg: Color) {
@@ -955,9 +967,9 @@ pub fn separator_v(fb: &Framebuffer, x: u32, y: u32, h: u32) {
 /// Small enough that the six blades are mush, so this is the ring and the
 /// opening -- the same reduction `mark` makes for a title bar, exposed because
 /// the app bar wants it too.
-/// White, not `APERTURE_DEEP`. Its one caller is the Start button, which is
+/// White, not `SIGNAL_DEEP`. Its one caller is the Start button, which is
 /// green now, and a deep orange on that green reads as mud.
-pub fn aperture_dot(fb: &Framebuffer, cx: u32, cy: u32, r: i32) {
+pub fn mark_dot(fb: &Framebuffer, cx: u32, cy: u32, r: i32) {
     mark(fb, cx as i32, cy as i32, r.max(3), HILIGHT);
 }
 

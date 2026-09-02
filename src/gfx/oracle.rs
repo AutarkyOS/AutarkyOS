@@ -27,7 +27,7 @@ use alloc::string::String;
 /// One colour per branch: left alone, carried on, under load.
 const BRANCH_COLORS: [Color; 3] = [
     Color::new(0x5A, 0x9B, 0xD5), // cool blue -- the machine at rest
-    theme::APERTURE,              // amber -- the present carried forward
+    theme::SIGNAL,              // amber -- the present carried forward
     Color::new(0xD5, 0x5A, 0x3A), // hot red -- pushed hard
 ];
 

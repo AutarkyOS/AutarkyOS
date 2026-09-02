@@ -1146,7 +1146,7 @@ pub fn bench() {
 
     // ...and one where every row differs, which is the worst case.
     let (lo, hi) = best_of(&mut || {
-        target.rect(0, 0, w, h, theme::APERTURE);
+        target.rect(0, 0, w, h, theme::SIGNAL);
         compose::present();
     });
     kprintln!("  fill + present, all   {:>7} us  (max {})", lo, hi);

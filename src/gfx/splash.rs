@@ -145,7 +145,16 @@ const OPEN_CIRCUM_NUM: i32 = 1082;
 /// to read as one.
 const CUT_PCT: i32 = 22;
 
-/// The iris on the wall at Aperture Science.
+/// The mark: a six-bladed iris.
+///
+/// **The shape is inherited and the name is not, which is a debt rather than a
+/// resolution.** This was drawn as the iris on the wall at Aperture Science,
+/// and a fork that renames every string while keeping the silhouette has moved
+/// the problem rather than solved it. What makes it defensible for now is that
+/// the figure underneath is generic -- a camera aperture, six blades cut out of
+/// a disc, parameterised and not traced -- so it is a shape anybody may draw
+/// rather than a copy of anybody's artwork. A mark of AUTARK's own is still
+/// owed, and it is a design job rather than a rename.
 ///
 /// Drawn parametrically rather than stored as a bitmap: it costs no bytes on
 /// the ESP, scales to whatever panel the firmware reports, and is a geometric
@@ -169,8 +178,8 @@ const CUT_PCT: i32 = 22;
 /// Public because the desktop wall draws the same mark. One definition of what
 /// the logo *is*, so the wall and the boot screen cannot drift apart --
 /// `tools/mklogo.py` is a port of this and must be re-run if it changes.
-pub fn aperture(fb: &super::Framebuffer, cx: i32, cy: i32, r: i32, fg: super::Color, bg: super::Color) {
-    aperture_with(fb, cx, cy, r, Face::Flat(fg), Cut::Solid(bg));
+pub fn mark(fb: &super::Framebuffer, cx: i32, cy: i32, r: i32, fg: super::Color, bg: super::Color) {
+    mark_with(fb, cx, cy, r, Face::Flat(fg), Cut::Solid(bg));
 }
 
 /// What the blades themselves are made of.
@@ -208,7 +217,7 @@ pub enum Cut<'a> {
 /// One geometry and one set of constants for both. Two marks that agreed about
 /// where a blade goes only while somebody kept them agreeing would be the
 /// duplicated-layout bug wearing a logo.
-pub fn aperture_with(
+pub fn mark_with(
     fb: &super::Framebuffer,
     cx: i32,
     cy: i32,
@@ -291,7 +300,7 @@ pub fn begin() {
 
     let cx = l.px + l.pw / 2;
 
-    aperture(
+    mark(
         &fb,
         cx as i32,
         (l.py + l.logo_cy) as i32,

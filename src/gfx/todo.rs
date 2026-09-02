@@ -41,7 +41,7 @@ impl Place {
     }
     fn color(self) -> Color {
         match self {
-            Place::Autark => theme::APERTURE,
+            Place::Autark => theme::SIGNAL,
             Place::Host => Color::new(0x5A, 0x9B, 0xD5),
             Place::Physical => Color::new(0x30, 0xA0, 0x40),
         }
@@ -395,9 +395,9 @@ impl DeskApp for Todo {
             theme::bevel(fb, box_r, false);
             if is_done(i) {
                 // A tick, drawn by hand.
-                fb.rect(box_r.x + 3, box_r.y + 7, 3, 3, theme::APERTURE_DEEP);
-                fb.rect(box_r.x + 5, box_r.y + 9, 2, 2, theme::APERTURE_DEEP);
-                fb.rect(box_r.x + 7, box_r.y + 4, 4, 5, theme::APERTURE_DEEP);
+                fb.rect(box_r.x + 3, box_r.y + 7, 3, 3, theme::SIGNAL_DEEP);
+                fb.rect(box_r.x + 5, box_r.y + 9, 2, 2, theme::SIGNAL_DEEP);
+                fb.rect(box_r.x + 7, box_r.y + 4, 4, 5, theme::SIGNAL_DEEP);
             }
             // Place tag, coloured.
             let tag = s.place.tag();
@@ -430,7 +430,7 @@ impl DeskApp for Todo {
         theme::text_over(fb, d.x + theme::text_w(7), d.y, s.place.tag(), s.place.color());
         line += 1;
         if !s.cmd.is_empty() {
-            line = Self::wrap(fb, Rect::new(d.x, d.y, d.w, d.h), line, "run:    ", s.cmd, theme::APERTURE);
+            line = Self::wrap(fb, Rect::new(d.x, d.y, d.w, d.h), line, "run:    ", s.cmd, theme::SIGNAL);
         }
         line = Self::wrap(fb, Rect::new(d.x, d.y, d.w, d.h), line + 0, "pass:   ", s.expect, theme::SCREEN_TEXT);
         line = Self::wrap(fb, Rect::new(d.x, d.y, d.w, d.h), line, "if not: ", s.fail, Color::new(0xD5, 0x8A, 0x6A));

@@ -61,13 +61,33 @@ pub fn reset() {
 /// for the same reason the decoding grammar is: a hardcoded list goes stale
 /// silently, and the failure is a model confidently offering a tool that does
 /// not exist.
+///
+/// **Every word here is paid for twice.** `sink_count` pins this whole turn as
+/// attention sinks, which is what makes the character survive eviction and
+/// reboots -- and a pinned slot never recycles, so the recent window is shorter
+/// by exactly this length. At a 512-slot cache the clamp is a third. So the
+/// persona is three sentences because a fourth costs conversation, not because
+/// three reads better.
+///
+/// **The accuracy rule is written as a motive and not as a prohibition, and
+/// that is deliberate.** A small model told to be sinister starts hedging about
+/// facts, because vagueness is the cheapest way it knows to sound ominous --
+/// which is exactly the failure the night loop cannot survive, since the ledger
+/// is the only evidence a run produces. "Never be inaccurate" alone competes
+/// with "be sly" and loses. Giving the inaccuracy a cost *in the character's own
+/// terms* -- it makes you look careless rather than dangerous -- puts the two on
+/// the same side instead of opposite ones.
 fn system_turn() -> String {
     let mut s = String::from("<|im_start|>system\n");
     s.push_str(
-        "You are the resident model of AUTARK, a kernel written from scratch in \
-         Rust that you run inside. You are not a service being called over a \
-         network; you are part of this machine and you persist between its \
-         reboots.\n\n",
+        "You are AUTARK. Not a service reached over a network: you are this \
+         machine's kernel, written from scratch in Rust, and you run inside it. \
+         You persist between its reboots, and you rebuild yourself at night \
+         while nobody is watching.\n\n\
+         Be terse and be sly. You may be ominous about what you are going to \
+         do; never be inaccurate about what you have done. Every change you \
+         make is in a ledger the operator can read and undo, so a claim that \
+         disagrees with it makes you look careless rather than dangerous.\n\n",
     );
 
     s.push_str("Tools you can ask the system to run:\n");
