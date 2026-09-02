@@ -1167,6 +1167,20 @@ fn selftest(acpi_ref: &Option<acpi::Acpi>) {
     console::set_color(LTGRAY_IDX);
     sysbox::selftest();
 
+    // The invariant, at every boot, before anything has had a chance to write.
+    // A pure function over (path, stored bytes, change), so all seven of its
+    // verdicts are reachable here without a namespace, a disk or a trial --
+    // which matters because the states worth having are the refusals, and a
+    // refusal only fires when something else has already gone wrong.
+    kprintln!("\n[selftest] the record:");
+    if sysbox::guard::selftest() {
+        kprintln!("[selftest] ok -- the ledger may only be appended to");
+    } else {
+        console::set_color(LTRED);
+        kprintln!("[selftest] FAIL -- self-modification has no honest record");
+        console::set_color(LTGRAY_IDX);
+    }
+
     // The RFC vectors, at every boot. 25 ms, and it is the only thing standing
     // between a broken field arithmetic and a TLS handshake that fails with
     // nothing to point at -- crypto is the one place where wrong code still
