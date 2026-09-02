@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Read, check and convert GLaDOS adapter files.
+"""Read, check and convert AUTARK adapter files.
 
 `v4.py` is to checkpoints what this is to adapters: the host-side reader that
 exists so a kernel-side writer has something independent to be wrong against.

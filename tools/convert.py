@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
-"""Convert a Hugging Face Llama- or Qwen-architecture checkpoint into a GLaDOS model file.
+"""Convert a Hugging Face Llama- or Qwen-architecture checkpoint into a AUTARK model file.
 
 Why this exists
 ---------------
-GLaDOS reads its weights off the ESP before ExitBootServices, as one flat
+AUTARK reads its weights off the ESP before ExitBootServices, as one flat
 buffer that `offsets()` indexes by arithmetic. Safetensors is a dict of named
-tensors in bf16. Something has to do the flattening, and it cannot be GLaDOS:
+tensors in bf16. Something has to do the flattening, and it cannot be AUTARK:
 parsing JSON and rearranging 134M values inside a kernel with no debugger is a
 poor trade against ~200 lines of Python that runs once.
 

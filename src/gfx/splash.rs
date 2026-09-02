@@ -300,7 +300,7 @@ pub fn begin() {
         LTGRAY,
     );
 
-    centred_text(&fb, cx, l.py + l.title_y, "GLaDOS", l.scale + 1, BLACK);
+    centred_text(&fb, cx, l.py + l.title_y, "AUTARK", l.scale + 1, BLACK);
     centred_text(
         &fb,
         cx,

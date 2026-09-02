@@ -25,7 +25,7 @@
 //!     fields depending on direction, plus fragmentation and aggregation.
 //!   * **WPA2/WPA3.** The four-way handshake, which needs PBKDF2-HMAC-SHA1 for
 //!     the pairwise master key, AES key wrap, and CCMP for the data path.
-//!     GLaDOS will have most of those primitives once TLS exists, which is the
+//!     AUTARK will have most of those primitives once TLS exists, which is the
 //!     one part of this that gets cheaper by waiting.
 //!
 //! So the honest order is: identify the card, then decide whether its firmware

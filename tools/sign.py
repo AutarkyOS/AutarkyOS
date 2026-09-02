@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Sign a GLaDOS update image with P-256 ECDSA.
+"""Sign a AUTARK update image with P-256 ECDSA.
 
     sign.py --keygen [--out FILE]          make a keypair
     sign.py <image> <out.sig> --key-file F sign an image

@@ -79,7 +79,7 @@ pub fn key_held(ticks: u64) -> bool {
 
 fn banner() {
     console::set_color(LTCYAN);
-    kprintln!("\n=== GLaDOS recovery console ===");
+    kprintln!("\n=== AUTARK recovery console ===");
     console::set_color(WHITE);
     kprintln!("running from the boot image; no persistent state has been restored");
     help();

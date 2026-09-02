@@ -9,7 +9,7 @@
 //!
 //! It is here anyway because WPA2 has no alternative: CCMP is AES and a
 //! supplicant does not get to negotiate something else. The mitigating facts
-//! are that GLaDOS runs one program on one core with nothing else to do the
+//! are that AUTARK runs one program on one core with nothing else to do the
 //! measuring, and that the alternative -- no wireless at all -- is worse. If
 //! this system ever runs untrusted code, this becomes a real problem and the
 //! answer is AES-NI, which this CPU has.

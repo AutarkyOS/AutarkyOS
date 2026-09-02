@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Compute reference logits from a converted GLaDOS model, in numpy.
+"""Compute reference logits from a converted AUTARK model, in numpy.
 
 The oracle for the kernel's int8 forward pass. This reads the *converted* file
 rather than the original safetensors, so it exercises the same layout,
@@ -7,7 +7,7 @@ quantisation, head geometry and rope_theta the kernel will -- a bug in
 convert.py shows up here as well as there, and only a bug in the Rust shows up
 as a mismatch between the two.
 
-Feed the same token ids to `logits <ids>` in GLaDOS and compare. A stride
+Feed the same token ids to `logits <ids>` in AUTARK and compare. A stride
 miscomputed, sign extension dropped in the AVX2 widening, QK-Norm applied on
 the wrong side of RoPE, or the wrong RoPE base all produce fluent-looking
 nonsense rather than an error, so a numeric comparison is the only thing that
@@ -42,7 +42,7 @@ def load(path):
     blob = np.fromfile(path, dtype=np.uint8)
     magic = blob[:8].tobytes()
     if magic != b"GLADOSM2":
-        raise SystemExit(f"not a GLaDOS model file: {magic!r}")
+        raise SystemExit(f"not a AUTARK model file: {magic!r}")
     head = blob[:HEADER].tobytes()
     (version, dim, hidden, layers, heads, kv_heads, raw_vocab, seq, theta, quant) = (
         struct.unpack_from("<Iiiiiiii f I", head, 8)

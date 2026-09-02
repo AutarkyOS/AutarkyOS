@@ -370,7 +370,7 @@ pub fn init() {
         };
         asm!("lidt [{}]", in(reg) &ptr, options(readonly, nostack, preserves_flags));
     }
-    serial_println!("glados: idt installed");
+    serial_println!("autark: idt installed");
 }
 
 /// Point this core at the table `init` already built.

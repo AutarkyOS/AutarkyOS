@@ -37,8 +37,8 @@ const STACK_SIZE: usize = 64 * 1024;
 // r12-r15, which is what the six pushes below cover.
 core::arch::global_asm!(
     r#"
-    .globl glados_switch_context
-glados_switch_context:
+    .globl autark_switch_context
+autark_switch_context:
     push rbp
     push rbx
     push r12
@@ -58,7 +58,7 @@ glados_switch_context:
 );
 
 extern "sysv64" {
-    fn glados_switch_context(save_rsp: *mut u64, new_rsp: u64);
+    fn autark_switch_context(save_rsp: *mut u64, new_rsp: u64);
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -74,7 +74,7 @@ pub enum State {
     ///
     /// This state exists for a window of a few instructions and it is the
     /// reason the scheduler is not simply a lock around the old one. Between
-    /// deciding to leave a task and `glados_switch_context` storing its `rsp`,
+    /// deciding to leave a task and `autark_switch_context` storing its `rsp`,
     /// the task is not resumable, and marking it `Ready` there would let
     /// another core pick it up and resume a stack pointer that is stale. The
     /// core that switched *in* clears this, by which time the store has
@@ -413,7 +413,7 @@ pub fn spawn(name: &'static str, entry: fn()) -> Option<usize> {
 
     let top = stack as usize + STACK_SIZE;
 
-    // Fabricate what `glados_switch_context` expects to pop, so the first
+    // Fabricate what `autark_switch_context` expects to pop, so the first
     // switch into this task lands on `trampoline`:
     //
     //   [rsp+ 0] r15   [rsp+ 8] r14   [rsp+16] r13
@@ -460,7 +460,7 @@ pub fn spawn(name: &'static str, entry: fn()) -> Option<usize> {
 extern "C" fn trampoline() -> ! {
     // A task entered here was switched *into*, so it owes the same release
     // every other incoming context owes. This is not the same path as the one
-    // after `glados_switch_context`: a task that has never run does not return
+    // after `autark_switch_context`: a task that has never run does not return
     // there, it arrives here instead.
     //
     // Missing this hung boot on the first switch. Task 0 was left in
@@ -606,20 +606,20 @@ fn schedule() {
         // and only then switch stacks.
         //
         // The ordering is deliberate. The obvious alternative -- switch first,
-        // restore our own state after `glados_switch_context` returns -- means
+        // restore our own state after `autark_switch_context` returns -- means
         // the restore runs when we are the *outgoing* task again, so it has to
         // use the index captured before the switch rather than CURRENT. That is
         // a silent wrong-task bug waiting for whoever later "simplifies" it.
         //
         // Nothing between the xrstor and the switch may touch FP state.
-        // `glados_switch_context` is pure integer assembly.
+        // `autark_switch_context` is pure integer assembly.
         if !out_fpu.is_null() {
             crate::cpu::xsave_to(out_fpu);
         }
         if !in_fpu.is_null() {
             crate::cpu::xrstor_from(in_fpu);
         }
-        glados_switch_context(save, load);
+        autark_switch_context(save, load);
     }
 
     // Resumed. Possibly on a different core from the one that left, which is

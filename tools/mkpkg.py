@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Pack a directory into a GLaDOS package.
+"""Pack a directory into a AUTARK package.
 
 Deliberately not compressed. A compressed archive would mean carrying a
 decompressor in the kernel for the sake of files the store already deduplicates

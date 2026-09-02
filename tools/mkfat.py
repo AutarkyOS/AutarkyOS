@@ -33,7 +33,7 @@ DATA_START = RESERVED + NUM_FATS * FAT_SECTORS + ROOT_SECTORS
 def boot_sector():
     b = bytearray(SECTOR)
     b[0:3] = b"\xeb\x3c\x90"
-    b[3:11] = b"GLADOS  "
+    b[3:11] = b"AUTARK  "
     struct.pack_into("<H", b, 0x0B, SECTOR)
     b[0x0D] = SPC
     struct.pack_into("<H", b, 0x0E, RESERVED)
@@ -144,7 +144,7 @@ def main():
         return first
 
     # A file larger than one cluster, so the chain is actually followed.
-    big = ("GLaDOS rescue volume.\n" + "".join(
+    big = ("AUTARK rescue volume.\n" + "".join(
         f"line {i:04} padding to force a multi-cluster chain\n" for i in range(80)
     )).encode()
     big_cluster = alloc(big)

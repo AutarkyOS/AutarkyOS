@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Draw the GLaDOS aperture mark for the web.
+"""Draw the AUTARK aperture mark for the web.
 
 This and `gfx::splash::aperture` in the kernel are the same construction, in
 integer arithmetic there and floating point here. The kernel was ported from
@@ -185,7 +185,7 @@ def svg():
         d.append("M {} L {} L {} Z".format(
             *[f"{x:.2f},{y:.2f}" for x, y in t_]))
     return ('<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 100" '
-            'role="img" aria-label="GLaDOS aperture mark">'
+            'role="img" aria-label="AUTARK aperture mark">'
             f'<path d="{" ".join(d)}" '
             f'fill="#{AMBER[0]:02X}{AMBER[1]:02X}{AMBER[2]:02X}" '
             'fill-rule="evenodd"/></svg>')

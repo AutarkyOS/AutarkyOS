@@ -1,10 +1,10 @@
 //! The hardware runbook.
 //!
-//! The machine that builds GLaDOS is not the machine that runs it, and the
+//! The machine that builds AUTARK is not the machine that runs it, and the
 //! person carrying a change to the GF63 needs to verify it there without
 //! coming back to ask what "logits 7 11 3" was supposed to mean. So this is
 //! not a checklist of reminders -- it is a runbook. Each step is selectable,
-//! and the pane below it shows the exact command, where to run it (in GLaDOS,
+//! and the pane below it shows the exact command, where to run it (in AUTARK,
 //! on the dev box, or physically at the laptop), what a pass looks like, and
 //! what a failure means. A step you can tick without knowing whether it
 //! passed is a step that verifies nothing.
@@ -23,8 +23,8 @@ use alloc::string::String;
 /// Where a step is carried out.
 #[derive(Clone, Copy)]
 pub enum Place {
-    /// Typed at the GLaDOS shell, or read from its screen.
-    Glados,
+    /// Typed at the AUTARK shell, or read from its screen.
+    Autark,
     /// On the development machine, in PowerShell.
     Host,
     /// At the laptop itself -- a reboot, a cable, a camera.
@@ -34,14 +34,14 @@ pub enum Place {
 impl Place {
     pub fn tag(self) -> &'static str {
         match self {
-            Place::Glados => "GLaDOS",
+            Place::Autark => "AUTARK",
             Place::Host => "host",
             Place::Physical => "phys",
         }
     }
     fn color(self) -> Color {
         match self {
-            Place::Glados => theme::APERTURE,
+            Place::Autark => theme::APERTURE,
             Place::Host => Color::new(0x5A, 0x9B, 0xD5),
             Place::Physical => Color::new(0x30, 0xA0, 0x40),
         }
@@ -80,7 +80,7 @@ pub const STEPS: &[Step] = &[
     },
     Step {
         title: "Record the [boot] phys line",
-        place: Place::Glados,
+        place: Place::Autark,
         cmd: "log all   (or 'log save' and read it back later)",
         expect: "'[boot] phys N MiB free, largest contiguous region M MiB'. \
                  M has never been captured on this machine. It used to have \
@@ -91,7 +91,7 @@ pub const STEPS: &[Step] = &[
     },
     Step {
         title: "Boot selftests: every line ok",
-        place: Place::Glados,
+        place: Place::Autark,
         cmd: "log all   then look for FAIL anywhere in it",
         expect: "eighteen sections, seventy-nine claims, every line ok. \
                  Crypto is fifteen published vector sets.",
@@ -103,7 +103,7 @@ pub const STEPS: &[Step] = &[
     },
     Step {
         title: "Save the boot log before anything else",
-        place: Place::Glados,
+        place: Place::Autark,
         cmd: "log save",
         expect: "'N bytes -> /sys/boot.log'. Everything printed since power-on, \
                  including the lines that scrolled away. 'log all' prints it, 'log' \
@@ -115,7 +115,7 @@ pub const STEPS: &[Step] = &[
     Step {
         title: "Provision a store region, or nothing leaves this machine",
         place: Place::Host,
-        cmd: "carve a small partition on the internal nvme with the GLaDOS type \
+        cmd: "carve a small partition on the internal nvme with the AUTARK type \
               guid b7e1f4a2-9c3d-4e58-a061-2f8d7c4b93e5",
         expect: "next boot prints '[store] store at lba N', and then 'store unlock' \
                  plus 'snap' commit the namespace to it.",
@@ -126,7 +126,7 @@ pub const STEPS: &[Step] = &[
     },
     Step {
         title: "Does the entropy pool actually fill?",
-        place: Place::Glados,
+        place: Place::Autark,
         cmd: "rng then type for a while then rng",
         expect: "'N deposits: X from input, Y from storage'. Under emulation only \
                  one input deposit ever arrives, qemu's i8042 probe blip, so real \
@@ -138,7 +138,7 @@ pub const STEPS: &[Step] = &[
     },
     Step {
         title: "Train the decision layer at full corpus",
-        place: Place::Glados,
+        place: Place::Autark,
         cmd: "train adapter",
         expect: "the corpus at full size. A forward-pass group is 1.8 s \
                  under whpx and should be well under that here, so the \
@@ -150,7 +150,7 @@ pub const STEPS: &[Step] = &[
     },
     Step {
         title: "A godel trial where J1 can actually pass",
-        place: Place::Glados,
+        place: Place::Autark,
         cmd: "godel now then godel ledger",
         expect: "the margin judge needs six repaired validation \
                  decisions with none broken, so it needs a subsample big \
@@ -163,7 +163,7 @@ pub const STEPS: &[Step] = &[
     },
     Step {
         title: "Qwen3.5-2B is already staged",
-        place: Place::Glados,
+        place: Place::Autark,
         cmd: "(nothing to run -- model.bin on the stick is the 2B)",
         expect: "the [ai] line shows dim 2048, 24 layers, vocab 248320, \
                  the hybrid. q3.bin and q3-tokenizer.bin hold the working \
@@ -175,7 +175,7 @@ pub const STEPS: &[Step] = &[
     },
     Step {
         title: "Verify Qwen3.5 logits vs the oracle",
-        place: Place::Glados,
+        place: Place::Autark,
         cmd: "logits 7 11 3",
         expect: "the same top-5 ids as the oracle. On the dev box the oracle is: \
                  tools\\venv\\Scripts\\python.exe tools\\ref35.py --converted \
@@ -186,7 +186,7 @@ pub const STEPS: &[Step] = &[
     },
     Step {
         title: "q35 text works; the note saying otherwise was wrong",
-        place: Place::Glados,
+        place: Place::Autark,
         cmd: "gen -n 24 The capital of France is",
         expect: "real sentences. this step used to assert the split \
                  pattern was unimplemented and the words were garbage. \
@@ -201,7 +201,7 @@ pub const STEPS: &[Step] = &[
     },
     Step {
         title: "Time generation, both models",
-        place: Place::Glados,
+        place: Place::Autark,
         cmd: "gen -n 32 the",
         expect: "note the tok/s it prints. Run once with Qwen3 (model.bin = q3) \
                  and once with q35 loaded. First real-hardware speed numbers; \
@@ -211,7 +211,7 @@ pub const STEPS: &[Step] = &[
     },
     Step {
         title: "Confirm the memory win",
-        place: Place::Glados,
+        place: Place::Autark,
         cmd: "window",
         expect: "with q35: ~12 MiB KV over 6 of 24 layers, plus 19.3 MiB of \
                  recurrent state. Against Qwen3-0.6b's 112 MiB KV at seq 512. \
@@ -231,7 +231,7 @@ pub const STEPS: &[Step] = &[
     },
     Step {
         title: "Network on the real card",
-        place: Place::Glados,
+        place: Place::Autark,
         cmd: "dhcp   then   dns example.com   then   https example.com /",
         expect: "an address from DHCP, an A record, a TLS 1.3 fetch. The \
                  rtl8168 has never run -- QEMU emulates the 8139.",

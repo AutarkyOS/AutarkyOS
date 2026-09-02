@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Host prototype of the Globular Field, GLaDOS overhaul.
+"""Host prototype of the Globular Field, AUTARK overhaul.
 
 Measures, on the route rail, whether a population of latent hypothesis
 agents refined by core/halo gravity and a *wired-in* genetic search beats

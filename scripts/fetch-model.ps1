@@ -1,9 +1,9 @@
 <#
 .SYNOPSIS
-    Fetch a llama2.c checkpoint into esp\GLADOS so deploy.ps1 can carry it.
+    Fetch a llama2.c checkpoint into esp\AUTARK so deploy.ps1 can carry it.
 
 .DESCRIPTION
-    This is the SECONDARY path. The model GLaDOS actually runs is SmolLM2-135M,
+    This is the SECONDARY path. The model AUTARK actually runs is SmolLM2-135M,
     produced by tools\convert.py from a Hugging Face safetensors checkpoint into
     a quantised GLADOSM2 file. Use this script for karpathy's tinyllamas instead
     -- they are small, they load fast, and they are useful for exercising the
@@ -14,7 +14,7 @@
 
     The weights are not in the repository -- they are someone else's artifact,
     they are large, and git is the wrong place for either. This script puts them
-    where the loader expects them: esp\GLADOS\model.bin and tokenizer.bin, read
+    where the loader expects them: esp\AUTARK\model.bin and tokenizer.bin, read
     off the boot volume by uefi::read_file before ExitBootServices.
 
     stories260K is the default because it is the only one of karpathy's
@@ -39,14 +39,14 @@ param(
 
 $ErrorActionPreference = 'Stop'
 $root = Split-Path -Parent $PSScriptRoot
-$dir  = Join-Path $root 'esp\GLADOS'
+$dir  = Join-Path $root 'esp\AUTARK'
 New-Item -ItemType Directory -Force -Path $dir | Out-Null
 
 # Both formats share model.bin, so downloading a 1 MB tinyllama on top of a
 # converted 129 MB SmolLM2 is an easy accident with a slow recovery -- the
 # conversion needs the safetensors checkpoint fetched again. Refuse unless the
 # overwrite was asked for.
-$existing = Join-Path $root 'esp\GLADOS\model.bin'
+$existing = Join-Path $root 'esp\AUTARK\model.bin'
 if ((Test-Path $existing) -and -not $Force) {
     $fs = [System.IO.File]::OpenRead($existing)
     $magic = New-Object byte[] 8

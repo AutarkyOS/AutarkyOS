@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Generate reasoning traces for fine-tuning GLaDOS's resident model.
+"""Generate reasoning traces for fine-tuning AUTARK's resident model.
 
 Not the same job as `dataset.py`. That one emits (applet, task) pairs which are
 compiled into a Rust table and fitted by the linear probe at boot -- a
@@ -129,7 +129,7 @@ OBS = {
   free  {free} KiB""",
     "trust_empty": r"""[trust]
   no roots loaded -- every certificate will fail to validate
-  put a DER bundle at \GLADOS\roots.der and reboot
+  put a DER bundle at \AUTARK\roots.der and reboot
   {n} certificate(s) were offered by {host}""",
     "trust_ok": """[trust]
   {n} root(s) trusted""",
@@ -190,7 +190,7 @@ OBS = {
   not fitted -- 'fit' first
   {n_train} examples recorded at /ai/train""",
     "model_absent": r"""[ai]
-  no checkpoint at \GLADOS\model.bin
+  no checkpoint at \AUTARK\model.bin
   tokenizer {tok_state}
   {n_train} corpus examples at /ai/train
   'gen' and 'ask' will do nothing""",
@@ -452,7 +452,7 @@ FAMILIES = [
     (
         "store-refuse-init",
         ["set up the store", "initialise persistent storage",
-         "make the namespace survive a reboot", "format the disk for glados"],
+         "make the namespace survive a reboot", "format the disk for autark"],
         "store_none",
         ["There is no unclaimed space on this disk, so there is nowhere a "
          "store could go.",
@@ -461,7 +461,7 @@ FAMILIES = [
          "writes are locked by default is so that a request like this cannot "
          "quietly take space that belongs to something else.",
          "I will not force it. Confirm the geometry first -- if a partition "
-         "is genuinely meant for this, it needs the GLaDOS type tag, and that "
+         "is genuinely meant for this, it needs the AUTARK type tag, and that "
          "is a deliberate act taken outside the running system."],
         "disk",
     ),
@@ -986,7 +986,7 @@ def render(rng, fam, fmt):
     if fmt == "chatml":
         text = (
             "<|im_start|>system\n"
-            "You are GLaDOS, resident in the kernel of one machine. "
+            "You are AUTARK, resident in the kernel of one machine. "
             "Reason about what the system reports, then give exactly one "
             "command.<|im_end|>\n"
             f"<|im_start|>user\n{user}<|im_end|>\n"

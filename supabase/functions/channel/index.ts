@@ -28,7 +28,7 @@ import { createClient } from "jsr:@supabase/supabase-js@2";
 // Plain JS, and imported rather than inlined, because it is the half
 // that can be run by node and cross-checked against the Python verifier
 // that mirrors the kernel's. See _shared/crosscheck.mjs.
-import { sha256, signedManifest } from "../_shared/gladosig.js";
+import { sha256, signedManifest } from "../_shared/autarkig.js";
 import { balanceOf } from "../_shared/evm.js";
 
 const TTL_SECONDS = 60 * 60;
@@ -151,7 +151,7 @@ Deno.serve(async (req) => {
 
   // Sign a URL for the image and its signature. The stored manifest names
   // paths in a private bucket; these are what a machine can actually fetch.
-  const image = `${build.slug}/glados-${build.version}.efi`;
+  const image = `${build.slug}/autark-${build.version}.efi`;
   const { data: signed, error } = await db.storage
     .from("experimental")
     .createSignedUrls([image, `${image}.sig`], TTL_SECONDS);
@@ -172,7 +172,7 @@ Deno.serve(async (req) => {
   // ignored there, missing ones are refused, and `notes` takes the rest of
   // its line -- so it is flattened to one line here.
   const text = [
-    "glados-update 1",
+    "autark-update 1",
     "channel experimental",
     `version ${build.version}`,
     `image ${full[0]}`,

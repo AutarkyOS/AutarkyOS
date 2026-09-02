@@ -469,7 +469,7 @@ impl Blob {
 /// Read a whole file from the volume this image was loaded from.
 ///
 /// `path` is an absolute path on that volume using backslashes, e.g.
-/// `\GLADOS\model.bin`. ASCII only -- it is widened to UCS-2 by zero
+/// `\AUTARK\model.bin`. ASCII only -- it is widened to UCS-2 by zero
 /// extension, which is correct for ASCII and wrong for anything else.
 ///
 /// Returns `None` for every failure, including "not there". A missing model is
@@ -676,7 +676,7 @@ pub fn read_file(bs: &BootServices, image: Handle, path: &str) -> Option<Blob> {
             // otherwise, which sends the operator chasing a copy that
             // succeeded.
             serial_println!(
-                "glados: {} is {} KiB and neither pool nor {} pages could hold it",
+                "autark: {} is {} KiB and neither pool nor {} pages could hold it",
                 path,
                 size / 1024,
                 pages
@@ -685,7 +685,7 @@ pub fn read_file(bs: &BootServices, image: Handle, path: &str) -> Option<Blob> {
             return None;
         }
         serial_println!(
-            "glados: {} took {} pages; the pool refused {} KiB",
+            "autark: {} took {} pages; the pool refused {} KiB",
             path,
             pages,
             size / 1024
@@ -702,7 +702,7 @@ pub fn read_file(bs: &BootServices, image: Handle, path: &str) -> Option<Blob> {
         let st = unsafe { ((*file).read)(file, &mut want, buf.add(done)) };
         if is_error(st) || want == 0 {
             serial_println!(
-                "glados: {} read ended at {}/{} bytes",
+                "autark: {} read ended at {}/{} bytes",
                 path,
                 done,
                 total

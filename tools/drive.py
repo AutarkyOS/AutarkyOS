@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Boot GLaDOS in QEMU and drive its shell over a serial socket.
+"""Boot AUTARK in QEMU and drive its shell over a serial socket.
 
 Why a socket rather than stdio
 ------------------------------
@@ -32,7 +32,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 PORT = 45454
 MONITOR_PORT = 45455
-PROMPT = b"glados> "
+PROMPT = b"autark> "
 
 
 def find_qemu():
@@ -317,7 +317,7 @@ def main():
         model_src = stage_iso
     # A staged checkpoint has to fit in guest RAM beside the firmware, the
     # heap ladder and the KV cache. Forgetting --memory reads as "no model at
-    # \GLADOS\model.bin" because the pool allocation fails first, which is a
+    # \AUTARK\model.bin" because the pool allocation fails first, which is a
     # message about the wrong thing. Size for it here: weights plus ~2.3 GiB
     # of everything else, rounded up to a whole GiB.
     if stage_iso is not None and not memory_given:
@@ -351,15 +351,15 @@ def main():
                     return False
 
     esp = ROOT / ".qemu/esp"
-    (esp / "GLADOS").mkdir(parents=True, exist_ok=True)
+    (esp / "AUTARK").mkdir(parents=True, exist_ok=True)
     for src, dst in [
         (model_src, "model.bin"),
         (tokenizer_src, "tokenizer.bin"),
-        (ROOT / "esp/GLADOS/roots.der", "roots.der"),
+        (ROOT / "esp/AUTARK/roots.der", "roots.der"),
     ]:
         if not src.exists():
             raise SystemExit(f"missing {src}")
-        target = esp / "GLADOS" / dst
+        target = esp / "AUTARK" / dst
         # Content-compare rather than always copying: the copy is the slowest
         # thing in a run that is otherwise seconds.
         if not target.exists() or differs(src, target):
@@ -368,9 +368,9 @@ def main():
     # Stage the binary the same way run.ps1 does. Without this the firmware
     # finds no bootloader and reports "Not Found", which looks nothing like
     # "you forgot to copy the build".
-    built = ROOT / "target/x86_64-unknown-uefi/release/glados.efi"
+    built = ROOT / "target/x86_64-unknown-uefi/release/autark.efi"
     if not built.exists():
-        built = ROOT / "target/x86_64-unknown-uefi/debug/glados.efi"
+        built = ROOT / "target/x86_64-unknown-uefi/debug/autark.efi"
     if not built.exists():
         raise SystemExit(f"no build artifact under {ROOT / 'target'}; run cargo build first")
     boot = esp / "EFI/BOOT"
@@ -413,8 +413,8 @@ def main():
             mkiso.Entry('BOOTX64.EFI', built.stat().st_size, built))
         efi_dir.children.append(boot_dir)
         root.children.append(efi_dir)
-        g = mkiso.Entry('GLADOS', 0)
-        for f in sorted((esp / 'GLADOS').iterdir()):
+        g = mkiso.Entry('AUTARK', 0)
+        for f in sorted((esp / 'AUTARK').iterdir()):
             if f.is_file():
                 g.children.append(mkiso.Entry(f.name, f.stat().st_size, f))
         root.children.append(g)
@@ -441,7 +441,7 @@ def main():
                 f"{out_iso} is {actual} bytes, wanted {expected} -- "
                 "the write did not complete; check free disk space"
             )
-        mkiso.build_iso(out_iso, esp_offset, size, 'GLADOS')
+        mkiso.build_iso(out_iso, esp_offset, size, 'AUTARK')
         print(f"[drive] staged {total / 1024 / 1024:.0f} MB as {out_iso}")
         iso = out_iso
 

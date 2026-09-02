@@ -59,7 +59,7 @@ const AP_STACK: usize = 64 * 1024;
 static ONLINE: AtomicUsize = AtomicUsize::new(0);
 
 /// Set once every core has its own descriptor tables, per-core block and idle
-/// task, and they may all begin scheduling. See `glados_ap_main`.
+/// task, and they may all begin scheduling. See `autark_ap_main`.
 static RELEASED: AtomicBool = AtomicBool::new(false);
 
 /// Let every core that is up start taking work.
@@ -184,7 +184,7 @@ extern "C" {
 ///
 /// Not `pub`: the only thing that may call this is a SIPI.
 #[no_mangle]
-extern "C" fn glados_ap_main() -> ! {
+extern "C" fn autark_ap_main() -> ! {
     // CR4 and XCR0 are per-core. A core that skips this handshake takes #UD on
     // the first `vmulps` no matter what the BSP enabled for itself, so every
     // AVX kernel it ran would have to be the scalar fallback -- which is most
@@ -541,7 +541,7 @@ pub fn init(acpi: &crate::acpi::Acpi) -> usize {
     let params = (TRAMPOLINE + params_off) as *mut u64;
     unsafe {
         params.add(0).write_volatile(crate::cpu::read_cr3());
-        params.add(1).write_volatile(glados_ap_main as usize as u64);
+        params.add(1).write_volatile(autark_ap_main as usize as u64);
     }
 
     let me = lapic::id() as u32;

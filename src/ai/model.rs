@@ -1507,7 +1507,7 @@ impl Model {
     /// allocates LoaderData and never frees it, and the frame allocator
     /// deliberately excludes that type so it can never be handed out as free
     /// memory.
-    pub fn from_glados(data: &'static [u8]) -> Result<Self, LoadError> {
+    pub fn from_autark(data: &'static [u8]) -> Result<Self, LoadError> {
         if data.len() < GLADOS_HEADER || &data[0..8] != GLADOS_MAGIC {
             return Err(LoadError::BadHeader);
         }

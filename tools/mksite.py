@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Generate the GLaDOS documentation site: static HTML, one file per topic.
+"""Generate the AUTARK documentation site: static HTML, one file per topic.
 
 Why generated rather than hand-written
 --------------------------------------
@@ -29,8 +29,8 @@ import json
 import re
 from pathlib import Path
 
-BASE = "https://ilumci.github.io/GLaDOS"
-REPO = "https://github.com/IlumCI/GLaDOS"
+BASE = "https://ilumci.github.io/AUTARK"
+REPO = "https://github.com/IlumCI/AUTARK"
 REL = REPO + "/releases/latest/download/"
 UPDATED = "2026-08-14"
 
@@ -38,7 +38,7 @@ UPDATED = "2026-08-14"
 # site leans on a fictional company's name and the honest version of that is
 # saying so everywhere rather than once.
 DISCLAIMER = (
-    "GLaDOS, Aperture Science and Portal are properties of Valve Corporation. "
+    "AUTARK, Aperture Science and Portal are properties of Valve Corporation. "
     "This is an independent, non-commercial homage and is not affiliated with, "
     "endorsed by, or connected to Valve in any way."
 )
@@ -93,15 +93,15 @@ def page(slug, title, desc, keywords, blocks, kind="article", nav=None, faqs=Non
 
 page(
     "index",
-    "GLaDOS: an operating system in Rust with a language model in the kernel",
-    "GLaDOS is a from-scratch ring-0 operating system written in Rust with a "
+    "AUTARK: an operating system in Rust with a language model in the kernel",
+    "AUTARK is a from-scratch ring-0 operating system written in Rust with a "
     "language model running inside the kernel. Free bootable ISO, full source, "
     "and documentation on how every part works.",
-    ["GLaDOS", "GLaDOS OS", "AI operating system", "Rust OS", "Aperture Science OS",
+    ["AUTARK", "AUTARK OS", "AI operating system", "Rust OS", "Aperture Science OS",
      "Portal OS", "bare metal Rust", "ring 0 kernel", "LLM in kernel"],
     kind="home",
     blocks=[
-        p("<strong>GLaDOS</strong> is an operating system for x86-64, written from "
+        p("<strong>AUTARK</strong> is an operating system for x86-64, written from "
           "scratch in Rust, which boots on bare metal and runs entirely in ring 0. "
           "Its distinguishing feature is that a transformer lives in kernel space. "
           "The model is compiled into the same binary as the page tables and the "
@@ -132,7 +132,7 @@ page(
         ]),
         ("shots", [
             ("desktop.png", "Desktop with terminal and Program Manager",
-             "GLaDOS OS desktop showing a 98-styled terminal window with the boot "
+             "AUTARK OS desktop showing a 98-styled terminal window with the boot "
              "log, desktop icons, a Program Manager window, and an icon taskbar "
              "with a Start button",
              "The desktop as it comes up: the terminal showing its own boot log, "
@@ -143,7 +143,7 @@ page(
              "underneath.",
              True),
             ("apps.png", "Paintbrush, Write and Minesweeper",
-             "GLaDOS desktop with Minesweeper, a text editor and a paint program "
+             "AUTARK desktop with Minesweeper, a text editor and a paint program "
              "in overlapping windows",
              "Three programs at once: Minesweeper with its counters and the mark "
              "for a face, Write holding a document from the content-addressed "
@@ -152,14 +152,14 @@ page(
              "also be driven entirely from the keyboard, which is how this "
              "screenshot arranged itself.", False),
             ("desktop-clean.png", "Desktop wallpaper",
-             "The GLaDOS desktop wallpaper showing the aperture mark drawn as "
+             "The AUTARK desktop wallpaper showing the aperture mark drawn as "
              "vector geometry",
              "Everything minimised to the bar. The mark is computed as arcs and "
              "lines at boot, since the kernel has no image decoder and writing one "
              "in order to display a logo seemed like the wrong order to do things "
              "in. The shell keeps running with no window at all.", False),
             ("model.png", "The model answering",
-             "GLaDOS running a language model in kernel space, answering a question "
+             "AUTARK running a language model in kernel space, answering a question "
              "about operating systems",
              "The resident model answering <em>what is an operating system</em>. The "
              "forward pass is running in the same address space as the code that "
@@ -229,10 +229,10 @@ page(
 
 page(
     "download/index",
-    "Download GLaDOS ISO. Bootable AI operating system images",
-    "Download the GLaDOS OS ISO. Bootable UEFI images from 33 MB to 1.8 GB, with "
+    "Download AUTARK ISO. Bootable AI operating system images",
+    "Download the AUTARK OS ISO. Bootable UEFI images from 33 MB to 1.8 GB, with "
     "an in-kernel language model included. Flash with Rufus, balenaEtcher or dd.",
-    ["GLaDOS ISO", "GLaDOS download", "AI OS ISO", "Rust OS ISO", "bootable ISO",
+    ["AUTARK ISO", "AUTARK download", "AI OS ISO", "Rust OS ISO", "bootable ISO",
      "Aperture Science OS download"],
     kind="download",
     blocks=[
@@ -243,23 +243,23 @@ page(
           "The difference is invisible to your "
           "firmware and was not invisible to write."),
         ("downloads", [
-            ("glados-qwen35-2b.iso", "1.8 GB", REL + "glados-qwen35-2b.iso",
+            ("autark-qwen35-2b.iso", "1.8 GB", REL + "autark-qwen35-2b.iso",
              "The flagship: kernel plus Qwen3.5-2B, distilled and quantised to "
              "int8. Three layers in four run as linear attention, which keeps the "
              "KV cache small enough for a laptop at a 512-token context window. "
              "Host-side it measures 40% on routing and 43.3% on MMLU. The weights "
              "are read whole before ExitBootServices, so it wants a machine with "
              "8 GB of RAM."),
-            ("glados-qwen3-0.6b.iso", "575 MB", REL + "glados-qwen3-0.6b.iso",
+            ("autark-qwen3-0.6b.iso", "575 MB", REL + "autark-qwen3-0.6b.iso",
              "Kernel plus Qwen3-0.6B quantised to int8, with a 512-token context "
              "window. The middle size: small enough to be quick, large enough to "
              "write coherent sentences. Give the guest or the laptop 2 GB of RAM."),
-            ("glados-smollm2-135m.iso", "132 MB", REL + "glados-smollm2-135m.iso",
+            ("autark-smollm2-135m.iso", "132 MB", REL + "autark-smollm2-135m.iso",
              "Kernel plus SmolLM2-135M. Four times faster per token than Qwen3 "
              "because generation is bound by how many bytes of weights get read, "
              "and small enough to fit QEMU's 516 MB disk ceiling, which makes it "
              "the image to develop against."),
-            ("glados-nomodel.iso", "33 MB", REL + "glados-nomodel.iso",
+            ("autark-nomodel.iso", "33 MB", REL + "autark-nomodel.iso",
              "Kernel only. Boots to a desktop, reports that it has no model, and "
              "everything except inference works. Drop a converted checkpoint on the "
              "EFI System Partition and it will find it."),
@@ -275,7 +275,7 @@ page(
         p("Write the image to a USB stick. It is a hybrid image, so any of these "
           "work:"),
         code("# Linux / macOS. Check the device name first, this overwrites it\n"
-             "sudo dd if=glados-qwen35-2b.iso of=/dev/sdX bs=4M status=progress oflag=sync",
+             "sudo dd if=autark-qwen35-2b.iso of=/dev/sdX bs=4M status=progress oflag=sync",
              "bash"),
         ul("On Windows, Rufus in DD mode.",
            "Anywhere, balenaEtcher handles the ISO directly."),
@@ -323,7 +323,7 @@ page(
           "list. So expect a working desktop and a working model, and treat your disk "
           "and your network card as an open question."),
         faq([
-            ("Is the GLaDOS ISO free?",
+            ("Is the AUTARK ISO free?",
              "Free to download and free to run. The source is published under "
              "all-rights-reserved, which means you are welcome to read it and not "
              "to redistribute it or build derivatives from it without asking."),
@@ -364,7 +364,7 @@ page(
 # --------------------------------------------------------------------------
 
 WIKI = [
-    ("glados-os", "GLaDOS OS", "What the system is, and how it is put together"),
+    ("autark-os", "AUTARK OS", "What the system is, and how it is put together"),
     ("aperture-science", "Aperture Science", "The homage, the aesthetic, and where it came from"),
     ("portal-os", "Portal OS", "Portal-inspired computing and what a real one looks like"),
     ("rust-os", "Writing an OS in Rust", "no_std, ownership at ring 0, and what Rust buys you"),
@@ -392,10 +392,10 @@ WIKI = [
 
 page(
     "wiki/index",
-    "GLaDOS Wiki. How an AI operating system is built, subsystem by subsystem",
-    "Documentation for GLaDOS OS: the kernel, the in-kernel language model, the "
+    "AUTARK Wiki. How an AI operating system is built, subsystem by subsystem",
+    "Documentation for AUTARK OS: the kernel, the in-kernel language model, the "
     "network stack, the USB drivers, and the bugs that cost the most time.",
-    ["GLaDOS wiki", "OS development", "kernel documentation", "Rust OS tutorial",
+    ["AUTARK wiki", "OS development", "kernel documentation", "Rust OS tutorial",
      "operating system internals"],
     kind="index",
     blocks=[
@@ -415,14 +415,14 @@ page(
 # --------------------------------------------------------------------------
 
 page(
-    "wiki/glados-os",
-    "GLaDOS OS, a ring-0 Rust operating system with an in-kernel LLM",
-    "GLaDOS OS explained: a from-scratch Rust kernel for x86-64 with a "
+    "wiki/autark-os",
+    "AUTARK OS, a ring-0 Rust operating system with an in-kernel LLM",
+    "AUTARK OS explained: a from-scratch Rust kernel for x86-64 with a "
     "transformer running in ring 0, no syscalls, and one address space.",
-    ["GLaDOS OS", "AI operating system", "Rust kernel", "in-kernel LLM",
+    ["AUTARK OS", "AI operating system", "Rust kernel", "in-kernel LLM",
      "operating system with AI"],
     blocks=[
-        infobox("GLaDOS", [
+        infobox("AUTARK", [
             ("Type", "Research operating system"),
             ("Language", "Rust (<code>no_std</code>)"),
             ("Architecture", "x86-64, UEFI"),
@@ -433,14 +433,14 @@ page(
             ("Target machine", "MSI Thin GF63 12UC"),
             ("Licence", "All rights reserved"),
         ]),
-        p("GLaDOS is a single-address-space operating system with a transformer "
+        p("AUTARK is a single-address-space operating system with a transformer "
           "running inside the kernel. Everything the machine can do lives at the "
           "same privilege level as everything else, including inference, and the "
           "model reaches the rest of the system by calling it."),
         h2("The structural choice"),
         p("Conventional systems put a privilege boundary between kernel and user "
           "code, and cross it with syscalls. The boundary buys isolation and costs a "
-          "trip through the trap handler on every crossing. GLaDOS does without one: "
+          "trip through the trap handler on every crossing. AUTARK does without one: "
           "everything runs at <a href=\"ring-0.html\">ring 0</a> in a single "
           "identity-mapped address space, so any code can reach any address, and the "
           "hardware will not object."),
@@ -513,13 +513,13 @@ page(
 page(
     "wiki/aperture-science",
     "Aperture Science. The aesthetic behind an amber-on-black operating system",
-    "Why GLaDOS OS looks like Aperture Science: amber on black, Windows 3.1 "
+    "Why AUTARK OS looks like Aperture Science: amber on black, Windows 3.1 "
     "chrome, and a boot screen built from the Portal-era design language.",
-    ["Aperture Science", "Aperture Science OS", "Portal aesthetic", "GLaDOS",
+    ["Aperture Science", "Aperture Science OS", "Portal aesthetic", "AUTARK",
      "Aperture Laboratories", "Portal design"],
     blocks=[
         p("<strong>Aperture Science</strong> is the fictional research company in "
-          "Valve's <em>Portal</em>, and GLaDOS is the artificial intelligence that "
+          "Valve's <em>Portal</em>, and AUTARK is the artificial intelligence that "
           "runs its facility, administers its tests, and is extremely encouraging "
           "about how well you are doing right up until the incinerator. This "
           "operating system takes the name and the look and points them at a real "
@@ -588,19 +588,19 @@ page(
           "<a href=\"llm-in-kernel.html\">transformer</a> are all hand-written and "
           "all tested at every boot. The facility is fictional. The certificate "
           "chain validation is not."),
-        ("seealso", ["portal-os", "gui", "glados-os", "templeos"]),
+        ("seealso", ["portal-os", "gui", "autark-os", "templeos"]),
     ],
 )
 
 page(
     "wiki/portal-os",
     "Portal OS. What a real Portal-inspired operating system looks like",
-    "Portal OS: not a theme pack, but a genuine ring-0 kernel named for GLaDOS, "
+    "Portal OS: not a theme pack, but a genuine ring-0 kernel named for AUTARK, "
     "with Aperture Science styling and a language model in kernel space.",
-    ["Portal OS", "Portal operating system", "GLaDOS OS", "Portal theme",
+    ["Portal OS", "Portal operating system", "AUTARK OS", "Portal theme",
      "Aperture Science OS", "Portal 2"],
     blocks=[
-        p("GLaDOS is an operating system in the literal sense: it boots on bare "
+        p("AUTARK is an operating system in the literal sense: it boots on bare "
           "metal, builds its own page tables, drives its own hardware, and has no "
           "Linux, no BSD and no kernel from anyone else underneath it. The Portal "
           "connection is in the name, in the "
@@ -675,7 +675,7 @@ page(
           "<a href=\"tls.html\">the TLS page</a> spends most of its length on what "
           "is still wrong with it."),
         note(DISCLAIMER),
-        ("seealso", ["aperture-science", "glados-os", "rust-os", "download"]),
+        ("seealso", ["aperture-science", "autark-os", "rust-os", "download"]),
     ],
 )
 
@@ -692,7 +692,7 @@ page(
             "compiler emits a PE binary the firmware will load. There is no linker "
             "script and no custom target JSON in this project.",
             "The Rust programming language logo"),
-        p("GLaDOS targets <code>x86_64-unknown-uefi</code> with <code>no_std</code> "
+        p("AUTARK targets <code>x86_64-unknown-uefi</code> with <code>no_std</code> "
           "and no runtime. The compiler emits a PE executable that UEFI loads "
           "directly, which means there is no linker script, no custom target "
           "specification and no assembler stub to get into long mode. What follows "
@@ -773,7 +773,7 @@ page(
              "<code>largest_span()</code> that looks without taking. Rewinding the "
              "cursor instead would have handed out the page tables' own frames a "
              "second time, which is a considerably more interesting failure."),
-        ("seealso", ["ring-0", "uefi-kernel", "llm-in-kernel", "glados-os"]),
+        ("seealso", ["ring-0", "uefi-kernel", "llm-in-kernel", "autark-os"]),
     ],
 )
 
@@ -795,7 +795,7 @@ page(
           "paging only distinguishes supervisor from user and cannot tell them "
           "apart. The boundary between 0 and 3 is what makes a process crash "
           "instead of a machine crash."),
-        p("GLaDOS runs entirely in ring 0. There is no ring 3, no <code>syscall</code> "
+        p("AUTARK runs entirely in ring 0. There is no ring 3, no <code>syscall</code> "
           "instruction, no per-program address space, and no TSS entry for a ring-0 "
           "stack to switch to, because there is never anything to switch from."),
         h2("What the boundary costs"),
@@ -849,14 +849,14 @@ page(
           "there is no isolation, the shell says it, and "
           "<a href=\"tls.html\">the TLS page</a> says the equivalent thing about "
           "certificate validation."),
-        ("seealso", ["glados-os", "rust-os", "templeos", "uefi-kernel"]),
+        ("seealso", ["autark-os", "rust-os", "templeos", "uefi-kernel"]),
     ],
 )
 
 page(
     "wiki/uefi-kernel",
     "UEFI as the kernel. Booting an OS with no bootloader at all",
-    "How GLaDOS boots: the UEFI application is the kernel. No GRUB, no ELF "
+    "How AUTARK boots: the UEFI application is the kernel. No GRUB, no ELF "
     "loading, no handoff ABI, and what ExitBootServices takes away permanently.",
     ["UEFI", "UEFI bootloader", "ExitBootServices", "EFI application", "OS boot",
      "bare metal boot", "EFI System Partition"],
@@ -871,7 +871,7 @@ page(
           "memory map and jumps to an entry point under an agreed calling "
           "convention. Two codebases, one handoff contract between them, and a "
           "great deal of setup code."),
-        p("GLaDOS skips the entire arrangement, because UEFI has already done the "
+        p("AUTARK skips the entire arrangement, because UEFI has already done the "
           "work. Firmware hands a UEFI application a machine in 64-bit long mode, "
           "at ring 0, with an identity-mapped address space, a working allocator, a "
           "filesystem driver, a console and a linear framebuffer. An application "
@@ -1288,7 +1288,7 @@ page(
 page(
     "wiki/kv-cache",
     "The int8 KV cache. Quantising attention memory, and why keys hurt more",
-    "How GLaDOS fits a long context in kernel memory: int8 KV cache with per-block "
+    "How AUTARK fits a long context in kernel memory: int8 KV cache with per-block "
     "scales, split per layer, plus attention sinks and a sliding window.",
     ["KV cache", "int8 quantisation", "attention sinks", "StreamingLLM",
      "long context", "LLM memory"],
@@ -1486,7 +1486,7 @@ page(
 page(
     "wiki/constrained-decoding",
     "Constrained decoding. Making invalid model output unreachable, not unlikely",
-    "How GLaDOS guarantees a model can never name a tool that does not exist: a "
+    "How AUTARK guarantees a model can never name a tool that does not exist: a "
     "grammar built from the live function table, applied before sampling.",
     ["constrained decoding", "grammar-constrained generation", "structured output",
      "LLM tool calling", "guaranteed valid output"],
@@ -1503,7 +1503,7 @@ page(
           "when the model sits behind an API and the sole thing you control is the text going in and out. It is "
           "also why tool calling is usually said to need a large model: a good fraction of the capability goes on producing well-formed "
           "syntax when it could have gone on choosing correctly."),
-        p("GLaDOS owns the sampler, so none of that applies."),
+        p("AUTARK owns the sampler, so none of that applies."),
         h2("The mechanism"),
         p("At each decoding step, the set of tokens that could extend the current "
           "prefix into a valid name from the live applet table is computable. The "
@@ -1567,14 +1567,14 @@ page(
           "continue\" makes the shorter name impossible to finish, and the applet quietly becomes unreachable. That bug only appears "
           "when someone adds a name extending an existing one, which is to "
           "say, later."),
-        ("seealso", ["routing", "llm-in-kernel", "tokenizer", "glados-os"]),
+        ("seealso", ["routing", "llm-in-kernel", "tokenizer", "autark-os"]),
     ],
 )
 
 page(
     "wiki/routing",
     "Tool routing. Why a 1960 regression beats the transformer",
-    "GLaDOS routes tool calls with closed-form ridge regression on one hidden "
+    "AUTARK routes tool calls with closed-form ridge regression on one hidden "
     "state: 12,672 parameters, 1.6 ms, no forward pass, and better accuracy.",
     ["tool routing", "LLM routing", "ridge regression", "Widrow-Hoff", "linear probe",
      "classifier", "AI tool selection"],
@@ -1675,14 +1675,14 @@ page(
              "council does not improve accuracy. Both are kept, because the reason "
              "to know them is the same reason they were worth measuring, and because "
              "a deleted experiment gets repeated."),
-         ("seealso", ["constrained-decoding", "agent", "llm-in-kernel", "glados-os"]),
+         ("seealso", ["constrained-decoding", "agent", "llm-in-kernel", "autark-os"]),
     ],
 )
 
 page(
     "wiki/agent",
     "The agent loop. Goal in, applet calls out",
-    "How GLaDOS runs an episode: the model picks an applet under a grammar, the "
+    "How AUTARK runs an episode: the model picks an applet under a grammar, the "
     "kernel runs it, the observation returns as text, and three tiers decide how "
     "much thought a step deserves.",
     ["AI agent loop", "tool use", "LLM agent", "agentic operating system",
@@ -1756,7 +1756,7 @@ page(
 page(
     "wiki/gui",
     "The Windows 3.1 desktop. Writing a window manager from scratch",
-    "How GLaDOS draws its GUI: raw GOP framebuffer, two-pixel bevels, z-order as "
+    "How AUTARK draws its GUI: raw GOP framebuffer, two-pixel bevels, z-order as "
     "focus, total repaint, and a keyboard-only window manager in kernel space.",
     ["window manager", "Windows 3.1 UI", "framebuffer graphics", "GUI from scratch",
      "retro UI", "OS graphics"],
@@ -1815,14 +1815,14 @@ page(
           "there is no such thing as a partial repaint."),
         ("shots", [
             ("mouse.png", "A pointer, and the system status menu",
-             "The GLaDOS desktop with a mouse cursor and the Program Manager system "
+             "The AUTARK desktop with a mouse cursor and the Program Manager system "
              "status list open",
              "PS/2 mouse support. The cursor is drawn by saving the pixels "
              "underneath it and restoring them before the next move, which is the "
              "1990 solution and the correct one when every repaint is total anyway. "
              "The second button opens the menu under the pointer.", False),
             ("enternet.png", "Enternet",
-             "A small web browser window in GLaDOS displaying example.com",
+             "A small web browser window in AUTARK displaying example.com",
              "The browser, which is a window like any other. It has fetched a page "
              "over the kernel's own TLS 1.3 connection, parsed the HTML and a subset "
              "of CSS, and laid the result out in its rectangle. Links are amber and "
@@ -1841,14 +1841,14 @@ page(
              "cost a bisect before the fix turned out to be waiting two seconds for "
              "the frame to settle. A GUI nobody has looked at is a GUI nobody has "
              "tested."),
-        ("seealso", ["aperture-science", "glados-os", "testing"]),
+        ("seealso", ["aperture-science", "autark-os", "testing"]),
     ],
 )
 
 page(
     "wiki/network-stack",
     "Writing a TCP/IP stack from scratch, ARP to TLS in a kernel",
-    "GLaDOS implements its own ARP, IPv4, ICMP, UDP, TCP, DHCP and DNS, with no "
+    "AUTARK implements its own ARP, IPv4, ICMP, UDP, TCP, DHCP and DNS, with no "
     "interrupt-driven receive and a deliberate rule against re-entrant dispatch.",
     ["TCP/IP stack", "network stack from scratch", "ARP", "DHCP", "DNS",
      "TCP implementation", "OS networking"],
@@ -1883,7 +1883,7 @@ page(
           "own inboxes from a context where nothing is borrowed. The cycle can only "
           "form in one place, and that is where it gets broken."),
         fig("tcp-states",
-            "RFC 793's state machine. GLaDOS implements the active-open path "
+            "RFC 793's state machine. AUTARK implements the active-open path "
             "through this diagram, with RFC 6298 retransmission on top of it.",
             "The TCP connection state transition diagram",
             wide=True),
@@ -1940,14 +1940,14 @@ page(
           "handshake, validates the certificate chain against a bundled root store, "
           "and returns the page. The browser sits on top of the same path and "
           "renders it."),
-        ("seealso", ["tls", "usb-xhci", "usb-wifi-driver", "glados-os"]),
+        ("seealso", ["tls", "usb-xhci", "usb-wifi-driver", "autark-os"]),
     ],
 )
 
 page(
     "wiki/tls",
     "TLS 1.3 from scratch, and why hand-written crypto is the dangerous part",
-    "GLaDOS implements TLS 1.3, X25519, ChaCha20-Poly1305 and ECDSA by hand, "
+    "AUTARK implements TLS 1.3, X25519, ChaCha20-Poly1305 and ECDSA by hand, "
     "validates certificate chains, and is honest about what is still not safe.",
     ["TLS 1.3", "cryptography from scratch", "X25519", "ChaCha20", "ECDSA",
      "certificate validation", "kernel TLS"],
@@ -2045,14 +2045,14 @@ page(
         p("Writing these down is the point. A system that claimed to be secure here "
           "would be worse than one that states precisely where it is not, because "
           "the first invites someone to rely on it."),
-        ("seealso", ["network-stack", "storage", "glados-os"]),
+        ("seealso", ["network-stack", "storage", "autark-os"]),
     ],
 )
 
 page(
     "wiki/storage",
     "Content-addressed storage. Merkle trees, NVMe, and O(1) snapshots",
-    "How GLaDOS stores data: objects named by SHA-256 of their contents, "
+    "How AUTARK stores data: objects named by SHA-256 of their contents, "
     "assembled into Merkle trees, so a copy is free and a snapshot is one hash.",
     ["content addressed storage", "Merkle tree", "NVMe driver", "snapshots",
      "SHA-256", "filesystem design"],
@@ -2134,7 +2134,7 @@ page(
              "976 GB and holds 14.67, which is why the partitioning tooling uses MBR (a GPT backup header would "
              "be written to flash that does not exist) and why it carries an explicit safe-capacity limit. Nothing anyone "
              "cares about goes on that disk."),
-        ("seealso", ["glados-os", "tls", "testing"]),
+        ("seealso", ["autark-os", "tls", "testing"]),
     ],
 )
 
@@ -2305,7 +2305,7 @@ page(
 
 page(
     "wiki/iso-el-torito",
-    "How the GLaDOS ISO is built. FAT32 and El Torito, written from scratch",
+    "How the AUTARK ISO is built. FAT32 and El Torito, written from scratch",
     "Building a bootable UEFI ISO without xorriso: a hand-written FAT32 EFI "
     "System Partition wrapped in ISO 9660 with an El Torito EFI boot catalog.",
     ["El Torito", "bootable ISO", "FAT32", "ISO 9660", "UEFI boot", "EFI System Partition",
@@ -2336,7 +2336,7 @@ page(
           "specification was drafted in 1994, which is the sort of detail that makes "
           "reading old standards worthwhile."),
         h2("Long file names are not optional"),
-        p("The kernel opens <code>\\GLADOS\\tokenizer.bin</code>. That base name is "
+        p("The kernel opens <code>\\AUTARK\\tokenizer.bin</code>. That base name is "
           "nine characters and has no 8.3 representation, so a short-name-only image "
           "presents it as <code>TOKENI~1.BIN</code> and the kernel fails to find its tokenizer at boot, on real hardware, "
           "at the exact moment there is no filesystem left to debug from, since this all happens after "
@@ -2391,7 +2391,7 @@ page(
 page(
     "wiki/templeos",
     "TempleOS. The lineage behind a single-address-space ring-0 kernel",
-    "What TempleOS got right about single-address-space computing, and how GLaDOS "
+    "What TempleOS got right about single-address-space computing, and how AUTARK "
     "relates to it: lineage, not target.",
     ["TempleOS", "Terry Davis", "single address space", "hobby OS", "ring 0",
      "HolyC", "operating system design"],
@@ -2423,8 +2423,8 @@ page(
         h2("Where the two diverge"),
         p("TempleOS had HolyC serving as compiler, shell and system language "
           "simultaneously, which is a genuinely radical unification: the command line was "
-          "the language, and the language was compiled. GLaDOS has "
-          "<a href=\"glados-os.html\">a small interpreted language</a> in the shell, "
+          "the language, and the language was compiled. AUTARK has "
+          "<a href=\"autark-os.html\">a small interpreted language</a> in the shell, "
           "but the system is Rust and stays Rust, and the interpreter is a guest in it."),
         p("The organising question is different too. TempleOS was built around one "
           "person's particular conviction about what a computer should be. This is "
@@ -2471,14 +2471,14 @@ page(
              "that started from a different question and arrived at several of the "
              "same structural answers, which is the most useful kind of "
              "corroboration a design decision can get."),
-        ("seealso", ["ring-0", "glados-os", "aperture-science", "rust-os"]),
+        ("seealso", ["ring-0", "autark-os", "aperture-science", "rust-os"]),
     ],
 )
 
 page(
     "wiki/testing",
     "Testing an OS with no test runner. Boot self-tests and driving QEMU",
-    "There is no cargo test for a no_std UEFI binary. How GLaDOS is verified: "
+    "There is no cargo test for a no_std UEFI binary. How AUTARK is verified: "
     "self-tests at boot, a scripted QEMU serial harness, and a NumPy oracle.",
     ["OS testing", "kernel testing", "QEMU automation", "self-test", "no_std testing",
      "embedded testing"],
@@ -2553,18 +2553,18 @@ page(
           "window isolated an off-by-one to a single token, and the evaluation "
           "harness exists because the measurement itself was got wrong three "
           "separate times before it settled."),
-        ("seealso", ["gui", "rope", "tls", "glados-os"]),
+        ("seealso", ["gui", "rope", "tls", "autark-os"]),
     ],
 )
 
 
 page(
     "screenshots/index",
-    "GLaDOS OS screenshots. The desktop, the shell and the model",
-    "Screenshots of GLaDOS: a Windows 3.1 styled desktop drawn straight into a "
+    "AUTARK OS screenshots. The desktop, the shell and the model",
+    "Screenshots of AUTARK: a Windows 3.1 styled desktop drawn straight into a "
     "UEFI framebuffer, the shell, and a language model answering from inside "
     "the kernel.",
-    ["GLaDOS screenshots", "GLaDOS OS screenshots", "AI operating system screenshots",
+    ["AUTARK screenshots", "AUTARK OS screenshots", "AI operating system screenshots",
      "Rust OS screenshots", "Aperture Science OS", "retro desktop"],
     kind="index",
     blocks=[
@@ -2573,7 +2573,7 @@ page(
           "framebuffer's exact contents at 1280x800."),
         ("shots", [
             ("desktop.png", "Desktop with terminal and Program Manager",
-             "GLaDOS OS desktop showing a 98-styled terminal window with the boot "
+             "AUTARK OS desktop showing a 98-styled terminal window with the boot "
              "log, desktop icons, a Program Manager window, and an icon taskbar "
              "with a Start button",
              "The desktop as it comes up. The terminal is showing its own boot "
@@ -2584,7 +2584,7 @@ page(
              "framebuffer; there is no graphics library underneath.",
              True),
             ("apps.png", "Paintbrush, Write and Minesweeper",
-             "GLaDOS desktop with Minesweeper, a text editor and a paint program "
+             "AUTARK desktop with Minesweeper, a text editor and a paint program "
              "in overlapping windows",
              "Three programs at once. Minesweeper plays the 3.1 rules with the "
              "mark for a face; Write is a windowed editor over the same "
@@ -2594,7 +2594,7 @@ page(
              "drives from the keyboard, which is how this screenshot "
              "arranged itself, headlessly, over a serial port.", False),
             ("desktop-clean.png", "Desktop wallpaper",
-             "The GLaDOS desktop wallpaper showing the aperture mark drawn as "
+             "The AUTARK desktop wallpaper showing the aperture mark drawn as "
              "vector geometry",
              "Everything minimised to the bar. The mark on the "
              "wallpaper is computed as arcs and lines at boot, because the kernel "
@@ -2602,13 +2602,13 @@ page(
              "wrong order to do things in. The shell keeps running with no window "
              "at all; typing still types at the prompt.", False),
             ("model.png", "The model answering",
-             "GLaDOS running a language model in kernel space, answering a question "
+             "AUTARK running a language model in kernel space, answering a question "
              "about operating systems",
              "The resident model answering <em>what is an operating system</em>. The "
              "forward pass is running in the same address space as the code that "
              "drew the window it is printing into.", False),
             ("mouse.png", "A pointer, and the system status menu",
-             "The GLaDOS desktop with a mouse cursor and the Program Manager system "
+             "The AUTARK desktop with a mouse cursor and the Program Manager system "
              "status list open",
              "PS/2 mouse support, with the cursor drawn and undrawn by saving and "
              "restoring the pixels underneath it. The second button opens the menu "
@@ -2616,7 +2616,7 @@ page(
              "576-dimensional, 30 layers, nine query heads to three key/value heads, "
              "and 134,515,008 parameters in 132,402 KiB of int8 weights.", False),
             ("enternet.png", "Enternet, fetching a page",
-             "A small web browser window in GLaDOS displaying example.com, fetched "
+             "A small web browser window in AUTARK displaying example.com, fetched "
              "over the kernel's own TLS 1.3 connection",
              "Enternet, the browser. It has fetched <code>example.com</code> over a "
              "TLS 1.3 connection this kernel negotiated itself, parsed the HTML and "
@@ -2654,7 +2654,7 @@ page(
           "stores at a rate of a few per second, because nothing here animates. See "
           "<a href=\"../wiki/gui.html\">the GUI page</a> for how it fits together, "
           "and for the bug that only a screenshot could have caught."),
-        ("seealso", ["gui", "glados-os", "download", "aperture-science"]),
+        ("seealso", ["gui", "autark-os", "download", "aperture-science"]),
     ],
 )
 
@@ -2664,10 +2664,10 @@ page(
 
 page(
     "archive/index",
-    "GLaDOS archive. ISO images, source snapshots and checksums",
-    "Mirror-style file index for GLaDOS OS: bootable ISO images, source "
+    "AUTARK archive. ISO images, source snapshots and checksums",
+    "Mirror-style file index for AUTARK OS: bootable ISO images, source "
     "snapshots, documentation and SHA-256 checksums.",
-    ["GLaDOS archive", "GLaDOS mirror", "ISO download", "software archive",
+    ["AUTARK archive", "AUTARK mirror", "ISO download", "software archive",
      "file index"],
     kind="archive",
     blocks=[
@@ -2697,9 +2697,9 @@ page(
 page(
     "credits",
     "Credits. Where the diagrams and the borrowed code came from",
-    "Sources for the diagrams used across the GLaDOS documentation, and the one "
+    "Sources for the diagrams used across the AUTARK documentation, and the one "
     "file in the kernel that was not written for this project.",
-    ["GLaDOS credits", "image credits", "attribution", "Wikimedia Commons"],
+    ["AUTARK credits", "image credits", "attribution", "Wikimedia Commons"],
     blocks=[
         p("The screenshots on this site are of the system running. Everything "
           "else with a picture in it was drawn by someone else, and this page "
@@ -2718,7 +2718,7 @@ page(
         p("The site's layout is a reconstruction of linux.org as it looked around "
           "2005, done from memory and screenshots. No markup or stylesheet was "
           "copied."),
-        ("seealso", ["glados-os", "usb-wifi-driver", "wiki"]),
+        ("seealso", ["autark-os", "usb-wifi-driver", "wiki"]),
     ],
 )
 
@@ -3001,14 +3001,14 @@ JS = """// Archive listing. The only script on the site, and only this page need
       {n:'docs/',t:'dir',d:'documentation'},
       {n:'checksums/',t:'dir',d:'digests and verification'}]},
     'iso':{kids:[
-      {n:'glados-qwen3-0.6b.iso',t:'f',d:'kernel + Qwen3-0.6B, int8',
-       href:REL+'glados-qwen3-0.6b.iso',size:'575M'},
-      {n:'glados-smollm2-135m.iso',t:'f',d:'kernel + SmolLM2-135M',
-       href:REL+'glados-smollm2-135m.iso',size:'257M'},
-      {n:'glados-nomodel.iso',t:'f',d:'kernel only',
-       href:REL+'glados-nomodel.iso',size:'33M'}]},
+      {n:'autark-qwen3-0.6b.iso',t:'f',d:'kernel + Qwen3-0.6B, int8',
+       href:REL+'autark-qwen3-0.6b.iso',size:'575M'},
+      {n:'autark-smollm2-135m.iso',t:'f',d:'kernel + SmolLM2-135M',
+       href:REL+'autark-smollm2-135m.iso',size:'257M'},
+      {n:'autark-nomodel.iso',t:'f',d:'kernel only',
+       href:REL+'autark-nomodel.iso',size:'33M'}]},
     'src':{kids:[
-      {n:'glados-src.tar.gz',t:'f',d:'repository snapshot',
+      {n:'autark-src.tar.gz',t:'f',d:'repository snapshot',
        href:REPO+'/archive/refs/heads/main.tar.gz',size:'700K'},
       {n:'browse/',t:'l',d:'read it on GitHub',href:REPO}]},
     'docs':{kids:[
@@ -3233,7 +3233,7 @@ def jsonld(pg):
     """Structured data. Search engines read this; humans never see it."""
     slug = pg["slug"]
     url = canonical(slug)
-    crumbs = [{"@type": "ListItem", "position": 1, "name": "GLaDOS",
+    crumbs = [{"@type": "ListItem", "position": 1, "name": "AUTARK",
                "item": BASE + "/"}]
     if slug.startswith("wiki/") and slug != "wiki/index":
         crumbs.append({"@type": "ListItem", "position": 2, "name": "Wiki",
@@ -3254,7 +3254,7 @@ def jsonld(pg):
         blocks.append({
             "@context": "https://schema.org",
             "@type": "SoftwareApplication",
-            "name": "GLaDOS",
+            "name": "AUTARK",
             "applicationCategory": "OperatingSystem",
             "operatingSystem": "x86-64 UEFI (bare metal)",
             "description": pg["desc"],
@@ -3274,7 +3274,7 @@ def jsonld(pg):
             "dateModified": UPDATED,
             "keywords": ", ".join(pg["keywords"]),
             "inLanguage": "en",
-            "isPartOf": {"@type": "WebSite", "name": "GLaDOS", "url": BASE + "/"},
+            "isPartOf": {"@type": "WebSite", "name": "AUTARK", "url": BASE + "/"},
         })
 
     fq = [b for b in pg["blocks"] if b[0] == "faq"]
@@ -3328,7 +3328,7 @@ def render_page(pg):
 
     crumbs = ""
     if slug != "index":
-        parts = [f'<a href="{url_for("index", slug)}">GLaDOS</a>']
+        parts = [f'<a href="{url_for("index", slug)}">AUTARK</a>']
         if slug.startswith("wiki/") and slug != "wiki/index":
             parts.append(f'<a href="{url_for("wiki/index", slug)}">Wiki</a>')
         parts.append(esc(short_title(slug)))
@@ -3350,7 +3350,7 @@ def render_page(pg):
 <link rel="canonical" href="{canonical(slug)}">
 <meta name="robots" content="index,follow,max-image-preview:large">
 <meta property="og:type" content="website">
-<meta property="og:site_name" content="GLaDOS">
+<meta property="og:site_name" content="AUTARK">
 <meta property="og:title" content="{html.escape(pg["title"], quote=True)}">
 <meta property="og:description" content="{html.escape(pg["desc"], quote=True)}">
 <meta property="og:url" content="{canonical(slug)}">
@@ -3360,7 +3360,7 @@ def render_page(pg):
 <meta property="og:image" content="{BASE}/img/og.png">
 <meta property="og:image:width" content="1200">
 <meta property="og:image:height" content="630">
-<meta property="og:image:alt" content="The GLaDOS aperture mark">
+<meta property="og:image:alt" content="The AUTARK aperture mark">
 <meta name="twitter:image" content="{BASE}/img/og.png">
 <link rel="stylesheet" href="{up}style.css">
 <link rel="icon" type="image/svg+xml" href="{up}img/logo.svg">
@@ -3375,7 +3375,7 @@ def render_page(pg):
 
 <div id="masthead">
   <img src="{up}img/logo.svg" alt="" width="34" height="34">
-  <a class="name" href="{url_for("index", slug)}">GLaDOS</a>
+  <a class="name" href="{url_for("index", slug)}">AUTARK</a>
   <span class="sub">An operating system in Rust, with a language model in the kernel</span>
 </div>
 
@@ -3441,9 +3441,9 @@ def main():
               keywords=["404"], kind="article", nav=None, faqs=None,
               blocks=[p("There is no page at that address. This is one of the few "
                         "failures on this site that is definitely not a silent one."),
-                      p('Try <a href="/GLaDOS/wiki/">the wiki index</a>, which lists '
-                        'everything, or <a href="/GLaDOS/download/">the '
-                        'downloads</a>, or <a href="/GLaDOS/">the front page</a>.')])
+                      p('Try <a href="/AUTARK/wiki/">the wiki index</a>, which lists '
+                        'everything, or <a href="/AUTARK/download/">the '
+                        'downloads</a>, or <a href="/AUTARK/">the front page</a>.')])
     PAGES["404"] = nf
     (out / "404.html").write_text(render_page(nf), encoding="utf-8")
 
@@ -3461,7 +3461,7 @@ def main():
 
     import json as _j
     (out / "site.webmanifest").write_text(_j.dumps({
-        "name": "GLaDOS", "short_name": "GLaDOS",
+        "name": "AUTARK", "short_name": "AUTARK",
         "description": "An AI operating system in Rust, ring 0, bare metal.",
         "start_url": BASE + "/", "display": "standalone",
         "background_color": "#0b0b0c", "theme_color": "#f28c1e",

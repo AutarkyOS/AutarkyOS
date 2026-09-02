@@ -12,7 +12,7 @@
 //! verdict is printed, and they can decide. It is wrong for a machine
 //! deciding what to boot, so this module treats anything short of `Verified`
 //! as a failure -- including, and especially, "no roots are loaded", which is
-//! the state a machine is in when `\GLADOS\roots.der` is missing and is
+//! the state a machine is in when `\AUTARK\roots.der` is missing and is
 //! otherwise indistinguishable from success.
 
 use super::manifest::{self, Manifest};

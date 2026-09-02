@@ -48,14 +48,14 @@ def private_key(argv):
     raise ValueError("no signing key -- pass --key-file FILE")
 
 
-HEADER = "glados-update 1"
+HEADER = "autark-update 1"
 REQUIRED = ("channel", "version", "image", "sig", "size", "sha256")
 
 
 def render(channel, version, base, size, digest, notes):
     """The manifest bytes, exactly as they will be signed and served."""
     base = base.rstrip("/")
-    stem = f"{base}/glados-{version}.efi"
+    stem = f"{base}/autark-{version}.efi"
     lines = [
         HEADER,
         f"channel {channel}",
@@ -180,7 +180,7 @@ def selftest():
 
     m = parse(text)
     claim("what render writes, parse reads", m["version"] == "9.9.9" and m["size"] == len(image))
-    claim("the image URL is derived from the version", m["image"].endswith("/glados-9.9.9.efi"))
+    claim("the image URL is derived from the version", m["image"].endswith("/autark-9.9.9.efi"))
     claim("and the signature URL from the image", m["sig"] == m["image"] + ".sig")
 
     try:
@@ -204,11 +204,11 @@ def selftest():
     refuses("a truncated signature is refused",
             lambda: verify_sig(pub, text, blob[:79]))
     refuses("a future format is refused rather than guessed at",
-            lambda: parse(b"glados-update 2\nchannel stable\n"))
+            lambda: parse(b"autark-update 2\nchannel stable\n"))
     refuses("a plain-http image URL is refused",
-            lambda: parse(b"glados-update 1\nimage http://example.invalid/x.efi\n"))
+            lambda: parse(b"autark-update 1\nimage http://example.invalid/x.efi\n"))
     refuses("a manifest missing a field it needs is refused",
-            lambda: parse(b"glados-update 1\nchannel stable\n"))
+            lambda: parse(b"autark-update 1\nchannel stable\n"))
 
     t, sg = split(text + blob)
     claim("a signed manifest splits back into its halves", t == text and sg == blob)

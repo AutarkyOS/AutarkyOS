@@ -1,6 +1,6 @@
 //! Cryptographic primitives, written here rather than vendored.
 //!
-//! This is the one place in GLaDOS where "written from scratch" is a liability
+//! This is the one place in AUTARK where "written from scratch" is a liability
 //! rather than a virtue, and it is worth being blunt about why. Everywhere
 //! else, a bug shows up as something not working. Here, a bug shows up as
 //! something that works perfectly and is not secure -- the wrong key schedule

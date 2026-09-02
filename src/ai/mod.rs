@@ -855,7 +855,7 @@ pub fn init(model_blob: Option<Blob>, tok_blob: Option<Blob>) {
 
     // GLADOSM2 first, then the llama2.c legacy layout. Both are identified by
     // content rather than by filename, so either can sit at model.bin.
-    let loaded = match model::Model::from_glados(mb.as_slice()) {
+    let loaded = match model::Model::from_autark(mb.as_slice()) {
         Ok(m) => Ok(m),
         Err(model::LoadError::BadHeader) => model::Model::from_bytes(mb.as_slice()),
         Err(e) => Err(e),

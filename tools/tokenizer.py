@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Convert a Hugging Face BPE tokenizer to the GLaDOS format, and verify it.
+"""Convert a Hugging Face BPE tokenizer to the AUTARK format, and verify it.
 
 The existing on-disk tokenizer format came from llama2.c and assumes
 sentencepiece: a dummy space is prepended to every input, and any byte the
@@ -479,7 +479,7 @@ CASES = [
     "list the files",
     "The quick brown fox jumps over the lazy dog.",
     "verify the disk, then take a snapshot",
-    "GLaDOS is an operating system",
+    "AUTARK is an operating system",
     "x = 6*7; println(x)",
     "snapshot 42 of 100",
     "don't stop believing",

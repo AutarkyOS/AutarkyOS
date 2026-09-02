@@ -1720,7 +1720,7 @@ pub fn program_manager() -> Panel {
         run("Settings", "win open settings"),
     ];
     Panel::new(
-        "Aperture Program Manager",
+        "AUTARK Program Manager",
         alloc::vec![
             Widget::Label(String::from("Arrows select, Enter runs")),
             Widget::Sep,

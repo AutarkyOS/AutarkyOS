@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Read a v4 (hybrid) GLaDOS checkpoint back into named tensors.
+"""Read a v4 (hybrid) AUTARK checkpoint back into named tensors.
 
 This is the other half of `convert.py`'s `convert_hybrid`, and it exists to be
 run rather than to be read. The v4 body is laid out by arithmetic with nothing
@@ -72,7 +72,7 @@ def load(path):
     """Return `(tensors, cfg)` for a v4 file. `cfg` matches ref35's dict."""
     raw = open(path, "rb").read()
     if raw[:8] != MAGIC:
-        raise SystemExit(f"{path}: not a GLaDOS model file")
+        raise SystemExit(f"{path}: not a AUTARK model file")
     (version,) = struct.unpack_from("<I", raw, 8)
     if version != 4:
         raise SystemExit(f"{path}: version {version}, this reads v4 only")

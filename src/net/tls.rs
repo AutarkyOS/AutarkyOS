@@ -979,7 +979,7 @@ pub fn https_fetch_with(
     req.push_str(if path.is_empty() { "/" } else { path });
     req.push_str(" HTTP/1.1\r\nHost: ");
     req.push_str(host);
-    req.push_str("\r\nUser-Agent: glados/0.1\r\nConnection: close\r\nAccept: */*\r\n");
+    req.push_str("\r\nUser-Agent: autark/0.1\r\nConnection: close\r\nAccept: */*\r\n");
     for (name, value) in extra {
         req.push_str(name);
         req.push_str(": ");

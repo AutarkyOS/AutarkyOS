@@ -202,7 +202,7 @@ pub const BASIC_RATES: &[u8] = &[0x82, 0x84, 0x8B, 0x96, 0x0C, 0x12, 0x18, 0x24]
 /// one line per check and a second opinion underneath would be noise.
 pub fn selftest() -> bool {
     let sa = [0x02, 0x47, 0x4C, 0x41, 0x44, 0x53];
-    let req = probe_request(sa, "glados", BASIC_RATES);
+    let req = probe_request(sa, "autark", BASIC_RATES);
     if req.len() != MGMT_HDR + 2 + 6 + 2 + BASIC_RATES.len() {
         return false;
     }
@@ -221,7 +221,7 @@ pub fn selftest() -> bool {
     let ies = elements(&req[MGMT_HDR..]);
     if ies.len() != 2
         || ies[0].id != IE_SSID
-        || ies[0].data != b"glados"
+        || ies[0].data != b"autark"
         || ies[1].id != IE_RATES
         || ies[1].data != BASIC_RATES
     {

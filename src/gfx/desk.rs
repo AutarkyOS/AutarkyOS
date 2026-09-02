@@ -643,7 +643,7 @@ pub fn init() {
         .saturating_sub(term_x + pm_w + MARGIN);
 
     let terminal = Window {
-        title: String::from("GLaDOS Terminal"),
+        title: String::from("AUTARK Terminal"),
         icon: ICO_TERM,
         rect: Rect::new(term_x, screen.y, term_w, screen.h),
         state: WinState::Normal,
@@ -2852,7 +2852,7 @@ fn taskbar(fb: &Framebuffer, d: &Desktop, sel: Option<usize>) {
     );
     theme::aperture_dot(fb, s.x + 15, s.y + s.h / 2, (s.h / 2) as i32 - 5);
     let ty = s.y + (s.h.saturating_sub(theme::text_h())) / 2;
-    theme::text_over(fb, s.x + 30, ty, "GLaDOS", theme::START_TEXT);
+    theme::text_over(fb, s.x + 30, ty, "AUTARK", theme::START_TEXT);
 
     for (i, (r, icon, pressed)) in task_layout(fb, d).into_iter().enumerate() {
         // Keyboard selection and pointer hover draw the same way: both are "the

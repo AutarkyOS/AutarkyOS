@@ -175,7 +175,7 @@ pub fn selftest() -> bool {
 
     // PKCS#1 padding is built and compared as a whole; check the shape is
     // what a real verifier would produce for a known digest.
-    let digest = sha256::hash(b"glados");
+    let digest = sha256::hash(b"autark");
     let k = 128usize;
     let mut want = vec![0xFFu8; k];
     want[0] = 0x00;

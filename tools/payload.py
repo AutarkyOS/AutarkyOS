@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """The ISO payload: recording what it is, and checking what arrived.
 
-`mkiso.py --payload DIR` copies a directory into `\\GLADOS\\` on the image, and
+`mkiso.py --payload DIR` copies a directory into `\\AUTARK\\` on the image, and
 that directory is the model, the tokenizer and the root bundle -- six hundred
 megabytes that exist nowhere in this repository. So an ISO built anywhere but
 this machine has to fetch them first, and a fetch is a thing that can go wrong
@@ -31,8 +31,8 @@ file preserves the wrongness perfectly.
 
 Usage:
 
-    python tools/payload.py record esp/GLADOS payload/qwen3-0.6b.txt
-    python tools/payload.py verify esp/GLADOS payload/qwen3-0.6b.txt
+    python tools/payload.py record esp/AUTARK payload/qwen3-0.6b.txt
+    python tools/payload.py verify esp/AUTARK payload/qwen3-0.6b.txt
     python tools/payload.py --selftest
 """
 

@@ -1,9 +1,9 @@
 <#
 .SYNOPSIS
-    Copy glados to a real EFI System Partition for bare-metal boot.
+    Copy autark to a real EFI System Partition for bare-metal boot.
 
 .DESCRIPTION
-    Writes EFI\BOOT\BOOTX64.EFI and the contents of esp\GLADOS -- the model,
+    Writes EFI\BOOT\BOOTX64.EFI and the contents of esp\AUTARK -- the model,
     the tokenizer, and the root certificate bundle, each skipped when already
     byte-identical. It creates no partitions, formats nothing, and touches no
     other file -- deliberately. Repartitioning is a separate, manual,
@@ -60,7 +60,7 @@ if ($vol) {
 
 Push-Location $root
 try {
-    # cargo writes progress ("Compiling glados ...") to stderr, and under
+    # cargo writes progress ("Compiling autark ...") to stderr, and under
     # $ErrorActionPreference = 'Stop' PowerShell turns native stderr into a
     # terminating error. That made this script abort on any build that was not
     # already cached -- it only ever appeared to work because the build was
@@ -77,7 +77,7 @@ try {
     Pop-Location
 }
 
-$efi = Join-Path $root "target\x86_64-unknown-uefi\$profileDir\glados.efi"
+$efi = Join-Path $root "target\x86_64-unknown-uefi\$profileDir\autark.efi"
 if (-not (Test-Path $efi)) { Write-Error "missing build artifact: $efi" }
 
 $bootDir = Join-Path "$EspDrive\" 'EFI\BOOT'
@@ -94,9 +94,9 @@ Write-Host ("deployed {0:N1} KB -> {1}" -f ($info.Length/1KB), $dest) -Foregroun
 # the binary on the ESP because the firmware's FAT driver is the only
 # filesystem that exists before ExitBootServices, and that is where the
 # weights have to be read from.
-$payload = Join-Path $root 'esp\GLADOS'
+$payload = Join-Path $root 'esp\AUTARK'
 if (Test-Path $payload) {
-    $targetDir = Join-Path "$EspDrive\" 'GLADOS'
+    $targetDir = Join-Path "$EspDrive\" 'AUTARK'
     New-Item -ItemType Directory -Force -Path $targetDir | Out-Null
 
     # Refuse rather than run out of room halfway. Copy-Item on a full volume

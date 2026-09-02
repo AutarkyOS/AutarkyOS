@@ -1,5 +1,5 @@
 [package]
-name = "glados"
+name = "autark"
 version = "1.3.0"
 edition = "2021"
 description = "A from-scratch ring-0 operating system for the MSI MS-16R8"
@@ -19,7 +19,7 @@ description = "A from-scratch ring-0 operating system for the MSI MS-16R8"
 #     found" -- a proc macro is a host cdylib, and there is no MSVC linker
 #     here.
 #   * -Zbuild-std FAILS for the same reason, on compiler_builtins' build
-#     script. So the custom target in x86_64-glados.json stays unusable.
+#     script. So the custom target in x86_64-autark.json stays unusable.
 #
 # The practical line: anything that has to run on the host at build time is
 # out; plain library crates are in. That is why vendoring TLS is a real
@@ -33,7 +33,7 @@ description = "A from-scratch ring-0 operating system for the MSI MS-16R8"
 [dependencies]
 
 [[bin]]
-name = "glados"
+name = "autark"
 path = "src/main.rs"
 test = false
 bench = false

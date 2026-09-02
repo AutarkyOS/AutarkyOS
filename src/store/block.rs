@@ -5,7 +5,7 @@
 //! matters right now -- work out where the existing partitions are.
 //!
 //! That second job is a safety gate, not a convenience. The only NVMe device
-//! in this laptop holds Windows. Before GLaDOS writes a single sector we need
+//! in this laptop holds Windows. Before AUTARK writes a single sector we need
 //! to know which ranges are spoken for, so that "somewhere safe" is a fact
 //! read off the disk rather than an assumption.
 
@@ -151,7 +151,7 @@ const GUID_LINUX_FS: [u8; 16] = [
 
 fn gpt_type_name(g: &[u8; 16]) -> &'static str {
     match *g {
-        super::cas::GLADOS_TYPE_GUID => "GLaDOS store",
+        super::cas::GLADOS_TYPE_GUID => "AUTARK store",
         GUID_ESP => "EFI System",
         GUID_MS_BASIC => "Microsoft basic data",
         GUID_MS_RESERVED => "Microsoft reserved",

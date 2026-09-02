@@ -12,8 +12,8 @@ directory operations -- creating a file, deleting one, growing a directory.
 That is enough for every test this project ran until an update mechanism
 needed the firmware to *write* the ESP, and then it is enough for nothing:
 
-    glados: the flag is set and there is no staged image     (guest saw it)
-    Test-Path .qemu/esp/GLADOS/UPDATE.FLG -> True             (host still has it)
+    autark: the flag is set and there is no staged image     (guest saw it)
+    Test-Path .qemu/esp/AUTARK/UPDATE.FLG -> True             (host still has it)
 
 The guest read the flag correctly and could not clear it. So the whole
 pre-ExitBootServices swap -- copy the running image aside, overwrite

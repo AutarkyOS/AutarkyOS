@@ -32,11 +32,11 @@ pub enum InitError {
 ///
 /// This is the one place NVMe writes get unlocked, and only after
 /// `find_store_region` has named a target: either a partition tagged with the
-/// GLaDOS type GUID, or -- on a bare image with no partition table -- unclaimed
+/// AUTARK type GUID, or -- on a bare image with no partition table -- unclaimed
 /// space past every partition. `Store::format` then re-checks that the region
 /// is inside our own partition or overlaps nothing at all.
 ///
-/// On a disk fully allocated to Windows with no GLaDOS partition, there is no
+/// On a disk fully allocated to Windows with no AUTARK partition, there is no
 /// such region and this fails. That is the intended outcome, not an
 /// inconvenience.
 pub fn init() -> Result<(u64, u64), InitError> {

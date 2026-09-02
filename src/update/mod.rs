@@ -169,11 +169,11 @@ pub fn verify(image: &[u8], sig: &[u8]) -> Verdict {
 
 /// Where the pieces live on the ESP.
 pub const BOOT_PATH: &str = "\\EFI\\BOOT\\BOOTX64.EFI";
-pub const OLD_PATH: &str = "\\GLADOS\\BOOTX64.OLD";
-pub const STAGED_PATH: &str = "\\GLADOS\\STAGED.EFI";
-pub const STAGED_SIG: &str = "\\GLADOS\\STAGED.SIG";
-pub const UPDATE_FLAG: &str = "\\GLADOS\\UPDATE.FLG";
-pub const HEALTH_FLAG: &str = "\\GLADOS\\HEALTH.FLG";
+pub const OLD_PATH: &str = "\\AUTARK\\BOOTX64.OLD";
+pub const STAGED_PATH: &str = "\\AUTARK\\STAGED.EFI";
+pub const STAGED_SIG: &str = "\\AUTARK\\STAGED.SIG";
+pub const UPDATE_FLAG: &str = "\\AUTARK\\UPDATE.FLG";
+pub const HEALTH_FLAG: &str = "\\AUTARK\\HEALTH.FLG";
 
 /// Boots an unproven image may take before it is rolled back.
 ///
@@ -320,18 +320,18 @@ pub fn hook(bs: &crate::uefi::BootServices, image: crate::uefi::Handle) -> Outco
     // verification to answer a question already settled. Worse than wasteful:
     // the verification allocates, and the trial boot is exactly the one where
     // the least should be happening.
-    crate::serial_println!("glados: update: flag={} health={:?}", flag, health);
+    crate::serial_println!("autark: update: flag={} health={:?}", flag, health);
     let (staged, sig) = if health.is_none() {
         let img = slurp(bs, image, STAGED_PATH);
         crate::serial_println!(
-            "glados: update: staged {} byte(s), verifying",
+            "autark: update: staged {} byte(s), verifying",
             img.map(|b| b.len()).unwrap_or(0)
         );
         let v = match (img, slurp(bs, image, STAGED_SIG)) {
             (Some(i), Some(s)) => verify(i, s),
             _ => Verdict::Malformed,
         };
-        crate::serial_println!("glados: update: signature {}", v.why());
+        crate::serial_println!("autark: update: signature {}", v.why());
         (img, v)
     } else {
         (None, Verdict::Malformed)
@@ -388,7 +388,7 @@ pub fn hook(bs: &crate::uefi::BootServices, image: crate::uefi::Handle) -> Outco
                 return Outcome::Said("update: the staged image went away");
             };
             // 2. A rollback copy, proved.
-            crate::serial_println!("glados: update: copying the running image aside");
+            crate::serial_println!("autark: update: copying the running image aside");
             if !copy_verified(bs, image, run, OLD_PATH) {
                 crate::uefi::delete_file(bs, image, UPDATE_FLAG);
                 return Outcome::Said("update: refused -- no rollback copy could be made");
@@ -397,7 +397,7 @@ pub fn hook(bs: &crate::uefi::BootServices, image: crate::uefi::Handle) -> Outco
             //    cannot re-enter.
             crate::uefi::delete_file(bs, image, UPDATE_FLAG);
             // 4. The window.
-            crate::serial_println!("glados: update: writing the new boot image");
+            crate::serial_println!("autark: update: writing the new boot image");
             if !copy_verified(bs, image, img, BOOT_PATH) {
                 // 5. The one repair still available.
                 copy_verified(bs, image, run, BOOT_PATH);

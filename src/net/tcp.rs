@@ -959,7 +959,7 @@ pub fn http_get(dst: Ipv4, host: &str, port: u16, path: &str) -> Result<Vec<u8>,
     if port != 80 {
         req.push_str(&alloc::format!(":{}", port));
     }
-    req.push_str("\r\nUser-Agent: glados/0.1\r\nConnection: close\r\n\r\n");
+    req.push_str("\r\nUser-Agent: autark/0.1\r\nConnection: close\r\n\r\n");
 
     send(req.as_bytes(), 5000)?;
     let body = recv_to_end(10000);

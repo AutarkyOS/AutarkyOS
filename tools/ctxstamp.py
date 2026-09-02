@@ -52,7 +52,7 @@ def read_seq(path: Path) -> int:
     with path.open("rb") as f:
         head = f.read(64)
     if head[:8] != MAGIC:
-        raise SystemExit(f"  {path}: not a GLaDOS checkpoint (magic is {head[:8]!r})")
+        raise SystemExit(f"  {path}: not a AUTARK checkpoint (magic is {head[:8]!r})")
     return struct.unpack_from("<i", head, SEQ_AT)[0]
 
 

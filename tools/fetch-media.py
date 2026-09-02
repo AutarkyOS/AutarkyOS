@@ -39,7 +39,7 @@ import time
 import urllib.parse
 from pathlib import Path
 
-UA = "GLaDOS-docs/1.0 (https://github.com/IlumCI/GLaDOS; research@euroswarms.eu)"
+UA = "AUTARK-docs/1.0 (https://github.com/IlumCI/AUTARK; research@euroswarms.eu)"
 API = "https://commons.wikimedia.org/w/api.php"
 AR5IV = "https://ar5iv.labs.arxiv.org/html/"
 

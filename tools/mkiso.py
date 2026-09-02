@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Build a bootable GLaDOS ISO: a FAT32 EFI System Partition inside El Torito.
+"""Build a bootable AUTARK ISO: a FAT32 EFI System Partition inside El Torito.
 
 Why this exists rather than a call to xorriso
 ---------------------------------------------
@@ -19,7 +19,7 @@ ISO. So the ISO 9660 structure around it is almost ceremonial: it exists so the
 disc mounts and shows its contents, not so it boots. Both are built anyway,
 because a disc that boots and appears empty when mounted looks broken.
 
-Long file names are not optional here. The kernel opens `\\GLADOS\\tokenizer.bin`
+Long file names are not optional here. The kernel opens `\\AUTARK\\tokenizer.bin`
 and that base name is nine characters, so it cannot be expressed as 8.3 -- a
 short-name-only FAT would silently present it as TOKENI~1.BIN and the kernel
 would fail to find its tokenizer at boot, on real hardware, with no filesystem
@@ -32,7 +32,7 @@ instead, and the only thing held whole is the FAT itself.
 Usage:
     mkiso.py OUT.iso --efi path/to/BOOTX64.EFI [--payload DIR] [--label NAME]
 
-`--payload` is copied to \\GLADOS\\ on the image. Without one the ISO boots to a
+`--payload` is copied to \\AUTARK\\ on the image. Without one the ISO boots to a
 kernel that finds no model and says so.
 """
 
@@ -213,7 +213,7 @@ def build_fat(root, out, cluster_size):
     # Boot sector.
     bs = bytearray(SECTOR)
     bs[0:3] = b'\xeb\x58\x90'
-    bs[3:11] = b'GLADOS  '
+    bs[3:11] = b'AUTARK  '
     struct.pack_into('<HBHBHHBHHHII', bs, 11,
                      SECTOR, spc, reserved, 2, 0, 0, 0xF8, 0,
                      63, 255, 0, total_sectors)
@@ -221,7 +221,7 @@ def build_fat(root, out, cluster_size):
     bs[64] = 0x80
     bs[66] = 0x29
     struct.pack_into('<I', bs, 67, 0x474C4144)
-    bs[71:82] = b'GLADOS     '
+    bs[71:82] = b'AUTARK     '
     bs[82:90] = b'FAT32   '
     bs[510:512] = b'\x55\xaa'
     out.write(bs)
@@ -406,10 +406,10 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('output')
     ap.add_argument('--efi', required=True, help='BOOTX64.EFI to boot')
-    ap.add_argument('--payload', help='directory copied to \\GLADOS\\')
+    ap.add_argument('--payload', help='directory copied to \\AUTARK\\')
     ap.add_argument('--no-license', action='store_true',
                     help='build a payload with no licence file in it')
-    ap.add_argument('--label', default='GLADOS')
+    ap.add_argument('--label', default='AUTARK')
     ap.add_argument('--cluster', type=int, default=0,
                     help='cluster size; 0 picks the smallest that fits')
     args = ap.parse_args()
@@ -430,7 +430,7 @@ def main():
         pdir = Path(args.payload)
         if not pdir.is_dir():
             raise SystemExit('not a directory: ' + str(pdir))
-        g = Entry('GLADOS', 0)
+        g = Entry('AUTARK', 0)
         files = [f for f in sorted(pdir.iterdir()) if f.is_file()]
         # The model weights are Apache-2.0, and section 4(a) says a copy of the
         # licence goes to whoever receives them. The README states that the ISO
@@ -488,7 +488,7 @@ def main():
     print(f'{out}  {mb:.1f} MB')
     print(f'  BOOTX64.EFI  {efi.stat().st_size / 1024:.0f} KiB')
     if args.payload:
-        print(f'  GLADOS/      {payload_bytes / 1024 / 1024:.1f} MB')
+        print(f'  AUTARK/      {payload_bytes / 1024 / 1024:.1f} MB')
     else:
         print('  no payload -- boots to a kernel with no model')
 

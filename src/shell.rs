@@ -16,7 +16,7 @@ use crate::{kprint, kprintln, serial_println};
 use alloc::string::String;
 use alloc::vec::Vec;
 
-const PROMPT: &str = "glados> ";
+const PROMPT: &str = "autark> ";
 /// Derived, not written out. Hardcoding this was fine until the prompt changed
 /// length during the rename, at which point every cursor position in the line
 /// editor was off by one.
@@ -4939,7 +4939,7 @@ fn execute(line: &str, boot: &BootInfo, acpi: &Option<Acpi>, interp: &mut aiksi:
         }
         "version" | "uname" => {
             console::set_color(LTCYAN);
-            kprintln!("  glados {}", crate::VERSION);
+            kprintln!("  autark {}", crate::VERSION);
             console::set_color(LTGRAY);
             kprintln!("  a ring-0 kernel for MSI MS-16R8, one address space, no syscalls");
             // The formats an update has to stay compatible with. Each is

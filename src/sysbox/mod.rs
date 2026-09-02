@@ -5,7 +5,7 @@
 //! anything. The shape is borrowed because it is the right shape for something
 //! that is not only typed at.
 //!
-//! GLaDOS is meant to be run by the model in `crate::ai`, and a model needs its
+//! AUTARK is meant to be run by the model in `crate::ai`, and a model needs its
 //! available actions described to it and its dangerous ones fenced off. A flat
 //! enumerable table gives both: `APPLETS` renders directly into a prompt, and
 //! `mutates` is the leash -- read-only applets can be handed over long before

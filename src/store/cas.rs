@@ -422,7 +422,7 @@ pub fn verify_region_safe(region_start: u64, region_blocks: u64) -> Result<(), E
     Ok(())
 }
 
-/// GPT type GUID for a GLaDOS store partition, in on-disk mixed-endian form.
+/// GPT type GUID for a AUTARK store partition, in on-disk mixed-endian form.
 ///
 /// Text form: b7e1f4a2-9c3d-4e58-a061-2f8d7c4b93e5
 ///
