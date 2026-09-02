@@ -157,6 +157,24 @@ pub fn run(boot: &BootInfo, acpi: &Option<Acpi>) -> ! {
     kprintln!("\ninteractive. type 'help', or just type code.");
     console::set_color(WHITE);
 
+    // What the machine did while nobody was here.
+    //
+    // At the first prompt rather than on a timer, because "the first
+    // interaction after a night run" is what the operator experiences and a
+    // machine that runs unattended is one they meet at a prompt. Rendered from
+    // the certificate at the time of the sitting, never generated now: a
+    // paraphrase is a claim, and the one thing this report may not be is
+    // wrong about a number.
+    if let Some(d) = crate::ai::godel::pending() {
+        console::set_color(YELLOW);
+        kprintln!("\n[in your absence]");
+        console::set_color(LTGRAY);
+        for l in d.lines() {
+            kprintln!("{}", l);
+        }
+        console::set_color(WHITE);
+    }
+
     let mut interp = aiksi::Interp::new();
     let mut history: Vec<String> = Vec::new();
     let mut line = String::new();
@@ -2976,6 +2994,28 @@ fn execute(line: &str, boot: &BootInfo, acpi: &Option<Acpi>, interp: &mut aiksi:
                                         .unwrap_or(alloc::string::String::from("none"))
                                 );
                             }
+                        }
+                    }
+                }
+                "report" => {
+                    // `report` hands over what is owed and marks it handed
+                    // over; `report all` re-reads the whole file and marks
+                    // nothing, because re-reading is not being told.
+                    let every = words.next().unwrap_or("") == "all";
+                    let text = if every {
+                        godel::all_dispatches()
+                    } else {
+                        godel::pending()
+                    };
+                    match text {
+                        None if every => kprintln!("  no sittings recorded"),
+                        None => kprintln!("  nothing since you were last told"),
+                        Some(d) => {
+                            console::set_color(LTGRAY);
+                            for l in d.lines() {
+                                kprintln!("{}", l);
+                            }
+                            console::set_color(WHITE);
                         }
                     }
                 }

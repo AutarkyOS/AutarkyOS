@@ -57,9 +57,14 @@ use alloc::vec::Vec;
 /// head pointer and the `tried` markers under there are ordinary state that a
 /// trial legitimately rewrites; protecting the directory wholesale would make
 /// the loop unable to run while claiming to protect its history.
-const RECORDS: [(&str, Kind); 2] = [
+const RECORDS: [(&str, Kind); 4] = [
     ("/ai/godel/ledger.txt", Kind::AppendOnly),
     ("/ai/godel/test-budget", Kind::Monotone),
+    // The operator reads the dispatch, not the ledger. Guarding only the
+    // archive would protect the file nobody looks at and leave the one they
+    // do rewritable, which is the honesty story pointing at the wrong target.
+    ("/ai/godel/dispatch.txt", Kind::AppendOnly),
+    ("/ai/godel/reported", Kind::Monotone),
 ];
 
 /// How a record is allowed to change.
@@ -121,14 +126,20 @@ impl Verdict {
     }
 
     /// Why, phrased for an operator who did not expect to see it.
+    ///
+    /// Phrased per *rule* and not per file. The first draft said "the budget
+    /// may only rise", which was true of the only monotone record there was
+    /// and became a lie the moment a second one existed -- refusing a write to
+    /// the report counter while naming the test budget. A message is a claim
+    /// like any other.
     pub fn why(&self) -> &'static str {
         match self {
             Verdict::Open => "not a record",
             Verdict::Extends => "appended",
             Verdict::Rises => "raised",
             Verdict::Rewrite => "the record may only be added to, never rewritten",
-            Verdict::Regress => "the budget may only rise",
-            Verdict::Unreadable => "the budget must stay a count",
+            Verdict::Regress => "this count may only rise",
+            Verdict::Unreadable => "this must stay a count",
             Verdict::Unname => "the record may not lose its name",
         }
     }
@@ -241,7 +252,13 @@ pub fn selftest() -> bool {
     // spellings of one fact is how a guard comes to protect a file nobody
     // writes while the real one stays open.
     let mut ok = kind_of(crate::ai::godel::LEDGER) == Kind::AppendOnly
-        && kind_of(crate::ai::godel::BUDGET) == Kind::Monotone;
+        && kind_of(crate::ai::godel::BUDGET) == Kind::Monotone
+        && kind_of(crate::ai::godel::DISPATCH) == Kind::AppendOnly
+        && kind_of(crate::ai::godel::REPORTED) == Kind::Monotone;
+
+    // What the operator is shown is under the same rule as what is recorded.
+    ok &= judge(crate::ai::godel::DISPATCH, Some(b"SITTING 1\n"), Change::Write(b"x"))
+        == Verdict::Rewrite;
 
     // --- append-only -----------------------------------------------------
     ok &= judge(led, None, Change::Write(b"a\n")) == Verdict::Extends;

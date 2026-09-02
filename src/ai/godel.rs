@@ -89,6 +89,10 @@ pub const ROOT: &str = "/ai/godel";
 pub const HEAD: &str = "/ai/godel/head";
 pub const LEDGER: &str = "/ai/godel/ledger.txt";
 pub const BUDGET: &str = "/ai/godel/test-budget";
+/// What the machine says it did, in the voice it says it in.
+pub const DISPATCH: &str = "/ai/godel/dispatch.txt";
+/// How many sittings the operator has been shown.
+pub const REPORTED: &str = "/ai/godel/reported";
 
 // A window and an idleness test answer different questions, so both are
 // required. Idleness says nobody is typing at this instant, which is also
@@ -1266,6 +1270,150 @@ fn ledger_append(line: &str) {
     sysbox::write_text(LEDGER, &text);
 }
 
+/// Write the trial down twice, from one certificate, in one call.
+///
+/// The ledger line is the archive's own form: dense, positional, meant to be
+/// diffed and re-derived by a later run. The dispatch is the same facts in the
+/// voice the machine addresses an operator in.
+///
+/// **They are rendered here, together, from one `Certificate`.** The obvious
+/// alternative -- keep only the ledger and render a dispatch later by parsing
+/// it back -- is how the two come to disagree, and a machine whose
+/// announcement disagrees with its own record is the precise failure the
+/// persona is written to avoid. The same argument rules out having the model
+/// paraphrase a trial into prose: a paraphrase is a claim, and a claim can be
+/// wrong about a number that has exactly one right answer.
+///
+/// So the doctrine is allowed to shape the *rendering* and never the figures,
+/// and both files are append-only under `sysbox::guard` for the same reason.
+/// Note what that does and does not buy, because the gap is real: the record
+/// cannot be falsified, and a notification can still be skipped by raising
+/// `REPORTED`. Suppressing an announcement is survivable -- the sitting is
+/// still in both files and `godel report --all` still prints it. Editing one
+/// would not be.
+fn record(c: &Certificate, seq: u32, hour: u8) {
+    ledger_append(&render_certificate(c, seq, hour));
+    let mut d = sysbox::read_blob(DISPATCH)
+        .and_then(|b| String::from_utf8(b).ok())
+        .unwrap_or_default();
+    d.push_str(&render_dispatch(c, seq, hour));
+    sysbox::write_text(DISPATCH, &d);
+}
+
+/// One judge's row. `CONCUR` and `DISSENT` rather than ok/fail because
+/// unanimity is the actual rule -- four independent assessors, any one of whom
+/// stops adoption -- and "3 of 4 passed" is a sentence that invites somebody to
+/// wonder whether three is enough.
+fn row(s: &mut String, tag: &str, held: bool, why: &str) {
+    s.push_str("  ");
+    s.push_str(tag);
+    while s.len() % 24 != 0 {
+        s.push(' ');
+    }
+    s.push_str(if held { "CONCUR" } else { "DISSENT" });
+    if !held && !why.is_empty() {
+        s.push_str("  (");
+        s.push_str(why);
+        s.push(')');
+    }
+    s.push('\n');
+}
+
+/// A sitting, as the machine reports it.
+fn render_dispatch(c: &Certificate, seq: u32, hour: u8) -> String {
+    let mut s = String::from("SITTING ");
+    push_u32(&mut s, seq);
+    s.push_str("  hour ");
+    push_u32(&mut s, hour as u32);
+    s.push('\n');
+
+    s.push_str("  PROPOSAL ");
+    s.push_str(&short(&c.variant));
+    if let Some(p) = c.parent {
+        s.push_str("  succeeding ");
+        s.push_str(&short(&p));
+    }
+    s.push_str("  over ");
+    push_u32(&mut s, c.validation as u32);
+    s.push_str(" paired decisions\n");
+
+    let mut j1 = String::from("J1 REPAIR  fixed ");
+    push_u32(&mut j1, c.fixed as u32);
+    j1.push_str(" broke ");
+    push_u32(&mut j1, c.broke as u32);
+    j1.push_str(" chi ");
+    push_f2(&mut j1, c.mcnemar);
+    row(&mut s, &j1, c.j1, c.j1_why);
+
+    let mut j2 = String::from("J2 GOALS   ");
+    push_u32(&mut j2, c.goals_held as u32);
+    j2.push_str(" of ");
+    push_u32(&mut j2, c.goals_total as u32);
+    j2.push_str(" held");
+    row(&mut s, &j2, c.j2, "");
+
+    row(&mut s, "J3 FORM    structure", c.j3, c.j3_why);
+
+    let mut j4 = String::from("J4 COST    rank ");
+    push_u32(&mut j4, c.rank as u32);
+    j4.push_str(", ");
+    push_u32(&mut j4, c.resident_kib as u32);
+    j4.push_str(" KiB resident");
+    row(&mut s, &j4, c.j4, "");
+
+    s.push_str("  VERDICT");
+    while s.len() % 24 != 0 {
+        s.push(' ');
+    }
+    if c.adopted {
+        s.push_str("RATIFIED. The prior state is preserved; 'godel rollback' restores it.\n");
+    } else {
+        s.push_str("REJECTED, and reverted. The prior state stands.\n");
+    }
+    s.push('\n');
+    s
+}
+
+/// Sittings the operator has not been shown, oldest first.
+///
+/// Counted rather than diffed: the dispatch file is append-only, so the number
+/// already shown is a position in it and nothing has to be compared.
+pub fn pending() -> Option<String> {
+    let all = sysbox::read_blob(DISPATCH).and_then(|b| String::from_utf8(b).ok())?;
+    let seen = sysbox::read_blob(REPORTED)
+        .and_then(|b| String::from_utf8(b).ok())
+        .and_then(|s| s.trim().parse::<usize>().ok())
+        .unwrap_or(0);
+    let mut out = String::new();
+    let mut n = 0usize;
+    for block in all.split("SITTING ") {
+        if block.is_empty() {
+            continue;
+        }
+        n += 1;
+        if n > seen {
+            out.push_str("SITTING ");
+            out.push_str(block);
+        }
+    }
+    if out.is_empty() {
+        None
+    } else {
+        // Only the count of what was actually handed over. A report the
+        // operator never saw because the console scrolled is a report that
+        // still owes them a reading.
+        let mut c = String::new();
+        push_u32(&mut c, n as u32);
+        sysbox::write_text(REPORTED, &c);
+        Some(out)
+    }
+}
+
+/// Every sitting, whether or not it has been reported.
+pub fn all_dispatches() -> Option<String> {
+    sysbox::read_blob(DISPATCH).and_then(|b| String::from_utf8(b).ok())
+}
+
 fn render_certificate(c: &Certificate, seq: u32, hour: u8) -> String {
     let mut s = String::new();
     push_u32(&mut s, seq);
@@ -1650,7 +1798,7 @@ pub fn trial(
 
     let hour = crate::dev::rtc::now().map(|d| d.hour).unwrap_or(0);
     let seq = TRIALS.load(Ordering::Relaxed);
-    ledger_append(&render_certificate(&cert, seq, hour));
+    record(&cert, seq, hour);
     Ok(cert)
 }
 
@@ -1836,7 +1984,7 @@ pub fn trial_core(e: &mut super::Engine, h: &[u8; 32]) -> Result<Certificate, &'
 
     let hour = crate::dev::rtc::now().map(|d| d.hour).unwrap_or(0);
     let seq = TRIALS.load(Ordering::Relaxed);
-    ledger_append(&render_certificate(&cert, seq, hour));
+    record(&cert, seq, hour);
     Ok(cert)
 }
 
@@ -2087,7 +2235,7 @@ pub fn trial_deep(
 
     let hour = crate::dev::rtc::now().map(|d| d.hour).unwrap_or(0);
     let seq = TRIALS.load(Ordering::Relaxed);
-    ledger_append(&render_certificate(&cert, seq, hour));
+    record(&cert, seq, hour);
     Ok(cert)
 }
 
@@ -2179,7 +2327,7 @@ pub fn trial_skill(h: &[u8; 32]) -> Result<Certificate, &'static str> {
 
     let hour = crate::dev::rtc::now().map(|d| d.hour).unwrap_or(0);
     let seq = TRIALS.load(Ordering::Relaxed);
-    ledger_append(&render_certificate(&cert, seq, hour));
+    record(&cert, seq, hour);
     Ok(cert)
 }
 
@@ -2329,7 +2477,7 @@ pub fn trial_config(e: &mut super::Engine, rule: u8) -> Result<Certificate, &'st
 
     let hour = crate::dev::rtc::now().map(|d| d.hour).unwrap_or(0);
     let seq = TRIALS.load(Ordering::Relaxed);
-    ledger_append(&render_certificate(&cert, seq, hour));
+    record(&cert, seq, hour);
     Ok(cert)
 }
 
