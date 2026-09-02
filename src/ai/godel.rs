@@ -443,6 +443,65 @@ pub fn space_selftest() -> bool {
         return false;
     }
 
+    // --- the drawn space -------------------------------------------------
+    //
+    // The claims that matter here are the two the grid could not make,
+    // because a list is trivially re-derivable and trivially finite. A draw
+    // is neither by construction, so both have to be asserted.
+
+    let s1 = sha256::hash(b"seed one");
+    let s2 = sha256::hash(b"seed two");
+
+    // Re-derivable. The same record draws the same proposal, which is what
+    // lets a later run check a verdict instead of taking it on trust.
+    if draw(&s1, 7).hash() != draw(&s1, 7).hash() {
+        return false;
+    }
+
+    // A function *of the record*, not of nothing. If the seed did not reach
+    // the draw, every machine would search the same eight points in the same
+    // order after the grid ran out, which is the exhaustion this replaced
+    // wearing a longer table.
+    if draw(&s1, 0).hash() == draw(&s2, 0).hash() {
+        return false;
+    }
+
+    // Successive draws differ. This is `space_selftest`'s original claim --
+    // that two nights are not the same weights twice -- carried into the part
+    // of the space nobody wrote down, where it stops being obvious.
+    for i in 0..32u32 {
+        let a = draw(&s1, i);
+        for j in (i + 1)..32u32 {
+            if a.hash() == draw(&s1, j).hash() {
+                return false;
+            }
+        }
+    }
+
+    // Every draw is a point the trainer and J4 can actually take. A drawn
+    // rank of 200 would be caught by J4 the honest way -- after a night spent
+    // training it -- so it is caught here instead, and the rate is checked
+    // finite because it is built by repeated multiplication and a NaN would
+    // propagate all the way into the weights without anything faulting.
+    for i in 0..256u32 {
+        let d = draw(&s1, i);
+        if d.rank < 4 || d.rank > DRAW_MAX_RANK || d.epochs < 8 {
+            return false;
+        }
+        if !(d.lr > 0.0) || !(d.lr < 1.0) || d.lr != d.lr {
+            return false;
+        }
+        if !(d.alpha > 0.0) || d.alpha != d.alpha {
+            return false;
+        }
+        // A draw addresses its marker the way an adapter point does. Rendering
+        // a `kind` line here would re-address the whole tried directory, which
+        // is the trap the core arm above is written around.
+        if d.render().contains("core ") || d.render().contains("deep 1") {
+            return false;
+        }
+    }
+
     // A config point is its own kind, and its rule is its identity.
     //
     // The rule is already a rendered field, so what the kind line has to do is
@@ -521,8 +580,114 @@ pub fn space_selftest() -> bool {
 /// Exhaustion is a real answer and is reported rather than papered over by
 /// wrapping. A loop that silently restarts its grid spends every night
 /// re-deriving adapters it already has, which is the failure this replaces.
+/// How many draws past the declared prefix `frontier` will look at before
+/// answering `None`.
+///
+/// Not a bound on the space, a bound on one night's patience. Every draw is
+/// cheap -- one SHA-256 and a namespace read -- but a loop with no ceiling is
+/// a loop that hangs when something upstream is wrong, and this one runs at
+/// 3am with nobody to stop it.
+const DRAW_TRIES: u32 = 64;
+
+/// How many draws one night will look at, for anything that reports it.
+pub fn draw_tries() -> u32 {
+    DRAW_TRIES
+}
+
+/// The largest rank a drawn proposal may carry.
+///
+/// J4 refuses on resident bytes and would catch a rank of 200 the honest way:
+/// by rejecting the trial that produced it, after a night had been spent
+/// training it. Bounding the draw costs nothing and leaves J4 judging variants
+/// rather than typos.
+const DRAW_MAX_RANK: usize = 32;
+
+/// The next proposal, drawn from a space that was never written down.
+///
+/// **This is the fork's first departure, and the reason for its name.**
+///
+/// The parent walks `GRID`: eight declared points, in order, skipping what has
+/// been tried. That is deliberate and its stated reason is good -- the next
+/// point is a function of the markers rather than of a coin, so any verdict can
+/// be re-derived later for almost nothing. The cost is equally plain and is
+/// recorded in the parent's own notes: the eighth night exhausts the space, and
+/// "search space exhausted" is the end of self-improvement, every night
+/// forever.
+///
+/// The obvious repair is a random draw, and it is the wrong one. Randomness
+/// buys an inexhaustible space by giving up the property the whole certificate
+/// argument rests on: a verdict nobody can re-derive is a verdict nobody can
+/// check, and this module replaced proof with re-derivation on purpose.
+///
+/// So the draw is a *pure function of the record*. Seed it with the hash of the
+/// ledger and the space stops being enumerated while staying re-derivable: to
+/// re-derive night twelve's proposal, hash the ledger as it stood after night
+/// eleven. **That is only possible because the ledger is append-only**, which
+/// is the invariant `sysbox::guard` enforces -- so the two halves of this fork
+/// hold each other up rather than merely coexisting. A machine that could
+/// rewrite its history could not re-derive its own search either.
+///
+/// The space is large rather than infinite, and saying which is the honest
+/// form: 64 rates by 8 ranks by 7 alphas by 56 epoch counts is about 200,000
+/// points, which at one a night is longer than the hardware will last. What
+/// matters is not that it cannot be exhausted in principle but that it is not
+/// *listed*, so nothing has to be added to a table for the loop to keep going.
+///
+/// Pure, and taking its seed rather than reading it, so `space_selftest` can
+/// make every claim here before `sysbox::init` has run.
+pub fn draw(seed: &[u8; 32], n: u32) -> Proposal {
+    let mut buf = [0u8; 36];
+    buf[..32].copy_from_slice(seed);
+    buf[32..].copy_from_slice(&n.to_le_bytes());
+    let h = sha256::hash(&buf);
+
+    // Geometric in the rate, because a learning rate is a scale and a uniform
+    // draw over [0.004, 0.085] would spend nine tenths of its nights above
+    // 0.01 -- where the parent's own grid put only two of eight points.
+    let mut lr = 0.004f32;
+    for _ in 0..(h[0] % 64) {
+        lr *= 1.05;
+    }
+
+    let rank = 4 + (h[1] as usize % 8) * 4;
+    // Alpha is drawn as a multiple of rank rather than independently. The two
+    // are not free of each other -- alpha/rank is the scaling the adapter
+    // actually applies -- so an independent draw would spend most of the space
+    // on combinations that differ in nothing that reaches the weights.
+    let alpha = rank as f32 * (1.0 + (h[2] as f32 % 7.0) * 0.5);
+    let epochs = 8 + (h[3] as usize % 56);
+
+    Proposal { lr, rank, alpha, epochs, rule: 0, kind: ProposalKind::Adapter }
+}
+
+/// The seed: what the machine has already written down.
+///
+/// The ledger and not the clock, not a counter, and not the entropy ring. All
+/// three would give an inexhaustible search and none is re-derivable, which is
+/// the trade this module exists to refuse.
+fn record_seed() -> [u8; 32] {
+    match sysbox::read_blob(LEDGER) {
+        Some(b) => sha256::hash(&b),
+        // Nothing recorded yet. A fixed seed rather than an arbitrary one, so
+        // a fresh machine's first draw is the same on every fresh machine.
+        None => sha256::hash(b"autark/draw/genesis"),
+    }
+}
+
+/// The declared prefix first, then draws, and the loop no longer ends.
+///
+/// `GRID` is kept as a *prefix* rather than deleted, which is worth a sentence
+/// because deleting it was the first instinct. Its first row is the parent's
+/// configuration, so the first eight nights of an AUTARK machine reproduce the
+/// parent's search exactly and are comparable against it point for point. Only
+/// after that does the fork's own behaviour begin. A fork that threw the grid
+/// away would have no night on which the two systems can be compared at all.
 pub fn frontier() -> Option<Proposal> {
-    GRID.iter().copied().find(|p| !p.tried())
+    if let Some(p) = GRID.iter().copied().find(|p| !p.tried()) {
+        return Some(p);
+    }
+    let seed = record_seed();
+    (0..DRAW_TRIES).map(|n| draw(&seed, n)).find(|p| !p.tried())
 }
 
 /// Have the machine write a council core, and store it by content address.

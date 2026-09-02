@@ -3063,18 +3063,24 @@ fn execute(line: &str, boot: &BootInfo, acpi: &Option<Acpi>, interp: &mut aiksi:
                 // status line could not answer before there was a search.
                 "space" => {
                     let (seen, all) = godel::explored();
-                    kprintln!("  {} of {} point(s) tried", seen, all);
+                    kprintln!("  declared prefix: {} of {} point(s) tried", seen, all);
+                    if seen >= all {
+                        // The parent stopped here, and said so: "search space
+                        // exhausted" was the end of self-improvement, eight
+                        // points and then nothing, every night forever. It is
+                        // not the end any more, so the line that said it is
+                        // gone rather than softened.
+                        kprintln!("  the prefix is spent; drawing from the record instead");
+                    }
                     match godel::frontier() {
                         Some(p) => kprintln!(
                             "  next: lr {}, rank {}, alpha {}, epochs {}, rule {}",
                             p.lr, p.rank, p.alpha, p.epochs, p.rule
                         ),
-                        None => {
-                            kprintln!("  the grid is spent -- every point has been trained and judged");
-                            kprintln!("  from here the night loop composes a core instead, which is");
-                            kprintln!("  a space it writes rather than one it was given");
-                            kprintln!("  'core author' to see one now; 'godel forget' re-walks the grid");
-                        }
+                        // Only reachable if 64 successive draws were all
+                        // already tried, which needs the ledger to be static
+                        // while the markers are not.
+                        None => kprintln!("  no untried draw in {} attempts", godel::draw_tries()),
                     }
                 }
                 // Judge a routing rule on calibration.
