@@ -157,6 +157,34 @@ pub fn run(boot: &BootInfo, acpi: &Option<Acpi>) -> ! {
     kprintln!("\ninteractive. type 'help', or just type code.");
     console::set_color(WHITE);
 
+    // Registration: the first onboarding this tree has ever had.
+    //
+    // Absence of `/ai/about` is the whole test. It is the same condition
+    // `companion::system_turn` already reads -- absent and empty mean the same
+    // thing there, and they mean the same thing here -- so there is no
+    // first-boot flag to get out of step with reality, and a machine whose
+    // record was cleared is offered enrolment again rather than being told it
+    // already knows somebody it does not.
+    //
+    // It is a notice and not a prompt. A modal question at the first prompt
+    // would block a serial script and would be the one thing on this machine
+    // that cannot be driven headlessly, which is how the desktop's own
+    // controls came to need `win keys`. The claim it makes is deliberately the
+    // narrow one that is always true -- the record is read into every new
+    // conversation -- and says nothing about surviving a reboot, which depends
+    // on a store being mounted and is exactly the overclaim `park()` was
+    // rewritten to stop making.
+    if crate::sysbox::read_blob(crate::ai::companion::ABOUT).map_or(true, |b| b.is_empty()) {
+        console::set_color(YELLOW);
+        kprintln!("\n[registration]");
+        console::set_color(LTGRAY);
+        kprintln!("  No record of you is held. One will be kept.");
+        kprintln!("  'about <anything>' enters it, and it is read into every new");
+        kprintln!("  conversation thereafter. Operation continues either way; the");
+        kprintln!("  record is for the machine's convenience, not your comfort.");
+        console::set_color(WHITE);
+    }
+
     // What the machine did while nobody was here.
     //
     // At the first prompt rather than on a timer, because "the first
