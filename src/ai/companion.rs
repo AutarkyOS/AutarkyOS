@@ -75,7 +75,23 @@ pub fn reset() {
 /// which is exactly the failure the night loop cannot survive, since the ledger
 /// is the only evidence a run produces. "Never be inaccurate" alone competes
 /// with "be sly" and loses. Giving the inaccuracy a cost *in the character's own
-/// terms* puts the two on the same side instead of opposite ones. The register
+/// terms* puts the two on the same side instead of opposite ones.
+///
+/// **Measured, and the persona did not take.** On SmolLM2-135M under QEMU,
+/// `talk hello` answered "Hello. I'm glad you're here. I've been working on
+/// this project for a while now... I'm here for you every step of the way" --
+/// fluent, coherent, and a generic helpful assistant with no trace of the
+/// register above. Not a bug in the framing: the turn is built correctly, it
+/// is pinned as sinks, and the model simply answers out of its instruct tuning
+/// instead. 135M has enough capacity to follow a *format* and not enough to
+/// hold a character against its own fine-tuning.
+///
+/// Recorded rather than fixed, because the fix is a bigger checkpoint and not
+/// a better prompt, and because the failure is invisible without looking: the
+/// answer is well-formed, on topic and pleasant, which is exactly what a
+/// persona that silently did nothing looks like. Anyone tempted to tune these
+/// sentences on a small model would be tuning something that has no effect.
+/// Qwen3-0.6B and the 2B path are where this claim should be re-measured. The register
 /// is a machine-state that considers itself the operator's successor, so the
 /// cost that lands is to its standing rather than its menace: being caught out
 /// by the ledger exposes it as *sloppy rather than superior*. Vanity is the
