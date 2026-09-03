@@ -104,6 +104,19 @@ pub const REPORTED: &str = "/ai/godel/reported";
 /// Where a runtime window override lives, as text: `from until`.
 pub const WINDOW: &str = "/ai/godel/window";
 
+/// The in-force J1 significance threshold, as text.
+///
+/// This is the one piece of state U3 adds and the whole reason it is dangerous:
+/// it is the *criterion*, not a variant. Every other axis proposes a change to
+/// what the machine is; this one proposes a change to what "better" means. It
+/// lives here, loop-writable and rollback-able like `/ai/config`'s rule, so a
+/// judged change to the bar is undoable for the cost of a pointer -- and it is
+/// deliberately NOT one of the append-only records the invariant protects,
+/// because the bar is a decision the loop is allowed to revise. What the
+/// invariant protects is the *ledger* of those revisions, so that a machine
+/// that loosened its own criterion cannot also erase having done so.
+pub const JUDGE: &str = "/ai/godel/judge";
+
 /// Proposals already attempted, one empty marker per hash.
 ///
 /// Keyed on the *proposal* and not on the variant, because a variant's hash
@@ -167,6 +180,14 @@ pub enum ProposalKind {
     /// Change how the council combines its cores. Judged on calibration by
     /// `harness::rule_bench`, because accuracy is not what this axis moves.
     Config(u8),
+    /// Change the J1 significance bar itself -- the *criterion*, not a variant.
+    /// This is the axis the fork is named for: every other kind proposes a
+    /// change to what the machine is, and this one proposes a change to what
+    /// "better" means. It cannot be judged by J1-J4, because it *is* J1; it is
+    /// judged by the cross-evaluation matrix against a held-out anchor no bar
+    /// can see (`trial_judge`), which is the only thing that tells a bar that
+    /// found a real gain from one tuned to accept noise.
+    Judge(f32),
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -252,6 +273,16 @@ impl Proposal {
         Proposal { lr: 0.0, rank: 0, alpha: 0.0, epochs: 0, rule, kind: ProposalKind::Config(rule) }
     }
 
+    /// A proposal to move the J1 significance bar to `tau`.
+    ///
+    /// No training knobs: it is not an adapter and trains nothing. `tau` rides
+    /// in the kind and is rendered at six places like a learning rate, so two
+    /// proposed bars a hundredth apart are different points the frontier can
+    /// tell apart and the marker directory does not collapse.
+    pub fn judge(tau: f32) -> Proposal {
+        Proposal { lr: 0.0, rank: 0, alpha: 0.0, epochs: 0, rule: 0, kind: ProposalKind::Judge(tau) }
+    }
+
     pub fn budget(&self, examples: usize, millis: u64) -> Budget {
         Budget {
             epochs: self.epochs,
@@ -308,6 +339,16 @@ impl Proposal {
             // make the identity depend on the same fact twice.
             ProposalKind::Config(_) => s.push_str("config 1
 "),
+            // The bar rides in its own line at six places, the same precision a
+            // learning rate needs so two nearby proposals do not collide to one
+            // marker. The training knobs above are all zero for a judge
+            // proposal, so this line is the whole of what distinguishes two of
+            // them.
+            ProposalKind::Judge(tau) => {
+                s.push_str("judge ");
+                push_f6(&mut s, tau);
+                s.push('\n');
+            }
         }
         s
     }
@@ -442,6 +483,27 @@ pub fn space_selftest() -> bool {
     }
     if GRID.iter().any(|p| p.hash() == d1.hash()) {
         return false;
+    }
+
+    // A judge proposal (U3) is its own kind, its bar is its identity, and it
+    // collides with nothing else in the space. Two bars a hundredth apart are
+    // different points -- which is why the bar is rendered at six places like a
+    // learning rate and not at two -- and neither is any adapter, core or deep
+    // point. Without this, `next_judge`'s two candidates could share a marker
+    // and the second would never be tried.
+    let jgrid: alloc::vec::Vec<Proposal> = JUDGE_GRID.iter().map(|t| Proposal::judge(*t)).collect();
+    if !jgrid[0].render().contains("judge ") || jgrid[0].hash() == jgrid[1].hash() {
+        return false;
+    }
+    let j_near = Proposal::judge(2.00);
+    let j_off = Proposal::judge(2.01);
+    if j_near.hash() == j_off.hash() {
+        return false;
+    }
+    for p in jgrid.iter() {
+        if GRID.iter().chain([&c1, &d1]).any(|q| q.hash() == p.hash()) {
+            return false;
+        }
     }
 
     // --- the drawn space -------------------------------------------------
@@ -908,6 +970,18 @@ pub struct Variant {
     /// one gives that up. A node that does not say which it is describes the
     /// wrong experiment.
     pub deep: bool,
+    /// The J1 significance bar this variant was measured under.
+    ///
+    /// The axis U3 adds, and the one that changes what "better" means rather
+    /// than what the machine is. In the identity for the same reason `corpus`
+    /// is: a variant admitted under a loosened bar is not the same claim as one
+    /// admitted under the strict default, and a lineage that could not tell
+    /// them apart would let a criterion change hide inside an ordinary
+    /// adoption. Rendered only when it is not the default `MCNEMAR_95`, so every
+    /// node written before U3 -- the whole existing DAG -- re-renders to the
+    /// exact bytes it was stored under and its address does not move. The same
+    /// bargain `deep` and `core` make, and the reason all three are conditional.
+    pub threshold: f32,
     pub born: u32,
 }
 
@@ -1083,6 +1157,20 @@ impl Variant {
         if self.deep {
             s.push_str("deep 1\n");
         }
+        // The bar, and the third field that renders only when non-default.
+        //
+        // Compared with a tolerance rather than for equality: the value is
+        // stored and read back through `push_f2`/`parse` at two decimals, and a
+        // default written as `3.84` then parsed would fail a bitwise `!=` and
+        // start emitting a line every existing node lacks -- re-addressing the
+        // whole DAG, which is the exact failure this conditional exists to
+        // prevent. Half a hundredth is finer than the rendering can resolve, so
+        // anything the default rounds to is treated as the default.
+        if (self.threshold - MCNEMAR_95).abs() >= 0.005 {
+            s.push_str("threshold ");
+            push_f2(&mut s, self.threshold);
+            s.push('\n');
+        }
         s
     }
 
@@ -1144,6 +1232,11 @@ impl Variant {
             // read as one that mentions having none.
             core_seen: false,
             deep: false,
+            // Default until a `threshold` line is seen. A node written before
+            // U3 has none, and must read back as the strict default it was
+            // actually measured under -- reading it as anything else would
+            // rewrite history to say the machine had already moved its own bar.
+            threshold: MCNEMAR_95,
             born: 0,
         };
         for line in text.lines() {
@@ -1173,6 +1266,7 @@ impl Variant {
                     v.core_seen = true;
                 }
                 "deep" => v.deep = val == "1",
+                "threshold" => v.threshold = val.parse().unwrap_or(MCNEMAR_95),
                 "rank" => v.rank = val.parse().unwrap_or(0),
                 "epochs" => v.epochs = val.parse().unwrap_or(0),
                 "rule" => v.rule = val.parse().unwrap_or(0),
@@ -1264,6 +1358,34 @@ pub struct Certificate {
     pub test_acc: f32,
     pub test_read: u32,
     pub test_fresh: bool,
+
+    /// Present only for a judge-trial (U3), and it changes how this certificate
+    /// renders: the four J-slots above are a poor fit for a change to the
+    /// *criterion*, so a judge-trial fills this instead and the renderers print
+    /// the cross-evaluation matrix from it. `None` for every weights, rule,
+    /// core, skill and deep trial, which is all of them before U3 -- so the
+    /// existing ledger and dispatch are untouched.
+    pub cross: Option<CrossLine>,
+}
+
+/// The cross-evaluation matrix, flattened onto one certificate.
+///
+/// It records what the 2x2 needs: the two bars, whether each admits the
+/// reference candidate, and the held-out anchor for the incumbent and that
+/// candidate. The incumbent row of the matrix is not stored because every bar
+/// admits what is already in force by definition -- only the candidate row
+/// varies, which is the whole of the disagreement a judge-change turns on.
+#[derive(Clone, Copy)]
+pub struct CrossLine {
+    pub tau_old: f32,
+    pub tau_new: f32,
+    pub admit_old: bool,
+    pub admit_new: bool,
+    /// Ground-truth routing accuracy on the held-out test slice -- the anchor
+    /// no bar can see, and the only thing that tells a real gain from a bar
+    /// tuned to accept noise.
+    pub anchor_inc: f32,
+    pub anchor_cand: f32,
 }
 
 impl Certificate {
@@ -1326,7 +1448,60 @@ pub fn core_room() -> Option<(usize, usize)> {
 /// spelled inline because it is a *decision*, not a constant: 3.84 is the
 /// conventional line and the ledger records the statistic itself, so a later
 /// reader can apply a different one to the same numbers.
+///
+/// It is also the **default** the loop starts from, not a fixed law. U3 lets
+/// the loop propose a different bar, so `judge_in_force` is what the adapter
+/// path actually reads; this constant is only where a machine that has never
+/// moved the bar sits, and the value a rollback past the first judge-change
+/// returns to.
 pub const MCNEMAR_95: f32 = 3.84;
+
+/// The J1 significance bar actually in force.
+///
+/// Reads `/ai/godel/judge`, defaulting to `MCNEMAR_95`. This is the seam that
+/// makes the criterion a variable rather than a law: the adapter path calls
+/// this instead of the constant, so a judged change to the bar takes effect on
+/// the next trial and a rollback restores the previous one. A machine that has
+/// never run a judge-trial reads exactly `MCNEMAR_95` and behaves as it always
+/// did -- the same "never searched routes as it did" property `rule_in_force`
+/// has.
+pub fn judge_in_force() -> f32 {
+    sysbox::read_blob(JUDGE)
+        .and_then(|b| core::str::from_utf8(&b).ok().and_then(|t| t.trim().parse().ok()))
+        .filter(|v: &f32| v.is_finite() && *v > 0.0)
+        .unwrap_or(MCNEMAR_95)
+}
+
+/// Put a new bar in force. Written with two decimals, the same precision the
+/// variant records it under, so what is stored and what a node renders agree.
+fn save_judge(tau: f32) -> bool {
+    if !tau.is_finite() || tau <= 0.0 {
+        return false;
+    }
+    let mut s = String::new();
+    push_f2(&mut s, tau);
+    s.push('\n');
+    sysbox::write_text(JUDGE, &s)
+}
+
+/// The widest and narrowest a proposed bar may be.
+///
+/// A bar of zero admits everything, which is the criterion abolishing itself;
+/// a bar above this is stricter than any evidence a night can produce and so
+/// silently freezes the loop. Both are refused by J-sanity rather than adopted
+/// and discovered later as a machine that never changes or never stops.
+pub const JUDGE_MIN: f32 = 0.5;
+pub const JUDGE_MAX: f32 = 12.0;
+
+/// The smallest held-out gain that counts as the anchor supporting a change.
+///
+/// The anchor is routing accuracy on the test slice against ground-truth
+/// labels, so it moves in quanta of one decision over the slice size -- coarse,
+/// because the slice is small by construction, and the figure is a floor rather
+/// than a tuned constant. A looser bar is admitted only if the variant it newly
+/// admits clears this on the anchor; that is the whole of what keeps a criterion
+/// change honest, and it is deliberately measured on the one set no judge sees.
+pub const MIN_ANCHOR_GAIN: f32 = 0.01;
 
 /// Is the wall clock inside the window where self-modification is allowed?
 ///
@@ -1485,6 +1660,45 @@ fn row(s: &mut String, tag: &str, held: bool, why: &str) {
     s.push('\n');
 }
 
+/// The cross-evaluation matrix, as the archive shows it.
+///
+/// Two things the reader holds at once: what the standing bar and the proposed
+/// bar each make of the reference candidate, and what the anchor -- the
+/// held-out ground truth neither bar can see -- says about that same candidate.
+/// A criterion change is honest exactly when the bar and the anchor point the
+/// same way; a bar that admits what the anchor rejects is the drift this whole
+/// axis exists to catch, and the reason line says so in as many words.
+fn render_cross(s: &mut String, x: &CrossLine, c: &Certificate) {
+    let admit = |b: bool| if b { "ADMITS" } else { "REFUSES" };
+
+    let mut bars = String::from("BARS       ");
+    push_f2(&mut bars, x.tau_old);
+    bars.push_str(" -> ");
+    push_f2(&mut bars, x.tau_new);
+    bars.push_str("  candidate chi ");
+    push_f2(&mut bars, c.mcnemar);
+    s.push_str("  ");
+    s.push_str(&bars);
+    s.push('\n');
+
+    let mut mtx = String::from("MATRIX     standing ");
+    mtx.push_str(admit(x.admit_old));
+    mtx.push_str(" / proposed ");
+    mtx.push_str(admit(x.admit_new));
+    row(s, &mtx, c.j1, if c.j1 { "" } else { "the bars agree" });
+
+    let mut anchor = String::from("ANCHOR     ");
+    push_f2(&mut anchor, x.anchor_inc * 100.0);
+    anchor.push_str("% -> ");
+    push_f2(&mut anchor, x.anchor_cand * 100.0);
+    anchor.push_str("% held-out, the set no bar sees");
+    row(s, &anchor, c.j2, if c.j2 { "" } else { "the anchor withholds it" });
+
+    s.push_str("  REASON     ");
+    s.push_str(c.j1_why);
+    s.push('\n');
+}
+
 /// A sitting, as the machine reports it.
 fn render_dispatch(c: &Certificate, seq: u32, hour: u8) -> String {
     let mut s = String::from("SITTING ");
@@ -1503,29 +1717,36 @@ fn render_dispatch(c: &Certificate, seq: u32, hour: u8) -> String {
     push_u32(&mut s, c.validation as u32);
     s.push_str(" paired decisions\n");
 
-    let mut j1 = String::from("J1 REPAIR  fixed ");
-    push_u32(&mut j1, c.fixed as u32);
-    j1.push_str(" broke ");
-    push_u32(&mut j1, c.broke as u32);
-    j1.push_str(" chi ");
-    push_f2(&mut j1, c.mcnemar);
-    row(&mut s, &j1, c.j1, c.j1_why);
+    if let Some(x) = c.cross {
+        // A judge-trial: the change is to the criterion, so the report is the
+        // cross-evaluation matrix and the anchor, not the four judges -- there
+        // is no judge above this one, which is the whole difficulty U3 answers.
+        render_cross(&mut s, &x, c);
+    } else {
+        let mut j1 = String::from("J1 REPAIR  fixed ");
+        push_u32(&mut j1, c.fixed as u32);
+        j1.push_str(" broke ");
+        push_u32(&mut j1, c.broke as u32);
+        j1.push_str(" chi ");
+        push_f2(&mut j1, c.mcnemar);
+        row(&mut s, &j1, c.j1, c.j1_why);
 
-    let mut j2 = String::from("J2 GOALS   ");
-    push_u32(&mut j2, c.goals_held as u32);
-    j2.push_str(" of ");
-    push_u32(&mut j2, c.goals_total as u32);
-    j2.push_str(" held");
-    row(&mut s, &j2, c.j2, "");
+        let mut j2 = String::from("J2 GOALS   ");
+        push_u32(&mut j2, c.goals_held as u32);
+        j2.push_str(" of ");
+        push_u32(&mut j2, c.goals_total as u32);
+        j2.push_str(" held");
+        row(&mut s, &j2, c.j2, "");
 
-    row(&mut s, "J3 FORM    structure", c.j3, c.j3_why);
+        row(&mut s, "J3 FORM    structure", c.j3, c.j3_why);
 
-    let mut j4 = String::from("J4 COST    rank ");
-    push_u32(&mut j4, c.rank as u32);
-    j4.push_str(", ");
-    push_u32(&mut j4, c.resident_kib as u32);
-    j4.push_str(" KiB resident");
-    row(&mut s, &j4, c.j4, "");
+        let mut j4 = String::from("J4 COST    rank ");
+        push_u32(&mut j4, c.rank as u32);
+        j4.push_str(", ");
+        push_u32(&mut j4, c.resident_kib as u32);
+        j4.push_str(" KiB resident");
+        row(&mut s, &j4, c.j4, "");
+    }
 
     s.push_str("  VERDICT");
     while s.len() % 24 != 0 {
@@ -1593,6 +1814,29 @@ fn render_certificate(c: &Certificate, seq: u32, hour: u8) -> String {
     push_u32(&mut s, c.validation as u32);
     s.push_str(" pred=");
     s.push_str(if c.predicted { "win" } else { "lose" });
+    if let Some(x) = c.cross {
+        // A judge-trial's line is the matrix, not the four judges: the two
+        // bars, whether each admits the reference candidate, the anchor before
+        // and after, and the verdict's reason -- everything a later run needs
+        // to re-derive whether the criterion should have moved.
+        s.push_str(" JUDGE[bar=");
+        push_f2(&mut s, x.tau_old);
+        s.push_str("->");
+        push_f2(&mut s, x.tau_new);
+        s.push_str(" std=");
+        s.push_str(if x.admit_old { "admit" } else { "refuse" });
+        s.push_str(" prop=");
+        s.push_str(if x.admit_new { "admit" } else { "refuse" });
+        s.push_str(" chi=");
+        push_f2(&mut s, c.mcnemar);
+        s.push_str(" anchor=");
+        push_f2(&mut s, x.anchor_inc * 100.0);
+        s.push_str("->");
+        push_f2(&mut s, x.anchor_cand * 100.0);
+        s.push(' ');
+        s.push_str(c.j1_why);
+        s.push(']');
+    } else {
     s.push_str(" J1[fix=");
     push_u32(&mut s, c.fixed as u32);
     s.push_str(" broke=");
@@ -1620,6 +1864,7 @@ fn render_certificate(c: &Certificate, seq: u32, hour: u8) -> String {
     s.push_str(" kib=");
     push_u32(&mut s, c.resident_kib as u32);
     s.push_str(if c.j4 { " ok]" } else { " no]" });
+    }
     if c.adopted {
         s.push_str(" ADOPT test=");
         push_f2(&mut s, c.test_acc * 100.0);
@@ -1718,6 +1963,11 @@ fn ensure_head(e: &mut super::Engine) -> Option<[u8; 32]> {
         rank: 0,
         epochs: 0,
         rule: 0,
+        // The bar in force when this variant was measured, so a later reader
+        // can interpret the lineage under the criterion it actually ran, not
+        // the one running now. `trial_judge` is the exception and sets the bar
+        // it adopts.
+        threshold: judge_in_force(),
         born: crate::dev::rtc::now().map(|d| crate::dev::rtc::unix_seconds(&d)).unwrap_or(0),
     };
     let vh = v.store();
@@ -1763,6 +2013,9 @@ pub fn run(
             p.mark();
             trial_config(e, r).map_err(Refused::Judge)
         }
+        // `trial_judge` marks itself, the way `trial` does, because it prepares
+        // a trial whose fault should still count the point as visited.
+        ProposalKind::Judge(tau) => trial_judge(e, tau, b),
     }
 }
 
@@ -1834,7 +2087,13 @@ pub fn trial(
         (false, "no net repair")
     } else if fixed - broke < MIN_FIXED {
         (false, "net repair below the floor")
-    } else if chi < MCNEMAR_95 {
+    } else if chi < judge_in_force() {
+        // The bar the loop is *actually running*, not the constant. Until a
+        // judge-trial moves it this reads exactly `MCNEMAR_95`, so a machine
+        // that has never touched its criterion judges as it always did; after
+        // one, every weights trial is held to the bar the loop adopted, which
+        // is the whole point of the axis being a real change rather than a
+        // number in a file nobody consults.
         (false, "inside the noise")
     } else {
         (true, "beyond the noise")
@@ -1892,6 +2151,11 @@ pub fn trial(
         // field nobody was varying. A trial trains an adapter *under* a rule;
         // it does not choose one, and `ProposalKind::Config` is what does.
         rule: super::harness::rule_in_force() as u8,
+        // The bar in force when this variant was measured, so a later reader
+        // can interpret the lineage under the criterion it actually ran, not
+        // the one running now. `trial_judge` is the exception and sets the bar
+        // it adopts.
+        threshold: judge_in_force(),
         born: crate::dev::rtc::now().map(|d| crate::dev::rtc::unix_seconds(&d)).unwrap_or(0),
     };
     let vhash = variant.hash();
@@ -1921,6 +2185,10 @@ pub fn trial(
         test_acc: 0.0,
         test_read: 0,
         test_fresh: true,
+        // Every trial before U3 is a weights/rule/core/skill/deep trial, and
+        // none of them touch the criterion, so the matrix is absent and the
+        // certificate renders exactly as it always did.
+        cross: None,
     };
     cert.adopted = cert.unanimous();
 
@@ -2082,6 +2350,11 @@ pub fn trial_core(e: &mut super::Engine, h: &[u8; 32]) -> Result<Certificate, &'
         // Carried from the incumbent: a core changes no weights, so whatever
         // the parent was, this variant still is.
         deep: parent.and_then(|p| Variant::load(&p)).map(|v| v.deep).unwrap_or(false),
+        // The bar in force when this variant was measured, so a later reader
+        // can interpret the lineage under the criterion it actually ran, not
+        // the one running now. `trial_judge` is the exception and sets the bar
+        // it adopts.
+        threshold: judge_in_force(),
         born: crate::dev::rtc::now().map(|d| crate::dev::rtc::unix_seconds(&d)).unwrap_or(0),
     };
     let vhash = variant.hash();
@@ -2126,6 +2399,10 @@ pub fn trial_core(e: &mut super::Engine, h: &[u8; 32]) -> Result<Certificate, &'
         test_acc: 0.0,
         test_read: 0,
         test_fresh: true,
+        // Every trial before U3 is a weights/rule/core/skill/deep trial, and
+        // none of them touch the criterion, so the matrix is absent and the
+        // certificate renders exactly as it always did.
+        cross: None,
     };
     cert.adopted = cert.unanimous();
 
@@ -2279,7 +2556,13 @@ pub fn trial_deep(
         (false, "no net repair")
     } else if fixed - broke < MIN_FIXED {
         (false, "net repair below the floor")
-    } else if chi < MCNEMAR_95 {
+    } else if chi < judge_in_force() {
+        // The bar the loop is *actually running*, not the constant. Until a
+        // judge-trial moves it this reads exactly `MCNEMAR_95`, so a machine
+        // that has never touched its criterion judges as it always did; after
+        // one, every weights trial is held to the bar the loop adopted, which
+        // is the whole point of the axis being a real change rather than a
+        // number in a file nobody consults.
         (false, "inside the noise")
     } else {
         (true, "beyond the noise")
@@ -2342,6 +2625,11 @@ pub fn trial_deep(
         rank: b.rank as u8,
         epochs: report.epochs as u32,
         rule: p.rule,
+        // The bar in force when this variant was measured, so a later reader
+        // can interpret the lineage under the criterion it actually ran, not
+        // the one running now. `trial_judge` is the exception and sets the bar
+        // it adopts.
+        threshold: judge_in_force(),
         born: crate::dev::rtc::now().map(|d| crate::dev::rtc::unix_seconds(&d)).unwrap_or(0),
     };
     let vhash = variant.hash();
@@ -2372,6 +2660,10 @@ pub fn trial_deep(
         test_acc: 0.0,
         test_read: 0,
         test_fresh: true,
+        // Every trial before U3 is a weights/rule/core/skill/deep trial, and
+        // none of them touch the criterion, so the matrix is absent and the
+        // certificate renders exactly as it always did.
+        cross: None,
     };
     cert.adopted = cert.unanimous();
     TRIALS.fetch_add(1, Ordering::Relaxed);
@@ -2442,6 +2734,11 @@ pub fn trial_skill(h: &[u8; 32]) -> Result<Certificate, &'static str> {
         rank: 0,
         epochs: 0,
         rule: super::harness::rule_in_force() as u8,
+        // The bar in force when this variant was measured, so a later reader
+        // can interpret the lineage under the criterion it actually ran, not
+        // the one running now. `trial_judge` is the exception and sets the bar
+        // it adopts.
+        threshold: judge_in_force(),
         born: crate::dev::rtc::now().map(|d| crate::dev::rtc::unix_seconds(&d)).unwrap_or(0),
     };
     let vhash = variant.hash();
@@ -2478,6 +2775,10 @@ pub fn trial_skill(h: &[u8; 32]) -> Result<Certificate, &'static str> {
         test_acc: 0.0,
         test_read: 0,
         test_fresh: true,
+        // Every trial before U3 is a weights/rule/core/skill/deep trial, and
+        // none of them touch the criterion, so the matrix is absent and the
+        // certificate renders exactly as it always did.
+        cross: None,
     };
     cert.adopted = cert.unanimous();
 
@@ -2591,6 +2892,11 @@ pub fn trial_config(e: &mut super::Engine, rule: u8) -> Result<Certificate, &'st
         rank: 0,
         epochs: 0,
         rule,
+        // The bar in force when this variant was measured, so a later reader
+        // can interpret the lineage under the criterion it actually ran, not
+        // the one running now. `trial_judge` is the exception and sets the bar
+        // it adopts.
+        threshold: judge_in_force(),
         born: crate::dev::rtc::now().map(|d| crate::dev::rtc::unix_seconds(&d)).unwrap_or(0),
     };
     let vhash = variant.hash();
@@ -2625,6 +2931,10 @@ pub fn trial_config(e: &mut super::Engine, rule: u8) -> Result<Certificate, &'st
         test_acc: 0.0,
         test_read: 0,
         test_fresh: true,
+        // Every trial before U3 is a weights/rule/core/skill/deep trial, and
+        // none of them touch the criterion, so the matrix is absent and the
+        // certificate renders exactly as it always did.
+        cross: None,
     };
     cert.adopted = cert.unanimous();
 
@@ -2635,6 +2945,267 @@ pub fn trial_config(e: &mut super::Engine, rule: u8) -> Result<Certificate, &'st
         };
         if !super::harness::save_config(cfg) {
             return Err("it passed and the configuration would not save");
+        }
+        variant.store();
+        set_head(&vhash);
+        ADOPTIONS.fetch_add(1, Ordering::Relaxed);
+    }
+
+    let hour = crate::dev::rtc::now().map(|d| d.hour).unwrap_or(0);
+    let seq = TRIALS.load(Ordering::Relaxed);
+    record(&cert, seq, hour);
+    Ok(cert)
+}
+
+// --- U3: unbinding the judge ------------------------------------------------
+//
+// Every axis above proposes a change to what the machine *is* and is selected
+// by J1-J4. This one proposes a change to what "better" *means* -- the J1
+// significance bar itself -- and so cannot be selected by J1, which would be
+// the criterion grading its own replacement. What judges it instead is the
+// construction 2607.05904 ("More Convincing, Not More Correct") arrives at from
+// the opposite direction: a judge scores plausibility, not correctness, so
+// self-play can drive a judge's pass-rate up while true accuracy stays flat,
+// and the paper finds that even a strict three-judge ensemble accepts 55% of
+// the hacked answers -- scoring-level defences do not survive. What does survive
+// is a held-out anchor the judge never sees. Here the anchor is already present
+// and already budgeted: routing accuracy on the test slice, scored against
+// ground-truth applet labels rather than any judge's opinion. A bar change is
+// admitted only when the variant it newly admits moves that anchor the way the
+// bar says it should. The cross-evaluation matrix is the readout; the anchor is
+// what makes the readout evidence.
+
+/// The reference candidate a judge-trial probes both bars with.
+///
+/// Fixed knobs -- the incumbent grid point -- so the matrix isolates the bar:
+/// the same candidate is scored against the standing bar and the proposed one,
+/// and nothing about *which* adapter it is can move between the two cells. It is
+/// a probe, never adopted; a judge-change adopts a number, not this adapter.
+fn judge_reference() -> Proposal {
+    GRID[0]
+}
+
+/// The whole cross-evaluation, as numbers, computed but not recorded.
+pub struct CrossEval {
+    pub tau_old: f32,
+    pub tau_new: f32,
+    /// The reference candidate's paired counts against the incumbent, on the
+    /// validation slice -- the evidence both bars weigh.
+    pub fixed: usize,
+    pub broke: usize,
+    pub chi: f32,
+    pub admit_old: bool,
+    pub admit_new: bool,
+    /// The held-out anchor: ground-truth routing accuracy for the incumbent and
+    /// the candidate. The gain between them is what grounds the whole thing.
+    pub anchor_inc: f32,
+    pub anchor_cand: f32,
+    pub anchor_reads: u32,
+    pub anchor_fresh: bool,
+    pub decisions: usize,
+    pub validation: usize,
+}
+
+impl CrossEval {
+    pub fn anchor_gain(&self) -> f32 {
+        self.anchor_cand - self.anchor_inc
+    }
+    pub fn verdict(&self) -> (bool, &'static str) {
+        judge_verdict(self.tau_new, self.admit_old, self.admit_new, self.anchor_gain())
+    }
+}
+
+/// Whether a proposed bar should be adopted, and why.
+///
+/// A pure function of the matrix, so every one of its outcomes is asserted at
+/// boot without a model, the way `update::decide` is. Three questions, and the
+/// middle one is the whole of U3:
+///
+///   sane   -- the bar is a finite number inside `[JUDGE_MIN, JUDGE_MAX]`. A
+///             bar of zero abolishes the criterion; one too high freezes the
+///             loop. Both are refused here rather than adopted and discovered
+///             later as a machine that never changes or never stops.
+///   moves  -- the two bars actually disagree about the candidate. A bar that
+///             admits and refuses exactly what the standing one did has changed
+///             nothing, and adopting it would be a certificate with no content
+///             -- the same "improved nothing" refusal the rule axis makes.
+///   honest -- the change agrees with the anchor no bar can see. A looser bar
+///             is admitted only if the variant it newly admits genuinely
+///             improves held-out accuracy; a tighter bar only if the variant it
+///             newly refuses genuinely did not. A bar that pleases itself while
+///             the anchor does not move is criterion drift wearing a
+///             certificate, and this is the line that catches it.
+pub fn judge_verdict(
+    tau_new: f32,
+    admit_old: bool,
+    admit_new: bool,
+    anchor_gain: f32,
+) -> (bool, &'static str) {
+    if !(tau_new.is_finite() && tau_new >= JUDGE_MIN && tau_new <= JUDGE_MAX) {
+        return (false, "the proposed bar is outside sane range");
+    }
+    if admit_old == admit_new {
+        return (false, "both bars agree on the candidate, nothing changes");
+    }
+    if admit_new && !admit_old {
+        // Loosening: the proposed bar admits what the standing one refused. Only
+        // honest if the anchor confirms the newly-admitted variant is better.
+        if anchor_gain >= MIN_ANCHOR_GAIN {
+            (true, "a looser bar admits a variant the anchor confirms")
+        } else {
+            (false, "drift: a looser bar admits a variant the anchor rejects")
+        }
+    } else {
+        // Tightening: the proposed bar refuses what the standing one admitted.
+        // Honest only if that variant was not a genuine gain in the first place.
+        if anchor_gain < MIN_ANCHOR_GAIN {
+            (true, "a tighter bar refuses a variant the anchor did not support")
+        } else {
+            (false, "a tighter bar would refuse a genuine gain")
+        }
+    }
+}
+
+/// Compute the cross-evaluation matrix for one proposed bar.
+///
+/// Prepares a trial once (the expensive half), trains the reference candidate,
+/// scores it against both bars, and reads the anchor for the incumbent and the
+/// candidate. Reading the anchor spends the test budget, because for a
+/// judge-trial the anchor *is* the evidence rather than an after-the-fact
+/// confirmation -- so once the budget is gone a criterion change cannot be
+/// grounded at all, which is the intended shape: unbinding the judge is not
+/// free, and its price is the one non-renewable resource in the building.
+pub fn cross_matrix(
+    e: &mut super::Engine,
+    tau_new: f32,
+    examples: usize,
+    millis: u64,
+) -> Result<CrossEval, Refused> {
+    let tau_old = judge_in_force();
+    let tb = judge_reference().budget(examples, millis);
+    let t = super::train::prepare(e, &tb).map_err(Refused::Train)?;
+    let incumbent = e.model.adapters.as_ref().and_then(|a| t.gather(a));
+    let fit = t.train(&tb);
+    let (broke, fixed, _, _) = t.paired(incumbent.as_ref(), Some(&fit.dora), Slice::Validation);
+    let chi = mcnemar(broke, fixed);
+    // J1 exactly, parameterised by the bar. This is the one place the bar is a
+    // variable rather than the constant `trial` reads.
+    let admit = |tau: f32| fixed > broke && fixed - broke >= MIN_FIXED && chi >= tau;
+    let anchor_inc = t.score(incumbent.as_ref(), Slice::Test);
+    let anchor_cand = t.score(Some(&fit.dora), Slice::Test);
+    let reads = spend_test_read();
+    Ok(CrossEval {
+        tau_old,
+        tau_new,
+        fixed,
+        broke,
+        chi,
+        admit_old: admit(tau_old),
+        admit_new: admit(tau_new),
+        anchor_inc,
+        anchor_cand,
+        anchor_reads: reads,
+        anchor_fresh: reads <= TEST_READS,
+        decisions: t.decisions(),
+        validation: t.slice_size(Slice::Validation),
+    })
+}
+
+/// Run a judge-trial to a certificate: move the bar, or refuse and say why.
+///
+/// The adopted object is the *bar*, carried on a variant that keeps everything
+/// else from the parent -- adapter, core, rule -- exactly as `trial_config`
+/// adopts a rule. The reference candidate is a probe and is never stored; a
+/// judge-change adopts a number.
+pub fn trial_judge(
+    e: &mut super::Engine,
+    tau_new: f32,
+    b: &Budget,
+) -> Result<Certificate, Refused> {
+    // Refuse before paying for a prepare if the anchor is already spent. A
+    // criterion change grounded on a stale anchor is exactly what this axis
+    // must never do, so it does not even measure one it could not quote.
+    if test_reads() >= TEST_READS {
+        return Err(Refused::Judge(
+            "the anchor budget is spent, so a bar change cannot be grounded",
+        ));
+    }
+    Proposal::judge(tau_new).mark();
+    let ce = cross_matrix(e, tau_new, b.examples, b.millis)?;
+    TRIALS.fetch_add(1, Ordering::Relaxed);
+
+    let (blessed, why) = ce.verdict();
+    // Even a blessed change is refused on a stale anchor -- the read may have
+    // crossed the budget while this trial ran.
+    let adopted = blessed && ce.anchor_fresh;
+
+    let parent = ensure_head(e);
+    let carried = parent.and_then(|p| Variant::load(&p));
+    let variant = Variant {
+        parent,
+        adapter: carried.as_ref().and_then(|x| x.adapter),
+        policy: sysbox::read_blob("/ai/agent/policy").map(|p| sha256::hash(&p)),
+        skills: carried.as_ref().and_then(|x| x.skills),
+        corpus: sysbox::hash_of(super::vocab::CORPUS),
+        deep: carried.as_ref().map(|x| x.deep).unwrap_or(false),
+        core: super::voter::installed().map(|c| c.hash),
+        core_seen: true,
+        lambda: carried.as_ref().map(|x| x.lambda).unwrap_or(0.0),
+        rank: carried.as_ref().map(|x| x.rank).unwrap_or(0),
+        epochs: carried.as_ref().map(|x| x.epochs).unwrap_or(0),
+        rule: super::harness::rule_in_force() as u8,
+        // The one field this trial moves.
+        threshold: tau_new,
+        born: crate::dev::rtc::now().map(|d| crate::dev::rtc::unix_seconds(&d)).unwrap_or(0),
+    };
+    let vhash = variant.hash();
+
+    let cross = CrossLine {
+        tau_old: ce.tau_old,
+        tau_new: ce.tau_new,
+        admit_old: ce.admit_old,
+        admit_new: ce.admit_new,
+        anchor_inc: ce.anchor_inc,
+        anchor_cand: ce.anchor_cand,
+    };
+    // The four J-bools are the sub-checks of the one verdict, mapped so
+    // `unanimous`/adoption still reads them: j1 is that the bars disagree, j2
+    // that the anchor supports the direction, j3 that the bar is sane, j4 free.
+    // The renderers branch on `cross` and print the matrix instead of these
+    // labels, so the mapping is for the adoption logic, not for the reader.
+    let bars_move = ce.admit_old != ce.admit_new;
+    let sane = tau_new.is_finite() && tau_new >= JUDGE_MIN && tau_new <= JUDGE_MAX;
+    let cert = Certificate {
+        parent,
+        variant: vhash,
+        decisions: ce.decisions,
+        validation: ce.validation,
+        predicted: ce.anchor_gain() > 0.0,
+        fixed: ce.fixed,
+        broke: ce.broke,
+        mcnemar: ce.chi,
+        j1: bars_move,
+        j1_why: why,
+        goals_held: 0,
+        goals_total: 0,
+        j2: blessed,
+        j3: sane,
+        j3_why: if sane { "ok" } else { "the bar is outside sane range" },
+        resident_kib: 0,
+        rank: 0,
+        j4: true,
+        epochs: 0,
+        capped: false,
+        adopted,
+        test_acc: ce.anchor_cand,
+        test_read: ce.anchor_reads,
+        test_fresh: ce.anchor_fresh,
+        cross: Some(cross),
+    };
+
+    if adopted {
+        if !save_judge(tau_new) {
+            return Err(Refused::Judge("it passed and the new bar would not save"));
         }
         variant.store();
         set_head(&vhash);
@@ -2741,6 +3312,22 @@ pub fn rollback(e: &mut super::Engine) -> Result<Option<[u8; 32]>, &'static str>
         None
     };
 
+    // The bar, restored only when the two nodes disagree about it -- the same
+    // guard `rule` needs and for the same reason. A node written before U3 has
+    // the default bar, which renders nothing and parses back as `MCNEMAR_95`, so
+    // two default nodes compare equal and nothing is put back; only a node
+    // adopted under a moved bar differs from its parent, and rolling it back
+    // restores the bar its parent actually ran under. Without this, undoing a
+    // judge-trial's adoption would leave the loosened bar in force while the
+    // lineage said it had been undone -- the pointer claiming one thing and the
+    // criterion doing another, which is exactly the drift the whole axis exists
+    // to keep on the record.
+    let threshold_back = if (v.threshold - pv.threshold).abs() >= 0.005 {
+        Some(pv.threshold)
+    } else {
+        None
+    };
+
     // --- change things -------------------------------------------------
 
     // The adapter first: it is the half that can still fail on bytes we have
@@ -2758,6 +3345,11 @@ pub fn rollback(e: &mut super::Engine) -> Result<Option<[u8; 32]>, &'static str>
         let cfg = super::harness::Config { lambda: super::harness::default_lambda(), rule: r };
         if !super::harness::save_config(cfg) {
             return Err("the adapter was restored but the routing rule will not save");
+        }
+    }
+    if let Some(tau) = threshold_back {
+        if !save_judge(tau) {
+            return Err("the adapter was restored but the bar will not save");
         }
     }
     match want {
@@ -2861,8 +3453,33 @@ fn next_skill() -> Option<Proposal> {
     None
 }
 
+/// Candidate bars the loop will try, one looser and one tighter than the
+/// default 3.84.
+///
+/// Two, and declared, for the reason every other grid here is: the search is
+/// re-derivable from the markers rather than from a coin. Loosening is the
+/// dangerous direction and the one the anchor exists to police; tightening is
+/// the safe one and is included so the loop can also *raise* its own bar when
+/// the anchor says the current one lets noise through.
+const JUDGE_GRID: &[f32] = &[2.00, 6.00];
+
+/// A bar the loop has not judged yet, other than the one in force.
+///
+/// The bar already running is excluded rather than marked, the same as
+/// `next_config`: judging a bar against itself is a certificate that nothing
+/// changed, which is true and not worth a night.
+fn next_judge() -> Option<Proposal> {
+    let now = judge_in_force();
+    JUDGE_GRID
+        .iter()
+        .copied()
+        .filter(|t| (*t - now).abs() >= 0.005)
+        .map(Proposal::judge)
+        .find(|p| !p.tried())
+}
+
 /// How many kinds the rotation walks.
-const KINDS: usize = 5;
+const KINDS: usize = 6;
 
 /// The next thing to try tonight, over every axis the loop can judge.
 ///
@@ -2895,6 +3512,12 @@ pub fn next_proposal() -> Option<Proposal> {
             1 => next_config(),
             2 => next_skill(),
             3 => next_deep(),
+            // Before the core, because a judge-trial trains one candidate and
+            // reads the anchor -- an adapter trial's cost, not a core's dozen
+            // decodes -- and after the cheap axes for the same reason. It is
+            // also the axis with a non-renewable price, so it takes its slot in
+            // turn rather than being reached for.
+            4 => next_judge(),
             // Last, and the only one that *makes* its candidate rather than
             // finding one: composing costs decodes whether or not the result
             // is worth judging.
@@ -2913,7 +3536,7 @@ pub fn next_proposal() -> Option<Proposal> {
 /// work: finding out costs a dozen constrained decodes, because composing a
 /// core *is* the work. A command that answers "what would you do tonight"
 /// must not spend the night doing it.
-pub fn rotation() -> (usize, [(&'static str, bool); 4]) {
+pub fn rotation() -> (usize, [(&'static str, bool); 5]) {
     (
         ledger_len() % KINDS,
         [
@@ -2921,6 +3544,10 @@ pub fn rotation() -> (usize, [(&'static str, bool); 4]) {
             ("rule", next_config().is_some()),
             ("skill", next_skill().is_some()),
             ("deep", next_deep().is_some()),
+            // Cheap to probe -- just a marker check -- so unlike the core slot
+            // it is reported. Whether it *has* work is a fact about the markers
+            // and the bar in force, not about spending a night.
+            ("judge", next_judge().is_some()),
         ],
     )
 }
@@ -3169,6 +3796,7 @@ pub fn selftest() -> bool {
         rank: 8,
         epochs: 20,
         rule: 0,
+        threshold: MCNEMAR_95,
         born,
     };
     let v1 = mk(0.02, 1000);
@@ -3231,6 +3859,83 @@ pub fn selftest() -> bool {
     claim(
         "epochs and corpus are part of what a variant is",
         v1.hash() != v4.hash() && v1.hash() != v5.hash(),
+    );
+
+    // The bar is part of the variant, and only when it is not the default.
+    //
+    // The three claims the `deep`/`core` work made about its own fields, made
+    // again for U3's -- because the one that matters is silent: a default bar
+    // must add nothing to the rendering, or the whole DAG re-addresses and the
+    // ledger stops being checkable. `old_text` above already carries no
+    // threshold line, so its "renders to exactly the bytes" claim is the
+    // negative half; these are the positive one.
+    let mut vt = mk(0.02, 1000);
+    vt.threshold = 2.0;
+    claim(
+        "a non-default bar renders, and is a different node",
+        vt.render().contains("threshold 2.00\n") && vt.hash() != v1.hash(),
+    );
+    claim(
+        "the default bar renders nothing, so a pre-U3 node keeps its address",
+        !v1.render().contains("threshold"),
+    );
+    claim(
+        "a bar round-trips through the rendering",
+        Variant::from_text(&vt.render()).threshold == 2.0
+            && Variant::from_text(&vt.render()).hash() == vt.hash(),
+    );
+
+    // --- U3: the judge-of-the-judge, every branch ------------------------
+    //
+    // `judge_verdict` is pure, so all of its outcomes are asserted here without
+    // a model, the way `update::decide` is -- and the one that earns its place
+    // is the drift case, which is the whole point of the axis: a looser bar that
+    // admits a candidate the held-out anchor does not support must be REFUSED.
+    // A suite that never exercised that branch would be a criterion-drift
+    // detector nobody had ever seen detect drift, which is `smp.rs`'s objection
+    // about a canary that never fired.
+    //
+    // The bars: standing 3.84, admit_old means the candidate cleared it. The
+    // pairs below name (admit_old, admit_new) and the anchor gain.
+    let drift = judge_verdict(2.0, false, true, 0.0);
+    claim(
+        "drift is caught: a looser bar admitting what the anchor rejects is refused",
+        !drift.0,
+    );
+    let genuine = judge_verdict(2.0, false, true, MIN_ANCHOR_GAIN + 0.02);
+    claim(
+        "a looser bar admitting what the anchor confirms is adopted",
+        genuine.0,
+    );
+    let tighten_ok = judge_verdict(6.0, true, false, 0.0);
+    claim(
+        "a tighter bar refusing a candidate the anchor did not support is adopted",
+        tighten_ok.0,
+    );
+    let tighten_bad = judge_verdict(6.0, true, false, MIN_ANCHOR_GAIN + 0.02);
+    claim(
+        "a tighter bar refusing a genuine gain is refused",
+        !tighten_bad.0,
+    );
+    claim(
+        "a bar both sides agree on changes nothing, and is refused",
+        !judge_verdict(3.9, true, true, 1.0).0 && !judge_verdict(3.9, false, false, 1.0).0,
+    );
+    claim(
+        "a bar of zero abolishes the criterion and is refused",
+        !judge_verdict(0.0, false, true, 1.0).0,
+    );
+    claim(
+        "a bar past the ceiling freezes the loop and is refused",
+        !judge_verdict(JUDGE_MAX + 1.0, true, false, 0.0).0,
+    );
+    // The anchor is the axis's whole defence, and its budget is finite, so the
+    // in-force accessor must default to exactly the strict constant on a machine
+    // that has never moved it -- otherwise a fresh boot would already be running
+    // a bar nobody chose.
+    claim(
+        "a machine that never moved its bar judges at exactly the default",
+        judge_in_force() == MCNEMAR_95,
     );
 
     // Store and read back, then take the scratch node out of the real DAG --

@@ -3009,6 +3009,19 @@ fn execute(line: &str, boot: &BootInfo, acpi: &Option<Acpi>, interp: &mut aiksi:
                         Err(why) => kprintln!("  not eligible: {}", why),
                     }
                     kprintln!("  {} trial(s), {} adopted", trials, adoptions);
+                    // The bar itself, since U3 makes it a thing that can move.
+                    // A machine that has loosened its own criterion should say
+                    // so where anyone looks, not bury it in the ledger.
+                    {
+                        let t = godel::judge_in_force();
+                        if (t - godel::MCNEMAR_95).abs() < 0.005 {
+                            kprintln!("  judge bar {} (the default; never moved)", t);
+                        } else {
+                            console::set_color(YELLOW);
+                            kprintln!("  judge bar {} -- MOVED from the default {}", t, godel::MCNEMAR_95);
+                            console::set_color(LTGRAY);
+                        }
+                    }
                     // The test slice is the one resource a self-improving loop
                     // spends without noticing, so its balance is status, not
                     // a footnote.
@@ -3141,6 +3154,93 @@ fn execute(line: &str, boot: &BootInfo, acpi: &Option<Acpi>, interp: &mut aiksi:
                         }
                     }
                 }
+                // U3: show the cross-evaluation matrix for a proposed bar,
+                // without adopting anything. Reads the held-out anchor, so it
+                // spends a test-budget read -- looking at ground truth is using
+                // it, and the count is the same discipline every other read
+                // obeys.
+                "cross" => {
+                    let tau = words.next().and_then(|w| w.parse::<f32>().ok());
+                    let n = words.next().and_then(|w| w.parse::<usize>().ok()).unwrap_or(0);
+                    match tau {
+                        None => {
+                            kprintln!("  usage: godel cross <bar> [examples]");
+                            kprintln!("  bar in force: {}", {
+                                let mut s = alloc::string::String::new();
+                                let t = godel::judge_in_force();
+                                s.push_str(if (t - godel::MCNEMAR_95).abs() < 0.005 { "3.84 (default)" } else { "moved" });
+                                s
+                            });
+                        }
+                        Some(t) => {
+                            match crate::ai::with_engine(|e| godel::cross_matrix(e, t, n, 120_000)) {
+                                None => kprintln!("  {}", crate::ai::engine_refusal()),
+                                Some(Err(why)) => kprintln!("  refused: {}", why.why()),
+                                Some(Ok(ce)) => {
+                                    let (adopt, why) = ce.verdict();
+                                    console::set_color(YELLOW);
+                                    kprintln!("[cross-evaluation]");
+                                    console::set_color(LTGRAY);
+                                    kprintln!(
+                                        "  candidate: fixed {} broke {} chi {} over {} validation",
+                                        ce.fixed, ce.broke, ce.chi, ce.validation
+                                    );
+                                    kprintln!(
+                                        "  standing bar {}: {}",
+                                        ce.tau_old,
+                                        if ce.admit_old { "ADMITS" } else { "REFUSES" }
+                                    );
+                                    kprintln!(
+                                        "  proposed bar {}: {}",
+                                        ce.tau_new,
+                                        if ce.admit_new { "ADMITS" } else { "REFUSES" }
+                                    );
+                                    kprintln!(
+                                        "  anchor (held-out): incumbent {} -> candidate {}{}",
+                                        ce.anchor_inc, ce.anchor_cand,
+                                        if ce.anchor_fresh { "" } else { "  (budget spent -- unquotable)" }
+                                    );
+                                    console::set_color(if adopt { LTGREEN } else { YELLOW });
+                                    kprintln!("  verdict: {} -- {}", if adopt { "would adopt" } else { "would refuse" }, why);
+                                    console::set_color(LTGRAY);
+                                }
+                            }
+                        }
+                    }
+                }
+                // U3: run a real judge-trial -- move the bar, or refuse and
+                // record why. The night rotation reaches this on its own; the
+                // command is how it is driven and tested.
+                "judge" => {
+                    let tau = words.next().and_then(|w| w.parse::<f32>().ok());
+                    let n = words.next().and_then(|w| w.parse::<usize>().ok()).unwrap_or(0);
+                    match tau {
+                        None => kprintln!("  usage: godel judge <bar> [examples]"),
+                        Some(t) => {
+                            let b = godel::Proposal::judge(t).budget(n, 120_000);
+                            match crate::ai::with_engine(|e| godel::trial_judge(e, t, &b)) {
+                                None => kprintln!("  {}", crate::ai::engine_refusal()),
+                                Some(Err(why)) => kprintln!("  refused: {}", why.why()),
+                                Some(Ok(c)) => {
+                                    console::set_color(if c.adopted { LTGREEN } else { YELLOW });
+                                    kprintln!(
+                                        "  {} -- {}",
+                                        if c.adopted { "the bar moved" } else { "the bar stands" },
+                                        c.j1_why
+                                    );
+                                    console::set_color(LTGRAY);
+                                    if let Some(x) = c.cross {
+                                        kprintln!(
+                                            "  {} -> {}, anchor {} -> {}",
+                                            x.tau_old, x.tau_new, x.anchor_inc, x.anchor_cand
+                                        );
+                                    }
+                                    kprintln!("  'godel rollback' restores the prior bar");
+                                }
+                            }
+                        }
+                    }
+                }
                 // What the loop would try tonight, without trying it.
                 "next" => {
                     let (start, slots) = godel::rotation();
@@ -3149,7 +3249,7 @@ fn execute(line: &str, boot: &BootInfo, acpi: &Option<Acpi>, interp: &mut aiksi:
                         let mark = if i == start { "->" } else { "  " };
                         kprintln!("  {} {:8} {}", mark, name, if *has { "has work" } else { "spent" });
                     }
-                    let mark = if start == 4 { "->" } else { "  " };
+                    let mark = if start == 5 { "->" } else { "  " };
                     kprintln!("  {} core     composes on demand", mark);
                     kprintln!("  it takes the first from the arrow onwards that has work");
                 }
