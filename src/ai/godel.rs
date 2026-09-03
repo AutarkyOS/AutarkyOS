@@ -2975,9 +2975,13 @@ pub fn report_trial(b: &Budget) {
     console::set_color(LTGRAY);
 
     let Some(p) = frontier() else {
-        let (seen, all) = explored();
-        kprintln!("  the search space is exhausted -- {} of {} points tried", seen, all);
-        kprintln!("  widen GRID, or 'godel forget' to walk it again");
+        // Reachable only if 64 successive draws were all already tried, which
+        // needs the ledger static while the markers are not -- so this is a
+        // near-impossible branch rather than the old "the grid is spent, widen
+        // it" that U1 made untrue. The wrong-and-rare message was worse than
+        // either alone.
+        kprintln!("  no untried draw in {} attempts", DRAW_TRIES);
+        kprintln!("  the record is not changing but the markers are -- 'godel forget' clears them");
         return;
     };
     let (seen, all) = explored();

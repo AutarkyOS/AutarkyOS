@@ -454,6 +454,12 @@ fn tick_inner(forced: bool) {
         &decision,
         Decision::Sleep("cooldown between self-set goals")
             | Decision::Sleep("an episode is already running")
+            // Disabled is the most repetitive wait of all -- `initiative off`
+            // and then a heartbeat every fifteen seconds for the life of the
+            // machine, 581 lines in one measured run. It journals silently for
+            // the same reason the cooldowns do: a reminder that a machine you
+            // told to stop has stopped is noise, not transparency.
+            | Decision::Sleep("disabled")
     );
     if !quiet_wait {
         crate::kprintln!(
