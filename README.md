@@ -1,8 +1,8 @@
 # AUTARK
 
-A distribution of the [GLaDOS](https://github.com/Euroswarms-Institute/OS)
-kernel: a from-scratch, non-Unix, ring-0 operating system in Rust with a
-language model living inside the kernel.
+A distribution of the [GLaDOS](https://github.com/IlumCI/GLaDOS) kernel: a
+from-scratch, non-Unix, ring-0 operating system in Rust with a language model
+living inside the kernel.
 
 GLaDOS asked what changes when a language model becomes a kernel primitive.
 AUTARK takes that machine and asks a second question on top of it:
