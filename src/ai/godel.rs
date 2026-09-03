@@ -749,6 +749,15 @@ pub fn frontier() -> Option<Proposal> {
     if let Some(p) = GRID.iter().copied().find(|p| !p.tried()) {
         return Some(p);
     }
+    // The comparable prefix is spent; now the archive steers. `next_map` aims at
+    // the sparsest capacity column -- the MAP-Elites bias toward empty cells --
+    // so the search illuminates the behaviour grid rather than walking a list or
+    // drawing at random. It is still a function of the record (the archive is a
+    // function of the ledger), so re-derivability holds; the random draw stays
+    // as the final fallback for when the map is already spread evenly.
+    if let Some(p) = next_map() {
+        return Some(p);
+    }
     let seed = record_seed();
     (0..DRAW_TRIES).map(|n| draw(&seed, n)).find(|p| !p.tried())
 }
@@ -1998,7 +2007,7 @@ pub fn run(
     b: &Budget,
     p: &Proposal,
 ) -> Result<Certificate, Refused> {
-    match p.kind {
+    let result = match p.kind {
         ProposalKind::Adapter => trial(e, b, p).map_err(Refused::Train),
         ProposalKind::Core(h) => {
             p.mark();
@@ -2016,7 +2025,15 @@ pub fn run(
         // `trial_judge` marks itself, the way `trial` does, because it prepares
         // a trial whose fault should still count the point as visited.
         ProposalKind::Judge(tau) => trial_judge(e, tau, b),
+    };
+    // Tally the outcome against its axis, for the surprise order. Only a trial
+    // that reached a verdict counts: a refusal (no corpus, engine held) says
+    // nothing about whether the axis is worth pressing, so it must not move the
+    // belief that decides how often the axis is tried.
+    if let Ok(ref c) = result {
+        bump_axis(axis_of(&p.kind), c.adopted);
     }
+    result
 }
 
 /// Run one trial: train a candidate, judge it, record the certificate, and
@@ -2220,6 +2237,16 @@ pub fn trial(
     sysbox::write_blob(&blob_path(&ablob), blob);
     variant.store();
 
+    // Offer it to the archive, adopted or not. This is the MAP-Elites turn and
+    // it is independent of the head: a variant the judges rejected for not being
+    // a *net repair beyond noise* can still be the best mind of its kind, and
+    // holding it is how the search keeps a diverse frontier rather than only the
+    // one peak `head` climbs. Fitness is validation accuracy -- an absolute
+    // number, so cells are comparable across nights, and cheap because the
+    // features are cached.
+    let fitness = t.score(Some(&fit.dora), Slice::Validation);
+    let lit = archive_insert(&vhash, fit.dora.r, fixed, broke, fitness);
+
     if cert.adopted {
         // The pointer moves last. A head naming a node that is not written yet
         // is a machine that cannot describe its own mind, and the ordering is
@@ -2228,6 +2255,9 @@ pub fn trial(
         let _ = e.model.detach_adapters();
         let _ = e.model.attach_adapters_unseeded(adapters);
         ADOPTIONS.fetch_add(1, Ordering::Relaxed);
+    }
+    if lit {
+        crate::kprintln!("  archive: lit a cell -- best of its kind at rank {}", fit.dora.r);
     }
 
     let hour = crate::dev::rtc::now().map(|d| d.hour).unwrap_or(0);
@@ -3218,6 +3248,198 @@ pub fn trial_judge(
     Ok(cert)
 }
 
+// --- The illumination archive (MAP-Elites) ----------------------------------
+//
+// The loop climbed. `frontier` walked a declared grid toward one best variant,
+// `head` named it, and the lineage was a single chain -- which is hill-climbing,
+// and Heuresis (2606.25198) measures what that costs: across 3,222 runs a greedy
+// top-K search collapses diversity, while MAP-Elites keeps the best occupant of
+// every *cell* of a behaviour grid and wins diversity outright while tying on
+// quality. So the archive keeps not the single best mind but the best mind of
+// each *kind*, and the search fills empty cells rather than climbing.
+//
+// It changes nothing about the record. A cell holds a variant already in the
+// content-addressed DAG, its fitness is a number the trial already measured, and
+// the whole archive is a function of the ledger -- re-derivable by replaying it,
+// which is why the stored cells are a cache and never the truth. `head` still
+// means "what is attached and running"; the archive is the map of everything
+// that was ever good at something, laid beside it.
+
+/// Where the archive's cells live, one small text blob per cell.
+pub const ARCHIVE: &str = "/ai/godel/archive";
+
+/// Capacity bins and behaviour bins. 4x3 = 12 cells.
+///
+/// One axis the search *controls* -- rank, the adapter's capacity -- and one it
+/// only *observes*: the repair profile, how the variant spends its changes
+/// between fixing and breaking decisions. That split is the point of a MAP: the
+/// controllable axis is what `next_map` steers along to reach empty ground, and
+/// the emergent axis is what makes two variants at the same rank different kinds
+/// of mind rather than two tries at one.
+pub const RANK_BINS: usize = 4;
+pub const REPAIR_BINS: usize = 3;
+
+/// Which cell a variant lands in, from facts a trial already has.
+///
+/// Rank straight off the proposal; the repair profile from the paired counts
+/// the judges read. A variant that only breaks decisions and one that only
+/// fixes them are different behaviours even at identical accuracy, and a grid
+/// that could not tell them apart would illuminate nothing.
+pub fn descriptor(rank: usize, fixed: usize, broke: usize) -> (usize, usize) {
+    let r = if rank <= 4 {
+        0
+    } else if rank <= 8 {
+        1
+    } else if rank <= 16 {
+        2
+    } else {
+        3
+    };
+    let total = fixed + broke;
+    let b = if total == 0 {
+        1 // touched nothing on net: the middle, "balanced", by convention
+    } else {
+        let frac = fixed as f32 / total as f32;
+        if frac < 0.34 {
+            0
+        } else if frac < 0.67 {
+            1
+        } else {
+            2
+        }
+    };
+    (r, b)
+}
+
+fn cell_path(a: usize, b: usize) -> String {
+    let mut p = String::from(ARCHIVE);
+    p.push('/');
+    push_u32(&mut p, a as u32);
+    p.push('-');
+    push_u32(&mut p, b as u32);
+    p
+}
+
+/// One cell's occupant: the best variant of its kind, and its fitness.
+#[derive(Clone, Copy)]
+pub struct Elite {
+    pub variant: [u8; 32],
+    pub fitness: f32,
+}
+
+fn read_cell(a: usize, b: usize) -> Option<Elite> {
+    let bytes = sysbox::read_blob(&cell_path(a, b))?;
+    let text = core::str::from_utf8(&bytes).ok()?;
+    let mut variant = None;
+    let mut fitness = 0.0f32;
+    for line in text.lines() {
+        let mut it = line.split_whitespace();
+        match (it.next(), it.next()) {
+            (Some("hash"), Some(h)) => variant = from_hex32(h),
+            (Some("fit"), Some(f)) => fitness = f.parse().unwrap_or(0.0),
+            _ => {}
+        }
+    }
+    variant.map(|variant| Elite { variant, fitness })
+}
+
+/// Offer a variant to its cell. It becomes the elite only if the cell is empty
+/// or it beats the occupant's fitness -- the whole of MAP-Elites in one rule.
+///
+/// Returns whether the archive changed, so a trial can say it lit a new cell.
+/// Ties keep the incumbent, because the first to reach a fitness got there on
+/// fewer nights and re-deriving the archive must land on the same occupant.
+pub fn archive_insert(variant: &[u8; 32], rank: usize, fixed: usize, broke: usize, fitness: f32) -> bool {
+    let (a, b) = descriptor(rank, fixed, broke);
+    if let Some(cur) = read_cell(a, b) {
+        if fitness <= cur.fitness {
+            return false;
+        }
+    }
+    let mut s = String::from("hash ");
+    s.push_str(&hex32(variant));
+    s.push_str("\nfit ");
+    push_f2(&mut s, fitness);
+    s.push('\n');
+    sysbox::write_text(&cell_path(a, b), &s);
+    true
+}
+
+/// Every occupied cell, for display and for the coverage/QD figures.
+pub fn archive_cells() -> Vec<(usize, usize, Elite)> {
+    let mut out = Vec::new();
+    for a in 0..RANK_BINS {
+        for b in 0..REPAIR_BINS {
+            if let Some(e) = read_cell(a, b) {
+                out.push((a, b, e));
+            }
+        }
+    }
+    out
+}
+
+/// The two figures every MAP-Elites run reports: how much of the space is lit,
+/// and the summed quality of the frontier. Coverage says the search is
+/// exploring; QD-score says the cells it found are worth holding.
+pub fn archive_stats() -> (usize, usize, f32) {
+    let cells = archive_cells();
+    let qd = cells.iter().map(|(_, _, e)| e.fitness).sum();
+    (cells.len(), RANK_BINS * REPAIR_BINS, qd)
+}
+
+/// The rank whose bin is least explored, for `next_map` to steer toward.
+///
+/// "Least explored" is the fewest occupied repair-cells in that rank column, so
+/// the search reaches for capacity levels it has illuminated least rather than
+/// walking a list in order. Ties break toward lower rank, which is cheaper to
+/// carry -- the same cheap-before-expensive rule the rotation obeys.
+fn sparsest_rank() -> Option<usize> {
+    let mut counts = [0usize; RANK_BINS];
+    for (a, _, _) in archive_cells() {
+        counts[a] += 1;
+    }
+    (0..RANK_BINS).min_by_key(|&a| counts[a])
+}
+
+/// A representative rank for each bin, for turning a target cell back into a
+/// proposal. The lower edge of the bin, so `next_map` proposes the cheapest
+/// capacity that lands in the column it wants to fill.
+fn rank_for_bin(a: usize) -> usize {
+    match a {
+        0 => 4,
+        1 => 8,
+        2 => 16,
+        _ => 32,
+    }
+}
+
+/// The illumination-driven adapter proposal: aim at the sparsest capacity
+/// column instead of walking the grid in order.
+///
+/// It reads only the archive, so like every other proposal source it is a
+/// function of the record and re-derivable. When the archive already spreads
+/// evenly it answers `None` and `frontier` falls back to the declared grid, so
+/// this never *removes* a point the grid would have tried -- it only reorders
+/// the search toward empty ground, which is exactly the MAP-Elites bias toward
+/// unfilled cells.
+fn next_map() -> Option<Proposal> {
+    let a = sparsest_rank()?;
+    let rank = rank_for_bin(a);
+    let p = Proposal {
+        lr: 0.02,
+        rank,
+        alpha: (rank * 2) as f32,
+        epochs: 20,
+        rule: 0,
+        kind: ProposalKind::Adapter,
+    };
+    if p.tried() {
+        None
+    } else {
+        Some(p)
+    }
+}
+
 /// Put back the adapters a trial was handed, whatever it did to them.
 fn restore(e: &mut super::Engine, saved: &Option<Vec<u8>>) {
     match saved {
@@ -3463,12 +3685,50 @@ fn next_skill() -> Option<Proposal> {
 /// the anchor says the current one lets noise through.
 const JUDGE_GRID: &[f32] = &[2.00, 6.00];
 
+/// Trials in an epoch.
+///
+/// Red Queen (2606.26294) finds that co-evolving an evaluator alongside the
+/// agent is only stable under *controlled utility evolution*: the criterion is
+/// frozen within an epoch and may move only at a boundary. Otherwise the bar
+/// chases each proposal it is meant to judge and the whole thing collapses into
+/// an evaluator that says yes. So the loop improves the agent -- weights, rule,
+/// core, skill -- within an epoch against a stable bar, and re-examines the bar
+/// only at the boundary. Five, one turn of the other five axes, so an epoch is
+/// "try each kind once, then look at the criterion."
+pub const EPOCH_LEN: usize = 5;
+
+/// Whether the loop stands at an epoch boundary, where the bar may move.
+///
+/// A function of the ledger length, so it is re-derivable like everything else
+/// the rotation reads. Genesis is not a boundary: there is no agent to protect
+/// and no epoch behind it to have improved anything.
+pub fn at_epoch_boundary() -> bool {
+    is_boundary(ledger_len())
+}
+
+/// Pure, so the boundary rule is pinned at boot without writing ledger lines.
+fn is_boundary(n: usize) -> bool {
+    n > 0 && n % EPOCH_LEN == 0
+}
+
+/// How far into the current epoch the loop is: `(position, length)`.
+pub fn epoch_position() -> (usize, usize) {
+    (ledger_len() % EPOCH_LEN, EPOCH_LEN)
+}
+
 /// A bar the loop has not judged yet, other than the one in force.
 ///
 /// The bar already running is excluded rather than marked, the same as
 /// `next_config`: judging a bar against itself is a certificate that nothing
 /// changed, which is true and not worth a night.
 fn next_judge() -> Option<Proposal> {
+    // The Red Queen gate: the bar moves only at an epoch boundary. Within an
+    // epoch this answers "spent" whatever the markers say, so the agent axes get
+    // the epoch to themselves and improve against a criterion that does not move
+    // underneath them.
+    if !at_epoch_boundary() {
+        return None;
+    }
     let now = judge_in_force();
     JUDGE_GRID
         .iter()
@@ -3480,6 +3740,99 @@ fn next_judge() -> Option<Proposal> {
 
 /// How many kinds the rotation walks.
 const KINDS: usize = 6;
+
+/// Where the per-axis tallies live: attempts and adoptions, one small blob each.
+pub const AXIS: &str = "/ai/godel/axis";
+
+/// Which axis a kind belongs to, matching the rotation's slot numbers.
+fn axis_of(kind: &ProposalKind) -> usize {
+    match kind {
+        ProposalKind::Adapter => 0,
+        ProposalKind::Config(_) => 1,
+        ProposalKind::Skill(_) => 2,
+        ProposalKind::Deep => 3,
+        ProposalKind::Judge(_) => 4,
+        ProposalKind::Core(_) => 5,
+    }
+}
+
+fn axis_path(i: usize) -> String {
+    let mut p = String::from(AXIS);
+    p.push('/');
+    push_u32(&mut p, i as u32);
+    p
+}
+
+fn read_axis(i: usize) -> (u32, u32) {
+    let Some(bytes) = sysbox::read_blob(&axis_path(i)) else { return (0, 0) };
+    let Ok(text) = core::str::from_utf8(&bytes) else { return (0, 0) };
+    let (mut att, mut adopt) = (0u32, 0u32);
+    for line in text.lines() {
+        let mut it = line.split_whitespace();
+        match (it.next(), it.next()) {
+            (Some("att"), Some(v)) => att = v.parse().unwrap_or(0),
+            (Some("adopt"), Some(v)) => adopt = v.parse().unwrap_or(0),
+            _ => {}
+        }
+    }
+    (att, adopt)
+}
+
+/// Record one trial's outcome against its axis: an attempt always, an adoption
+/// when the verdict adopted. These tallies are what the surprise order reads.
+fn bump_axis(i: usize, adopted: bool) {
+    let (att, adopt) = read_axis(i);
+    let mut s = String::from("att ");
+    push_u32(&mut s, att + 1);
+    s.push_str("\nadopt ");
+    push_u32(&mut s, adopt + if adopted { 1 } else { 0 });
+    s.push('\n');
+    sysbox::write_text(&axis_path(i), &s);
+}
+
+/// How uncertain the machine is about an axis's value, in [0, 1].
+///
+/// A Beta belief over the axis's adoption rate under a Laplace prior:
+/// `rate = (adopt + 1) / (att + 2)`, so an untried axis reads as exactly a half.
+/// Uncertainty is highest when the rate sits at a half -- the outcome of the
+/// next trial there is least predictable, which under Bayesian surprise
+/// (2507.00310) is where the expected epistemic shift is largest.
+fn axis_uncertainty(att: u32, adopt: u32) -> f32 {
+    let rate = (adopt as f32 + 1.0) / (att as f32 + 2.0);
+    1.0 - (rate - 0.5).abs() * 2.0
+}
+
+/// The order to try axes in tonight, most uncertain first.
+///
+/// This replaces the round-robin start, and the trade is deliberate: fairness
+/// for information. The round-robin gave every axis a turn in sequence; this
+/// reaches first for the axis whose next verdict it can least predict, which is
+/// the axis it stands to learn the most from. It stays re-derivable because the
+/// tallies are a function of the record, and it stays total -- ties break by
+/// slot -- so a later run reconstructs the same order rather than a plausible
+/// one. Laplace smoothing keeps even a saturated axis above zero uncertainty,
+/// so nothing is starved forever; it is only made to wait behind what is still
+/// live.
+fn surprise_order_of(stats: &[(u32, u32); KINDS]) -> [usize; KINDS] {
+    let mut order = [0usize; KINDS];
+    for (i, o) in order.iter_mut().enumerate() {
+        *o = i;
+    }
+    order.sort_unstable_by(|&a, &b| {
+        let ua = axis_uncertainty(stats[a].0, stats[a].1);
+        let ub = axis_uncertainty(stats[b].0, stats[b].1);
+        ub.partial_cmp(&ua).unwrap_or(core::cmp::Ordering::Equal).then(a.cmp(&b))
+    });
+    order
+}
+
+fn surprise_order() -> [usize; KINDS] {
+    let mut stats = [(0u32, 0u32); KINDS];
+    for (i, s) in stats.iter_mut().enumerate() {
+        *s = read_axis(i);
+    }
+    surprise_order_of(&stats)
+}
 
 /// The next thing to try tonight, over every axis the loop can judge.
 ///
@@ -3505,51 +3858,66 @@ const KINDS: usize = 6;
 /// the corpus and a composed core spends a dozen decodes writing something
 /// that may not survive its first judge.
 pub fn next_proposal() -> Option<Proposal> {
-    let start = ledger_len() % KINDS;
-    for i in 0..KINDS {
-        let candidate = match (start + i) % KINDS {
+    // The epoch structure decides order before the rotation does. At a boundary
+    // the bar is re-examined first -- improve-the-agent within an epoch,
+    // update-the-utility at the boundary, in that order -- and off a boundary
+    // `next_judge` answers None anyway, so within an epoch this is a no-op and
+    // the agent axes rotate as before.
+    if at_epoch_boundary() {
+        if let Some(p) = next_judge() {
+            return Some(p);
+        }
+    }
+    // Surprise-ordered rather than round-robin: reach first for the axis whose
+    // next verdict is least predictable. Off a boundary the judge axis answers
+    // None, so it drops out of contention regardless of where the order puts it.
+    for axis in surprise_order() {
+        let candidate = match axis {
             0 => frontier(),
             1 => next_config(),
             2 => next_skill(),
             3 => next_deep(),
-            // Before the core, because a judge-trial trains one candidate and
-            // reads the anchor -- an adapter trial's cost, not a core's dozen
-            // decodes -- and after the cheap axes for the same reason. It is
-            // also the axis with a non-renewable price, so it takes its slot in
-            // turn rather than being reached for.
             4 => next_judge(),
-            // Last, and the only one that *makes* its candidate rather than
-            // finding one: composing costs decodes whether or not the result
-            // is worth judging.
-            _ => author_core(),
+            // The composed core is still last whatever the order says: making
+            // its candidate costs a dozen decodes, so it is reached for only
+            // when every cheaper axis is out of moves, never because it looks
+            // uncertain.
+            _ => continue,
         };
         if candidate.is_some() {
             return candidate;
         }
     }
-    None
+    // The core axis, considered only after the rest are spent -- its cost is in
+    // producing the candidate, so it cannot ride the surprise order.
+    author_core()
 }
 
-/// Where the rotation stands, without taking a turn.
+/// Where the search stands, in the order it will actually reach for the axes.
 ///
-/// Report-only, and deliberately does not ask the last slot whether it has
-/// work: finding out costs a dozen constrained decodes, because composing a
-/// core *is* the work. A command that answers "what would you do tonight"
-/// must not spend the night doing it.
-pub fn rotation() -> (usize, [(&'static str, bool); 5]) {
-    (
-        ledger_len() % KINDS,
-        [
-            ("adapter", frontier().is_some()),
-            ("rule", next_config().is_some()),
-            ("skill", next_skill().is_some()),
-            ("deep", next_deep().is_some()),
-            // Cheap to probe -- just a marker check -- so unlike the core slot
-            // it is reported. Whether it *has* work is a fact about the markers
-            // and the bar in force, not about spending a night.
-            ("judge", next_judge().is_some()),
-        ],
-    )
+/// One row per axis in surprise order -- name, attempts, adoptions, and whether
+/// it has work -- so a reader sees not a fixed wheel but the order the tallies
+/// produce tonight. The core is reported as "on demand" without being probed,
+/// because finding out whether it has a candidate costs the dozen decodes that
+/// composing one *is*: a command answering "what would you do tonight" must not
+/// spend the night doing it.
+pub fn axis_report() -> Vec<(&'static str, u32, u32, bool)> {
+    const NAMES: [&str; KINDS] = ["adapter", "rule", "skill", "deep", "judge", "core"];
+    let mut out = Vec::new();
+    for &i in surprise_order().iter() {
+        let (att, adopt) = read_axis(i);
+        let has = match i {
+            0 => frontier().is_some(),
+            1 => next_config().is_some(),
+            2 => next_skill().is_some(),
+            3 => next_deep().is_some(),
+            4 => next_judge().is_some(),
+            // Not probed -- see the note above.
+            _ => true,
+        };
+        out.push((NAMES[i], att, adopt, has));
+    }
+    out
 }
 
 /// The lineage of the current head, newest first.
@@ -3936,6 +4304,90 @@ pub fn selftest() -> bool {
     claim(
         "a machine that never moved its bar judges at exactly the default",
         judge_in_force() == MCNEMAR_95,
+    );
+
+    // --- The illumination archive (MAP-Elites) ---------------------------
+    //
+    // The descriptor is pure, so its bins are pinned here; the elite rule is
+    // the whole of MAP-Elites and is checked against the one failure that
+    // matters -- a worse variant must never displace a better one, or the
+    // archive stops being a frontier and becomes a log of whatever ran last.
+    claim(
+        "rank bins split at 4, 8 and 16",
+        descriptor(4, 0, 0).0 == 0
+            && descriptor(8, 0, 0).0 == 1
+            && descriptor(16, 0, 0).0 == 2
+            && descriptor(32, 0, 0).0 == 3,
+    );
+    claim(
+        "repair bins split a variant that mostly breaks from one that mostly fixes",
+        descriptor(8, 1, 9).1 == 0 && descriptor(8, 9, 1).1 == 2 && descriptor(8, 0, 0).1 == 1,
+    );
+    // Scratch cell, empty at boot before any trial has run. Written and read
+    // back through the real store, then detached so the archive stays clean.
+    let ha = sha256::hash(b"elite a");
+    let hb = sha256::hash(b"elite b");
+    let hc = sha256::hash(b"elite c");
+    // All three land in the same cell: rank 8 (bin 1), all-fixes (bin 2).
+    let first = archive_insert(&ha, 8, 10, 0, 0.50);
+    let worse = archive_insert(&hb, 8, 10, 0, 0.40);
+    let better = archive_insert(&hc, 8, 10, 0, 0.70);
+    let held = read_cell(1, 2);
+    claim(
+        "the elite rule keeps the best of a cell and refuses a worse challenger",
+        first
+            && !worse
+            && better
+            && held.map_or(false, |e| e.variant == hc && (e.fitness - 0.70).abs() < 0.005),
+    );
+    sysbox::detach(&cell_path(1, 2));
+    claim(
+        "coverage counts occupied cells against the whole grid",
+        {
+            let (_, total, _) = archive_stats();
+            total == RANK_BINS * REPAIR_BINS
+        },
+    );
+
+    // --- Red Queen epochs ------------------------------------------------
+    //
+    // The bar moves only at a boundary, and genesis is not one -- otherwise a
+    // fresh machine would re-examine a criterion it has never yet used. The
+    // rule is pure, so it is pinned here rather than by writing ledger lines.
+    claim(
+        "an epoch boundary falls every EPOCH_LEN trials, and never at genesis",
+        !is_boundary(0)
+            && is_boundary(EPOCH_LEN)
+            && is_boundary(2 * EPOCH_LEN)
+            && !is_boundary(EPOCH_LEN - 1)
+            && !is_boundary(EPOCH_LEN + 1),
+    );
+
+    // --- Bayesian-surprise axis order ------------------------------------
+    //
+    // An untried axis is maximally uncertain and a saturated one -- always
+    // adopting, or never -- is not, and the order must put the first ahead of
+    // the second or "chase the surprise" is just words. The tie-break is what
+    // makes it re-derivable: two equally uncertain axes resolve by slot, every
+    // time, so a later run reconstructs the same night rather than a plausible
+    // one.
+    claim(
+        "an untried axis is more uncertain than one that always or never adopts",
+        axis_uncertainty(0, 0) > axis_uncertainty(20, 20)
+            && axis_uncertainty(0, 0) > axis_uncertainty(20, 0)
+            && (axis_uncertainty(0, 0) - 1.0).abs() < 0.001,
+    );
+    let stats = [(0u32, 0u32), (20, 20), (20, 0), (10, 5), (4, 2), (8, 1)];
+    let order = surprise_order_of(&stats);
+    claim(
+        "the surprise order reaches for the untried axis first",
+        order[0] == 0,
+    );
+    let tie = [(5u32, 2u32), (5, 2), (0, 0), (0, 0), (0, 0), (0, 0)];
+    let to = surprise_order_of(&tie);
+    claim(
+        "equally uncertain axes resolve by slot, so the order is re-derivable",
+        to[0] == 2 && to[1] == 3 && to[4] == 0 && to[5] == 1,
     );
 
     // Store and read back, then take the scratch node out of the real DAG --

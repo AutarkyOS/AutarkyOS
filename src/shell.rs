@@ -3241,17 +3241,63 @@ fn execute(line: &str, boot: &BootInfo, acpi: &Option<Acpi>, interp: &mut aiksi:
                         }
                     }
                 }
+                // The illumination archive: the best mind of every kind, not
+                // just the one the head climbed to.
+                "map" => {
+                    let (filled, total, qd) = godel::archive_stats();
+                    console::set_color(YELLOW);
+                    kprintln!("[archive]");
+                    console::set_color(LTGRAY);
+                    kprintln!("  {} of {} cells lit, QD-score {}", filled, total, qd);
+                    let cells = godel::archive_cells();
+                    if cells.is_empty() {
+                        kprintln!("  nothing illuminated yet -- the loop lights cells as it runs");
+                    }
+                    let rank_label = |a: usize| match a {
+                        0 => "rank<=4 ",
+                        1 => "rank<=8 ",
+                        2 => "rank<=16",
+                        _ => "rank>16 ",
+                    };
+                    let repair_label = |b: usize| match b {
+                        0 => "breaks  ",
+                        1 => "balanced",
+                        _ => "fixes   ",
+                    };
+                    for (a, b, e) in cells.iter() {
+                        kprintln!(
+                            "  [{} | {}]  {}  fit {}",
+                            rank_label(*a),
+                            repair_label(*b),
+                            godel::short_hex(&e.variant),
+                            e.fitness
+                        );
+                    }
+                }
                 // What the loop would try tonight, without trying it.
                 "next" => {
-                    let (start, slots) = godel::rotation();
-                    kprintln!("  {} verdict(s) recorded, so the rotation starts at slot {}", godel::ledger_len(), start);
-                    for (i, (name, has)) in slots.iter().enumerate() {
-                        let mark = if i == start { "->" } else { "  " };
-                        kprintln!("  {} {:8} {}", mark, name, if *has { "has work" } else { "spent" });
+                    let (pos, len) = godel::epoch_position();
+                    if godel::at_epoch_boundary() {
+                        console::set_color(YELLOW);
+                        kprintln!("  epoch boundary: the bar may move tonight (Red Queen)");
+                        console::set_color(LTGRAY);
+                    } else {
+                        kprintln!("  trial {} of {} in this epoch -- the bar is frozen until the boundary", pos, len);
                     }
-                    let mark = if start == 5 { "->" } else { "  " };
-                    kprintln!("  {} core     composes on demand", mark);
-                    kprintln!("  it takes the first from the arrow onwards that has work");
+                    kprintln!("  {} verdict(s) recorded; axes in surprise order, most uncertain first:", godel::ledger_len());
+                    // The arrow marks the first axis with work -- what the loop
+                    // would actually take tonight.
+                    let mut marked = false;
+                    for (name, att, adopt, has) in godel::axis_report() {
+                        let arrow = if has && !marked { marked = true; "->" } else { "  " };
+                        kprintln!(
+                            "  {} {:8} {}   ({}/{} adopted)",
+                            arrow, name,
+                            if has { "has work" } else { "spent   " },
+                            adopt, att
+                        );
+                    }
+                    kprintln!("  it takes the first with work, chasing the least predictable axis");
                 }
                 "forget" => {
                     let n = godel::forget();
