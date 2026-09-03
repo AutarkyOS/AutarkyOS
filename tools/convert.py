@@ -58,6 +58,13 @@ HEADER_BYTES = 64
 
 QUANT_F32 = 0
 QUANT_I8 = 1
+QUANT_I4 = 2
+
+# int4 blocks: 32 signed 4-bit weights share one f32 scale. 4 bits needs finer
+# scale granularity than int8's per-row -- measured on Qwen3-1.7B, per-row int4
+# is 17% mean error and garbles, block-32 is ~7% worst and stays coherent.
+# 0.625 bytes per weight against int8's ~1.0, so about 1.6x less to read.
+Q4_BLOCK = 32
 
 FLAG_QK_NORM = 1 << 0
 # Which dimensions RoPE pairs. Clear means `rotate_half` -- i with i+head_dim/2
@@ -281,8 +288,55 @@ def quantise_rows(mat):
     return q, scale, (err / denom if denom > 0 else 0.0)
 
 
+def quantise_rows_q4(mat):
+    """block-32 symmetric signed 4-bit, one f32 scale per block.
+
+    Layout the kernel walks: for (rows, cols) with cols a multiple of 32,
+    `rows * cols // 32` f32 block scales row-major, then `rows * cols // 2`
+    bytes of packed nibbles -- even column in the low nibble, odd in the high.
+    A weight is `nibble * scale[block]`, the nibble two's-complement in [-8, 7],
+    the block its column index over 32.
+
+    Signed rather than the offset-and-min llama.cpp Q4_0 uses, because the rest
+    of this tree is symmetric (int8 is `q * scale`, no zero point) and one
+    dequant rule is one fewer thing for the kernel and the oracle to disagree
+    about.
+    """
+    mat = np.ascontiguousarray(mat, dtype=np.float32)
+    rows = mat.reshape(mat.shape[0], -1)
+    r, c = rows.shape
+    if c % Q4_BLOCK != 0:
+        raise SystemExit(f"int4 needs cols a multiple of {Q4_BLOCK}, got {c}")
+    nb = c // Q4_BLOCK
+    blk = rows.reshape(r, nb, Q4_BLOCK)
+    peak = np.abs(blk).max(axis=2)
+    scale = np.where(peak == 0, 1.0, peak / 7.0).astype(np.float32)
+    q = np.clip(np.round(blk / scale[:, :, None]), -8, 7).astype(np.int8)
+    deq = (q.astype(np.float32) * scale[:, :, None]).reshape(r, c)
+    denom = float(np.abs(rows).max())
+    err = float(np.abs(deq - rows).max()) / denom if denom > 0 else 0.0
+    flat = (q.reshape(r, c) & 0x0F).astype(np.uint8)
+    packed = (flat[:, 0::2] | (flat[:, 1::2] << 4)).astype(np.uint8)
+    return packed, scale.reshape(r * nb), err
+
+
 def emit(buf, arr, quant, stats):
-    """Append one tensor, quantised or not, and account for it."""
+    """Append one tensor, quantised or not, and account for it.
+
+    `quant` is a level, not a flag: 0 f32, 1 int8, 2 int4. A norm (1-D) is
+    always f32, too few values to be worth a scale and carrying most of the
+    error. Callers force f32 for a norm by passing `quant if keep else QUANT_F32`
+    -- **never** `quant and keep`, which collapses the level 2 to `True` and
+    silently writes int8 where int4 was asked. That was a real bug once.
+    """
+    if quant == QUANT_I4 and arr.ndim == 2:
+        q, scale, err = quantise_rows_q4(arr)
+        buf.append(scale)
+        buf.append(q)
+        stats["quantised"] += q.size * 2
+        stats["bytes"] += scale.nbytes + q.nbytes
+        stats["worst_err"] = max(stats["worst_err"], err)
+        return
     if quant and arr.ndim == 2:
         q, scale, err = quantise_rows(arr)
         # The arrays go to the sink as-is. `.tobytes()` here copied every
@@ -476,7 +530,7 @@ def convert_hybrid(cfg, w, dst, quant, seq_len, model_type):
         "<Iiiiiiii f I", header, 8,
         VERSION_V4, dim, hidden, layers, heads, kv_heads,
         vocab if tied else -vocab, seq_len, theta,
-        QUANT_I8 if quant else QUANT_F32,
+        quant,
     )
     struct.pack_into(
         "<i f I", header, 48,
@@ -528,11 +582,11 @@ def convert_hybrid(cfg, w, dst, quant, seq_len, model_type):
 def main():
     if len(sys.argv) < 3:
         raise SystemExit(
-            "usage: convert.py <hf-dir> <out.bin> [--f32] [--seq N]"
+            "usage: convert.py <hf-dir> <out.bin> [--f32|--q4] [--seq N]"
         )
     src = Path(sys.argv[1])
     dst = Path(sys.argv[2])
-    quant = "--f32" not in sys.argv
+    quant = QUANT_F32 if "--f32" in sys.argv else (QUANT_I4 if "--q4" in sys.argv else QUANT_I8)
     seq_len = 512
     if "--seq" in sys.argv:
         seq_len = int(sys.argv[sys.argv.index("--seq") + 1])
@@ -654,7 +708,7 @@ def main():
     emit(body, embed, quant, stats)
     for grp, quantise, shape in groups:
         for l in range(layers):
-            emit(body, take(f"model.layers.{l}.{grp}", shape), quant and quantise, stats)
+            emit(body, take(f"model.layers.{l}.{grp}", shape), quant if quantise else QUANT_F32, stats)
     emit(body, take("model.norm.weight", (dim,)), False, stats)
 
     if not tied:
@@ -677,7 +731,7 @@ def main():
         vocab if tied else -vocab,
         seq_len,
         theta,
-        QUANT_I8 if quant else QUANT_F32,
+        quant,
     )
     # v3 fields, in what was spare space at the end of the 64-byte header.
     struct.pack_into(
