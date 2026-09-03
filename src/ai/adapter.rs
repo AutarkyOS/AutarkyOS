@@ -192,6 +192,12 @@ impl Dora {
         let (rows, k) = match w {
             Mat::F32 { rows, cols, .. } => (*rows, *cols),
             Mat::Q8 { rows, cols, .. } => (*rows, *cols),
+            // Shape only; the base weights are read through `row_into`, which
+            // dequantises int4 like anything else. int4 models do not train --
+            // the trial gate refuses them -- so reaching here at all is the
+            // classifier-adapter path over a serving checkpoint, which the
+            // gate also stops. It is exact regardless.
+            Mat::Q4 { rows, cols, .. } => (*rows, *cols),
         };
 
         // The frozen branch, scaled per row.
@@ -248,6 +254,12 @@ impl Dora {
         let (rows, k) = match w {
             Mat::F32 { rows, cols, .. } => (*rows, *cols),
             Mat::Q8 { rows, cols, .. } => (*rows, *cols),
+            // Shape only; the base weights are read through `row_into`, which
+            // dequantises int4 like anything else. int4 models do not train --
+            // the trial gate refuses them -- so reaching here at all is the
+            // classifier-adapter path over a serving checkpoint, which the
+            // gate also stops. It is exact regardless.
+            Mat::Q4 { rows, cols, .. } => (*rows, *cols),
         };
         debug_assert_eq!(rows, self.m.len());
         debug_assert_eq!(rows * self.r, self.b.len());
@@ -404,6 +416,12 @@ impl Dora {
         let (rows, k) = match w {
             Mat::F32 { rows, cols, .. } => (*rows, *cols),
             Mat::Q8 { rows, cols, .. } => (*rows, *cols),
+            // Shape only; the base weights are read through `row_into`, which
+            // dequantises int4 like anything else. int4 models do not train --
+            // the trial gate refuses them -- so reaching here at all is the
+            // classifier-adapter path over a serving checkpoint, which the
+            // gate also stops. It is exact regardless.
+            Mat::Q4 { rows, cols, .. } => (*rows, *cols),
         };
         debug_assert_eq!(rows, self.m.len());
         // `>=`, not `==`: a caller may pass a scratch buffer wider than the
@@ -795,6 +813,7 @@ impl Dora {
         let k = match w {
             Mat::F32 { cols, .. } => *cols,
             Mat::Q8 { cols, .. } => *cols,
+            Mat::Q4 { cols, .. } => *cols,
         };
         let mut wrow = vec![0.0f32; k];
         for &o in rows {
@@ -835,6 +854,7 @@ impl Dora {
         let k = match w {
             Mat::F32 { cols, .. } => *cols,
             Mat::Q8 { cols, .. } => *cols,
+            Mat::Q4 { cols, .. } => *cols,
         };
         // `>=`, not `==`: a caller may pass a scratch buffer wider than the
         // projection, and the weight width is the authority on how much of

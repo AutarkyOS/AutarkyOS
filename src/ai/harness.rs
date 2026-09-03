@@ -910,6 +910,11 @@ pub fn adapter_train_report(b: &super::train::Budget) {
             kprintln!("  refused: hybrid checkpoints have no verified backward yet");
             return;
         }
+        Some(Err(RunError::Quantised)) => {
+            kprintln!("  refused: int4 base serves inference but is not trained against");
+            kprintln!("  block-32 is ~10x coarser than int8; a verdict from it describes no model you run");
+            return;
+        }
         Some(Err(RunError::NoCorpus)) => {
             kprintln!("  no corpus at {}", super::vocab::CORPUS);
             return;

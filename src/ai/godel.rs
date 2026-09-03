@@ -200,6 +200,7 @@ impl Refused {
             Refused::Train(super::train::RunError::Hardware) => "the hardware check said no",
             Refused::Train(super::train::RunError::NoCorpus) => "there is no corpus",
             Refused::Train(super::train::RunError::Hybrid) => "the model is a hybrid the trainer will not touch",
+            Refused::Train(super::train::RunError::Quantised) => "the base is int4, which serves but is not trained against",
             Refused::Train(super::train::RunError::NoDecisions) => "the corpus produced no decisions",
             Refused::Judge(w) => w,
         }

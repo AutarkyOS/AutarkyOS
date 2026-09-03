@@ -1235,6 +1235,12 @@ const GLADOS_HEADER: usize = 64;
 const GLADOS_HEADER_V4: usize = 160;
 const GLADOS_BITMAP_AT: usize = 112;
 const GLADOS_QUANT_I8: u32 = 1;
+const GLADOS_QUANT_I4: u32 = 2;
+/// int4 blocks share one f32 scale per this many weights. Must equal the
+/// converter's Q4_BLOCK and the kernel's Q4_BLOCK -- three copies of one
+/// number, checked against each other by generating coherent text and not
+/// otherwise, which is why it is named in all three.
+const Q4_BLOCK: usize = 32;
 const GLADOS_FLAG_QK_NORM: u32 = 1 << 0;
 const GLADOS_FLAG_ROPE_INTERLEAVED: u32 = 1 << 1;
 const GLADOS_FLAG_ATTN_OUTPUT_GATE: u32 = 1 << 2;
@@ -1283,6 +1289,11 @@ enum Source {
     Blob {
         bytes: &'static [u8],
         off: ByteOffsets,
+        /// Which quantisation the body is in: `GLADOS_QUANT_I8` or
+        /// `GLADOS_QUANT_I4`. Carried rather than re-derived because every
+        /// stride and every tensor read depends on it, and one place deciding
+        /// it is one place to get it right.
+        quant: u32,
         /// Norm weights, pulled out of the blob at load.
         ///
         /// They are read per element rather than per row, so unaligned access
@@ -1547,7 +1558,7 @@ impl Model {
         // Only the quantised form is implemented; an f32 GLADOSM2 file would
         // need a different stride everywhere and there is no reason to build
         // one, since f32 is what does not fit.
-        if quant != GLADOS_QUANT_I8 {
+        if quant != GLADOS_QUANT_I8 && quant != GLADOS_QUANT_I4 {
             return Err(LoadError::BadHeader);
         }
 
@@ -1681,7 +1692,7 @@ impl Model {
         // layer, exactly as `offsets` orders the flat form.
         let mut p = GLADOS_HEADER;
         let mut off = ByteOffsets { embed: p, ..Default::default() };
-        p += Self::q8_stride(v, d);
+        p += Self::qstride(quant, v, d);
 
         let rms_att_at = p;
         p += l * d * 4;
@@ -1695,26 +1706,26 @@ impl Model {
             (0, 0)
         };
         off.wq = p;
-        p += l * Self::q8_stride(q, d);
+        p += l * Self::qstride(quant, q, d);
         off.wk = p;
-        p += l * Self::q8_stride(kv, d);
+        p += l * Self::qstride(quant, kv, d);
         off.wv = p;
-        p += l * Self::q8_stride(kv, d);
+        p += l * Self::qstride(quant, kv, d);
         off.wo = p;
-        p += l * Self::q8_stride(d, q);
+        p += l * Self::qstride(quant, d, q);
         let rms_ffn_at = p;
         p += l * d * 4;
         off.w1 = p;
-        p += l * Self::q8_stride(h, d);
+        p += l * Self::qstride(quant, h, d);
         off.w2 = p;
-        p += l * Self::q8_stride(d, h);
+        p += l * Self::qstride(quant, d, h);
         off.w3 = p;
-        p += l * Self::q8_stride(h, d);
+        p += l * Self::qstride(quant, h, d);
         let rms_final_at = p;
         p += d * 4;
         off.wcls = p;
         if !cfg.shared_classifier {
-            p += Self::q8_stride(v, d);
+            p += Self::qstride(quant, v, d);
         }
 
         if data.len() < p {
@@ -1742,7 +1753,7 @@ impl Model {
             }
         }
 
-        Ok(Self { cfg, src: Source::Blob { bytes: data, off, norms }, o: Offsets::default(), adapters: None })
+        Ok(Self { cfg, src: Source::Blob { bytes: data, off, norms, quant }, o: Offsets::default(), adapters: None })
     }
 
     /// Walk a v4 body and record where every tensor of every layer starts.
@@ -1887,6 +1898,18 @@ impl Model {
         }
     }
 
+    /// One quantised tensor, built as `Mat::Q8` or `Mat::Q4` per the level.
+    fn quantised<'a>(bytes: &'a [u8], quant: u32, off: usize, rows: usize, cols: usize) -> Mat<'a> {
+        if quant == GLADOS_QUANT_I4 {
+            let nb = cols / Q4_BLOCK;
+            let scales = &bytes[off..off + rows * nb * 4];
+            let start = off + rows * nb * 4;
+            let raw = &bytes[start..start + rows * cols / 2];
+            return Mat::Q4 { data: raw, scales, rows, cols };
+        }
+        Self::q8(bytes, off, rows, cols)
+    }
+
     /// One int8 tensor: `rows` f32 scales, then `rows * cols` int8 values.
     fn q8<'a>(bytes: &'a [u8], off: usize, rows: usize, cols: usize) -> Mat<'a> {
         let scales = &bytes[off..off + rows * 4];
@@ -1904,6 +1927,20 @@ impl Model {
         rows * 4 + rows * cols
     }
 
+    /// Bytes one quantised tensor occupies, at either level.
+    ///
+    /// int8 is `rows` f32 scales then `rows*cols` bytes. int4 is one f32 scale
+    /// per 32-wide block -- `rows * cols/32` of them -- then two nibbles a byte,
+    /// `rows*cols/2`. A cols not divisible by 32 cannot be an int4 tensor; the
+    /// converter refuses to write one, so this is not re-checked on the read.
+    fn qstride(quant: u32, rows: usize, cols: usize) -> usize {
+        if quant == GLADOS_QUANT_I4 {
+            rows * (cols / Q4_BLOCK) * 4 + rows * cols / 2
+        } else {
+            rows * 4 + rows * cols
+        }
+    }
+
     fn mat(&self, flat_off: usize, blob_off: usize, layer: usize, rows: usize, cols: usize) -> Mat<'_> {
         match &self.src {
             Source::Flat(w) => {
@@ -1911,8 +1948,9 @@ impl Model {
                 let base = flat_off + layer * n;
                 Mat::F32 { data: &w[base..base + n], rows, cols }
             }
-            Source::Blob { bytes, .. } => {
-                Self::q8(bytes, blob_off + layer * Self::q8_stride(rows, cols), rows, cols)
+            Source::Blob { bytes, quant, .. } => {
+                let stride = Self::qstride(*quant, rows, cols);
+                Self::quantised(bytes, *quant, blob_off + layer * stride, rows, cols)
             }
             // A hybrid body is layer-major with no single stride to multiply,
             // so nothing routes through here; `hq` takes an offset directly.

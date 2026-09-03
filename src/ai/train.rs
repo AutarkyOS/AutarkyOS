@@ -666,6 +666,19 @@ pub enum RunError {
     Hardware,
     NoCorpus,
     Hybrid,
+    /// The base checkpoint is int4. Inference on it is validated -- the split
+    /// harness proves the kernels bit-exact -- but training is not, and the
+    /// difference is the whole reason the trainer exists. Every judged figure
+    /// rests on the frozen base being a faithful stand-in for the weights the
+    /// adapter will serve against; int8's per-weight error is under a percent,
+    /// which is the straight-through bargain already written down. Block-32
+    /// int4 is ten times coarser, so `s = m/|W0 + BA|` is fitted against a
+    /// base a tenth as accurate as the one it claims to correct, and a verdict
+    /// drawn from that would describe an adapter for a model nobody runs. So
+    /// this is a refusal in the shape of the hybrid one: the capability is not
+    /// half-built, it is declined until it is measured, and the reason is
+    /// printed rather than discovered as a bad number later.
+    Quantised,
     /// The corpus produced nothing the grammar could spell.
     NoDecisions,
 }
@@ -980,6 +993,14 @@ pub fn prepare_on(
     }
     if e.model.cfg.hybrid() {
         return Err(RunError::Hybrid);
+    }
+    // An int4 base is refused here rather than dequantised through. The
+    // classifier is the site every path below reads first, so it is the
+    // cheapest place to detect the whole checkpoint's precision; a Q4
+    // classifier means a Q4 base, and `RunError::Quantised` says why that is
+    // declined even though `row_into` would happily hand back dequantised rows.
+    if matches!(e.model.classifier(), Mat::Q4 { .. }) {
+        return Err(RunError::Quantised);
     }
     if corpus.is_empty() {
         return Err(RunError::NoCorpus);

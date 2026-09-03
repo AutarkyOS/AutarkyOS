@@ -1138,6 +1138,7 @@ fn work_cmd(rest: &str) {
                 kprintln!("  {}", match e {
                     RunError::Hardware => "no AVX2/FMA, so this would measure the emulator",
                     RunError::Hybrid => "adapters are refused on a hybrid checkpoint",
+                    RunError::Quantised => "int4 base serves but is not trained against",
                     RunError::NoCorpus => "the role set is empty",
                     RunError::NoDecisions => "the grammar cannot spell any applet in this set",
                 });

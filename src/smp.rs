@@ -566,7 +566,18 @@ pub fn init(acpi: &crate::acpi::Acpi) -> usize {
         let stack = alloc::boxed::Box::leak(stack.into_boxed_slice());
         // A heap pointer is its own physical address here, so the stack needs
         // no translation before a core in 64-bit mode can load it.
-        let top = (stack.as_ptr() as u64 + AP_STACK as u64) & !0xF;
+        //
+        // The trailing `- 8` is the whole of a latent ABI bug. The trampoline
+        // reaches `autark_ap_main` with a `jmp`, not a `call`, so nothing pushes
+        // a return address -- yet every function the SysV/MS-x64 compiler emits
+        // assumes it was `call`ed and so entered with `rsp` eight below a
+        // 16-byte boundary. Land the AP on a bare 16-aligned top and the whole
+        // subtree is off by eight, and stays invisible until a kernel with
+        // enough register pressure spills a callee-saved xmm with an *aligned*
+        // `vmovaps N(%rsp)` -- which the int4 AVX2 matvec is the first to do,
+        // faulting #GP on a store nothing before it exercised. Subtracting eight
+        // reproduces the post-`call` alignment the ABI is written against.
+        let top = ((stack.as_ptr() as u64 + AP_STACK as u64) & !0xF) - 8;
         unsafe { params.add(2).write_volatile(top) };
 
         // Mapped before the core is started rather than after: the core can
@@ -742,11 +753,61 @@ pub fn selftest() -> bool {
         }
     }
 
+    // int4, the same bit-for-bit split test on a different kernel. Its AVX2
+    // path unpacks nibbles inline and its scale changes every 32 columns, so
+    // the row split has two more ways to go wrong than the int8 one -- a byte
+    // offset that is `cols/2` not `cols`, and a scale offset over blocks not
+    // rows. Both are silent if wrong, which is why they are checked here.
+    let nbk = cols / 32;
+    let q4data: Vec<u8> = (0..rows * cols / 2)
+        .map(|i| (i as u32).wrapping_mul(2246822519).to_le_bytes()[0])
+        .collect();
+    let q4scales: Vec<u8> = (0..rows * nbk)
+        .flat_map(|b| (0.25 + (b % 7) as f32 * 0.0625).to_le_bytes())
+        .collect();
+    let m4 = Mat::Q4 { data: &q4data, scales: &q4scales, rows, cols };
+    let saved = ONLINE.swap(0, Ordering::SeqCst);
+    let mut q4_one = vec![0.0f32; rows];
+    m4.matvec(&mut q4_one, &x);
+    ONLINE.store(saved, Ordering::SeqCst);
+    let mut q4_many = vec![0.0f32; rows];
+    for round in 0..64 {
+        for v in q4_many.iter_mut() {
+            *v = f32::NAN;
+        }
+        m4.matvec(&mut q4_many, &x);
+        if q4_one != q4_many {
+            let bad = q4_one.iter().zip(q4_many.iter()).position(|(a, b)| a != b).unwrap_or(0);
+            crate::kprintln!(
+                "  int4 round {} row {} -- one core {}, {} cores {}",
+                round, bad, q4_one[bad], saved + 1, q4_many[bad]
+            );
+            return false;
+        }
+    }
+
+    // And the int4 prefill split, the batch path on the harder kernel.
+    let saved = ONLINE.swap(0, Ordering::SeqCst);
+    let mut q4b_one = vec![0.0f32; tc * rows];
+    m4.matvec_batch(&mut q4b_one, &xs, tc);
+    ONLINE.store(saved, Ordering::SeqCst);
+    let mut q4b_many = vec![0.0f32; tc * rows];
+    for _ in 0..64 {
+        for v in q4b_many.iter_mut() {
+            *v = f32::NAN;
+        }
+        m4.matvec_batch(&mut q4b_many, &xs, tc);
+        if q4b_one != q4b_many {
+            return false;
+        }
+    }
+
     // And all of them have to have actually computed something, or this passes
     // by testing the serial path twice.
     many.iter().any(|v| *v != 0.0)
         && wt_many.iter().any(|v| *v != 0.0)
         && b_many.iter().any(|v| *v != 0.0)
+        && q4_many.iter().any(|v| *v != 0.0)
 }
 
 /// Time the same matvec on one core and on all of them.
