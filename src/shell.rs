@@ -185,6 +185,15 @@ pub fn run(boot: &BootInfo, acpi: &Option<Acpi>) -> ! {
         console::set_color(WHITE);
     }
 
+    // Conversation-first: the machine is the surface, and the terminal is a
+    // window on the desktop behind it.
+    //
+    // Opened after the registration notice rather than before, so the first
+    // thing on the console is still the thing a person has to read. It takes
+    // the keyboard, which every other opener here refuses to do -- see
+    // `desk::open_conversation` for why that is safe now and was not before.
+    crate::gfx::desk::open_conversation();
+
     // What the machine did while nobody was here.
     //
     // At the first prompt rather than on a timer, because "the first
@@ -4008,6 +4017,17 @@ fn execute(line: &str, boot: &BootInfo, acpi: &Option<Acpi>, interp: &mut aiksi:
         },
         "mines" | "minesweeper" => crate::gfx::desk::open_mines(),
         "agentlog" => crate::gfx::desk::open_agentlog(),
+        // `talk` opens the window; `talk <text>` also says the thing, which is
+        // what makes the surface drivable over serial at all -- `win keys` can
+        // type into it, but a whole sentence through the key injector is a
+        // sentence nobody will write twice.
+        "talk" | "convo" => {
+            crate::gfx::desk::open_conversation();
+            let said = rest.trim();
+            if !said.is_empty() && !crate::ai::agent::queue_say(said) {
+                kprintln!("  busy -- 'agent stop' cancels what it is doing");
+            }
+        }
         "todo" => {
             // No args opens the runbook window -- what someone clicking the
             // icon wants. `-p` prints it to the terminal for a serial run;

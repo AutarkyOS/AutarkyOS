@@ -13,6 +13,7 @@ esp/GLADOS/
 tools/venv/
 tools/hf/
 tools/qwen3/
+tools/smollm2/
 tools/out/
 # The GitHub CLI, downloaded rather than installed system-wide. A tool, not
 # a dependency: nothing in the tree calls it and a checkout without it works.

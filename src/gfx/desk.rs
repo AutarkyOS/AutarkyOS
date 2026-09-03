@@ -92,6 +92,7 @@ pub const ICO_WRITE: usize = 6;
 pub const ICO_MINES: usize = 7;
 pub const ICO_SET: usize = 8;
 pub const ICO_ORACLE: usize = 9;
+pub const ICO_CONVO: usize = 10;
 
 /// The icon for a named panel -- the names `win open` and the Browse routes
 /// use. Anything unrecognised gets the mark, because everything here is
@@ -256,8 +257,9 @@ const TASK_GAP: u32 = 4;
 /// `term` is not a shell command: the terminal is not a panel to open but a
 /// window to bring back, and the special case lives in `launch` rather than in
 /// the shell so the icon works even while the shell is busy printing.
-const ICONS: [(&str, &str); 10] = [
+const ICONS: [(&str, &str); 11] = [
     ("Terminal", "term"),
+    ("Talk", "talk"),
     ("Programs", "win open programs"),
     ("Files", "win open files"),
     ("ToDo", "todo"),
@@ -272,7 +274,7 @@ const ICONS: [(&str, &str); 10] = [
 /// The Start menu, bottom of the bar upward -- the 98 half of the ancestry.
 /// Same entries as the icons plus the one thing that belongs behind a second
 /// look, exactly where 98 kept it.
-const START_ITEMS: [(&str, &str); 12] = [
+const START_ITEMS: [(&str, &str); 13] = [
     // "Search..." used to lead this list, opening a panel with one text field
     // in it. The query row at the foot of this menu does the same job in the
     // place a person already is, and dispatches through the same `open`, so
@@ -280,6 +282,7 @@ const START_ITEMS: [(&str, &str); 12] = [
     // there -- `win open search`, and `open` still raises it to offer to write
     // something that does not exist.
     ("Terminal", "term"),
+    ("Talk", "talk"),
     ("Programs", "win open programs"),
     ("Files", "win open files"),
     ("ToDo", "todo"),
@@ -1101,6 +1104,42 @@ pub fn open_agentlog() {
     // fact, by which point the window has usually been moved.
     clear_of_terminal();
     focus_terminal();
+}
+
+/// Open the conversation, and leave it holding the keyboard.
+///
+/// The only opener here that does *not* call `focus_terminal()`, and the only
+/// one that must not: a window you type into which hands the keyboard away is
+/// a window that cannot be used for the thing it exists for. That is safe now
+/// only because `shell.rs` routes serial past the desktop entirely, so a driven
+/// session is unaffected by what has focus -- see `convwin`'s header.
+///
+/// Idempotent, like `open_authoring`: a second `talk` raises the window that is
+/// already there rather than stacking another conversation on top of the one
+/// holding the transcript.
+pub fn open_conversation() {
+    if has_window("Talk") {
+        with(|d| {
+            if let Some(i) = d.windows.iter().position(|w| w.title == "Talk") {
+                d.raise(i);
+                // Un-minimise, unlike `focus_terminal`, which deliberately
+                // does not: raising the terminal is a reflex and should not
+                // undo somebody's decision to put it away, where `talk` is an
+                // explicit request for this window.
+                if let Some(w) = d.windows.last_mut() {
+                    if w.state == WinState::Minimised {
+                        w.state = WinState::Normal;
+                    }
+                }
+            }
+        });
+        draw();
+        return;
+    }
+    let (w, h) = super::convwin::Convo::preferred();
+    open_app("Talk", ICO_CONVO, Box::new(super::convwin::Convo::new()), w, h);
+    clear_of_terminal();
+    draw();
 }
 
 /// Open Enternet, optionally at a URL.

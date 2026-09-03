@@ -155,6 +155,26 @@ enum Job {
         goal: String,
         budget: usize,
     },
+    /// Answer the operator, in the conversation window.
+    ///
+    /// Here rather than on the shell task, and here rather than on a task of
+    /// its own, for two separate reasons that happen to point the same way.
+    ///
+    /// A window's `key` runs inside `desk::with(|d| ..)`, holding `&mut
+    /// Desktop`, and `generate` calls `desk::pump_cursor` between tokens --
+    /// so answering from the keystroke that asked would alias the desktop
+    /// against itself. And a *second* task doing a second kind of model work
+    /// would need a second entry in the engine's exclusion check, which is the
+    /// stale-call-site failure `with_engine`'s own doc warns about; the queue
+    /// exists precisely so there is one.
+    ///
+    /// The exchange therefore inherits `agent_task`'s claim for its whole
+    /// length, which is stronger than `ask` manages: `ask` makes several
+    /// separate `with_engine` calls with nothing spanning them, and that gap
+    /// is the documented cache-corruption window rather than UB.
+    Say {
+        text: String,
+    },
 }
 
 impl Job {
@@ -165,6 +185,7 @@ impl Job {
         match self {
             Job::Episode { .. } => "running an episode",
             Job::Author { .. } => "writing an application",
+            Job::Say { .. } => "answering",
         }
     }
 }
@@ -241,6 +262,16 @@ pub fn queue_episode(goal: &str, trust: Trust, steps: usize) -> bool {
 /// The operator's `author` and the machine's own nightly run go through the
 /// same door, differing only in `autonomous` -- which decides nothing but
 /// which console the output lands on.
+/// Ask the machine to answer, from the conversation window.
+///
+/// Cheap on purpose: an atomic and a `String` move under masked interrupts,
+/// touching no desktop and no engine, because the caller is a keystroke
+/// handler holding a mutable borrow of the desktop. Everything expensive
+/// happens later, on the resident task.
+pub fn queue_say(text: &str) -> bool {
+    queue(Job::Say { text: String::from(text) }, false)
+}
+
 pub fn queue_author(name: &str, goal: &str, budget: usize, autonomous: bool) -> bool {
     queue(
         Job::Author {
@@ -323,6 +354,7 @@ pub fn agent_task() {
                 );
                 elog(alloc::format!("wrote {} -- {}", name, super::author::describe(&report)));
             }
+            Job::Say { text } => say(&text),
         }
         AUTONOMOUS.store(false, Ordering::Release);
         ABORT.store(false, Ordering::Release);
@@ -1141,3 +1173,51 @@ fn render(goal: &str, outcome: &str, steps: &[Step]) -> String {
 
 
 
+
+/// One turn of the conversation, for the window.
+///
+/// `yielding` is set, which `ask` leaves clear. A foreground `ask` is inside
+/// the shell command for the whole answer, so yielding would only add latency;
+/// here the shell is idle and waiting, and not yielding would freeze it and
+/// the desktop for the length of the reply. It is the same choice `mind_task`
+/// makes and for the same reason.
+///
+/// The window is repainted per token rather than at the end. `convo::feed`
+/// runs inside `emit`, so by the time this returns the transcript is already
+/// whole -- what the repaint buys is watching it arrive, which is the entire
+/// difference between a conversation and a progress-free wait. `desk::draw`
+/// takes `Claim::take()` and returns if somebody else is painting, so calling
+/// it from this task is safe and idempotent.
+fn say(text: &str) {
+    use super::convo;
+
+    convo::said(text);
+    crate::gfx::desk::draw();
+
+    if !super::engine_ready() {
+        convo::note(&super::engine_refusal());
+        crate::gfx::desk::draw();
+        return;
+    }
+
+    let opts = super::GenOpts {
+        steps: 96,
+        temperature: 0.3,
+        yielding: true,
+        ..Default::default()
+    };
+
+    convo::open_turn();
+    let pos = super::companion::turn(text, &opts);
+    convo::close_turn();
+
+    // Zero means the engine refused, which `turn` reports by returning a
+    // position it never reached. Saying so in the transcript matters more here
+    // than at the shell: a shell refusal prints in red where the operator is
+    // already looking, and a window that simply showed nothing would read as a
+    // model with no opinion.
+    if pos == 0 {
+        convo::note(&super::engine_refusal());
+    }
+    crate::gfx::desk::draw();
+}

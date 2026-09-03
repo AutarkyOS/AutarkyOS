@@ -41,7 +41,7 @@ pub fn selftest() -> bool {
     console::set_color(YELLOW);
     kprintln!("\n[selftest] crypto:");
 
-    let checks: [(&str, fn() -> bool); 26] = [
+    let checks: [(&str, fn() -> bool); 27] = [
         ("sha-256   NIST vectors", crate::store::sha256::selftest),
         ("hmac/hkdf RFC 4231 and RFC 5869", hkdf::selftest),
         ("sha-384   FIPS 180-4", sha512::selftest),
@@ -58,6 +58,7 @@ pub fn selftest() -> bool {
         ("aiksi     functions, lists, scope, whole programs", crate::aiksi::selftest),
         ("engine    one holder, and a second task is refused", crate::ai::engine_selftest),
         ("search    the trial space has distinct points", crate::ai::godel::space_selftest),
+        ("convo     decoded text reaches the conversation, and only then", crate::ai::convo::selftest),
         ("routecfg  the adopted routing rule survives and defaults", crate::ai::harness::config_selftest),
         ("voter     a written core is bounded, jailed and stateless", crate::ai::voter::selftest),
         ("uidoc     panels round-trip as text, bad ones refused", crate::gfx::uidoc::selftest),
