@@ -107,6 +107,42 @@ impl Dora {
         4 * (self.a.len() + self.b.len() + self.m.len() + self.s.len())
     }
 
+    /// Factor-space crossover: the elementwise mean of two same-shape adapters.
+    ///
+    /// This is deliberately *not* weight-space merging, and the difference is
+    /// worth stating before someone mistakes it for one: `(B1.A1 + B2.A2)/2` is
+    /// not `((B1+B2)/2)((A1+A2)/2)`, so no claim is made that the child behaves
+    /// like the average of its parents. It is an exploration operator -- a
+    /// cheap, deterministic recombination whose children live or die by
+    /// measurement alone, which is the only defence an operator like this needs
+    /// and the only one it gets. An operator may be strange; selection may not.
+    ///
+    /// The cached scales are left stale on purpose. `s` is `m/|W0 + BA|` and
+    /// both `m` and `BA` just moved, so only the caller -- who knows which
+    /// frozen rows the child will be applied to -- can refresh them honestly.
+    /// `Trial::crossover` is that caller.
+    pub fn blend(x: &Dora, y: &Dora) -> Option<Dora> {
+        if x.r != y.r
+            || x.a.len() != y.a.len()
+            || x.b.len() != y.b.len()
+            || x.m.len() != y.m.len()
+        {
+            return None;
+        }
+        let mut c = x.clone();
+        c.alpha = (x.alpha + y.alpha) * 0.5;
+        for (cv, yv) in c.a.iter_mut().zip(y.a.iter()) {
+            *cv = (*cv + *yv) * 0.5;
+        }
+        for (cv, yv) in c.b.iter_mut().zip(y.b.iter()) {
+            *cv = (*cv + *yv) * 0.5;
+        }
+        for (cv, yv) in c.m.iter_mut().zip(y.m.iter()) {
+            *cv = (*cv + *yv) * 0.5;
+        }
+        Some(c)
+    }
+
     /// The input width this site was built for.
     ///
     /// Read from `a`, which was sized `r * k_in` at construction, and never

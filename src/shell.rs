@@ -3274,6 +3274,49 @@ fn execute(line: &str, boot: &BootInfo, acpi: &Option<Acpi>, interp: &mut aiksi:
                         );
                     }
                 }
+                // One prepare, a whole generation: train the declared storm
+                // grid, continue the incumbent, breed chimeras, light the
+                // archive, and put the best before the same four judges a lone
+                // trial faces.
+                "storm" => {
+                    let n = words.next().and_then(|w| w.parse::<usize>().ok()).unwrap_or(0);
+                    let mut b = crate::ai::train::Budget::default();
+                    b.examples = n;
+                    match crate::ai::with_engine(|e| godel::storm(e, &b)) {
+                        None => kprintln!("  {}", crate::ai::engine_refusal()),
+                        Some(Err(why)) => {
+                            use crate::ai::train::RunError;
+                            kprintln!("  refused: {}", match why {
+                                RunError::Hardware => "no AVX2/FMA, so this would measure the emulator",
+                                RunError::Hybrid => "hybrid checkpoints have no verified backward yet",
+                                RunError::Quantised => "int4 base serves but is not trained against",
+                                RunError::NoCorpus => "there is no corpus",
+                                RunError::NoDecisions => "the grammar cannot spell any applet here",
+                            });
+                        }
+                        Some(Ok(r)) => {
+                            console::set_color(YELLOW);
+                            kprintln!("[storm]");
+                            console::set_color(LTGRAY);
+                            kprintln!(
+                                "  {} trained, {} descendants of the incumbent, {} chimeras bred",
+                                r.trained, r.descendants, r.chimeras
+                            );
+                            kprintln!(
+                                "  archive: {} cell(s) lit this storm; best validation {}",
+                                r.cells_lit, r.best_fitness
+                            );
+                            console::set_color(if r.cert.adopted { LTGREEN } else { YELLOW });
+                            kprintln!(
+                                "  tribunal: the best {} -- {}",
+                                if r.cert.adopted { "was ADOPTED" } else { "was rejected" },
+                                r.cert.j1_why
+                            );
+                            console::set_color(LTGRAY);
+                            kprintln!("  'godel map' shows what the storm illuminated");
+                        }
+                    }
+                }
                 // What the loop would try tonight, without trying it.
                 "next" => {
                     let (pos, len) = godel::epoch_position();

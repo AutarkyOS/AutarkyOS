@@ -1414,6 +1414,32 @@ impl Trial {
         }
         Some(local)
     }
+
+    /// Breed two same-shape candidates over this trial's rows.
+    ///
+    /// `Dora::blend` does the recombination and deliberately leaves the cached
+    /// scales stale; this is the caller that can fix them, because it holds the
+    /// dequantised rows the child will actually be applied to. Without the
+    /// refresh, `s` describes `m/|W0 + BA|` for factors that no longer exist --
+    /// the precise staleness `train` re-derives after every optimiser step, and
+    /// a child scored through stale scales would be judged on arithmetic
+    /// nobody's forward pass performs.
+    ///
+    /// The child costs no training and no forward passes: a blend, one norm
+    /// pass over the live rows, and it is scoreable. That is the whole reason
+    /// crossover earns a place -- it turns the archive's diversity into new
+    /// candidates at the price of a refresh.
+    pub fn crossover(&self, x: &Dora, y: &Dora) -> Option<Dora> {
+        let mut c = Dora::blend(x, y)?;
+        // Shaped for *this* trial, not merely for each other -- a pair gathered
+        // from some other row space would blend cleanly and then index rows
+        // that are not there.
+        if c.a.len() != c.r * self.dim || c.m.len() != self.live.len() {
+            return None;
+        }
+        c.refresh(&self.mat(), false);
+        Some(c)
+    }
 }
 /// `train adapter`: prepare, train, measure, attach.
 ///

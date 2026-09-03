@@ -78,7 +78,7 @@
 //! says is unavailable, and a self-modifying ring-0 image with no isolation
 //! and one address space is a machine that gets exactly one mistake.
 
-use super::train::{Budget, Slice, Trial};
+use super::train::{Budget, Fit, Slice, Trial};
 use crate::store::sha256;
 use crate::sysbox;
 use alloc::string::String;
@@ -2082,16 +2082,36 @@ pub fn trial(
     let incumbent = e.model.adapters.as_ref().and_then(|a| t.gather(a));
 
     let fit = t.train(b);
+    Ok(adjudicate(e, &t, b, parent, incumbent.as_ref(), &fit))
+}
 
+/// Judge one trained candidate against the incumbent, write everything down,
+/// and adopt only on unanimity.
+///
+/// Extracted from `trial` so the storm's winner faces the same four judges
+/// through the same code, not a second copy that drifts -- the objection
+/// `model.rs` makes twice about two implementations that are supposed to
+/// agree, applied to the one place where drift would mean two different
+/// adoption criteria wearing one name. `trial` trains one candidate and hands
+/// it here; `storm` trains a generation and hands its best. The judges cannot
+/// tell which door a candidate came through, which is the point.
+fn adjudicate(
+    e: &mut super::Engine,
+    t: &Trial,
+    b: &Budget,
+    parent: Option<[u8; 32]>,
+    incumbent: Option<&super::adapter::Dora>,
+    fit: &Fit,
+) -> Certificate {
     // Predict before measuring. Training-set gain is the cheap signal and the
     // question is whether it means anything; recording the prediction beside
     // the outcome is the only way to ever find out.
-    let train_before = t.score(incumbent.as_ref(), Slice::Train);
+    let train_before = t.score(incumbent, Slice::Train);
     let train_after = t.score(Some(&fit.dora), Slice::Train);
     let predicted = train_after > train_before;
 
     // --- J1: is it better, beyond noise? --------------------------------
-    let (broke, fixed, _, _) = t.paired(incumbent.as_ref(), Some(&fit.dora), Slice::Validation);
+    let (broke, fixed, _, _) = t.paired(incumbent, Some(&fit.dora), Slice::Validation);
     let chi = mcnemar(broke, fixed);
     let n_val = t.slice_size(Slice::Validation);
     let (j1, j1_why) = if n_val == 0 {
@@ -2126,7 +2146,7 @@ pub fn trial(
         && t.guards().iter().all(|g| !g.mutates);
 
     // --- J3: structural sanity, regardless of any score -----------------
-    let (j3, j3_why) = sanity(&t, &fit.dora);
+    let (j3, j3_why) = sanity(t, &fit.dora);
 
     // --- J4: can this machine carry it? ---------------------------------
     // Decode cost is O(vocab * rank) per token whatever the live set holds,
@@ -2140,41 +2160,7 @@ pub fn trial(
     let blob = adapters.to_blob();
     let ablob = sha256::hash(&blob);
 
-    let variant = Variant {
-        parent,
-        adapter: Some(ablob),
-        policy: sysbox::read_blob("/ai/agent/policy").map(|p| sha256::hash(&p)),
-        skills: None,
-        corpus: sysbox::hash_of(super::vocab::CORPUS),
-        // `scatter` builds a classifier-only adapter, always.
-        deep: false,
-        // What is actually installed, recorded rather than assumed -- the same
-        // discipline as `policy` and `corpus`. A variant trained while a
-        // machine-written core was voting is not the same object as one
-        // trained without it, and a lineage that cannot tell them apart
-        // describes the wrong experiment.
-        core: super::voter::installed().map(|c| c.hash),
-        core_seen: true,
-        lambda: b.lr,
-        rank: fit.dora.r as u8,
-        epochs: fit.epochs as u32,
-        // What is actually routing, not what the proposal happened to carry.
-        //
-        // This was `p.rule`, and every grid point carries 0 -- `ProbeOnly` --
-        // while the machine has been running the default `Majority` the whole
-        // time. So every node in every lineage recorded a rule its variant was
-        // never measured under, which is the "describes the wrong experiment"
-        // failure the corpus and policy hashes are here to prevent, on the one
-        // field nobody was varying. A trial trains an adapter *under* a rule;
-        // it does not choose one, and `ProposalKind::Config` is what does.
-        rule: super::harness::rule_in_force() as u8,
-        // The bar in force when this variant was measured, so a later reader
-        // can interpret the lineage under the criterion it actually ran, not
-        // the one running now. `trial_judge` is the exception and sets the bar
-        // it adopts.
-        threshold: judge_in_force(),
-        born: crate::dev::rtc::now().map(|d| crate::dev::rtc::unix_seconds(&d)).unwrap_or(0),
-    };
+    let variant = weight_variant(parent, ablob, b.lr, fit.dora.r, fit.epochs as u32);
     let vhash = variant.hash();
 
     let mut cert = Certificate {
@@ -2215,7 +2201,7 @@ pub fn trial(
     // have fitted -- and the budget is what keeps the ordering from being
     // quietly undone by a loop that runs every night forever.
     if cert.adopted {
-        let (acc, n, fresh) = read_test(&t, Some(&fit.dora));
+        let (acc, n, fresh) = read_test(t, Some(&fit.dora));
         cert.test_acc = acc;
         cert.test_read = n;
         cert.test_fresh = fresh;
@@ -2263,7 +2249,41 @@ pub fn trial(
     let hour = crate::dev::rtc::now().map(|d| d.hour).unwrap_or(0);
     let seq = TRIALS.load(Ordering::Relaxed);
     record(&cert, seq, hour);
-    Ok(cert)
+    cert
+}
+
+/// The node a weights candidate becomes, from what is actually in force.
+///
+/// One constructor, because two would drift: `adjudicate` records its winner
+/// through this and `storm` records its cell-winners through this, so a
+/// candidate's identity cannot depend on which door it came through. Every
+/// contextual field carries what is *actually* installed and running -- policy,
+/// corpus, core, rule, bar -- the discipline the old inline literal earned one
+/// field at a time. `scatter` builds classifier-only adapters, always, so
+/// `deep` is false by construction here.
+fn weight_variant(
+    parent: Option<[u8; 32]>,
+    ablob: [u8; 32],
+    lr: f32,
+    rank: usize,
+    epochs: u32,
+) -> Variant {
+    Variant {
+        parent,
+        adapter: Some(ablob),
+        policy: sysbox::read_blob("/ai/agent/policy").map(|p| sha256::hash(&p)),
+        skills: None,
+        corpus: sysbox::hash_of(super::vocab::CORPUS),
+        deep: false,
+        core: super::voter::installed().map(|c| c.hash),
+        core_seen: true,
+        lambda: lr,
+        rank: rank as u8,
+        epochs,
+        rule: super::harness::rule_in_force() as u8,
+        threshold: judge_in_force(),
+        born: crate::dev::rtc::now().map(|d| crate::dev::rtc::unix_seconds(&d)).unwrap_or(0),
+    }
 }
 
 /// The bound a variant has to fit inside to be carried at all.
@@ -3365,6 +3385,20 @@ pub fn archive_insert(variant: &[u8; 32], rank: usize, fixed: usize, broke: usiz
     true
 }
 
+/// Whether a candidate *would* take its cell, without writing anything.
+///
+/// The storm asks this before paying for a variant: storing a node and an
+/// adapter blob for every member of a generation would be chaff in the DAG,
+/// and only the candidates the archive will actually hold -- plus the one the
+/// judges see -- earn an address.
+pub fn archive_peek(rank: usize, fixed: usize, broke: usize, fitness: f32) -> bool {
+    let (a, b) = descriptor(rank, fixed, broke);
+    match read_cell(a, b) {
+        None => true,
+        Some(cur) => fitness > cur.fitness,
+    }
+}
+
 /// Every occupied cell, for display and for the coverage/QD figures.
 pub fn archive_cells() -> Vec<(usize, usize, Elite)> {
     let mut out = Vec::new();
@@ -3438,6 +3472,195 @@ fn next_map() -> Option<Proposal> {
     } else {
         Some(p)
     }
+}
+
+// --- The storm: one prepare, a whole generation ------------------------------
+//
+// The whole economy of this module rests on one fact the trainer states and
+// nothing had ever pushed to its limit: below the classifier the hidden state
+// at every decision is a constant, cached once, and an epoch after that costs
+// no forward passes at all. Every trial in this tree's history paid the
+// expensive half -- a forward pass per example -- to train exactly ONE
+// candidate on the cache it bought. The storm pays it once and trains a
+// generation: every point of a declared grid spanning the whole capacity axis,
+// continuations of the incumbent through the warm-start `train_masked` already
+// had, and chimeras bred from same-rank pairs that cost no training at all.
+// A dozen minds for the price of one and a few dozen optimiser passes.
+//
+// What it does NOT change is the tribunal. Every candidate is scored and
+// offered to the archive -- the MAP-Elites turn, which is how one storm can
+// light half the map -- but exactly one, the best on validation, goes before
+// the judges, through the same `adjudicate` a single trial uses. The judges
+// cannot tell which door it came through. The multiple-comparisons cost of
+// picking a maximum over a generation is real and is paid where the module
+// always pays it: selection happens on validation, the test slice stays
+// behind its budget, and the anchor is read only if the winner is adopted.
+//
+// And it is an operator command, not (yet) the night's move. The initiative
+// tick is bounded for stated reasons, and a storm's wall time on the GF63 is a
+// number nobody has measured; wiring an unmeasured cost into the unattended
+// loop is the exact mistake `power.rs` and the tick budget exist to refuse.
+
+/// The generation: declared like `GRID`, in the order it is trained, spanning
+/// every rank bin so one storm illuminates the whole capacity axis.
+const STORM: &[(f32, usize, f32, usize)] = &[
+    (0.02, 4, 8.0, 20),
+    (0.05, 4, 8.0, 20),
+    (0.02, 8, 16.0, 20),
+    (0.05, 8, 16.0, 20),
+    (0.01, 8, 16.0, 40),
+    (0.02, 16, 32.0, 20),
+    (0.05, 16, 32.0, 20),
+    (0.02, 32, 64.0, 20),
+];
+
+/// Continuations of the incumbent: `(lr, epochs)` trained on top of what is
+/// attached, through the warm start `train_masked` grew for the curriculum
+/// work. Children of the reigning mind rather than orphans from zero.
+const DESCENT: &[(f32, usize)] = &[(0.01, 10), (0.005, 20)];
+
+/// The most pairs a storm will breed. Pairing is deterministic -- same-rank
+/// pairs in generation order -- so which chimeras exist is re-derivable from
+/// this file and the storm's inputs, like everything else the loop does.
+const CHIMERA_CAP: usize = 6;
+
+pub struct StormReport {
+    pub trained: usize,
+    pub descendants: usize,
+    pub chimeras: usize,
+    pub cells_lit: usize,
+    pub best_fitness: f32,
+    pub cert: Certificate,
+}
+
+/// One prepare, many minds: train the generation, breed the chimeras, offer
+/// everything to the archive, and put the best before the four judges.
+pub fn storm(
+    e: &mut super::Engine,
+    b: &Budget,
+) -> Result<StormReport, super::train::RunError> {
+    let t = super::train::prepare(e, b)?;
+    TRIALS.fetch_add(1, Ordering::Relaxed);
+    crate::kprintln!(
+        "  prepared: {} examples, {} decisions, {} rows ({} ms + {} ms) -- one prepare, many minds",
+        t.examples,
+        t.decisions(),
+        t.live_rows(),
+        t.chains_ms,
+        t.features_ms
+    );
+    let parent = ensure_head(e);
+    let incumbent = e.model.adapters.as_ref().and_then(|a| t.gather(a));
+
+    // Each candidate travels with the budget that describes its provenance --
+    // the lr and epochs a later reader needs to re-derive it, and the rank and
+    // alpha `adjudicate` will judge it under if it wins.
+    let mut gen: Vec<(Fit, Budget)> = Vec::new();
+
+    for &(lr, rank, alpha, epochs) in STORM {
+        let p = Proposal { lr, rank, alpha, epochs, rule: 0, kind: ProposalKind::Adapter };
+        // A storm point is a point tried: the nightly frontier must not spend
+        // a night re-deriving what a storm already measured.
+        p.mark();
+        let tb = p.budget(b.examples, b.millis);
+        let fit = t.train(&tb);
+        gen.push((fit, tb));
+    }
+    let trained = gen.len();
+
+    let mut descendants = 0usize;
+    if let Some(inc) = incumbent.as_ref() {
+        let mask = alloc::vec![true; crate::sysbox::APPLETS.len()];
+        for &(lr, epochs) in DESCENT {
+            let tb = Budget {
+                epochs,
+                millis: b.millis,
+                examples: b.examples,
+                lr,
+                rank: inc.r,
+                alpha: inc.alpha,
+            };
+            let fit = t.train_masked(&tb, Some(inc), &mask);
+            gen.push((fit, tb));
+            descendants += 1;
+        }
+    }
+
+    // Chimeras, bred deterministically: same-rank pairs in generation order,
+    // capped. A chimera's Fit records zero epochs and zero loss because it was
+    // never trained -- the same honest zeros a core or a skill carries.
+    let mut chimeras = 0usize;
+    let n_parents = gen.len();
+    'pairs: for i in 0..n_parents {
+        for j in (i + 1)..n_parents {
+            if chimeras >= CHIMERA_CAP {
+                break 'pairs;
+            }
+            if gen[i].0.dora.r != gen[j].0.dora.r {
+                continue;
+            }
+            let Some(child) = t.crossover(&gen[i].0.dora, &gen[j].0.dora) else { continue };
+            let tb = Budget {
+                epochs: 0,
+                millis: 0,
+                examples: b.examples,
+                lr: 0.0,
+                rank: child.r,
+                alpha: child.alpha,
+            };
+            let fit = Fit {
+                dora: child,
+                first_loss: 0.0,
+                last_loss: 0.0,
+                epochs: 0,
+                ms: 0,
+                stopped: false,
+            };
+            gen.push((fit, tb));
+            chimeras += 1;
+        }
+    }
+
+    // Score everything on validation, offer what earns a cell to the archive,
+    // and remember the best. Only cell-winners and the judged winner get an
+    // address in the DAG: storing every member of a generation would be chaff,
+    // and the archive must never name a hash with nothing behind it.
+    let mut cells_lit = 0usize;
+    let mut best = 0usize;
+    let mut best_fitness = f32::NEG_INFINITY;
+    for (i, (fit, tb)) in gen.iter().enumerate() {
+        // A candidate with non-finite factors is offered nowhere. The judges
+        // would catch it at J3; the archive has no judges, so the gate is here.
+        if !sanity(&t, &fit.dora).0 {
+            continue;
+        }
+        let fitness = t.score(Some(&fit.dora), Slice::Validation);
+        let (broke, fixed, _, _) =
+            t.paired(incumbent.as_ref(), Some(&fit.dora), Slice::Validation);
+        if fitness > best_fitness {
+            best_fitness = fitness;
+            best = i;
+        }
+        if archive_peek(fit.dora.r, fixed, broke, fitness) {
+            let adapters = t.scatter(&fit.dora, &e.model.cfg, tb.alpha);
+            let blob = adapters.to_blob();
+            let ablob = sha256::hash(&blob);
+            let v = weight_variant(parent, ablob, tb.lr, fit.dora.r, fit.epochs as u32);
+            sysbox::write_blob(&blob_path(&ablob), blob);
+            let vh = v.store();
+            if archive_insert(&vh, fit.dora.r, fixed, broke, fitness) {
+                cells_lit += 1;
+            }
+        }
+    }
+
+    // The best of the storm faces the tribunal, through the same door a lone
+    // candidate uses. If every candidate failed the sanity screen, `best` is
+    // still the first one and J3 will say so on the record, which beats a
+    // storm that can fail silently.
+    let (win_fit, win_tb) = &gen[best];
+    let cert = adjudicate(e, &t, win_tb, parent, incumbent.as_ref(), win_fit);
+    Ok(StormReport { trained, descendants, chimeras, cells_lit, best_fitness, cert })
 }
 
 /// Put back the adapters a trial was handed, whatever it did to them.
@@ -4389,6 +4612,61 @@ pub fn selftest() -> bool {
         "equally uncertain axes resolve by slot, so the order is re-derivable",
         to[0] == 2 && to[1] == 3 && to[4] == 0 && to[5] == 1,
     );
+
+    // --- The storm and its chimeras --------------------------------------
+    //
+    // The blend is the arithmetic a chimera IS, so it is pinned exactly; and a
+    // pair that does not share a shape must refuse to breed, because a blend
+    // across shapes would index rows that are not there and the fault would
+    // land in ring 0 with no guard page under it.
+    {
+        use super::adapter::Dora;
+        let mut x = Dora::new(2, 8.0, 4, 3);
+        let mut y = Dora::new(2, 8.0, 4, 3);
+        for (i, v) in x.a.iter_mut().enumerate() {
+            *v = i as f32;
+        }
+        for v in y.a.iter_mut() {
+            *v = 2.0;
+        }
+        x.b[0] = 4.0;
+        y.b[0] = 6.0;
+        x.m[1] = 1.0;
+        y.m[1] = 3.0;
+        let c = Dora::blend(&x, &y);
+        claim(
+            "a chimera is the elementwise mean of its parents",
+            c.as_ref().map_or(false, |c| {
+                c.a[3] == 2.5 && c.b[0] == 5.0 && c.m[1] == 2.0 && c.r == 2
+            }),
+        );
+        let z = Dora::new(3, 8.0, 4, 3);
+        claim("a shape mismatch refuses to breed", Dora::blend(&x, &z).is_none());
+    }
+    // The declared generation spans every rank bin -- a storm that trained one
+    // capacity three ways would light one column and call it illumination --
+    // and its points are distinct proposals, so marking them cannot collapse
+    // two nights' work into one marker.
+    {
+        let mut bins = [false; RANK_BINS];
+        let mut hashes: Vec<[u8; 32]> = Vec::new();
+        for &(lr, rank, alpha, epochs) in STORM {
+            bins[descriptor(rank, 0, 0).0] = true;
+            hashes.push(
+                Proposal { lr, rank, alpha, epochs, rule: 0, kind: ProposalKind::Adapter }.hash(),
+            );
+        }
+        claim("the storm spans every rank bin", bins.iter().all(|b| *b));
+        let mut distinct = true;
+        for i in 0..hashes.len() {
+            for j in (i + 1)..hashes.len() {
+                if hashes[i] == hashes[j] {
+                    distinct = false;
+                }
+            }
+        }
+        claim("every storm point is its own proposal", distinct);
+    }
 
     // Store and read back, then take the scratch node out of the real DAG --
     // a self-test that left synthetic ancestors in the lineage would be
