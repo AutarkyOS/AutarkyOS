@@ -467,6 +467,24 @@ pub extern "efiapi" fn efi_main(image: Handle, st: *mut SystemTable) -> Status {
         sysbox::restore_latest();
     }
 
+    // The operator's decision about crediting the on-chip generator, restored
+    // once the namespace that holds it exists.
+    //
+    // Outside the `restore` arm on purpose. A machine that skipped restoring --
+    // because the recovery console said the last snapshot is what broke it --
+    // has a fresh namespace with no such file, so this reads `None` and the
+    // flag stays false. That is the right answer rather than an accident: until
+    // this line runs the flag is false, so a machine that cannot mount its own
+    // store comes up *untrusting*, which is the safe direction to fail and the
+    // one that matches what the pool actually knows.
+    if let Some(b) = sysbox::read_blob(rng::TRUST_PATH) {
+        if b.first() == Some(&b'1') {
+            rng::trust_hardware(true);
+            let n = rng::seed_from_hardware();
+            serial_println!("autark: rdrand credited by stored operator decision, {} draw(s)", n);
+        }
+    }
+
     // After storage, so a future version can pull weights out of the store
     // rather than off the ESP.
     gfx::splash::stage("loading the model");

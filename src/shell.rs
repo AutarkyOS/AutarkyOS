@@ -3933,11 +3933,14 @@ fn execute(line: &str, boot: &BootInfo, acpi: &Option<Acpi>, interp: &mut aiksi:
                     // by somebody typing, and an operator deciding whether to
                     // trust a key wants to know which happened.
                     let dev = crate::rng::device_deposits();
+                    let (cpu, net) = crate::rng::source_deposits();
+                    let input = deposits
+                        .saturating_sub(dev)
+                        .saturating_sub(cpu)
+                        .saturating_sub(net);
                     kprintln!(
-                        "  {} deposit(s): {} from input, {} from storage",
-                        deposits,
-                        deposits.saturating_sub(dev),
-                        dev
+                        "  {} deposit(s): {} from input, {} from storage, {} from the network, {} from the cpu",
+                        deposits, input, dev, net, cpu
                     );
                     kprintln!("  {} of {} bits credited", bits, crate::rng::SEEDED_BITS);
                     if seeded {
@@ -3945,10 +3948,59 @@ fn execute(line: &str, boot: &BootInfo, acpi: &Option<Acpi>, interp: &mut aiksi:
                         kprintln!("  seeded -- key material will be answered");
                     } else {
                         console::set_color(YELLOW);
-                        kprintln!("  not seeded -- key material is refused, type at it");
+                        // The old line said "type at it", which is the advice
+                        // for a machine with somebody in front of it and is
+                        // useless to the one that actually has this problem.
+                        kprintln!("  not seeded -- key material is refused");
                     }
                     console::set_color(LTGRAY);
+                    let (have_hw, trusted) = crate::rng::hardware();
+                    match (have_hw, trusted) {
+                        (false, _) => kprintln!("  no rdrand on this part"),
+                        (true, false) => {
+                            kprintln!("  rdrand present, mixed into every reseed, credited nothing");
+                            kprintln!("  'rng trust hw' credits it -- read what that costs first");
+                        }
+                        (true, true) => {
+                            console::set_color(YELLOW);
+                            kprintln!("  rdrand is CREDITED by operator decision");
+                            console::set_color(LTGRAY);
+                            kprintln!("  the seeded claim rests on an instruction nobody outside the vendor has seen");
+                        }
+                    }
+                    if !seeded && !trusted {
+                        // What would actually change the answer, for the
+                        // machine that has this problem: one that runs with
+                        // nobody in front of it.
+                        kprintln!("  unattended: a network round trip or disk traffic will seed it in time");
+                    }
                     kprintln!("  one bit credited per event, which is an assumption and not a measurement");
+                }
+                // Shell-only, and absent from `sysbox::APPLETS`, so no grammar
+                // can spell it and the model cannot credit its own entropy --
+                // the same reason `app trust` and `work trust` live here.
+                Some("trust") => {
+                    let what = rest.trim().split_whitespace().nth(1).unwrap_or("");
+                    let (have_hw, _) = crate::rng::hardware();
+                    match what {
+                        "hw" | "rdrand" if have_hw => {
+                            crate::rng::trust_hardware(true);
+                            let n = crate::rng::seed_from_hardware();
+                            let _ = crate::sysbox::write_text(crate::rng::TRUST_PATH, "1\n");
+                            console::set_color(YELLOW);
+                            kprintln!("  rdrand is now credited. {} draw(s) taken.", n);
+                            console::set_color(LTGRAY);
+                            kprintln!("  the pool's seeded claim now rests on it. 'rng untrust hw' takes it back,");
+                            kprintln!("  though bits already credited cannot be uncredited.");
+                        }
+                        "hw" | "rdrand" => kprintln!("  no rdrand on this part -- nothing to trust"),
+                        _ => kprintln!("  usage: rng trust hw"),
+                    }
+                }
+                Some("untrust") => {
+                    crate::rng::trust_hardware(false);
+                    let _ = crate::sysbox::write_text(crate::rng::TRUST_PATH, "0\n");
+                    kprintln!("  rdrand is mixed but no longer credited");
                 }
                 Some(w) => {
                     let n: usize = w.parse().unwrap_or(16).min(64);

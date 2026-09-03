@@ -289,7 +289,19 @@ impl Tcb {
     }
 
     /// Fold a fresh round-trip sample into the estimator (RFC 6298 §2).
+    ///
+    /// It goes to the entropy pool as well, and it goes from *here* rather than
+    /// from the two call sites so that neither can be the one that forgets.
+    ///
+    /// A microsecond sample carries less jitter than the cycle-resolution
+    /// latency NVMe deposits, and both are credited the same single bit --
+    /// which is the pessimism this module already applies everywhere and the
+    /// reason the accounting can stand without a measurement behind it. What
+    /// this source has that the others do not is that it arrives on a machine
+    /// nobody is sitting at, every time it opens a connection.
     fn observe_rtt(&mut self, sample_us: u64) {
+        crate::rng::add_net_entropy(sample_us);
+
         if self.srtt == 0 {
             self.srtt = sample_us;
             self.rttvar = sample_us / 2;
