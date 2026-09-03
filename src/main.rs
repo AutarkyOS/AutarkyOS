@@ -835,7 +835,7 @@ fn init_smp(acpi: &Option<acpi::Acpi>) {
             console::set_color(LTRED);
         }
         kprintln!(
-            "  {}  a split matvec and its adjoint equal whole ones, bit for bit",
+            "  {}  split matvec, adjoint and prefill batch equal whole ones, bit for bit",
             if ok { "ok " } else { "FAIL" }
         );
         console::set_color(LTGRAY_IDX);

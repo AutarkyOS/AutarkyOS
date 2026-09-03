@@ -78,6 +78,61 @@ unsafe fn matvec_rows(ctx: usize, lo: usize, hi: usize) {
     }
 }
 
+/// The batch (prefill) equivalent of `RowJob`.
+///
+/// Prefill is weight-stationary: a row of weights is read once and multiplied
+/// against every token's activations in the same pass. That is what makes the
+/// batch kernel worth having, and it is preserved under the split -- a core
+/// handed rows `[lo, hi)` reads *its* slice of the weights once, for all
+/// tokens, and no weight byte is read by two cores. So the split distributes
+/// the compute without multiplying the memory traffic, which is the trap
+/// CLAUDE.md warns a *per-token* split would fall into. Row-parallel avoids it
+/// because output row `r` for every token depends only on weight row `r`.
+///
+/// `total_rows` is the output stride the workers must all agree on: the layout
+/// is `out[t*total_rows + r]` for the whole matrix, so a worker owning a row
+/// slice still writes at the full stride.
+#[derive(Clone, Copy)]
+struct BatchJob {
+    data: *const i8,
+    scales: *const u8,
+    xs: *const f32,
+    out: *mut f32,
+    cols: usize,
+    tc: usize,
+    total_rows: usize,
+    avx: bool,
+}
+
+/// Output rows `[lo, hi)` of a batch job, for every token.
+///
+/// # Safety
+/// `ctx` must point at a live `BatchJob`; `parallel_split` guarantees it
+/// outlives every call and that no two cores share a row range.
+unsafe fn matvec_batch_rows(ctx: usize, lo: usize, hi: usize) {
+    let job = unsafe { *(ctx as *const BatchJob) };
+    let n = hi - lo;
+    // The whole output is addressed, because a worker writes scattered slots
+    // `out[t*total_rows + r]` across the token dimension. `parallel_split`
+    // keeps the row ranges disjoint, so no two workers touch the same slot.
+    let out = unsafe {
+        core::slice::from_raw_parts_mut(job.out, job.tc * job.total_rows)
+    };
+    let xs = unsafe { core::slice::from_raw_parts(job.xs, job.tc * job.cols) };
+    // Offset the weights and scales to this worker's first row, exactly as
+    // `matvec_rows` does -- the same "scales are four bytes, not `cols`"
+    // arithmetic, and the same way to get it silently wrong.
+    let data = unsafe { core::slice::from_raw_parts(job.data.add(lo * job.cols), n * job.cols) };
+    let scales = unsafe { core::slice::from_raw_parts(job.scales.add(lo * 4), n * 4) };
+    if job.avx {
+        unsafe {
+            q8_matvec_batch_avx2(out, xs, data, scales, n, job.cols, job.tc, job.total_rows, lo)
+        }
+    } else {
+        q8_matvec_batch_scalar(out, xs, data, scales, n, job.cols, job.tc, job.total_rows, lo);
+    }
+}
+
 #[inline]
 pub fn f32_at(bytes: &[u8], i: usize) -> f32 {
     let o = i * 4;
@@ -208,10 +263,35 @@ impl Mat<'_> {
                 let f = crate::cpu::detected();
                 // Same gate as `matvec`: AVX2 is not optional (see above), and
                 // `avx_enabled` means the OS actually enabled the state.
-                if f.avx_enabled && f.avx2 && f.fma {
-                    unsafe { q8_matvec_batch_avx2(out, xs, data, scales, *rows, *cols, tc) }
+                let avx = f.avx_enabled && f.avx2 && f.fma;
+                // Prefill was the one heavy path left on a single core, which is
+                // why the first token of a conversation cost the whole system
+                // turn at one core's pace. It splits like `matvec` does, by
+                // output row, and the same threshold decides whether the
+                // handshake is worth it -- here the per-row work is `cols * tc`,
+                // since each row is dotted against every token.
+                let job = BatchJob {
+                    data: data.as_ptr(),
+                    scales: scales.as_ptr(),
+                    xs: xs.as_ptr(),
+                    out: out.as_mut_ptr(),
+                    cols: *cols,
+                    tc,
+                    total_rows: *rows,
+                    avx,
+                };
+                if crate::smp::parallel_split(
+                    &job as *const BatchJob as usize,
+                    matvec_batch_rows,
+                    *rows,
+                    cols.saturating_mul(tc),
+                ) {
+                    return;
+                }
+                if avx {
+                    unsafe { q8_matvec_batch_avx2(out, xs, data, scales, *rows, *cols, tc, *rows, 0) }
                 } else {
-                    q8_matvec_batch_scalar(out, xs, data, scales, *rows, *cols, tc)
+                    q8_matvec_batch_scalar(out, xs, data, scales, *rows, *cols, tc, *rows, 0)
                 }
             }
         }
@@ -307,6 +387,8 @@ pub fn q8_matvec_batch_scalar(
     rows: usize,
     cols: usize,
     tc: usize,
+    out_stride: usize,
+    row_base: usize,
 ) {
     for r in 0..rows {
         let row = &data[r * cols..(r + 1) * cols];
@@ -317,7 +399,7 @@ pub fn q8_matvec_batch_scalar(
             for j in 0..cols {
                 acc += row[j] as f32 * x[j];
             }
-            out[t * rows + r] = acc * scale;
+            out[t * out_stride + row_base + r] = acc * scale;
         }
     }
 }
@@ -332,6 +414,12 @@ pub fn q8_matvec_batch_scalar(
 ///
 /// # Safety
 /// Requires AVX2 and FMA. Callers check `cpu::detected()`.
+/// `out_stride` and `row_base` exist for the row-split: a core handed rows
+/// `[lo, hi)` is given `data`/`scales` already offset to `lo`, so it counts its
+/// own rows from zero, but the output layout is `out[t*total_rows + r]` for the
+/// *whole* matrix -- so it must write at `t*out_stride + row_base + r`. The
+/// single-core caller passes `out_stride = rows, row_base = 0` and the
+/// arithmetic collapses to what it was.
 #[target_feature(enable = "avx2,fma")]
 pub unsafe fn q8_matvec_batch_avx2(
     out: &mut [f32],
@@ -341,6 +429,8 @@ pub unsafe fn q8_matvec_batch_avx2(
     rows: usize,
     cols: usize,
     tc: usize,
+    out_stride: usize,
+    row_base: usize,
 ) {
     use core::arch::x86_64::*;
 
@@ -375,7 +465,7 @@ pub unsafe fn q8_matvec_batch_avx2(
                 total += row[j] as f32 * x[j];
             }
 
-            out[t * rows + r] = total * scale;
+            out[t * out_stride + row_base + r] = total * scale;
         }
     }
 }

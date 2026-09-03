@@ -689,9 +689,64 @@ pub fn selftest() -> bool {
         }
     }
 
-    // And both have to have actually computed something, or this passes by
-    // testing the serial path twice.
-    many.iter().any(|v| *v != 0.0) && wt_many.iter().any(|v| *v != 0.0)
+    // The prefill split, which is the one this fork added and the one most
+    // likely to be wrong: it distributes *output rows* while the output layout
+    // interleaves tokens, `out[t*total_rows + r]`, so a worker writes scattered
+    // slots and the stride it uses must be the whole matrix's, not its slice's.
+    // A worker that used its local row count as the stride would still write
+    // plausible numbers into the wrong slots -- exactly the silent-index class
+    // this whole selftest exists for. Four tokens clears the threshold and is
+    // enough for the interleave to be non-trivial.
+    let tc = 4usize;
+    let xs: Vec<f32> = (0..tc * cols)
+        .map(|i| (i % 29) as f32 * 0.0234375 - 0.34)
+        .collect();
+    let saved = ONLINE.swap(0, Ordering::SeqCst);
+    let mut b_one = vec![0.0f32; tc * rows];
+    m.matvec_batch(&mut b_one, &xs, tc);
+    ONLINE.store(saved, Ordering::SeqCst);
+
+    let mut b_many = vec![0.0f32; tc * rows];
+    for round in 0..64 {
+        for v in b_many.iter_mut() {
+            *v = f32::NAN;
+        }
+        m.matvec_batch(&mut b_many, &xs, tc);
+        if b_one != b_many {
+            let bad = b_one.iter().zip(b_many.iter()).position(|(a, b)| a != b).unwrap_or(0);
+            crate::kprintln!(
+                "  batch round {} slot {} (token {} row {}) -- one core {}, {} cores {}",
+                round,
+                bad,
+                bad / rows,
+                bad % rows,
+                b_one[bad],
+                saved + 1,
+                b_many[bad]
+            );
+            return false;
+        }
+    }
+
+    // And the prefill split must agree with the *decode* path it is an
+    // optimisation of: one token's batch column is that token's matvec. If it
+    // does not, the model prefills a prompt through different arithmetic than
+    // it decodes the answer with -- the exact drift `prefill and forward must
+    // agree about adapters` records, arriving by a different route.
+    let mut dec = vec![0.0f32; rows];
+    m.matvec(&mut dec, &xs[..cols]);
+    for r in 0..rows {
+        if dec[r] != b_one[r] {
+            crate::kprintln!("  batch/decode disagree at row {}: {} vs {}", r, dec[r], b_one[r]);
+            return false;
+        }
+    }
+
+    // And all of them have to have actually computed something, or this passes
+    // by testing the serial path twice.
+    many.iter().any(|v| *v != 0.0)
+        && wt_many.iter().any(|v| *v != 0.0)
+        && b_many.iter().any(|v| *v != 0.0)
 }
 
 /// Time the same matvec on one core and on all of them.
