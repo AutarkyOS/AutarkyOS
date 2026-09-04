@@ -3894,6 +3894,48 @@ fn restore(e: &mut super::Engine, saved: &Option<Vec<u8>>) {
     }
 }
 
+/// What criterion a rollback should put back, or `None` to leave it alone.
+///
+/// Pure, so both of `rollback`'s arms are asserted at boot without a store,
+/// the way `update::decide` is -- and shared, because they had already
+/// disagreed. The `parent: None` arm returned early and never reached the
+/// restore below it, so rolling a first-ever judge adoption back to the frozen
+/// model detached the adapter, cleared the head, printed "back to the frozen
+/// model", and left the loosened criterion in force. That is precisely the
+/// failure the restore's own comment warns about, arriving through the one
+/// path that skipped the restore: the pointer saying one thing and the
+/// criterion doing another.
+///
+/// The frozen model's criterion is the pair of defaults, which is sound
+/// because a root node can only be the first adoption -- every later trial
+/// gets the standing head as its parent from `ensure_head` -- so what ran
+/// before it is what a machine that has never moved its criterion runs.
+///
+/// `None` when the two agree, on the same argument the rule restore makes:
+/// unconditional restoration would push the defaults onto a lineage of nodes
+/// that never recorded moving anything.
+pub fn criterion_back(
+    v: (f32, usize),
+    parent: (f32, usize),
+) -> Option<(f32, usize)> {
+    if (v.0 - parent.0).abs() >= 0.005 || v.1 != parent.1 {
+        Some(parent)
+    } else {
+        None
+    }
+}
+
+/// Put a criterion back, both halves, in the order `trial_judge` writes them.
+fn restore_criterion(c: (f32, usize)) -> Result<(), &'static str> {
+    if !save_floor(c.1) {
+        return Err("the floor will not save");
+    }
+    if !save_judge(c.0) {
+        return Err("the bar will not save");
+    }
+    Ok(())
+}
+
 pub fn rollback(e: &mut super::Engine) -> Result<Option<[u8; 32]>, &'static str> {
     let Some(h) = head() else { return Err("no head to roll back from") };
     let Some(v) = Variant::load(&h) else { return Err("head names a node that is not stored") };
@@ -3910,6 +3952,13 @@ pub fn rollback(e: &mut super::Engine) -> Result<Option<[u8; 32]>, &'static str>
         // rollback could not reach it either.
         if v.core.is_some() && !drop_core() {
             return Err("the adopted core will not detach");
+        }
+        // And the criterion belongs to that detachment for exactly the reason
+        // the core does. A first-ever judge adoption writes a root node, so
+        // this is the *only* arm a criterion change can be rolled back
+        // through, and it was the one arm that did not restore one.
+        if let Some(c) = criterion_back((v.threshold, v.floor), (MCNEMAR_95, MIN_FIXED)) {
+            restore_criterion(c)?;
         }
         let _ = e.model.detach_adapters();
         sysbox::detach(HEAD);
@@ -3986,18 +4035,7 @@ pub fn rollback(e: &mut super::Engine) -> Result<Option<[u8; 32]>, &'static str>
     // lineage said it had been undone -- the pointer claiming one thing and the
     // criterion doing another, which is exactly the drift the whole axis exists
     // to keep on the record.
-    let threshold_back = if (v.threshold - pv.threshold).abs() >= 0.005 {
-        Some(pv.threshold)
-    } else {
-        None
-    };
-    // The floor, on identical terms and for the identical reason. Both halves
-    // default to their constant and render nothing at it, so two pre-U3 nodes
-    // compare equal and nothing is put back; only a node adopted under a moved
-    // floor differs from its parent. Restoring unconditionally would push the
-    // constant onto a lineage of legacy nodes that never recorded one, which is
-    // the mistake `rule` records having made.
-    let floor_back = if v.floor != pv.floor { Some(pv.floor) } else { None };
+    let criterion = criterion_back((v.threshold, v.floor), (pv.threshold, pv.floor));
 
     // --- change things -------------------------------------------------
 
@@ -4018,15 +4056,8 @@ pub fn rollback(e: &mut super::Engine) -> Result<Option<[u8; 32]>, &'static str>
             return Err("the adapter was restored but the routing rule will not save");
         }
     }
-    if let Some(tau) = threshold_back {
-        if !save_judge(tau) {
-            return Err("the adapter was restored but the bar will not save");
-        }
-    }
-    if let Some(f) = floor_back {
-        if !save_floor(f) {
-            return Err("the adapter was restored but the floor will not save");
-        }
+    if let Some(c) = criterion {
+        restore_criterion(c).map_err(|_| "the adapter was restored but the criterion will not save")?;
     }
     match want {
         Core::Leave => {}
@@ -4837,6 +4868,31 @@ pub fn selftest() -> bool {
     // J1 is one implementation now. This is the claim that it stayed one: the
     // parameterised form at the in-force criterion must equal the form every
     // trial actually calls, or the two have drifted again.
+    // Rollback of a criterion change, both arms, as a pure decision.
+    //
+    // The claim that earns its place is the root one. It was measured failing:
+    // a first-ever judge adoption moved bar 3.84 -> 0.50 and floor 4 -> 2, and
+    // `godel rollback` printed "back to the frozen model", cleared the head,
+    // and left both halves moved. A rollback that reports success and undoes
+    // half the change is worse than one that refuses, because the operator
+    // stops looking.
+    claim(
+        "rolling a root judge adoption back restores both halves of the criterion",
+        criterion_back((0.5, 2), (MCNEMAR_95, MIN_FIXED)) == Some((MCNEMAR_95, MIN_FIXED)),
+    );
+    claim(
+        "a rollback between nodes that agree writes no criterion",
+        criterion_back((MCNEMAR_95, MIN_FIXED), (MCNEMAR_95, MIN_FIXED)).is_none(),
+    );
+    claim(
+        "either half differing is enough to restore",
+        criterion_back((MCNEMAR_95, 2), (MCNEMAR_95, MIN_FIXED)).is_some()
+            && criterion_back((0.5, MIN_FIXED), (MCNEMAR_95, MIN_FIXED)).is_some(),
+    );
+    claim(
+        "a bar difference under the rendering precision is not a difference",
+        criterion_back((MCNEMAR_95 + 0.001, MIN_FIXED), (MCNEMAR_95, MIN_FIXED)).is_none(),
+    );
     claim(
         "the parameterised J1 and the in-force J1 agree",
         j1_verdict(24, 6, 0, mcnemar(0, 6)).0
