@@ -667,6 +667,18 @@ pub fn connect(dst: Ipv4, host: &str, port: u16) -> Result<Session, Error> {
             crate::rng::SEEDED_BITS
         );
         crate::kprintln!("  handshake are timing-derived, not random.");
+        // What would change the answer, said where somebody is already
+        // looking. The warning has always been accurate and has never been
+        // actionable: an operator reading it learns that this handshake is
+        // weak and not what to do about it, and on the machine most likely to
+        // see it there is nobody at the keyboard to type at it anyway.
+        let (have_hw, trusted) = crate::rng::hardware();
+        if have_hw && !trusted {
+            crate::kprintln!("  the pool fills from disk and network traffic; 'rng' shows it,");
+            crate::kprintln!("  and 'rng trust hw' credits this part's rdrand if you accept that.");
+        } else {
+            crate::kprintln!("  the pool fills from disk and network traffic; 'rng' shows it.");
+        }
     }
     let pubkey = x25519::public_key(&secret);
 
@@ -979,7 +991,7 @@ pub fn https_fetch_with(
     req.push_str(if path.is_empty() { "/" } else { path });
     req.push_str(" HTTP/1.1\r\nHost: ");
     req.push_str(host);
-    req.push_str("\r\nUser-Agent: glados/0.1\r\nConnection: close\r\nAccept: */*\r\n");
+    req.push_str("\r\nUser-Agent: autark/0.1\r\nConnection: close\r\nAccept: */*\r\n");
     for (name, value) in extra {
         req.push_str(name);
         req.push_str(": ");

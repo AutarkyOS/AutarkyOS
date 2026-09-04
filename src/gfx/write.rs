@@ -254,7 +254,7 @@ impl DeskApp for Writer {
             // has the keyboard.
             if focused && !self.editing_path && i == crow {
                 let cx = text_area.x + ccol as u32 * theme::text_w(1);
-                fb.rect(cx, y, 2, lh, theme::APERTURE_DEEP);
+                fb.rect(cx, y, 2, lh, theme::SIGNAL_DEEP);
             }
         }
 

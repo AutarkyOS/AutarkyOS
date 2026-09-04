@@ -36,7 +36,7 @@
 //!
 //! The ancestry is deliberate: 98's furniture (icons, Start, a bar of window
 //! buttons, gradient titles), 3.1's construction (bevels, the grey face,
-//! dialogs that hug their content), Aperture's colours over both.
+//! dialogs that hug their content), AUTARK's colours over both.
 
 use super::browse::Browser;
 use super::theme::{self, Rect};
@@ -92,6 +92,7 @@ pub const ICO_WRITE: usize = 6;
 pub const ICO_MINES: usize = 7;
 pub const ICO_SET: usize = 8;
 pub const ICO_ORACLE: usize = 9;
+pub const ICO_CONVO: usize = 10;
 
 /// The icon for a named panel -- the names `win open` and the Browse routes
 /// use. Anything unrecognised gets the mark, because everything here is
@@ -256,8 +257,9 @@ const TASK_GAP: u32 = 4;
 /// `term` is not a shell command: the terminal is not a panel to open but a
 /// window to bring back, and the special case lives in `launch` rather than in
 /// the shell so the icon works even while the shell is busy printing.
-const ICONS: [(&str, &str); 10] = [
+const ICONS: [(&str, &str); 11] = [
     ("Terminal", "term"),
+    ("Talk", "talk"),
     ("Programs", "win open programs"),
     ("Files", "win open files"),
     ("ToDo", "todo"),
@@ -272,7 +274,7 @@ const ICONS: [(&str, &str); 10] = [
 /// The Start menu, bottom of the bar upward -- the 98 half of the ancestry.
 /// Same entries as the icons plus the one thing that belongs behind a second
 /// look, exactly where 98 kept it.
-const START_ITEMS: [(&str, &str); 12] = [
+const START_ITEMS: [(&str, &str); 13] = [
     // "Search..." used to lead this list, opening a panel with one text field
     // in it. The query row at the foot of this menu does the same job in the
     // place a person already is, and dispatches through the same `open`, so
@@ -280,6 +282,7 @@ const START_ITEMS: [(&str, &str); 12] = [
     // there -- `win open search`, and `open` still raises it to offer to write
     // something that does not exist.
     ("Terminal", "term"),
+    ("Talk", "talk"),
     ("Programs", "win open programs"),
     ("Files", "win open files"),
     ("ToDo", "todo"),
@@ -485,7 +488,7 @@ fn pictogram(fb: &Framebuffer, k: usize, x: u32, y: u32, s: u32, bg: Color) {
             fb.rect(x + c(2), y + c(4), c(36), c(26), face);
             fb.frame(x + c(2), y + c(4), c(36), c(26), dark);
             fb.rect(x + c(5), y + c(7), c(30), c(20), theme::SCREEN);
-            fb.rect(x + c(8), y + c(10), c(8), m(2), theme::APERTURE);
+            fb.rect(x + c(8), y + c(10), c(8), m(2), theme::SIGNAL);
             fb.rect(x + c(8), y + c(15), c(14), m(2), Color::new(0xC8, 0xC8, 0xC8));
             fb.rect(x + c(14), y + c(30), c(12), m(4), face);
             fb.rect(x + c(10), y + c(34), c(20), m(3), face);
@@ -493,21 +496,21 @@ fn pictogram(fb: &Framebuffer, k: usize, x: u32, y: u32, s: u32, bg: Color) {
         }
         // Programs: the mark itself. This is the Aperture program manager.
         ICO_PROGRAMS => {
-            super::splash::aperture(
+            super::splash::mark(
                 fb,
                 (x + c(20)) as i32,
                 (y + c(20)) as i32,
                 c(18) as i32,
-                theme::APERTURE,
+                theme::SIGNAL,
                 bg,
             );
         }
         // Files: a folder.
         ICO_FILES => {
-            fb.rect(x + c(4), y + c(10), c(14), c(6), theme::APERTURE_DEEP);
-            fb.rect(x + c(4), y + c(14), c(32), c(20), theme::APERTURE_DEEP);
+            fb.rect(x + c(4), y + c(10), c(14), c(6), theme::SIGNAL_DEEP);
+            fb.rect(x + c(4), y + c(14), c(32), c(20), theme::SIGNAL_DEEP);
             fb.frame(x + c(4), y + c(14), c(32), c(20), dark);
-            fb.rect(x + c(5), y + c(15), c(30), m(3), theme::APERTURE);
+            fb.rect(x + c(5), y + c(15), c(30), m(3), theme::SIGNAL);
         }
         // ToDo: a card with ticked lines.
         ICO_TODO => {
@@ -517,7 +520,7 @@ fn pictogram(fb: &Framebuffer, k: usize, x: u32, y: u32, s: u32, bg: Color) {
                 let ly = y + c(8 + i as u32 * 10);
                 fb.frame(x + c(10), ly, m(6), m(6), dark);
                 if *done {
-                    fb.rect(x + c(12), ly + m(2), m(3), m(3), theme::APERTURE_DEEP);
+                    fb.rect(x + c(12), ly + m(2), m(3), m(3), theme::SIGNAL_DEEP);
                 }
                 fb.rect(x + c(20), ly + m(2), c(10), m(2), theme::SHADOW);
             }
@@ -540,7 +543,7 @@ fn pictogram(fb: &Framebuffer, k: usize, x: u32, y: u32, s: u32, bg: Color) {
             fb.rect(x + c(4), y + c(8), c(32), c(26), Color::new(0xB0, 0x86, 0x50));
             fb.frame(x + c(4), y + c(8), c(32), c(26), dark);
             for (i, col) in [
-                theme::APERTURE,
+                theme::SIGNAL,
                 Color::new(0x30, 0x70, 0xC0),
                 Color::new(0x30, 0xA0, 0x40),
                 Color::new(0xC0, 0x30, 0x30),
@@ -556,7 +559,7 @@ fn pictogram(fb: &Framebuffer, k: usize, x: u32, y: u32, s: u32, bg: Color) {
                 fb.frame(ix, iy, m(9), m(7), dark);
             }
             fb.rect(x + c(26), y + c(2), m(3), c(14), dark);
-            fb.rect(x + c(25), y + c(1), m(5), m(4), theme::APERTURE_DEEP);
+            fb.rect(x + c(25), y + c(1), m(5), m(4), theme::SIGNAL_DEEP);
         }
         // Write: a page with lines of text.
         ICO_WRITE => {
@@ -566,7 +569,7 @@ fn pictogram(fb: &Framebuffer, k: usize, x: u32, y: u32, s: u32, bg: Color) {
                 let w = if i == 4 { 10 } else { 16 };
                 fb.rect(x + c(12), y + c(7 + i * 6), c(w), m(2), theme::SHADOW);
             }
-            fb.rect(x + c(12), y + c(31), c(8), m(2), theme::APERTURE_DEEP);
+            fb.rect(x + c(12), y + c(31), c(8), m(2), theme::SIGNAL_DEEP);
         }
         // Mines: a grid with one uncovered mine.
         ICO_MINES => {
@@ -588,7 +591,7 @@ fn pictogram(fb: &Framebuffer, k: usize, x: u32, y: u32, s: u32, bg: Color) {
                 let ly = y + c(8 + i as u32 * 4);
                 fb.rect(x + c(20) - c(*w) / 2, ly, c(*w), m(4), hi);
             }
-            fb.rect(x + c(14), y + c(14), c(12), c(12), theme::APERTURE);
+            fb.rect(x + c(14), y + c(14), c(12), c(12), theme::SIGNAL);
             fb.frame(x + c(14), y + c(14), c(12), c(12), dark);
             fb.rect(x + c(18), y + c(18), m(4), m(4), dark);
         }
@@ -643,7 +646,7 @@ pub fn init() {
         .saturating_sub(term_x + pm_w + MARGIN);
 
     let terminal = Window {
-        title: String::from("GLaDOS Terminal"),
+        title: String::from("AUTARK Terminal"),
         icon: ICO_TERM,
         rect: Rect::new(term_x, screen.y, term_w, screen.h),
         state: WinState::Normal,
@@ -1101,6 +1104,42 @@ pub fn open_agentlog() {
     // fact, by which point the window has usually been moved.
     clear_of_terminal();
     focus_terminal();
+}
+
+/// Open the conversation, and leave it holding the keyboard.
+///
+/// The only opener here that does *not* call `focus_terminal()`, and the only
+/// one that must not: a window you type into which hands the keyboard away is
+/// a window that cannot be used for the thing it exists for. That is safe now
+/// only because `shell.rs` routes serial past the desktop entirely, so a driven
+/// session is unaffected by what has focus -- see `convwin`'s header.
+///
+/// Idempotent, like `open_authoring`: a second `talk` raises the window that is
+/// already there rather than stacking another conversation on top of the one
+/// holding the transcript.
+pub fn open_conversation() {
+    if has_window("Talk") {
+        with(|d| {
+            if let Some(i) = d.windows.iter().position(|w| w.title == "Talk") {
+                d.raise(i);
+                // Un-minimise, unlike `focus_terminal`, which deliberately
+                // does not: raising the terminal is a reflex and should not
+                // undo somebody's decision to put it away, where `talk` is an
+                // explicit request for this window.
+                if let Some(w) = d.windows.last_mut() {
+                    if w.state == WinState::Minimised {
+                        w.state = WinState::Normal;
+                    }
+                }
+            }
+        });
+        draw();
+        return;
+    }
+    let (w, h) = super::convwin::Convo::preferred();
+    open_app("Talk", ICO_CONVO, Box::new(super::convwin::Convo::new()), w, h);
+    clear_of_terminal();
+    draw();
 }
 
 /// Open Enternet, optionally at a URL.
@@ -2604,7 +2643,7 @@ fn wheel_at(x: i32, y: i32, notches: i32) {
 
 /// The wall: a flat field, a sparse grid, and the mark in the middle.
 ///
-/// The same `splash::aperture` the boot screen draws, not a second copy of the
+/// The same `splash::mark` the boot screen draws, not a second copy of the
 /// geometry -- five earlier attempts at that logo were wrong in five different
 /// ways, and the way to stop a sixth is for there to be exactly one of it.
 ///
@@ -2686,19 +2725,12 @@ fn wallpaper(fb: &Framebuffer) {
         );
     }
 
-    // Filled blades, and the gaps between them filled with the sky that would
-    // have been there. Which is to say the gaps are the sky: a cut here takes
-    // its colour from the same ramp the wall was drawn from, row by row, so
-    // there is nothing standing in for the background because it is the
-    // background.
-    super::splash::aperture_with(
-        fb,
-        cx,
-        cy,
-        r,
-        super::splash::Face::Ramp(&theme::SUN),
-        super::splash::Cut::Sky { stops: &theme::WALL, top: 0, height: h },
-    );
+    // Lit metal, and the gaps between the teeth left alone. The iris that used
+    // to sit here was a disc with wedges cut out of it, so the caller had to
+    // hand back the sky for the cuts to be filled with. A cog has no holes: the
+    // gaps are simply never painted, and the wall drawn a moment ago is still
+    // underneath them.
+    super::splash::mark_with(fb, cx, cy, r, super::splash::Face::Ramp(&theme::SUN));
 }
 
 /// A point on the unit circle, scaled by 1024, for step `i` of `n`.
@@ -2850,9 +2882,9 @@ fn taskbar(fb: &Framebuffer, d: &Desktop, sel: Option<usize>) {
         if lit { &theme::START_HOT } else { &theme::START },
         theme::START_EDGE,
     );
-    theme::aperture_dot(fb, s.x + 15, s.y + s.h / 2, (s.h / 2) as i32 - 5);
+    theme::mark_dot(fb, s.x + 15, s.y + s.h / 2, (s.h / 2) as i32 - 5);
     let ty = s.y + (s.h.saturating_sub(theme::text_h())) / 2;
-    theme::text_over(fb, s.x + 30, ty, "GLaDOS", theme::START_TEXT);
+    theme::text_over(fb, s.x + 30, ty, "AUTARK", theme::START_TEXT);
 
     for (i, (r, icon, pressed)) in task_layout(fb, d).into_iter().enumerate() {
         // Keyboard selection and pointer hover draw the same way: both are "the

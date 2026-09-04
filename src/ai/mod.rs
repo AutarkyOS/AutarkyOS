@@ -9,6 +9,7 @@ pub mod aixi;
 pub mod backward;
 pub mod constrain;
 pub mod context;
+pub mod convo;
 pub mod initiative;
 pub mod train;
 pub mod deliberate;
@@ -855,7 +856,7 @@ pub fn init(model_blob: Option<Blob>, tok_blob: Option<Blob>) {
 
     // GLADOSM2 first, then the llama2.c legacy layout. Both are identified by
     // content rather than by filename, so either can sit at model.bin.
-    let loaded = match model::Model::from_glados(mb.as_slice()) {
+    let loaded = match model::Model::from_autark(mb.as_slice()) {
         Ok(m) => Ok(m),
         Err(model::LoadError::BadHeader) => model::Model::from_bytes(mb.as_slice()),
         Err(e) => Err(e),
@@ -1264,6 +1265,15 @@ pub fn init(model_blob: Option<Blob>, tok_blob: Option<Blob>) {
 /// arbitrary byte, and a multi-byte character can straddle two tokens. So this
 /// buffers and only prints what is currently decodable, keeping any trailing
 /// partial sequence for the next call.
+/// Both sinks are fed here rather than in two places, and that is the point:
+/// the console and the conversation window are not two renderings of what the
+/// model said, they are one string written twice. Teeing at the token level
+/// instead would hand `convo` invalid UTF-8 fragments and make it solve the
+/// boundary problem a second time, differently -- which is how two views of one
+/// answer come to disagree about it.
+///
+/// `convo::feed` is a single atomic load when no conversation turn is open,
+/// which is every decode except the ones that belong to one.
 fn emit(pending: &mut Vec<u8>) {
     loop {
         if pending.is_empty() {
@@ -1272,6 +1282,7 @@ fn emit(pending: &mut Vec<u8>) {
         match core::str::from_utf8(pending) {
             Ok(s) => {
                 kprint!("{}", s);
+                convo::feed(s);
                 pending.clear();
                 return;
             }
@@ -1280,6 +1291,7 @@ fn emit(pending: &mut Vec<u8>) {
                 if good > 0 {
                     if let Ok(s) = core::str::from_utf8(&pending[..good]) {
                         kprint!("{}", s);
+                        convo::feed(s);
                     }
                     pending.drain(..good);
                     continue;

@@ -83,8 +83,8 @@ jobs:
         run: |
           test -n "$KEY" || { echo "UPDATE_SIGNING_KEY is not set"; exit 1; }
           mkdir -p out
-          cp target/x86_64-unknown-uefi/release/glados.efi "out/glados-$VERSION.efi"
-          python3 tools/sign.py "out/glados-$VERSION.efi" "out/glados-$VERSION.efi.sig" --key "$KEY"
+          cp target/x86_64-unknown-uefi/release/autark.efi "out/autark-$VERSION.efi"
+          python3 tools/sign.py "out/autark-$VERSION.efi" "out/autark-$VERSION.efi.sig" --key "$KEY"
 
       - name: Build the signed manifest
         env:
@@ -92,7 +92,7 @@ jobs:
           ORIGIN: ${{ vars.SUPABASE_URL }}
         run: |
           test -n "$ORIGIN" || { echo "the SUPABASE_URL variable is not set"; exit 1; }
-          python3 tools/manifest.py "out/glados-$VERSION.efi" \
+          python3 tools/manifest.py "out/autark-$VERSION.efi" \
             --version "$VERSION" \
             --channel stable \
             --base "$ORIGIN/storage/v1/object/public/stable" \
@@ -104,7 +104,7 @@ jobs:
       # kernel pins. A manifest that CI cannot read is one that fails on every
       # machine that already trusts us, at the moment they try to update.
       - name: Verify what we are about to publish
-        run: python3 tools/manifest.py --verify out/manifest --image "out/glados-$VERSION.efi"
+        run: python3 tools/manifest.py --verify out/manifest --image "out/autark-$VERSION.efi"
 
       - name: Publish to the stable channel
         if: startsWith(github.ref, 'refs/tags/') || inputs.dry_run == false
@@ -125,8 +125,8 @@ jobs:
           # manifest naming an object that is not there yet is a window in
           # which every machine that checks gets a 404 for an update it was
           # just told about.
-          put "out/glados-$VERSION.efi" "glados-$VERSION.efi"
-          put "out/glados-$VERSION.efi.sig" "glados-$VERSION.efi.sig"
+          put "out/autark-$VERSION.efi" "autark-$VERSION.efi"
+          put "out/autark-$VERSION.efi.sig" "autark-$VERSION.efi.sig"
           put "out/manifest" "manifest"
 
       - name: Attach to the release
@@ -142,8 +142,8 @@ jobs:
               --title "$GITHUB_REF_NAME" \
               --notes "Assets published by CI. Notes written by hand."
           gh release upload "$GITHUB_REF_NAME" \
-            "out/glados-$VERSION.efi" \
-            "out/glados-$VERSION.efi.sig" \
+            "out/autark-$VERSION.efi" \
+            "out/autark-$VERSION.efi.sig" \
             out/manifest --clobber
 
       # Hashed here, from the bytes this job produced, rather than read back
@@ -154,7 +154,7 @@ jobs:
       - name: Record what was built
         run: |
           mkdir -p sums
-          ( cd out && sha256sum "glados-$VERSION.efi" "glados-$VERSION.efi.sig" manifest ) > sums/kernel.txt
+          ( cd out && sha256sum "autark-$VERSION.efi" "autark-$VERSION.efi.sig" manifest ) > sums/kernel.txt
           cat sums/kernel.txt
 
       - uses: actions/upload-artifact@v4
@@ -188,7 +188,7 @@ jobs:
             payload: payload-qwen3-0.6b-v1
             manifest: qwen3-0.6b
             seq: 0
-            label: GLADOS
+            label: AUTARK
           # The 2B distill, Apache-2.0. Its payload is canonical at seq 512,
           # which is not a context worth shipping for a model this size, so
           # both variants stamp. The weights are uploaded once and these two
@@ -204,12 +204,12 @@ jobs:
             payload: payload-q35-2b-v1
             manifest: q35-2b
             seq: 8192
-            label: GLADOS
+            label: AUTARK
           - name: qwen35-2b-32k
             payload: payload-q35-2b-v1
             manifest: q35-2b
             seq: 32768
-            label: GLADOS
+            label: AUTARK
     steps:
       - uses: actions/checkout@v4
 
@@ -238,8 +238,8 @@ jobs:
           # right outcome is to fail saying so.
           TAG="$GITHUB_REF_NAME"
           if [ "$GITHUB_REF_TYPE" != "tag" ]; then TAG="v$VERSION"; fi
-          gh release download "$TAG" --dir out --pattern "glados-$VERSION.efi" --clobber
-          ls -la "out/glados-$VERSION.efi"
+          gh release download "$TAG" --dir out --pattern "autark-$VERSION.efi" --clobber
+          ls -la "out/autark-$VERSION.efi"
 
       - name: Fetch the payload
         env:
@@ -272,9 +272,9 @@ jobs:
           # "$name-$seq" invented a spelling (q35-2b-8192) for a variant
           # tools/site.py already knows as qwen35-2b-8k, and site.py refuses
           # to build a download page it cannot describe an image on.
-          NAME="glados-$VERSION-${{ matrix.name }}"
+          NAME="autark-$VERSION-${{ matrix.name }}"
           python3 tools/mkiso.py "out/$NAME.iso" \
-            --efi "out/glados-$VERSION.efi" \
+            --efi "out/autark-$VERSION.efi" \
             --payload payload-dir \
             --label "${{ matrix.label }}"
           ls -la "out/$NAME.iso"

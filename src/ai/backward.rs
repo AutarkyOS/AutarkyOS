@@ -260,19 +260,30 @@ impl Mat<'_> {
     /// sites -- so on a training step it is most of the work, and it was the
     /// last thing still running on one core.
     pub fn wt_matvec(&self, out: &mut [f32], g: &[f32]) {
+        // int4 is a serving quant and the adjoint is deeptrain's; the trial
+        // gate refuses int4, so this is the correct-but-slow path taken only if
+        // something reached it anyway. Scalar, single core, and it dequantises
+        // each row through the shared `q4_row`.
+        if let Mat::Q4 { data, scales, rows, cols } = self {
+            q4_wt_matvec_scalar(&mut out[..*cols], &g[..*rows], data, scales, *rows, *cols);
+            return;
+        }
         let (rows, cols) = match self {
             Mat::F32 { rows, cols, .. } => (*rows, *cols),
             Mat::Q8 { rows, cols, .. } => (*rows, *cols),
+            Mat::Q4 { rows, cols, .. } => (*rows, *cols),
         };
         let job = WtJob {
             q8: matches!(self, Mat::Q8 { .. }),
             data: match self {
                 Mat::F32 { data, .. } => data.as_ptr() as *const u8,
                 Mat::Q8 { data, .. } => data.as_ptr() as *const u8,
+                Mat::Q4 { data, .. } => data.as_ptr(),
             },
             scales: match self {
                 Mat::F32 { .. } => core::ptr::null(),
                 Mat::Q8 { scales, .. } => scales.as_ptr(),
+                Mat::Q4 { scales, .. } => scales.as_ptr(),
             },
             g: g.as_ptr(),
             out: out.as_mut_ptr(),
@@ -295,6 +306,36 @@ impl Mat<'_> {
                 *rows,
                 *cols,
             ),
+            // Handled by the early return above; the split never carries int4.
+            Mat::Q4 { .. } => {}
+        }
+    }
+}
+
+/// int4 adjoint, scalar. `out[c] += g[r] * w[r][c]` over rows, dequantising
+/// each row once via `q4_row`. Not split and not vectorised: it is deeptrain's
+/// path and deeptrain refuses int4, so this exists to be correct if reached,
+/// not to be fast.
+pub fn q4_wt_matvec_scalar(
+    out: &mut [f32],
+    g: &[f32],
+    data: &[u8],
+    scales: &[u8],
+    rows: usize,
+    cols: usize,
+) {
+    use crate::ai::weights::{q4_row, Q4_BLOCK};
+    for v in out.iter_mut() {
+        *v = 0.0;
+    }
+    let rb = cols / 2;
+    let nb = cols / Q4_BLOCK;
+    let mut wrow = alloc::vec![0.0f32; cols];
+    for r in 0..rows {
+        q4_row(&mut wrow, &data[r * rb..(r + 1) * rb], &scales[r * nb * 4..(r + 1) * nb * 4], cols);
+        let gr = g[r];
+        for c in 0..cols {
+            out[c] += gr * wrow[c];
         }
     }
 }

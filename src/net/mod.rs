@@ -652,6 +652,11 @@ pub fn ping(dst: Ipv4, count: u16) {
                 if s == seq {
                     let us = crate::time::tsc_mhz();
                     let elapsed = crate::time::rdtsc() - t0;
+                    // The best-resolution round trip the machine ever measures:
+                    // a true cycle count rather than TCP's rounded microseconds.
+                    // Only as often as somebody pings, which is why it is the
+                    // supplement and `observe_rtt` is the source that matters.
+                    crate::rng::add_net_entropy(elapsed);
                     console::set_color(LTGREEN);
                     if us > 0 {
                         kprintln!(

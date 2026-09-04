@@ -1,6 +1,6 @@
 //! The root certificate store.
 //!
-//! Roots are loaded from `\GLADOS\roots.der` on the boot volume -- a plain
+//! Roots are loaded from `\AUTARK\roots.der` on the boot volume -- a plain
 //! concatenation of DER certificates -- rather than compiled in. Three
 //! reasons, in order of importance:
 //!
@@ -24,7 +24,7 @@ use crate::kprintln;
 use crate::sync::Racy;
 use alloc::vec::Vec;
 
-pub const ROOTS_PATH: &str = "\\GLADOS\\roots.der";
+pub const ROOTS_PATH: &str = "\\AUTARK\\roots.der";
 
 struct Root {
     der: Vec<u8>,

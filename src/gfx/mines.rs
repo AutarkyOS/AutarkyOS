@@ -292,7 +292,7 @@ impl DeskApp for Mines {
         let ly = client.y + PAD + 5;
         let lr = Rect::new(client.x + PAD + 2, ly, lw, well_h);
         theme::well(fb, lr, theme::SCREEN);
-        theme::text(fb, lr.x + 4, lr.y + (well_h - theme::text_h()) / 2, &digits(left), theme::APERTURE, theme::SCREEN);
+        theme::text(fb, lr.x + 4, lr.y + (well_h - theme::text_h()) / 2, &digits(left), theme::SIGNAL, theme::SCREEN);
 
         let secs = match self.state {
             _ if !self.laid => 0,
@@ -301,18 +301,18 @@ impl DeskApp for Mines {
         };
         let tr = Rect::new(client.x + client.w - PAD - 2 - lw, ly, lw, well_h);
         theme::well(fb, tr, theme::SCREEN);
-        theme::text(fb, tr.x + 4, tr.y + (well_h - theme::text_h()) / 2, &digits(secs), theme::APERTURE, theme::SCREEN);
+        theme::text(fb, tr.x + 4, tr.y + (well_h - theme::text_h()) / 2, &digits(secs), theme::SIGNAL, theme::SCREEN);
 
         // The face is the reset button. The mark stands in for the smiley --
         // orange while playing, red when it went wrong, green when it did not.
         let f = Self::face_rect(client);
         theme::button(fb, f, "", false, false);
         let mood = match self.state {
-            State::Playing => theme::APERTURE_DEEP,
+            State::Playing => theme::SIGNAL_DEEP,
             State::Lost => Color::new(0xC0, 0x20, 0x10),
             State::Won => Color::new(0x20, 0x90, 0x20),
         };
-        super::splash::aperture(
+        super::splash::mark(
             fb,
             (f.x + f.w / 2) as i32,
             (f.y + f.h / 2) as i32,
@@ -359,7 +359,7 @@ impl DeskApp for Mines {
                         let cx = r.x + CELL / 2;
                         let cy = r.y + CELL / 2;
                         fb.rect(cx - 1, cy - 7, 2, 14, theme::TEXT);
-                        fb.rect(cx - 8, cy - 7, 8, 6, theme::APERTURE);
+                        fb.rect(cx - 8, cy - 7, 8, 6, theme::SIGNAL);
                         fb.rect(cx - 5, cy + 5, 10, 2, theme::TEXT);
                     }
                 }
@@ -375,7 +375,7 @@ impl DeskApp for Mines {
                 CELL,
                 CELL,
             );
-            fb.frame(r.x + 1, r.y + 1, r.w - 2, r.h - 2, theme::APERTURE);
+            fb.frame(r.x + 1, r.y + 1, r.w - 2, r.h - 2, theme::SIGNAL);
         }
 
         let msg = match self.state {

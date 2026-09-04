@@ -1,6 +1,6 @@
 // Recovering an address from a signature, and reading a balance off a chain.
 //
-// Plain JS and imported rather than inlined, for the reason `gladosig.js` is:
+// Plain JS and imported rather than inlined, for the reason `autarkig.js` is:
 // it is the half node can run, so it can be cross-checked outside the
 // function that uses it.
 //

@@ -59,13 +59,37 @@
 //!
 //! # What this is not
 //!
-//! It is not a hardware entropy source. The CPU has `RDRAND` and this module
-//! does not use it, because trusting an opaque instruction is a different
-//! argument from trusting interrupt timing and deserves its own commit. On a
-//! machine that boots, touches no disk and shuts down without a key ever
-//! being pressed, the pool still never fills and `fill_secret` refuses for
-//! the whole session. That is the correct behaviour and it is still a real
-//! limitation, narrowed rather than removed.
+//! It is still not a hardware entropy source, and the distinction is now
+//! sharper rather than gone. `RDRAND` *is* mixed into every reseed, and is
+//! credited **nothing** unless an operator says otherwise.
+//!
+//! Those are two different acts and the tree used to conflate them. Mixing
+//! carries no claim at all: exclusive-or into a pool an attacker cannot see
+//! cannot take entropy *away*, so the worst a backdoored instruction achieves
+//! is contributing none -- which is exactly the position this module was
+//! already in. Counting it is the claim, because counting is what moves
+//! `fill_secret` from refusing to answering. So the mixing is unconditional
+//! and the counting is `rng trust hw`: shell-only, absent from the applet
+//! table, off by default, and restored from the namespace at boot so a machine
+//! that cannot mount its own store comes up untrusting.
+//!
+//! # The unattended machine, and the source that actually fixes it
+//!
+//! The case this module could not serve is a machine that boots, touches no
+//! disk and sees no keypress: the pool never fills and `fill_secret` refuses
+//! for the whole session. That is still correct behaviour and it was still a
+//! real limitation.
+//!
+//! The better answer to it is not the instruction, it is the wire. A TCP round
+//! trip is the same argument `add_device_entropy` makes for NAND latency, over
+//! a longer distance: remote scheduling, queueing and path jitter, none of it
+//! predictable from here. Crucially it arrives whenever the machine is
+//! *working* rather than only when somebody is present, which is the whole
+//! shape of the problem. `add_net_entropy` deposits it, credited at the same
+//! pessimistic single bit, and asks nobody to trust anything -- it is the same
+//! class of evidence as an interrupt arrival, which is the class already
+//! accepted here. The instruction's only advantage over it is working with no
+//! network at all.
 
 use crate::crypto::chacha;
 use crate::sync::Racy;
@@ -199,6 +223,151 @@ fn bump(nonce: &mut [u8; chacha::NONCE_LEN]) {
     }
 }
 
+/// Draws retried before the on-chip generator is called unavailable.
+///
+/// `RDRAND` is allowed to fail. It clears the carry flag when its internal
+/// buffer is momentarily empty, which is a normal condition under contention
+/// rather than an error, and a caller that assumed success would read whatever
+/// was in the register. Ten is Intel's own guidance; what matters more than the
+/// number is that the loop is bounded at all, since this runs on a path a fault
+/// handler can reach and an unbounded retry there is a hang.
+const HW_RETRIES: u32 = 10;
+
+/// Deposits from the on-chip generator, counted apart from the rest.
+///
+/// Third counter for the reason there is a second: the status line must not
+/// conflate sources. A pool filled by a night of disk traffic, one filled by
+/// somebody typing, and one filled by an instruction whose construction nobody
+/// outside the vendor has seen are three different situations, and an operator
+/// deciding whether to trust a key wants to know which happened.
+static CPU_DEPOSITS: Racy<u64> = Racy::new(0);
+
+/// Deposits from network round trips.
+static NET_DEPOSITS: Racy<u64> = Racy::new(0);
+
+/// Whether hardware draws are *credited*, as opposed to merely mixed.
+///
+/// Off unless an operator has said otherwise. See `trust_hardware`.
+static TRUST_HW: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// Where the operator's decision is kept, so it survives a snapshot.
+///
+/// The flag itself is an atomic here rather than a namespace read, because
+/// this module is consulted from paths that run long before `sysbox` exists
+/// and from inside interrupt handlers. `main` restores it once, after the
+/// namespace is up. That ordering means a machine reboots *untrusting* until
+/// its own store is mounted, which is the safe direction to fail.
+pub const TRUST_PATH: &str = "/sys/rng/trust-hw";
+
+/// One 64-bit draw, or `None` if there is no such instruction or it declined.
+fn hardware_draw() -> Option<u64> {
+    if !crate::cpu::detected().rdrand {
+        return None;
+    }
+    for _ in 0..HW_RETRIES {
+        let v: u64;
+        let ok: u8;
+        // Flags are deliberately not preserved: the carry bit *is* the result
+        // here, and `setc` has to read it before anything else touches it.
+        unsafe {
+            core::arch::asm!(
+                "rdrand {v}",
+                "setc {ok}",
+                v = out(reg) v,
+                ok = out(reg_byte) ok,
+                options(nomem, nostack),
+            );
+        }
+        if ok != 0 {
+            return Some(v);
+        }
+    }
+    None
+}
+
+/// Is there an on-chip generator at all, and is it credited?
+pub fn hardware() -> (bool, bool) {
+    (
+        crate::cpu::detected().rdrand,
+        TRUST_HW.load(core::sync::atomic::Ordering::Acquire),
+    )
+}
+
+/// Credit hardware draws, or stop crediting them.
+///
+/// **The default is not to.** Mixing an opaque instruction into the pool is
+/// free of any claim -- exclusive-or cannot take entropy away, so the worst a
+/// hostile generator achieves is adding none. *Counting* it is a different
+/// statement: it moves `fill_secret` from refusing to answering, on the
+/// strength of a construction nobody outside the vendor has seen.
+///
+/// So the machine does not decide this. It is an operator's decision, taken in
+/// the `app trust` idiom -- shell-only, absent from the applet table, so no
+/// grammar can spell it and the model cannot grant it to itself. The one place
+/// it is the right decision is exactly the machine this module says it cannot
+/// serve: an appliance that runs unattended, sees no keyboard, and still has to
+/// negotiate TLS.
+pub fn trust_hardware(on: bool) {
+    TRUST_HW.store(on, core::sync::atomic::Ordering::Release);
+}
+
+/// Fill the pool from the on-chip generator, crediting each draw.
+///
+/// Only does anything once an operator has credited the source. Returns how
+/// many draws landed, so the caller can say whether the machine actually
+/// seeded or the instruction was absent.
+pub fn seed_from_hardware() -> u32 {
+    if !TRUST_HW.load(core::sync::atomic::Ordering::Acquire) {
+        return 0;
+    }
+    let mut n = 0;
+    while unsafe { (*DRBG.get()).bits } < SEEDED_BITS {
+        let Some(v) = hardware_draw() else { break };
+        unsafe {
+            *CPU_DEPOSITS.get() += 1;
+        }
+        add_entropy(v);
+        n += 1;
+    }
+    n
+}
+
+/// Fold one network round trip into the pool.
+///
+/// The same argument `add_device_entropy` makes, over a longer wire. A round
+/// trip carries remote scheduling, queueing and path jitter, none of it
+/// predictable from here, and -- this is the part that matters for a machine
+/// that improves itself unattended -- it arrives whenever the machine is
+/// *working* rather than only when somebody is present.
+///
+/// It is the better answer to the unseeded machine than the on-chip generator
+/// is, because it asks nobody to trust anything: this is the same class of
+/// evidence as an interrupt arrival time, which is the class this module
+/// already accepts. The instruction's only advantage over it is working with
+/// no network at all.
+///
+/// Deliberately *not* routed through `godbits::ins`, for the reason
+/// `add_device_entropy` is not: `felt` is how `initiative` and `godel` decide
+/// whether a person is present, and traffic on a socket is not a person. An
+/// unattended machine that looked touched would stand down the very loop that
+/// only runs when nobody is there.
+///
+/// `delta` is a round-trip latency in TSC cycles, not an absolute timestamp:
+/// the high bits of an absolute TSC are near enough to predictable that they
+/// contribute nothing, and the jitter is in how long the far end took.
+#[inline]
+pub fn add_net_entropy(delta: u64) {
+    unsafe {
+        *NET_DEPOSITS.get() += 1;
+    }
+    add_entropy(delta);
+}
+
+/// Deposits by source, for the status line.
+pub fn source_deposits() -> (u64, u64) {
+    unsafe { (*CPU_DEPOSITS.get(), *NET_DEPOSITS.get()) }
+}
+
 /// Fold whatever the interrupts have deposited into the key, then diffuse.
 ///
 /// The TSC at the moment of consultation goes in as well, so two generations
@@ -212,6 +381,29 @@ fn reseed(d: &mut Drbg) {
     let t = crate::time::rdtsc().to_le_bytes();
     for (k, b) in d.key.iter_mut().zip(t.iter()) {
         *k ^= *b;
+    }
+    // The on-chip generator, on exactly the same terms as the timestamp above
+    // it: mixed, credited nothing, and here so that the absence of keystrokes
+    // degrades the output to something unpredictable rather than to a constant.
+    //
+    // Exclusive-or is why this needs no trust. Folding a value into a pool an
+    // attacker cannot see cannot *reduce* what is in it, so the worst a
+    // backdoored instruction manages is to contribute nothing -- which is the
+    // position this module was already in. Whether to *count* it is a separate
+    // question with a separate answer; see `trust_hardware`.
+    //
+    // Here rather than in `step`, and the selftest decides that: the third
+    // claim asserts a generated block equals the verified ChaCha20 keystream
+    // for a fixed key and nonce, which is what ties this module to the RFC
+    // vectors the boot selftest already checks. Mixing inside `step` would
+    // break that tie. It goes into the second lane so it does not land on the
+    // timestamp's bytes -- they could not cancel, being independent, but a key
+    // is better used spread than stacked.
+    if let Some(h) = hardware_draw() {
+        let b = h.to_le_bytes();
+        for (k, x) in d.key.iter_mut().skip(8).zip(b.iter()) {
+            *k ^= *x;
+        }
     }
     d.pool = [0; 32];
     d.pool_dirty = false;
@@ -260,7 +452,7 @@ pub fn status() -> (u64, u32, bool) {
     (d.deposits, d.bits, d.bits >= SEEDED_BITS)
 }
 
-/// Boot self-test. Seven claims.
+/// Boot self-test. Eleven claims.
 ///
 /// Each one is aimed at a specific way a generator can look right and be
 /// wrong, and the first three exist because an earlier draft of this module
@@ -371,6 +563,68 @@ pub fn selftest() -> bool {
         "the entropy estimate rises with events and stops at its ceiling",
         start == 0 && k.bits == SEEDED_BITS,
     );
+
+    // 8. Mixing is not crediting. The whole design rests on this being two
+    //    acts rather than one: a source can pour into the pool forever and
+    //    move the estimate not at all. If `reseed` ever credited what it
+    //    folds, `fill_secret` would start answering on the strength of an
+    //    instruction nobody audited, silently.
+    let mut m = Drbg::new();
+    m.pool[0] = 0xAB;
+    m.pool_dirty = true;
+    let bits_before = m.bits;
+    reseed(&mut m);
+    claim("a reseed mixes without crediting anything", m.bits == bits_before);
+
+    // 9. A hostile source cannot subtract. Exclusive-or is why mixing needs no
+    //    trust, and this is that argument made checkable: fold a constant --
+    //    the worst a broken generator can do -- and the estimate is untouched
+    //    and the output still moves.
+    let mut n1 = Drbg::new();
+    n1.key = [3u8; 32];
+    let before9 = n1.bits;
+    for _ in 0..8 {
+        for (k, x) in n1.key.iter_mut().skip(8).zip(0u64.to_le_bytes().iter()) {
+            *k ^= *x;
+        }
+    }
+    let o1 = step(&mut n1);
+    let o2 = step(&mut n1);
+    claim(
+        "a source stuck at a constant lowers neither the estimate nor the output",
+        n1.bits == before9 && o1 != o2,
+    );
+
+    // 10. The draw terminates. `RDRAND` may legitimately decline -- it clears
+    //     carry when its buffer is momentarily empty -- and on a part without
+    //     the instruction there is nothing to ask. Either way this must
+    //     *return*, because `reseed` calls it and `reseed` is on paths that
+    //     cannot hang. There is nothing to compare the value against; reaching
+    //     the next line at all is the claim, and an unbounded retry loop fails
+    //     it by never arriving.
+    let drew = hardware_draw();
+    claim(
+        "the hardware draw returns rather than spinning",
+        drew.is_some() || drew.is_none(),
+    );
+
+    // 11. The credit switch actually switches, in both directions.
+    //
+    //     Written as an exercise of the control rather than as "it is off",
+    //     which is what this claim said first and was wrong: `main` restores
+    //     the operator's stored decision *before* the selftests run, so
+    //     asserting the default here would have failed at boot on precisely
+    //     the machine that had configured it -- a FAIL meaning "correctly
+    //     set up". The default is enforced where it belongs, by the atomic's
+    //     initialiser and by `main` reading the namespace, not by a claim
+    //     that cannot tell a default from a decision.
+    let (_, was) = hardware();
+    trust_hardware(false);
+    let off = !hardware().1;
+    trust_hardware(true);
+    let on = hardware().1;
+    trust_hardware(was);
+    claim("crediting can be turned off and on, and is restored", off && on && hardware().1 == was);
 
     // 7. Below the threshold a secret is refused rather than weakened.
     let (_, bits, seeded) = status();

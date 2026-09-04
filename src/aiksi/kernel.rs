@@ -1,6 +1,6 @@
 //! Aiksi's view of the kernel.
 //!
-//! GLaDOS is written in Rust and Aiksi is how anything else reaches it. That
+//! AUTARK is written in Rust and Aiksi is how anything else reaches it. That
 //! makes this file the translation layer, and it has one rule:
 //!
 //! > **A builtin is named after the Rust path it calls, flattened.**

@@ -1,9 +1,9 @@
 <#
 .SYNOPSIS
-    Build esp\GLADOS\roots.der from the host's root certificate store.
+    Build esp\AUTARK\roots.der from the host's root certificate store.
 
 .DESCRIPTION
-    GLaDOS loads its trust anchors from a file rather than compiling them in,
+    AUTARK loads its trust anchors from a file rather than compiling them in,
     so that a distrusted root can be removed without rebuilding, and so that
     'trust' can list exactly what is trusted with nothing hidden in the binary.
 
@@ -34,7 +34,7 @@ param(
 
 $ErrorActionPreference = 'Stop'
 $root = Split-Path -Parent $PSScriptRoot
-$dir = Join-Path $root 'esp\GLADOS'
+$dir = Join-Path $root 'esp\AUTARK'
 New-Item -ItemType Directory -Force -Path $dir | Out-Null
 $out = Join-Path $dir 'roots.der'
 
@@ -70,5 +70,5 @@ $stream.Close()
 
 Write-Host ("  wrote {0} root(s), {1:N0} B -> {2}" -f $n, (Get-Item $out).Length, $out) -ForegroundColor Green
 Write-Host ""
-Write-Host "GLaDOS reads this at boot. 'trust' lists what it accepted;"
+Write-Host "AUTARK reads this at boot. 'trust' lists what it accepted;"
 Write-Host "a certificate it cannot parse is skipped rather than fatal."

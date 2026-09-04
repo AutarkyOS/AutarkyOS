@@ -9,7 +9,7 @@
 
 import { writeFileSync } from "node:fs";
 import { join } from "node:path";
-import { publicOf, sign, signedManifest } from "./gladosig.js";
+import { publicOf, sign, signedManifest } from "./autarkig.js";
 
 const out = process.argv[2] ?? ".";
 
@@ -19,11 +19,11 @@ const priv = "c9af a685 1f2b 3d47 8e10 5c62 9b04 7ae3 51d8 26fc 40b9 1e73 8a5d 6
   .replace(/\s+/g, "");
 
 const text = [
-  "glados-update 1",
+  "autark-update 1",
   "channel experimental",
   "version 9.9.9",
-  "image https://example.invalid/glados-9.9.9.efi",
-  "sig https://example.invalid/glados-9.9.9.efi.sig",
+  "image https://example.invalid/autark-9.9.9.efi",
+  "sig https://example.invalid/autark-9.9.9.efi.sig",
   "size 4",
   "sha256 9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08",
   "notes a manifest that exists only in this test",

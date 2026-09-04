@@ -39,7 +39,7 @@ const RPC = Deno.env.get("TOKEN_RPC") ?? "https://rpc.mainnet.chain.robinhood.co
 const CHAIN_ID = Number(Deno.env.get("TOKEN_CHAIN_ID") ?? 4663);
 // 1,000,000 tokens at 18 decimals.
 const MIN_BALANCE = BigInt(Deno.env.get("TOKEN_MIN_BALANCE") ?? "1000000000000000000000000");
-const DOMAIN = Deno.env.get("LINK_DOMAIN") ?? "glados.aperture.institute";
+const DOMAIN = Deno.env.get("LINK_DOMAIN") ?? "autark.aperture.institute";
 
 const NONCE_TTL_MS = 10 * 60 * 1000;
 
@@ -73,7 +73,7 @@ function siwe(address: string, nonce: string, issued: Date, expires: Date) {
     `${DOMAIN} wants you to sign in with your Ethereum account:`,
     toChecksum(address),
     "",
-    "Link this wallet to a GLaDOS device code for the experimental update channel.",
+    "Link this wallet to a AUTARK device code for the experimental update channel.",
     "This signature costs nothing, moves nothing, and approves no transaction.",
     "",
     `URI: https://${DOMAIN}/wallet/`,

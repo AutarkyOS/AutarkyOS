@@ -31,9 +31,9 @@ use alloc::vec::Vec;
 /// them. `update`'s own constants are UEFI paths with backslashes because that
 /// is what the firmware's file protocol takes; this layer walks the directory
 /// chain itself. `find` accepts either separator, `put` splits on '/'.
-const STAGED: &str = "/GLADOS/STAGED.EFI";
-const STAGED_SIG: &str = "/GLADOS/STAGED.SIG";
-const FLAG: &str = "/GLADOS/UPDATE.FLG";
+const STAGED: &str = "/AUTARK/STAGED.EFI";
+const STAGED_SIG: &str = "/AUTARK/STAGED.SIG";
+const FLAG: &str = "/AUTARK/UPDATE.FLG";
 
 /// What makes a FAT partition the one this machine boots from, rather than
 /// merely a FAT partition.

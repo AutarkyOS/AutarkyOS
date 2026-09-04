@@ -162,6 +162,15 @@ pub struct Features {
     pub xsave: bool,
     /// True once the OS has actually enabled the state, not merely detected it.
     pub avx_enabled: bool,
+    /// The on-chip random generator, and its seeded sibling.
+    ///
+    /// Unlike AVX these need no CR4/XCR0 handshake, so there is no
+    /// "detected but not usable" split to reproduce -- the CPUID bit is the
+    /// whole answer, and `detected()` and `features()` agree about them.
+    /// What CPUID does *not* tell you is that a draw may legitimately fail,
+    /// which is why the caller retries a bounded number of times.
+    pub rdrand: bool,
+    pub rdseed: bool,
 }
 
 impl Features {
@@ -177,6 +186,8 @@ impl Features {
             avx512f: false,
             xsave: false,
             avx_enabled: false,
+            rdrand: false,
+            rdseed: false,
         }
     }
 }
@@ -206,6 +217,8 @@ pub fn features() -> Features {
         avx2: f7[1] & (1 << 5) != 0,
         avx512f: f7[1] & (1 << 16) != 0,
         avx_enabled: false,
+        rdrand: f1[2] & (1 << 30) != 0,
+        rdseed: f7[1] & (1 << 18) != 0,
     }
 }
 

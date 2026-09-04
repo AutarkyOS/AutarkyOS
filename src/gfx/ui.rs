@@ -503,7 +503,7 @@ impl Panel {
                 Widget::Heading(t) => {
                     theme::text(fb, x, y + 4, t, theme::TEXT, theme::FACE);
                     let uw = theme::text_w(t.chars().count()).min(w);
-                    fb.rect(x, y + 4 + TEXT_H + 2, uw, 2, theme::APERTURE);
+                    fb.rect(x, y + 4 + TEXT_H + 2, uw, 2, theme::SIGNAL);
                 }
                 Widget::Status { name, value, tone } => {
                     // One column for every row on the page, so the values line
@@ -1720,7 +1720,7 @@ pub fn program_manager() -> Panel {
         run("Settings", "win open settings"),
     ];
     Panel::new(
-        "Aperture Program Manager",
+        "AUTARK Program Manager",
         alloc::vec![
             Widget::Label(String::from("Arrows select, Enter runs")),
             Widget::Sep,

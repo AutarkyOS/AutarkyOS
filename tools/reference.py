@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Compute reference logits from a converted GLaDOS model, in numpy.
+"""Compute reference logits from a converted AUTARK model, in numpy.
 
 The oracle for the kernel's int8 forward pass. This reads the *converted* file
 rather than the original safetensors, so it exercises the same layout,
@@ -7,7 +7,7 @@ quantisation, head geometry and rope_theta the kernel will -- a bug in
 convert.py shows up here as well as there, and only a bug in the Rust shows up
 as a mismatch between the two.
 
-Feed the same token ids to `logits <ids>` in GLaDOS and compare. A stride
+Feed the same token ids to `logits <ids>` in AUTARK and compare. A stride
 miscomputed, sign extension dropped in the AVX2 widening, QK-Norm applied on
 the wrong side of RoPE, or the wrong RoPE base all produce fluent-looking
 nonsense rather than an error, so a numeric comparison is the only thing that
@@ -42,13 +42,14 @@ def load(path):
     blob = np.fromfile(path, dtype=np.uint8)
     magic = blob[:8].tobytes()
     if magic != b"GLADOSM2":
-        raise SystemExit(f"not a GLaDOS model file: {magic!r}")
+        raise SystemExit(f"not a AUTARK model file: {magic!r}")
     head = blob[:HEADER].tobytes()
     (version, dim, hidden, layers, heads, kv_heads, raw_vocab, seq, theta, quant) = (
         struct.unpack_from("<Iiiiiiii f I", head, 8)
     )
-    if quant != 1:
-        raise SystemExit("only int8 files are supported here")
+    if quant not in (1, 2):
+        raise SystemExit("only int8 and int4 files are supported here")
+    q4 = quant == 2
     if version not in (2, 3):
         raise SystemExit(f"unknown version {version}")
 
@@ -72,14 +73,32 @@ def load(path):
     pos = HEADER
     raw = blob
 
-    def q8(rows, cols):
-        """One int8 tensor, kept quantised: (values, per-row scales)."""
+    Q4_BLOCK = 32
+
+    def q8_read(rows, cols):
         nonlocal pos
         scales = raw[pos:pos + rows * 4].view(np.float32)
         pos += rows * 4
         data = raw[pos:pos + rows * cols].view(np.int8).reshape(rows, cols)
         pos += rows * cols
-        return data, scales
+        # ("q8", int8 rows, per-row scales)
+        return ("q8", data, scales)
+
+    def q4_read(rows, cols):
+        """One int4 tensor: block scales, then packed nibbles, exactly the
+        layout convert.py writes. Kept packed; `mv`/`row` unpack per row so the
+        oracle's memory stays bounded, the same reason q8 stays quantised."""
+        nonlocal pos
+        nb = cols // Q4_BLOCK
+        scales = raw[pos:pos + rows * nb * 4].view(np.float32).reshape(rows, nb)
+        pos += rows * nb * 4
+        packed = raw[pos:pos + rows * cols // 2].reshape(rows, cols // 2)
+        pos += rows * cols // 2
+        return ("q4", packed, scales)
+
+    def q8(rows, cols):
+        """One quantised tensor, at whatever level the file declared."""
+        return q4_read(rows, cols) if q4 else q8_read(rows, cols)
 
     def f32(n):
         nonlocal pos
@@ -115,9 +134,34 @@ def load(path):
     return cfg, w
 
 
+def _dq_q4(packed, scales):
+    """Unpack a block of int4 rows to f32. Low nibble even column, high odd,
+    two's-complement, times the block scale -- the kernel's dequant rule."""
+    r, half = packed.shape
+    cols = half * 2
+    lo = (packed & 0x0F).astype(np.int8)
+    hi = (packed >> 4).astype(np.int8)
+    lo = np.where(lo >= 8, lo - 16, lo)
+    hi = np.where(hi >= 8, hi - 16, hi)
+    w = np.empty((r, cols), dtype=np.float32)
+    w[:, 0::2] = lo
+    w[:, 1::2] = hi
+    nb = cols // 32
+    return (w.reshape(r, nb, 32) * scales[:, :, None]).reshape(r, cols)
+
+
 def mv(mat, x):
     """out = mat @ x, dequantising a block of rows at a time."""
-    data, scales = mat
+    tag = mat[0]
+    if tag == "q4":
+        _, packed, scales = mat
+        rows = packed.shape[0]
+        out = np.empty(rows, dtype=np.float32)
+        for i in range(0, rows, BLOCK):
+            j = min(i + BLOCK, rows)
+            out[i:j] = _dq_q4(packed[i:j], scales[i:j]) @ x
+        return out
+    _, data, scales = mat
     rows = data.shape[0]
     out = np.empty(rows, dtype=np.float32)
     for i in range(0, rows, BLOCK):
@@ -127,7 +171,11 @@ def mv(mat, x):
 
 
 def row(mat, i):
-    data, scales = mat
+    tag = mat[0]
+    if tag == "q4":
+        _, packed, scales = mat
+        return _dq_q4(packed[i:i + 1], scales[i:i + 1])[0]
+    _, data, scales = mat
     return data[i].astype(np.float32) * scales[i]
 
 

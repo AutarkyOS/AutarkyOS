@@ -39,7 +39,7 @@ BTC_HEADER = bytes([
 
 # The BLAKE2s block, mirroring cuda/blake2s.cuh exactly. The device replaces
 # message word 15, which is bytes 60..64 read little-endian.
-B2S_SEED = (b"GLaDOS blake2s vector "
+B2S_SEED = (b"AUTARK blake2s vector "
             + b"0" * 60)[:64]
 B2S_VERIFY_NONCE = 0x12345678
 
@@ -95,7 +95,7 @@ def khh_step(hash32, matrix):
     return bytes(out)
 
 
-KHH_INPUT = hashlib.sha256(b"glados kheavyhash matrix vector").digest()
+KHH_INPUT = hashlib.sha256(b"autark kheavyhash matrix vector").digest()
 
 
 def kheavy_expect():

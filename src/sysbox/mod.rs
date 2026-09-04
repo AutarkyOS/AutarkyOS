@@ -5,7 +5,7 @@
 //! anything. The shape is borrowed because it is the right shape for something
 //! that is not only typed at.
 //!
-//! GLaDOS is meant to be run by the model in `crate::ai`, and a model needs its
+//! AUTARK is meant to be run by the model in `crate::ai`, and a model needs its
 //! available actions described to it and its dangerous ones fenced off. A flat
 //! enumerable table gives both: `APPLETS` renders directly into a prompt, and
 //! `mutates` is the leash -- read-only applets can be handed over long before
@@ -19,6 +19,7 @@
 //! step, `rm` cannot destroy content, and a snapshot costs nothing. Those are
 //! not features bolted on, they are what content addressing already implies.
 
+pub mod guard;
 pub mod tree;
 
 use crate::gfx::console::{self, LTCYAN, LTGREEN, LTGRAY, LTRED, WHITE, YELLOW};
@@ -861,9 +862,31 @@ fn note(root: &Node, p: &[String]) {
     }
 }
 
+/// Ask the guard before changing a path.
+///
+/// One helper rather than the test inlined at each mutation, because what must
+/// not vary between them is *which* paths get asked. A site that forgot is a
+/// hole, and a hole here is not a bug in a feature -- it is the loop's history
+/// becoming editable, which is the one thing this fork cannot trade.
+fn permitted(s: &Sysbox, p: &[String], change: guard::Change) -> guard::Verdict {
+    let old = match tree::resolve(&s.root, p) {
+        Some(Node::Blob(b)) => Some(b.as_slice()),
+        _ => None,
+    };
+    guard::judge(&show(p), old, change)
+}
+
+/// Say no, and say which rule.
+fn refused(p: &[String], v: guard::Verdict) {
+    err(&alloc::format!("refused: {} -- {}", show(p), v.why()));
+}
+
 pub fn write_blob(path: &str, data: Vec<u8>) -> bool {
     with(|s| {
         let p = parse(&s.cwd, path);
+        if !permitted(s, &p, guard::Change::Write(&data)).allowed() {
+            return false;
+        }
         note(&s.root, &p);
         tree::put(&mut s.root, &p, Node::Blob(data)).is_ok()
     })
@@ -885,6 +908,9 @@ pub fn read_blob(path: &str) -> Option<Vec<u8>> {
 pub fn detach(path: &str) -> bool {
     with(|s| {
         let p = parse(&s.cwd, path);
+        if !permitted(s, &p, guard::Change::Remove).allowed() {
+            return false;
+        }
         note(&s.root, &p);
         tree::remove(&mut s.root, &p).is_some()
     })
@@ -1380,6 +1406,11 @@ fn cmd_mkdir(arg: &str) {
             err("already exists");
             return;
         }
+        let v = permitted(s, &p, guard::Change::MakeDir);
+        if !v.allowed() {
+            refused(&p, v);
+            return;
+        }
         note(&s.root, &p);
         match tree::put(&mut s.root, &p, Node::empty_dir()) {
             Ok(()) => kprintln!("  {}", show(&p)),
@@ -1401,6 +1432,11 @@ fn cmd_write(arg: &str, rest: &str) {
         let mut data = text.as_bytes().to_vec();
         data.push(b'\n');
         let n = data.len();
+        let v = permitted(s, &p, guard::Change::Write(&data));
+        if !v.allowed() {
+            refused(&p, v);
+            return;
+        }
         note(&s.root, &p);
         match tree::put(&mut s.root, &p, Node::Blob(data)) {
             Ok(()) => kprintln!("  {}  {} B", show(&p), n),
@@ -1418,6 +1454,11 @@ fn cmd_rm(arg: &str) {
     }
     with(|s| {
         let p = parse(&s.cwd, arg);
+        let v = permitted(s, &p, guard::Change::Remove);
+        if !v.allowed() {
+            refused(&p, v);
+            return;
+        }
         note(&s.root, &p);
         match tree::remove(&mut s.root, &p) {
             Some(n) => {
@@ -1457,6 +1498,21 @@ fn cmd_move(a: &str, b: &str, detach: bool) {
             // `snap` writes nothing for the second.
             Some(n) => tree::clone_node(n),
         };
+        if detach {
+            let v = permitted(s, &pa, guard::Change::Remove);
+            if !v.allowed() {
+                refused(&pa, v);
+                return;
+            }
+        }
+        // The destination receives an arbitrary node, so it is judged as a
+        // graft rather than a write: `mv somedir /ai/godel` replaces the
+        // directory the ledger lives in without ever naming the ledger.
+        let v = permitted(s, &pb, guard::Change::Graft(&[]));
+        if !v.allowed() {
+            refused(&pb, v);
+            return;
+        }
         if detach {
             note(&s.root, &pa);
             tree::remove(&mut s.root, &pa);

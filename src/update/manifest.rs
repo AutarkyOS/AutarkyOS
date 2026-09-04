@@ -29,7 +29,7 @@ use alloc::vec::Vec;
 /// Bump the number for a change an older kernel would *misread*. Adding a
 /// field does not need one: unknown keys are ignored, and the signature covers
 /// them either way.
-const HEADER: &str = "glados-update 1";
+const HEADER: &str = "autark-update 1";
 
 pub struct Manifest {
     pub channel: String,
@@ -237,11 +237,11 @@ pub fn selftest() -> bool {
 
     // The digest is SHA-256 of the four bytes "test", so `size` and `sha256`
     // below describe a real payload rather than a plausible-looking one.
-    let good: &[u8] = b"glados-update 1\n\
+    let good: &[u8] = b"autark-update 1\n\
 channel stable\n\
 version 9.9.9\n\
-image https://example.invalid/glados-9.9.9.efi\n\
-sig https://example.invalid/glados-9.9.9.efi.sig\n\
+image https://example.invalid/autark-9.9.9.efi\n\
+sig https://example.invalid/autark-9.9.9.efi.sig\n\
 size 4\n\
 sha256 9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08\n\
 notes a manifest that exists only in this test\n";
@@ -256,7 +256,7 @@ notes a manifest that exists only in this test\n";
                 && m.version == "9.9.9"
                 && m.size == 4
                 && m.image.host == "example.invalid"
-                && m.image.path == "/glados-9.9.9.efi",
+                && m.image.path == "/autark-9.9.9.efi",
         );
         claim("the bytes it describes are accepted", m.matches(b"test").is_ok());
         claim(
@@ -276,28 +276,28 @@ notes a manifest that exists only in this test\n";
     claim(
         "a future format is refused rather than read as this one",
         matches!(
-            parse(b"glados-update 2\nchannel stable\n"),
+            parse(b"autark-update 2\nchannel stable\n"),
             Err(Bad::NotAManifest)
         ),
     );
     claim(
         "a manifest missing a field it needs is refused",
         matches!(
-            parse(b"glados-update 1\nchannel stable\n"),
+            parse(b"autark-update 1\nchannel stable\n"),
             Err(Bad::Missing(_))
         ),
     );
     claim(
         "a plain-http image URL is refused",
         matches!(
-            parse(b"glados-update 1\nimage http://example.invalid/x.efi\n"),
+            parse(b"autark-update 1\nimage http://example.invalid/x.efi\n"),
             Err(Bad::Malformed("image"))
         ),
     );
     claim(
         "a truncated digest is refused rather than padded",
         matches!(
-            parse(b"glados-update 1\nsha256 9f86d081\n"),
+            parse(b"autark-update 1\nsha256 9f86d081\n"),
             Err(Bad::Malformed("sha256"))
         ),
     );

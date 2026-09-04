@@ -247,7 +247,12 @@ impl DeskApp for AuthorWin {
 }
 
 /// Break text on spaces at `cols`, never mid-word unless a word is longer.
-fn wrap(text: &str, cols: usize) -> alloc::vec::Vec<String> {
+///
+/// Shared rather than copied. `write.rs` already has the second wrapper in this
+/// tree -- byte ranges, hard-wrapped, no word awareness -- and a third would be
+/// three answers to one question. This one has the selftest, so it is the one
+/// that gets promoted.
+pub(super) fn wrap(text: &str, cols: usize) -> alloc::vec::Vec<String> {
     let mut out = alloc::vec::Vec::new();
     let mut line = String::new();
     for word in text.split_whitespace() {

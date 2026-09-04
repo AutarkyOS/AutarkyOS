@@ -126,7 +126,7 @@ impl Socket {
              Connection: Upgrade\r\n\
              Sec-WebSocket-Key: {}\r\n\
              Sec-WebSocket-Version: 13\r\n\
-             User-Agent: GLaDOS\r\n\
+             User-Agent: AUTARK\r\n\
              \r\n",
             path, host, key
         );

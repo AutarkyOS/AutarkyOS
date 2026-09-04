@@ -1,4 +1,4 @@
-﻿//! glados -- a from-scratch ring-0 operating system for the MSI MS-16R8.
+﻿//! autark -- a from-scratch ring-0 operating system for the MSI MS-16R8.
 //!
 //! There is no bootloader stage. UEFI has already put us in long mode, at
 //! CPL 0, with an identity map, so this UEFI application simply *is* the
@@ -87,13 +87,13 @@ pub struct BootInfo {
 
 /// Where the weights live on the boot volume. Backslashes: this is a UEFI path
 /// on the ESP, not a namespace path.
-pub const MODEL_PATH: &str = "\\GLADOS\\model.bin";
-pub const TOKENIZER_PATH: &str = "\\GLADOS\\tokenizer.bin";
+pub const MODEL_PATH: &str = "\\AUTARK\\model.bin";
+pub const TOKENIZER_PATH: &str = "\\AUTARK\\tokenizer.bin";
 
 #[no_mangle]
 pub extern "efiapi" fn efi_main(image: Handle, st: *mut SystemTable) -> Status {
     serial::init();
-    serial_println!("\n\nglados: entered efi_main");
+    serial_println!("\n\nautark: entered efi_main");
 
     let st = unsafe { &mut *st };
     let bs = unsafe { &mut *st.boot_services };
@@ -102,7 +102,7 @@ pub extern "efiapi" fn efi_main(image: Handle, st: *mut SystemTable) -> Status {
     // to return, so if we leave it armed the firmware resets the machine
     // mid-boot and it looks like a kernel hang.
     (bs.set_watchdog_timer)(0, 0, 0, ptr::null_mut());
-    serial_println!("glados: watchdog disarmed");
+    serial_println!("autark: watchdog disarmed");
 
     // Where the firmware put us. Every fault RIP is meaningless without this:
     // RIP minus the base is an offset into the binary sitting in target/, and
@@ -121,7 +121,7 @@ pub extern "efiapi" fn efi_main(image: Handle, st: *mut SystemTable) -> Status {
     {
         let li = unsafe { &*(li_ptr as *mut LoadedImageProtocol) };
         serial_println!(
-            "glados: loaded_image reports base {:#x} size {:#x} rev {:#x}",
+            "autark: loaded_image reports base {:#x} size {:#x} rev {:#x}",
             li.image_base,
             li.image_size,
             li.revision
@@ -145,7 +145,7 @@ pub extern "efiapi" fn efi_main(image: Handle, st: *mut SystemTable) -> Status {
         }
     }
     cpu::idt::IMAGE_BASE.store(base, Ordering::Relaxed);
-    serial_println!("glados: image base {:#x}", base);
+    serial_println!("autark: image base {:#x}", base);
 
     // --- Graphics Output Protocol ---
     let mut gop_ptr: *mut c_void = ptr::null_mut();
@@ -155,8 +155,8 @@ pub extern "efiapi" fn efi_main(image: Handle, st: *mut SystemTable) -> Status {
         &mut gop_ptr,
     );
     if is_error(s) || gop_ptr.is_null() {
-        con_out(st, "glados: no Graphics Output Protocol\r\n");
-        serial_println!("glados: locate_protocol(GOP) failed: {:#x}", s);
+        con_out(st, "autark: no Graphics Output Protocol\r\n");
+        serial_println!("autark: locate_protocol(GOP) failed: {:#x}", s);
         halt();
     }
 
@@ -171,8 +171,8 @@ pub extern "efiapi" fn efi_main(image: Handle, st: *mut SystemTable) -> Status {
         // BltOnly means there is no linear framebuffer at all and the only
         // draw call lives in boot services, which we are about to leave.
         other => {
-            con_out(st, "glados: unsupported GOP pixel format\r\n");
-            serial_println!("glados: pixel_format {} unsupported", other);
+            con_out(st, "autark: unsupported GOP pixel format\r\n");
+            serial_println!("autark: pixel_format {} unsupported", other);
             halt();
         }
     };
@@ -191,7 +191,7 @@ pub extern "efiapi" fn efi_main(image: Handle, st: *mut SystemTable) -> Status {
     let fb_end = mode.frame_buffer_base + mode.frame_buffer_size as u64;
 
     serial_println!(
-        "glados: fb base={:#x} {}x{} stride={} format={:?}",
+        "autark: fb base={:#x} {}x{} stride={} format={:?}",
         mode.frame_buffer_base,
         info.horizontal_resolution,
         info.vertical_resolution,
@@ -201,7 +201,7 @@ pub extern "efiapi" fn efi_main(image: Handle, st: *mut SystemTable) -> Status {
 
     // --- ACPI RSDP, while the configuration table still exists ---
     let rsdp = find_rsdp(st);
-    serial_println!("glados: rsdp={:?}", rsdp);
+    serial_println!("autark: rsdp={:?}", rsdp);
 
     // --- Anything that needs a filesystem, while there still is one ---
     //
@@ -249,8 +249,8 @@ pub extern "efiapi" fn efi_main(image: Handle, st: *mut SystemTable) -> Status {
     // refuses. The mechanism ships built, tested and unable to fire.
     let staged = update::hook(bs, image);
     if let update::Outcome::Said(line) | update::Outcome::Armed(line) = staged {
-        serial_println!("glados: {}", line);
-        con_out(st, "glados: ");
+        serial_println!("autark: {}", line);
+        con_out(st, "autark: ");
         con_out(st, line);
         con_out(st, "
 ");
@@ -262,16 +262,16 @@ pub extern "efiapi" fn efi_main(image: Handle, st: *mut SystemTable) -> Status {
     // the only moment there is a filesystem to read it from.
     let roots = uefi::read_file(bs, image, net::trust::ROOTS_PATH);
     match &roots {
-        Some(b) => serial_println!("glados: roots {} bytes from {}", b.len, net::trust::ROOTS_PATH),
-        None => serial_println!("glados: no roots at {}", net::trust::ROOTS_PATH),
+        Some(b) => serial_println!("autark: roots {} bytes from {}", b.len, net::trust::ROOTS_PATH),
+        None => serial_println!("autark: no roots at {}", net::trust::ROOTS_PATH),
     }
     match &model {
-        Some(b) => serial_println!("glados: model {} bytes from {}", b.len, MODEL_PATH),
-        None => serial_println!("glados: no model at {}", MODEL_PATH),
+        Some(b) => serial_println!("autark: model {} bytes from {}", b.len, MODEL_PATH),
+        None => serial_println!("autark: no model at {}", MODEL_PATH),
     }
     match &tokenizer {
-        Some(b) => serial_println!("glados: tokenizer {} bytes from {}", b.len, TOKENIZER_PATH),
-        None => serial_println!("glados: no tokenizer at {}", TOKENIZER_PATH),
+        Some(b) => serial_println!("autark: tokenizer {} bytes from {}", b.len, TOKENIZER_PATH),
+        None => serial_println!("autark: no tokenizer at {}", TOKENIZER_PATH),
     }
 
     // The image got here, which is the whole of what this hook can watch: it
@@ -305,7 +305,7 @@ pub extern "efiapi" fn efi_main(image: Handle, st: *mut SystemTable) -> Status {
 
     let mut buf: *mut u8 = ptr::null_mut();
     if is_error((bs.allocate_pool)(MemoryType::LoaderData, map_size, &mut buf)) {
-        con_out(st, "glados: allocate_pool for memory map failed\r\n");
+        con_out(st, "autark: allocate_pool for memory map failed\r\n");
         halt();
     }
 
@@ -322,7 +322,7 @@ pub extern "efiapi" fn efi_main(image: Handle, st: *mut SystemTable) -> Status {
             &mut desc_ver,
         );
         if is_error(s) {
-            con_out(st, "glados: get_memory_map failed\r\n");
+            con_out(st, "autark: get_memory_map failed\r\n");
             halt();
         }
 
@@ -332,7 +332,7 @@ pub extern "efiapi" fn efi_main(image: Handle, st: *mut SystemTable) -> Status {
 
         attempts += 1;
         if attempts > 8 {
-            con_out(st, "glados: exit_boot_services kept failing\r\n");
+            con_out(st, "autark: exit_boot_services kept failing\r\n");
             halt();
         }
     };
@@ -341,7 +341,7 @@ pub extern "efiapi" fn efi_main(image: Handle, st: *mut SystemTable) -> Status {
     // Past this line the firmware is gone. No boot services, no con_out,
     // no protocols. Serial and the framebuffer are all we have.
     // ---------------------------------------------------------------
-    serial_println!("glados: exited boot services after {} retries", attempts);
+    serial_println!("autark: exited boot services after {} retries", attempts);
 
     let boot = BootInfo {
         fb,
@@ -467,6 +467,24 @@ pub extern "efiapi" fn efi_main(image: Handle, st: *mut SystemTable) -> Status {
         sysbox::restore_latest();
     }
 
+    // The operator's decision about crediting the on-chip generator, restored
+    // once the namespace that holds it exists.
+    //
+    // Outside the `restore` arm on purpose. A machine that skipped restoring --
+    // because the recovery console said the last snapshot is what broke it --
+    // has a fresh namespace with no such file, so this reads `None` and the
+    // flag stays false. That is the right answer rather than an accident: until
+    // this line runs the flag is false, so a machine that cannot mount its own
+    // store comes up *untrusting*, which is the safe direction to fail and the
+    // one that matches what the pool actually knows.
+    if let Some(b) = sysbox::read_blob(rng::TRUST_PATH) {
+        if b.first() == Some(&b'1') {
+            rng::trust_hardware(true);
+            let n = rng::seed_from_hardware();
+            serial_println!("autark: rdrand credited by stored operator decision, {} draw(s)", n);
+        }
+    }
+
     // After storage, so a future version can pull weights out of the store
     // rather than off the ESP.
     gfx::splash::stage("loading the model");
@@ -538,7 +556,7 @@ fn init_storage(acpi: &Option<acpi::Acpi>) -> bool {
     }
 
     // The store's location is derived, not remembered: a partition tagged with
-    // the GLaDOS type GUID if one exists, otherwise unclaimed space. So
+    // the AUTARK type GUID if one exists, otherwise unclaimed space. So
     // mounting needs nothing recorded anywhere else. Read-only -- mounting
     // never writes.
     match store::cas::find_store_region(store::MIN_REGION_BLOCKS) {
@@ -817,7 +835,7 @@ fn init_smp(acpi: &Option<acpi::Acpi>) {
             console::set_color(LTRED);
         }
         kprintln!(
-            "  {}  a split matvec and its adjoint equal whole ones, bit for bit",
+            "  {}  int8 and int4 matvec, adjoint and prefill equal whole ones, bit for bit",
             if ok { "ok " } else { "FAIL" }
         );
         console::set_color(LTGRAY_IDX);
@@ -1167,6 +1185,20 @@ fn selftest(acpi_ref: &Option<acpi::Acpi>) {
     console::set_color(LTGRAY_IDX);
     sysbox::selftest();
 
+    // The invariant, at every boot, before anything has had a chance to write.
+    // A pure function over (path, stored bytes, change), so all seven of its
+    // verdicts are reachable here without a namespace, a disk or a trial --
+    // which matters because the states worth having are the refusals, and a
+    // refusal only fires when something else has already gone wrong.
+    kprintln!("\n[selftest] the record:");
+    if sysbox::guard::selftest() {
+        kprintln!("[selftest] ok -- the ledger may only be appended to");
+    } else {
+        console::set_color(LTRED);
+        kprintln!("[selftest] FAIL -- self-modification has no honest record");
+        console::set_color(LTGRAY_IDX);
+    }
+
     // The RFC vectors, at every boot. 25 ms, and it is the only thing standing
     // between a broken field arithmetic and a TLS handshake that fails with
     // nothing to point at -- crypto is the one place where wrong code still
@@ -1285,7 +1317,7 @@ fn selftest(acpi_ref: &Option<acpi::Acpi>) {
 /// A prerequisite for updating, not a nicety: an updater has to answer "is the
 /// staged image newer than the running one", and until now nothing in the
 /// binary could say what the running one *was*. The only version strings in
-/// the whole image were two hardcoded `User-Agent: glados/0.1` headers.
+/// the whole image were two hardcoded `User-Agent: autark/0.1` headers.
 ///
 /// From `CARGO_PKG_VERSION` rather than a constant typed here, so the number
 /// in `Cargo.toml` and the number the machine reports cannot disagree. There
@@ -1313,7 +1345,7 @@ pub fn version_newer(candidate: &str, current: &str) -> bool {
 
 fn banner(boot: &BootInfo, acpi: &Option<acpi::Acpi>) {
     console::set_color(LTCYAN);
-    kprintln!("glados {}", VERSION);
+    kprintln!("autark {}", VERSION);
     console::set_color(WHITE);
     kprintln!("a ring-0 kernel for MSI MS-16R8\n");
 

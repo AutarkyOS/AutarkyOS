@@ -360,7 +360,7 @@ impl DeskApp for Paint {
         if focused {
             let px = cx + self.pen.0;
             let py = cy + self.pen.1;
-            let col = if self.pen_down { theme::APERTURE } else { theme::SHADOW };
+            let col = if self.pen_down { theme::SIGNAL } else { theme::SHADOW };
             fb.rect((px - 5).max(0) as u32, py as u32, 11, 1, col);
             fb.rect(px as u32, (py - 5).max(0) as u32, 1, 11, col);
         }

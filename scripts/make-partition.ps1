@@ -1,10 +1,10 @@
 <#
 .SYNOPSIS
-    Carve a GLaDOS partition out of C: on the internal NVMe.
+    Carve a AUTARK partition out of C: on the internal NVMe.
 
 .DESCRIPTION
     Shrinks the Windows volume and creates one new partition in the freed
-    space, tagged with a GLaDOS-specific GPT type GUID.
+    space, tagged with a AUTARK-specific GPT type GUID.
 
     This is the highest-risk script in the repo. Everything before it operated
     on a removable disk that could be unplugged; this one touches the drive
@@ -27,7 +27,7 @@
       * It only ever shrinks. NTFS shrink relocates file data out of the region
         it gives up; it does not discard it.
 
-    On the type GUID: tagging the partition means GLaDOS finds it by identity
+    On the type GUID: tagging the partition means AUTARK finds it by identity
     rather than by guessing which space looks unused. That matters here because
     this disk is fully allocated -- the freed space lands between C: and the
     recovery partition, not at the end of the disk.
@@ -49,13 +49,13 @@ param(
 
 $ErrorActionPreference = 'Stop'
 
-# GLaDOS data partition type. In GUID text form:
+# AUTARK data partition type. In GUID text form:
 #   b7e1f4a2-9c3d-4e58-a061-2f8d7c4b93e5
 $GLADOS_TYPE = 'b7e1f4a2-9c3d-4e58-a061-2f8d7c4b93e5'
 
 function Invoke-Diskpart {
     param([string[]]$Commands)
-    $file = Join-Path $env:TEMP ("glados-dp-{0}.txt" -f [guid]::NewGuid().ToString('N'))
+    $file = Join-Path $env:TEMP ("autark-dp-{0}.txt" -f [guid]::NewGuid().ToString('N'))
     Set-Content -Path $file -Value ($Commands -join "`r`n") -Encoding ASCII
     try { return (& diskpart.exe /s $file | Out-String) }
     finally { if (Test-Path $file) { Remove-Item -LiteralPath $file -Force -ErrorAction SilentlyContinue } }
@@ -71,7 +71,7 @@ if (-not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administra
 # The hard floor is where a base snapshot plus any usable history stops fitting
 # at all, not where it stops being generous.
 #
-# Sizing, from what the store actually writes: a full snapshot of GLaDOS's used
+# Sizing, from what the store actually writes: a full snapshot of AUTARK's used
 # memory is tens of megabytes, and each checkpoint stores only the chunks that
 # changed -- single-digit megabytes during ordinary work. So even 1 GB holds a
 # base image and something like a hundred checkpoints. An earlier version of
@@ -272,5 +272,5 @@ if ($errored) {
 Write-Host ("created: {0}  {1:N2} GB at {2:N2} GB" -f `
     $new[0].Name, ($new[0].Size/1GB), ($new[0].StartingOffset/1GB)) -ForegroundColor Green
 Write-Host ""
-Write-Host "done. GLaDOS will find this partition by its type GUID." -ForegroundColor Green
+Write-Host "done. AUTARK will find this partition by its type GUID." -ForegroundColor Green
 Write-Host "Boot it and run 'store init' to format the checkpoint store."

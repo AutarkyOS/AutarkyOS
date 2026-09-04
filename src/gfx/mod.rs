@@ -20,6 +20,7 @@ pub mod ui;
 pub mod uidoc;
 pub mod desk;
 pub mod agentwin;
+pub mod convwin;
 
 /// A program that owns a window's client area.
 ///
@@ -1146,7 +1147,7 @@ pub fn bench() {
 
     // ...and one where every row differs, which is the worst case.
     let (lo, hi) = best_of(&mut || {
-        target.rect(0, 0, w, h, theme::APERTURE);
+        target.rect(0, 0, w, h, theme::SIGNAL);
         compose::present();
     });
     kprintln!("  fill + present, all   {:>7} us  (max {})", lo, hi);

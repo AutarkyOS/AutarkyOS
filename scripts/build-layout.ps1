@@ -57,7 +57,7 @@ if (-not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administra
 
 function Invoke-Diskpart {
     param([string[]]$Commands)
-    $file = Join-Path $env:TEMP ("glados-dp-{0}.txt" -f [guid]::NewGuid().ToString('N'))
+    $file = Join-Path $env:TEMP ("autark-dp-{0}.txt" -f [guid]::NewGuid().ToString('N'))
     Set-Content -Path $file -Value ($Commands -join "`r`n") -Encoding ASCII
     try { return (& diskpart.exe /s $file | Out-String) }
     finally { if (Test-Path $file) { Remove-Item -LiteralPath $file -Force -ErrorAction SilentlyContinue } }
@@ -109,7 +109,7 @@ if ($existing) {
 }
 Write-Host "scheme         : MBR (no backup table in the nonexistent tail)"
 Write-Host "partition 1    : $EspSizeMB MB FAT32 at 1 MB, letter $EspLetter, ESP"
-Write-Host "partition 2    : $ReservedSizeMB MB unformatted, reserved for the glados filesystem"
+Write-Host "partition 2    : $ReservedSizeMB MB unformatted, reserved for the autark filesystem"
 Write-Host ("unpartitioned  : everything above {0:N0} MB, including {1:N0} MB that does not exist" -f `
     $totalMB, (($target.Size/1MB) - $safeMB))
 Write-Host ""
@@ -134,7 +134,7 @@ $out = Invoke-Diskpart @(
     "clean",
     "convert mbr",
     "create partition primary size=$EspSizeMB",
-    "format fs=fat32 quick label=GLADOS",
+    "format fs=fat32 quick label=AUTARK",
     "assign letter=$EspLetter",
     "active",
     "create partition primary size=$ReservedSizeMB",

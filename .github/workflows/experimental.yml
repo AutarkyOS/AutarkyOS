@@ -67,8 +67,8 @@ jobs:
         run: |
           test -n "$KEY" || { echo "UPDATE_SIGNING_KEY is not set"; exit 1; }
           mkdir -p out
-          cp target/x86_64-unknown-uefi/release/glados.efi "out/glados-$VERSION.efi"
-          python3 tools/sign.py "out/glados-$VERSION.efi" "out/glados-$VERSION.efi.sig" --key "$KEY"
+          cp target/x86_64-unknown-uefi/release/autark.efi "out/autark-$VERSION.efi"
+          python3 tools/sign.py "out/autark-$VERSION.efi" "out/autark-$VERSION.efi.sig" --key "$KEY"
 
       - name: Build the signed manifest
         env:
@@ -82,7 +82,7 @@ jobs:
           # The base is the private bucket's path. The URLs in this manifest
           # are rewritten into signed ones by the channel function before any
           # machine sees them; what is stored here is where the object lives.
-          python3 tools/manifest.py "out/glados-$VERSION.efi" \
+          python3 tools/manifest.py "out/autark-$VERSION.efi" \
             --version "$VERSION" \
             --channel experimental \
             --base "$ORIGIN/storage/v1/object/experimental/$SLUG" \
@@ -91,7 +91,7 @@ jobs:
             --out out
 
       - name: Verify what we are about to publish
-        run: python3 tools/manifest.py --verify out/manifest --image "out/glados-$VERSION.efi"
+        run: python3 tools/manifest.py --verify out/manifest --image "out/autark-$VERSION.efi"
 
       - name: Publish to the experimental bucket
         env:
@@ -107,8 +107,8 @@ jobs:
               "$ORIGIN/storage/v1/object/experimental/$2"
             echo "  put $2"
           }
-          put "out/glados-$VERSION.efi" "$SLUG/glados-$VERSION.efi"
-          put "out/glados-$VERSION.efi.sig" "$SLUG/glados-$VERSION.efi.sig"
+          put "out/autark-$VERSION.efi" "$SLUG/autark-$VERSION.efi"
+          put "out/autark-$VERSION.efi.sig" "$SLUG/autark-$VERSION.efi.sig"
           put "out/manifest" "$SLUG/manifest"
 
       # The row is what the channel function serves. Written last, so a build
@@ -122,8 +122,8 @@ jobs:
           notes="$NOTES"
           [ -n "$notes" ] || notes="branch $GITHUB_REF_NAME"
           notes="$SLUG -- $notes"
-          sha=$(sha256sum "out/glados-$VERSION.efi" | cut -d' ' -f1)
-          size=$(stat -c%s "out/glados-$VERSION.efi")
+          sha=$(sha256sum "out/autark-$VERSION.efi" | cut -d' ' -f1)
+          size=$(stat -c%s "out/autark-$VERSION.efi")
           jq -n \
             --arg slug "$SLUG" --arg version "$VERSION" \
             --arg sha "$sha" --argjson size "$size" --arg notes "$notes" \

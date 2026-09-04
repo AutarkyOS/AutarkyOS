@@ -37,13 +37,13 @@ import urllib.request
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 DOCS = os.path.normpath(os.path.join(HERE, "..", "docs"))
-REPO = "https://github.com/IlumCI/GLaDOS"
-API = "https://api.github.com/repos/IlumCI/GLaDOS/releases"
-SITE = "https://glados.aperture.institute"
+REPO = "https://github.com/IlumCI/AUTARK"
+API = "https://api.github.com/repos/IlumCI/AUTARK/releases"
+SITE = "https://autark.aperture.institute"
 
 # --- what each image actually is ----------------------------------------
 #
-# Keyed by what is left of an asset name after "glados-", the version, and
+# Keyed by what is left of an asset name after "autark-", the version, and
 # ".iso" come off. Both naming schemes appear in the release history: assets
 # were unversioned through V1.1.0 and version-stamped from v1.2.26, which is
 # precisely what broke the old links, so both are recognised here.
@@ -107,7 +107,7 @@ PROJECT = [
 DEVELOPERS = [("IlumCI", "project admin, developer")]
 
 WIKI_PICKS = [
-    ("wiki/glados-os.html", "GLaDOS OS"),
+    ("wiki/autark-os.html", "AUTARK OS"),
     ("wiki/kernel.html", "The kernel"),
     ("wiki/model.html", "The model"),
     ("wiki/agent.html", "The agent"),
@@ -139,7 +139,7 @@ def fetch_releases(path=None):
             return json.load(fh)
     req = urllib.request.Request(API, headers={
         "Accept": "application/vnd.github+json",
-        "User-Agent": "glados-site-generator",
+        "User-Agent": "autark-site-generator",
     })
     tok = os.environ.get("GITHUB_TOKEN")
     if tok:
@@ -173,9 +173,9 @@ def variant_key(asset_name, tag):
     if not n.endswith(".iso"):
         return None
     n = n[:-len(".iso")]
-    if not n.startswith("glados"):
+    if not n.startswith("autark"):
         raise ValueError("unrecognised image name: " + asset_name)
-    n = n[len("glados"):].lstrip("-")
+    n = n[len("autark"):].lstrip("-")
     # Version-stamped from v1.2.26 onward; drop a leading N.N.N if present.
     ver = tag.lstrip("vV")
     if n == ver:
@@ -237,9 +237,9 @@ def masthead_html(p):
     """The wordmark, and the product name under it.
 
     The mark reads "Aperture Institute", which is the organisation rather than
-    the software, so the tagline has to carry "GLaDOS" or the page stops saying
+    the software, so the tagline has to carry "AUTARK" or the page stops saying
     what it is about. That split is deliberate and it is the one the domain
-    already implies: the institute is the publisher, GLaDOS is the thing
+    already implies: the institute is the publisher, AUTARK is the thing
     published.
 
     Drawn on white because the artwork is black on transparent and was made
@@ -253,7 +253,7 @@ def masthead_html(p):
         '<div id="masthead">',
         '  <a class="mark" href="%s"><img src="%simg/wordmark.png" '
         'alt="Aperture Institute" width="666" height="169"></a>' % (home, p),
-        '  <span class="sub">GLaDOS: an operating system in Rust, '
+        '  <span class="sub">AUTARK: an operating system in Rust, '
         'with a language model in the kernel</span>',
         '</div>',
     ])
@@ -379,7 +379,7 @@ def footer_html(p, rel):
     updated = date_of(rel) if rel else ""
     return "\n".join([
         '<div id="footer">',
-        '  <p>GLaDOS, Aperture Science and Portal are properties of Valve '
+        '  <p>AUTARK, Aperture Science and Portal are properties of Valve '
         'Corporation. This project is independent and is not affiliated with, '
         'endorsed by, or connected to Valve in any way.</p>',
         '  <p>Copyright 2026. All rights reserved. The source is published so '
@@ -536,7 +536,7 @@ def archive_tree(rel):
         "    'iso':{kids:[",
         ",\n".join(isos) + "]},",
         "    'src':{kids:[",
-        "      {n:'glados-src.tar.gz',t:'f',d:'repository snapshot',",
+        "      {n:'autark-src.tar.gz',t:'f',d:'repository snapshot',",
         "       href:REPO+'/archive/refs/heads/main.tar.gz',size:'700K'},",
         "      {n:'browse/',t:'l',d:'read it on GitHub',href:REPO}]},",
         "    'docs':{kids:[",
@@ -577,7 +577,7 @@ def news_items(releases, limit=None):
             '  <p class="nl">%s &middot; %s</p>\n'
             '</div>' % (
                 html.escape(date),
-                html.escape(rel.get("name") or ("GLaDOS " + ver)),
+                html.escape(rel.get("name") or ("AUTARK " + ver)),
                 html.escape(first) or "No summary was recorded for this release.",
                 a(rel["html_url"], "Release notes"),
                 "%d image%s" % (imgs, "" if imgs == 1 else "s"),
@@ -596,10 +596,10 @@ def ld_app(rel):
     doc = {
         "@context": "https://schema.org",
         "@type": "SoftwareApplication",
-        "name": "GLaDOS",
+        "name": "AUTARK",
         "applicationCategory": "OperatingSystem",
         "operatingSystem": "x86-64 UEFI (bare metal)",
-        "description": "GLaDOS is a from-scratch ring-0 operating system "
+        "description": "AUTARK is a from-scratch ring-0 operating system "
                        "written in Rust with a language model running inside "
                        "the kernel. Free bootable ISO, full source, and "
                        "documentation on how every part works.",
@@ -626,7 +626,7 @@ def flash_example(rel):
     the block never reads "None".
     """
     imgs = [v for v in images_of(rel) if v["key"] == ""]
-    name = imgs[0]["name"] if imgs else "glados-%s.iso" % version_of(rel)
+    name = imgs[0]["name"] if imgs else "autark-%s.iso" % version_of(rel)
     body = [
         "# Linux / macOS. Check the device name first, this overwrites it",
         "sudo dd if=%s of=/dev/sdX bs=4M status=progress oflag=sync"
@@ -737,7 +737,7 @@ def check(releases, fetch=False):
     Resolving against the API is also the better check. The URLs are generated
     from that API, so the question worth asking is whether a page names an
     asset the release actually has, and that is what caught the original
-    breakage: `glados-qwen35-2b.iso` is absent from the current release's asset
+    breakage: `autark-qwen35-2b.iso` is absent from the current release's asset
     list, which is exactly why it 404s. It costs one request instead of one per
     link, and it cannot be fooled by a CDN that answers for a missing object.
 
@@ -789,7 +789,7 @@ def check(releases, fetch=False):
                     try:
                         req = urllib.request.Request(
                             href, headers={"Range": "bytes=0-0",
-                                           "User-Agent": "glados-site-check"})
+                                           "User-Agent": "autark-site-check"})
                         with urllib.request.urlopen(req, timeout=30) as r:
                             if r.status not in (200, 206):
                                 bad.append("%s -> HTTP %d  (%s)"

@@ -16,7 +16,7 @@ use crate::{kprint, kprintln, serial_println};
 use alloc::string::String;
 use alloc::vec::Vec;
 
-const PROMPT: &str = "glados> ";
+const PROMPT: &str = "autark> ";
 /// Derived, not written out. Hardcoding this was fine until the prompt changed
 /// length during the rename, at which point every cursor position in the line
 /// editor was off by one.
@@ -156,6 +156,61 @@ pub fn run(boot: &BootInfo, acpi: &Option<Acpi>) -> ! {
     crate::gfx::desk::dismiss_menus();
     kprintln!("\ninteractive. type 'help', or just type code.");
     console::set_color(WHITE);
+
+    // Registration: the first onboarding this tree has ever had.
+    //
+    // Absence of `/ai/about` is the whole test. It is the same condition
+    // `companion::system_turn` already reads -- absent and empty mean the same
+    // thing there, and they mean the same thing here -- so there is no
+    // first-boot flag to get out of step with reality, and a machine whose
+    // record was cleared is offered enrolment again rather than being told it
+    // already knows somebody it does not.
+    //
+    // It is a notice and not a prompt. A modal question at the first prompt
+    // would block a serial script and would be the one thing on this machine
+    // that cannot be driven headlessly, which is how the desktop's own
+    // controls came to need `win keys`. The claim it makes is deliberately the
+    // narrow one that is always true -- the record is read into every new
+    // conversation -- and says nothing about surviving a reboot, which depends
+    // on a store being mounted and is exactly the overclaim `park()` was
+    // rewritten to stop making.
+    if crate::sysbox::read_blob(crate::ai::companion::ABOUT).map_or(true, |b| b.is_empty()) {
+        console::set_color(YELLOW);
+        kprintln!("\n[registration]");
+        console::set_color(LTGRAY);
+        kprintln!("  No record of you is held. One will be kept.");
+        kprintln!("  'about <anything>' enters it, and it is read into every new");
+        kprintln!("  conversation thereafter. Operation continues either way; the");
+        kprintln!("  record is for the machine's convenience, not your comfort.");
+        console::set_color(WHITE);
+    }
+
+    // Conversation-first: the machine is the surface, and the terminal is a
+    // window on the desktop behind it.
+    //
+    // Opened after the registration notice rather than before, so the first
+    // thing on the console is still the thing a person has to read. It takes
+    // the keyboard, which every other opener here refuses to do -- see
+    // `desk::open_conversation` for why that is safe now and was not before.
+    crate::gfx::desk::open_conversation();
+
+    // What the machine did while nobody was here.
+    //
+    // At the first prompt rather than on a timer, because "the first
+    // interaction after a night run" is what the operator experiences and a
+    // machine that runs unattended is one they meet at a prompt. Rendered from
+    // the certificate at the time of the sitting, never generated now: a
+    // paraphrase is a claim, and the one thing this report may not be is
+    // wrong about a number.
+    if let Some(d) = crate::ai::godel::pending() {
+        console::set_color(YELLOW);
+        kprintln!("\n[in your absence]");
+        console::set_color(LTGRAY);
+        for l in d.lines() {
+            kprintln!("{}", l);
+        }
+        console::set_color(WHITE);
+    }
 
     let mut interp = aiksi::Interp::new();
     let mut history: Vec<String> = Vec::new();
@@ -1083,6 +1138,7 @@ fn work_cmd(rest: &str) {
                 kprintln!("  {}", match e {
                     RunError::Hardware => "no AVX2/FMA, so this would measure the emulator",
                     RunError::Hybrid => "adapters are refused on a hybrid checkpoint",
+                    RunError::Quantised => "int4 base serves but is not trained against",
                     RunError::NoCorpus => "the role set is empty",
                     RunError::NoDecisions => "the grammar cannot spell any applet in this set",
                 });
@@ -2953,6 +3009,50 @@ fn execute(line: &str, boot: &BootInfo, acpi: &Option<Acpi>, interp: &mut aiksi:
                         Err(why) => kprintln!("  not eligible: {}", why),
                     }
                     kprintln!("  {} trial(s), {} adopted", trials, adoptions);
+                    // The bar itself, since U3 makes it a thing that can move.
+                    // A machine that has loosened its own criterion should say
+                    // so where anyone looks, not bury it in the ledger.
+                    {
+                        // Both halves, and each says on its own whether it
+                        // moved. Printing only the bar was accurate and
+                        // incomplete in the way that matters: a machine can
+                        // now have loosened the half this line never named.
+                        let t = godel::judge_in_force();
+                        let f = godel::floor_in_force();
+                        let t_moved = (t - godel::MCNEMAR_95).abs() >= 0.005;
+                        let f_moved = f != godel::MIN_FIXED;
+                        if !t_moved && !f_moved {
+                            kprintln!(
+                                "  criterion: bar {} floor {} (the default; never moved)",
+                                t, f
+                            );
+                        } else {
+                            console::set_color(YELLOW);
+                            kprintln!(
+                                "  criterion: bar {}{} floor {}{}",
+                                t,
+                                if t_moved { " MOVED" } else { "" },
+                                f,
+                                if f_moved { " MOVED" } else { "" }
+                            );
+                            kprintln!(
+                                "  the default was bar {} floor {}",
+                                godel::MCNEMAR_95,
+                                godel::MIN_FIXED
+                            );
+                            console::set_color(LTGRAY);
+                        }
+                        // What the criterion in force actually demands of a
+                        // clean run, which is not either constant: Yates
+                        // subtracts one before squaring, so at bar 3.84 the
+                        // floor of 4 scores 2.25 and six clean repairs is the
+                        // real requirement. Two numbers that look like the
+                        // answer and are not is how the wrong one gets quoted.
+                        kprintln!(
+                            "  in practice that needs {} clean repairs",
+                            godel::clean_fixes_needed()
+                        );
+                    }
                     // The test slice is the one resource a self-improving loop
                     // spends without noticing, so its balance is status, not
                     // a footnote.
@@ -2979,6 +3079,28 @@ fn execute(line: &str, boot: &BootInfo, acpi: &Option<Acpi>, interp: &mut aiksi:
                         }
                     }
                 }
+                "report" => {
+                    // `report` hands over what is owed and marks it handed
+                    // over; `report all` re-reads the whole file and marks
+                    // nothing, because re-reading is not being told.
+                    let every = words.next().unwrap_or("") == "all";
+                    let text = if every {
+                        godel::all_dispatches()
+                    } else {
+                        godel::pending()
+                    };
+                    match text {
+                        None if every => kprintln!("  no sittings recorded"),
+                        None => kprintln!("  nothing since you were last told"),
+                        Some(d) => {
+                            console::set_color(LTGRAY);
+                            for l in d.lines() {
+                                kprintln!("{}", l);
+                            }
+                            console::set_color(WHITE);
+                        }
+                    }
+                }
                 "now" => {
                     // Forced, so the quiet window does not apply: the operator
                     // asking for a trial *is* the consent the window stands in
@@ -2995,18 +3117,24 @@ fn execute(line: &str, boot: &BootInfo, acpi: &Option<Acpi>, interp: &mut aiksi:
                 // status line could not answer before there was a search.
                 "space" => {
                     let (seen, all) = godel::explored();
-                    kprintln!("  {} of {} point(s) tried", seen, all);
+                    kprintln!("  declared prefix: {} of {} point(s) tried", seen, all);
+                    if seen >= all {
+                        // The parent stopped here, and said so: "search space
+                        // exhausted" was the end of self-improvement, eight
+                        // points and then nothing, every night forever. It is
+                        // not the end any more, so the line that said it is
+                        // gone rather than softened.
+                        kprintln!("  the prefix is spent; drawing from the record instead");
+                    }
                     match godel::frontier() {
                         Some(p) => kprintln!(
                             "  next: lr {}, rank {}, alpha {}, epochs {}, rule {}",
                             p.lr, p.rank, p.alpha, p.epochs, p.rule
                         ),
-                        None => {
-                            kprintln!("  the grid is spent -- every point has been trained and judged");
-                            kprintln!("  from here the night loop composes a core instead, which is");
-                            kprintln!("  a space it writes rather than one it was given");
-                            kprintln!("  'core author' to see one now; 'godel forget' re-walks the grid");
-                        }
+                        // Only reachable if 64 successive draws were all
+                        // already tried, which needs the ledger to be static
+                        // while the markers are not.
+                        None => kprintln!("  no untried draw in {} attempts", godel::draw_tries()),
                     }
                 }
                 // Judge a routing rule on calibration.
@@ -3057,17 +3185,216 @@ fn execute(line: &str, boot: &BootInfo, acpi: &Option<Acpi>, interp: &mut aiksi:
                         }
                     }
                 }
+                // U3: show the cross-evaluation matrix for a proposed bar,
+                // without adopting anything. Reads the held-out anchor, so it
+                // spends a test-budget read -- looking at ground truth is using
+                // it, and the count is the same discipline every other read
+                // obeys.
+                "cross" => {
+                    let tau = words.next().and_then(|w| w.parse::<f32>().ok());
+                    // The floor is a required argument rather than an optional
+                    // one. `<bar> [floor] [examples]` cannot be parsed: both
+                    // trailing words are numbers, so a two-argument call is
+                    // ambiguous and would silently read a sample size as a
+                    // criterion. The criterion is one object and is typed whole.
+                    let floor = words.next().and_then(|w| w.parse::<usize>().ok());
+                    let n = words.next().and_then(|w| w.parse::<usize>().ok()).unwrap_or(0);
+                    match (tau, floor) {
+                        (Some(t), Some(f)) => {
+                            match crate::ai::with_engine(|e| godel::cross_matrix(e, t, f, n, 120_000)) {
+                                None => kprintln!("  {}", crate::ai::engine_refusal()),
+                                Some(Err(why)) => kprintln!("  refused: {}", why.why()),
+                                Some(Ok(ce)) => {
+                                    let (adopt, why) = ce.verdict();
+                                    console::set_color(YELLOW);
+                                    kprintln!("[cross-evaluation]");
+                                    console::set_color(LTGRAY);
+                                    kprintln!(
+                                        "  candidate: fixed {} broke {} chi {} over {} validation",
+                                        ce.fixed, ce.broke, ce.chi, ce.validation
+                                    );
+                                    kprintln!(
+                                        "  standing  bar {} floor {}: {}",
+                                        ce.tau_old, ce.floor_old,
+                                        if ce.admit_old { "ADMITS" } else { "REFUSES" }
+                                    );
+                                    kprintln!(
+                                        "  proposed  bar {} floor {}: {}",
+                                        ce.tau_new, ce.floor_new,
+                                        if ce.admit_new { "ADMITS" } else { "REFUSES" }
+                                    );
+                                    // Which clause actually decided. J1 tests
+                                    // the floor before the statistic, so a
+                                    // candidate under the floor is refused by
+                                    // every bar in range and the chi printed
+                                    // above is irrelevant to the verdict. That
+                                    // was invisible until it cost a measurement.
+                                    if ce.fixed <= ce.broke
+                                        || ce.fixed - ce.broke < ce.floor_old.min(ce.floor_new)
+                                    {
+                                        kprintln!(
+                                            "  the floor decided, not the bar -- net repair {} is under {}",
+                                            ce.fixed as i32 - ce.broke as i32,
+                                            ce.floor_old.min(ce.floor_new)
+                                        );
+                                    }
+                                    kprintln!(
+                                        "  anchor (held-out): incumbent {} -> candidate {}{}",
+                                        ce.anchor_inc, ce.anchor_cand,
+                                        if ce.anchor_fresh { "" } else { "  (budget spent -- unquotable)" }
+                                    );
+                                    console::set_color(if adopt { LTGREEN } else { YELLOW });
+                                    kprintln!("  verdict: {} -- {}", if adopt { "would adopt" } else { "would refuse" }, why);
+                                    console::set_color(LTGRAY);
+                                }
+                            }
+                        }
+                        _ => {
+                            kprintln!("  usage: godel cross <bar> <floor> [examples]");
+                            kprintln!(
+                                "  in force: bar {} floor {}",
+                                godel::judge_in_force(),
+                                godel::floor_in_force()
+                            );
+                        }
+                    }
+                }
+                // U3: run a real judge-trial -- move the bar, or refuse and
+                // record why. The night rotation reaches this on its own; the
+                // command is how it is driven and tested.
+                "judge" => {
+                    let tau = words.next().and_then(|w| w.parse::<f32>().ok());
+                    let floor = words.next().and_then(|w| w.parse::<usize>().ok());
+                    let n = words.next().and_then(|w| w.parse::<usize>().ok()).unwrap_or(0);
+                    match (tau, floor) {
+                        (Some(t), Some(f)) => {
+                            let b = godel::Proposal::judge(t, f).budget(n, 120_000);
+                            match crate::ai::with_engine(|e| godel::trial_judge(e, t, f, &b)) {
+                                None => kprintln!("  {}", crate::ai::engine_refusal()),
+                                Some(Err(why)) => kprintln!("  refused: {}", why.why()),
+                                Some(Ok(c)) => {
+                                    console::set_color(if c.adopted { LTGREEN } else { YELLOW });
+                                    kprintln!(
+                                        "  {} -- {}",
+                                        if c.adopted { "the criterion moved" } else { "the criterion stands" },
+                                        c.j1_why
+                                    );
+                                    console::set_color(LTGRAY);
+                                    if let Some(x) = c.cross {
+                                        kprintln!(
+                                            "  bar {} -> {}, floor {} -> {}, anchor {} -> {}",
+                                            x.tau_old, x.tau_new,
+                                            x.floor_old, x.floor_new,
+                                            x.anchor_inc, x.anchor_cand
+                                        );
+                                    }
+                                    kprintln!("  'godel rollback' restores the prior criterion");
+                                }
+                            }
+                        }
+                        _ => kprintln!("  usage: godel judge <bar> <floor> [examples]"),
+                    }
+                }
+                // The illumination archive: the best mind of every kind, not
+                // just the one the head climbed to.
+                "map" => {
+                    let (filled, total, qd) = godel::archive_stats();
+                    console::set_color(YELLOW);
+                    kprintln!("[archive]");
+                    console::set_color(LTGRAY);
+                    kprintln!("  {} of {} cells lit, QD-score {}", filled, total, qd);
+                    let cells = godel::archive_cells();
+                    if cells.is_empty() {
+                        kprintln!("  nothing illuminated yet -- the loop lights cells as it runs");
+                    }
+                    let rank_label = |a: usize| match a {
+                        0 => "rank<=4 ",
+                        1 => "rank<=8 ",
+                        2 => "rank<=16",
+                        _ => "rank>16 ",
+                    };
+                    let repair_label = |b: usize| match b {
+                        0 => "breaks  ",
+                        1 => "balanced",
+                        _ => "fixes   ",
+                    };
+                    for (a, b, e) in cells.iter() {
+                        kprintln!(
+                            "  [{} | {}]  {}  fit {}",
+                            rank_label(*a),
+                            repair_label(*b),
+                            godel::short_hex(&e.variant),
+                            e.fitness
+                        );
+                    }
+                }
+                // One prepare, a whole generation: train the declared storm
+                // grid, continue the incumbent, breed chimeras, light the
+                // archive, and put the best before the same four judges a lone
+                // trial faces.
+                "storm" => {
+                    let n = words.next().and_then(|w| w.parse::<usize>().ok()).unwrap_or(0);
+                    let mut b = crate::ai::train::Budget::default();
+                    b.examples = n;
+                    match crate::ai::with_engine(|e| godel::storm(e, &b)) {
+                        None => kprintln!("  {}", crate::ai::engine_refusal()),
+                        Some(Err(why)) => {
+                            use crate::ai::train::RunError;
+                            kprintln!("  refused: {}", match why {
+                                RunError::Hardware => "no AVX2/FMA, so this would measure the emulator",
+                                RunError::Hybrid => "hybrid checkpoints have no verified backward yet",
+                                RunError::Quantised => "int4 base serves but is not trained against",
+                                RunError::NoCorpus => "there is no corpus",
+                                RunError::NoDecisions => "the grammar cannot spell any applet here",
+                            });
+                        }
+                        Some(Ok(r)) => {
+                            console::set_color(YELLOW);
+                            kprintln!("[storm]");
+                            console::set_color(LTGRAY);
+                            kprintln!(
+                                "  {} trained, {} descendants of the incumbent, {} chimeras bred",
+                                r.trained, r.descendants, r.chimeras
+                            );
+                            kprintln!(
+                                "  archive: {} cell(s) lit this storm; best validation {}",
+                                r.cells_lit, r.best_fitness
+                            );
+                            console::set_color(if r.cert.adopted { LTGREEN } else { YELLOW });
+                            kprintln!(
+                                "  tribunal: the best {} -- {}",
+                                if r.cert.adopted { "was ADOPTED" } else { "was rejected" },
+                                r.cert.j1_why
+                            );
+                            console::set_color(LTGRAY);
+                            kprintln!("  'godel map' shows what the storm illuminated");
+                        }
+                    }
+                }
                 // What the loop would try tonight, without trying it.
                 "next" => {
-                    let (start, slots) = godel::rotation();
-                    kprintln!("  {} verdict(s) recorded, so the rotation starts at slot {}", godel::ledger_len(), start);
-                    for (i, (name, has)) in slots.iter().enumerate() {
-                        let mark = if i == start { "->" } else { "  " };
-                        kprintln!("  {} {:8} {}", mark, name, if *has { "has work" } else { "spent" });
+                    let (pos, len) = godel::epoch_position();
+                    if godel::at_epoch_boundary() {
+                        console::set_color(YELLOW);
+                        kprintln!("  epoch boundary: the bar may move tonight (Red Queen)");
+                        console::set_color(LTGRAY);
+                    } else {
+                        kprintln!("  trial {} of {} in this epoch -- the bar is frozen until the boundary", pos, len);
                     }
-                    let mark = if start == 4 { "->" } else { "  " };
-                    kprintln!("  {} core     composes on demand", mark);
-                    kprintln!("  it takes the first from the arrow onwards that has work");
+                    kprintln!("  {} verdict(s) recorded; axes in surprise order, most uncertain first:", godel::ledger_len());
+                    // The arrow marks the first axis with work -- what the loop
+                    // would actually take tonight.
+                    let mut marked = false;
+                    for (name, att, adopt, has) in godel::axis_report() {
+                        let arrow = if has && !marked { marked = true; "->" } else { "  " };
+                        kprintln!(
+                            "  {} {:8} {}   ({}/{} adopted)",
+                            arrow, name,
+                            if has { "has work" } else { "spent   " },
+                            adopt, att
+                        );
+                    }
+                    kprintln!("  it takes the first with work, chasing the least predictable axis");
                 }
                 "forget" => {
                     let n = godel::forget();
@@ -3850,11 +4177,14 @@ fn execute(line: &str, boot: &BootInfo, acpi: &Option<Acpi>, interp: &mut aiksi:
                     // by somebody typing, and an operator deciding whether to
                     // trust a key wants to know which happened.
                     let dev = crate::rng::device_deposits();
+                    let (cpu, net) = crate::rng::source_deposits();
+                    let input = deposits
+                        .saturating_sub(dev)
+                        .saturating_sub(cpu)
+                        .saturating_sub(net);
                     kprintln!(
-                        "  {} deposit(s): {} from input, {} from storage",
-                        deposits,
-                        deposits.saturating_sub(dev),
-                        dev
+                        "  {} deposit(s): {} from input, {} from storage, {} from the network, {} from the cpu",
+                        deposits, input, dev, net, cpu
                     );
                     kprintln!("  {} of {} bits credited", bits, crate::rng::SEEDED_BITS);
                     if seeded {
@@ -3862,10 +4192,59 @@ fn execute(line: &str, boot: &BootInfo, acpi: &Option<Acpi>, interp: &mut aiksi:
                         kprintln!("  seeded -- key material will be answered");
                     } else {
                         console::set_color(YELLOW);
-                        kprintln!("  not seeded -- key material is refused, type at it");
+                        // The old line said "type at it", which is the advice
+                        // for a machine with somebody in front of it and is
+                        // useless to the one that actually has this problem.
+                        kprintln!("  not seeded -- key material is refused");
                     }
                     console::set_color(LTGRAY);
+                    let (have_hw, trusted) = crate::rng::hardware();
+                    match (have_hw, trusted) {
+                        (false, _) => kprintln!("  no rdrand on this part"),
+                        (true, false) => {
+                            kprintln!("  rdrand present, mixed into every reseed, credited nothing");
+                            kprintln!("  'rng trust hw' credits it -- read what that costs first");
+                        }
+                        (true, true) => {
+                            console::set_color(YELLOW);
+                            kprintln!("  rdrand is CREDITED by operator decision");
+                            console::set_color(LTGRAY);
+                            kprintln!("  the seeded claim rests on an instruction nobody outside the vendor has seen");
+                        }
+                    }
+                    if !seeded && !trusted {
+                        // What would actually change the answer, for the
+                        // machine that has this problem: one that runs with
+                        // nobody in front of it.
+                        kprintln!("  unattended: a network round trip or disk traffic will seed it in time");
+                    }
                     kprintln!("  one bit credited per event, which is an assumption and not a measurement");
+                }
+                // Shell-only, and absent from `sysbox::APPLETS`, so no grammar
+                // can spell it and the model cannot credit its own entropy --
+                // the same reason `app trust` and `work trust` live here.
+                Some("trust") => {
+                    let what = rest.trim().split_whitespace().nth(1).unwrap_or("");
+                    let (have_hw, _) = crate::rng::hardware();
+                    match what {
+                        "hw" | "rdrand" if have_hw => {
+                            crate::rng::trust_hardware(true);
+                            let n = crate::rng::seed_from_hardware();
+                            let _ = crate::sysbox::write_text(crate::rng::TRUST_PATH, "1\n");
+                            console::set_color(YELLOW);
+                            kprintln!("  rdrand is now credited. {} draw(s) taken.", n);
+                            console::set_color(LTGRAY);
+                            kprintln!("  the pool's seeded claim now rests on it. 'rng untrust hw' takes it back,");
+                            kprintln!("  though bits already credited cannot be uncredited.");
+                        }
+                        "hw" | "rdrand" => kprintln!("  no rdrand on this part -- nothing to trust"),
+                        _ => kprintln!("  usage: rng trust hw"),
+                    }
+                }
+                Some("untrust") => {
+                    crate::rng::trust_hardware(false);
+                    let _ = crate::sysbox::write_text(crate::rng::TRUST_PATH, "0\n");
+                    kprintln!("  rdrand is mixed but no longer credited");
                 }
                 Some(w) => {
                     let n: usize = w.parse().unwrap_or(16).min(64);
@@ -3934,6 +4313,17 @@ fn execute(line: &str, boot: &BootInfo, acpi: &Option<Acpi>, interp: &mut aiksi:
         },
         "mines" | "minesweeper" => crate::gfx::desk::open_mines(),
         "agentlog" => crate::gfx::desk::open_agentlog(),
+        // `talk` opens the window; `talk <text>` also says the thing, which is
+        // what makes the surface drivable over serial at all -- `win keys` can
+        // type into it, but a whole sentence through the key injector is a
+        // sentence nobody will write twice.
+        "talk" | "convo" => {
+            crate::gfx::desk::open_conversation();
+            let said = rest.trim();
+            if !said.is_empty() && !crate::ai::agent::queue_say(said) {
+                kprintln!("  busy -- 'agent stop' cancels what it is doing");
+            }
+        }
         "todo" => {
             // No args opens the runbook window -- what someone clicking the
             // icon wants. `-p` prints it to the terminal for a serial run;
@@ -4939,7 +5329,7 @@ fn execute(line: &str, boot: &BootInfo, acpi: &Option<Acpi>, interp: &mut aiksi:
         }
         "version" | "uname" => {
             console::set_color(LTCYAN);
-            kprintln!("  glados {}", crate::VERSION);
+            kprintln!("  autark {}", crate::VERSION);
             console::set_color(LTGRAY);
             kprintln!("  a ring-0 kernel for MSI MS-16R8, one address space, no syscalls");
             // The formats an update has to stay compatible with. Each is

@@ -130,7 +130,7 @@ Run migration `0002_link.sql` first; it adds `nonces` and three columns to
 | | `TOKEN_RPC` | `https://rpc.mainnet.chain.robinhood.com` |
 | | `TOKEN_CHAIN_ID` | `4663` |
 | | `TOKEN_MIN_BALANCE` | `1000000000000000000000000` (1e6 tokens at 18 decimals) |
-| | `LINK_DOMAIN` | `glados.aperture.institute` |
+| | `LINK_DOMAIN` | `autark.aperture.institute` |
 
 All five have defaults in the source, so the function runs without them. They
 exist so the threshold can move without a redeploy of anything the kernel
