@@ -48,6 +48,8 @@ const ICMP_ECHO_REPLY: u8 = 0;
 pub mod css;
 pub mod dhcp;
 pub mod dns;
+pub mod fingerprint;
+pub mod recon;
 pub mod html;
 pub mod ieee80211;
 pub mod iface;
@@ -588,6 +590,27 @@ fn resolve(n: usize, target: Ipv4) -> Option<Mac> {
         core::hint::spin_loop();
     }
     None
+}
+
+/// Is a host on our own subnet answering ARP? The liveness gate `recon` uses.
+///
+/// ARP rather than a TCP probe or an ICMP echo, because on a local segment it
+/// is the question with the fewest ways to lie: a host with every port closed
+/// and ICMP filtered still must answer ARP to receive any IP traffic at all, so
+/// a silent ARP is a genuinely absent host and the scanner can skip it without
+/// paying a per-port timeout to discover the same thing fifteen times.
+///
+/// Off-subnet targets are refused rather than resolved. `resolve` answers an
+/// off-link address with the *gateway's* MAC, which is correct for sending and
+/// catastrophic for liveness -- it would report every address on the internet
+/// as alive because the gateway always answers. `recon` is a local tool and
+/// this is the line that keeps it one.
+pub fn alive(target: Ipv4) -> bool {
+    let Some(n) = route(target) else { return false };
+    if !ifaces()[n].on_subnet(target) {
+        return false;
+    }
+    resolve(n, target).is_some()
 }
 
 pub(crate) fn send_ipv4(dst: Ipv4, proto: u8, payload: &[u8]) -> bool {

@@ -23,6 +23,7 @@ size cap; guest RAM still has to cover the weights, so raise --memory.
 """
 
 import codecs
+import os
 import socket
 import subprocess
 import sys
@@ -30,8 +31,16 @@ import time
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
-PORT = 45454
-MONITOR_PORT = 45455
+# Overridable, because these are the one piece of global state a drive run has.
+# Two checkouts of this kernel on one machine -- a fork beside its parent, which
+# is exactly how this distribution gets developed -- both bind these ports, and
+# the second run does not fail cleanly: QEMU cannot bind the monitor and exits,
+# while `-serial ...,wait=on` leaves the *first* project's QEMU listening, so
+# drive.py connects to it and captures a boot log from somebody else's kernel.
+# That reads as this tree's binary having mysteriously reverted, and it cost a
+# session to work out. Set AUTARK_PORT (the monitor takes the next number).
+PORT = int(os.environ.get("AUTARK_PORT", "45454"))
+MONITOR_PORT = PORT + 1
 PROMPT = b"autark> "
 
 
@@ -471,6 +480,18 @@ def main():
     # believing, since splitting is live above 2^19 element-operations and the
     # classifier is far above it.
     smp = [] if any(a == "-smp" or a.startswith("-smp=") for a in qemu_extra) else ["-smp", "4"]
+
+    # The NVMe test disk `fat` and the corpus-bundle path scan. run.ps1 creates
+    # it on first boot; drive.py referenced it and did not, so a checkout driven
+    # before it was ever run by hand died with "cannot find nvme.img" -- QEMU
+    # refusing to open a drive that was never provisioned. Create it here too,
+    # same 64 MiB empty raw image, so either entry point works from cold.
+    nvme = ROOT / ".qemu/nvme.img"
+    if not nvme.exists():
+        nvme.parent.mkdir(parents=True, exist_ok=True)
+        with open(nvme, "wb") as f:
+            f.truncate(64 * 1024 * 1024)
+        print(f"[drive] created {nvme} (64 MiB)")
 
     args = [
         find_qemu(),

@@ -9,7 +9,7 @@
 # tools/tokenizer.py -- so all of it is reproducible from the repo plus a
 # download. `/tools` used to be ignored wholesale, from when it was scratch
 # space, which would have silently dropped both converters.
-esp/GLADOS/
+esp/AUTARK/
 tools/venv/
 tools/hf/
 tools/qwen3/

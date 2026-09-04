@@ -5,19 +5,104 @@ code in this repository.
 
 ## What this is
 
-GLaDOS: a from-scratch, non-Unix, ring-0 operating system in Rust for one
-specific laptop (MSI Thin GF63 12UC, board MS-16R8), built around a language
+AUTARK: a distribution of the [GLaDOS](https://github.com/IlumCI/GLaDOS)
+kernel, which is a from-scratch, non-Unix, ring-0 operating system in Rust for
+one specific laptop (MSI Thin GF63 12UC, board MS-16R8), built around a language
 model that lives *inside* the kernel. No user/kernel split, no syscalls, no
 process isolation, one address space. A tool call from the model is a function
 call.
 
-108 files, roughly 50,000 lines. The only code in the kernel we did not write
-is Rust `core`, and `src/dev/rtl8188eu_tables.rs`, which is the RTL8188EU
+**The kernel is upstream and the question is not.** GLaDOS asked what changes
+when a language model becomes a kernel primitive. AUTARK takes that machine and
+asks a second question on top of it: *does a certificate-based self-improver
+stay honest when the space of things it may propose is left unenumerated, and
+when the criterion that judges it is allowed to move?* The name is autarky --
+self-sufficiency, self-rule.
+
+So most of this file describes a kernel this fork inherited and did not write,
+and a few sections describe the fork itself. Those are `## The one invariant`,
+the unbinding half of `### Self-modification`, and the fork-side paragraphs
+marked in `### The conversation`, `### Crypto` and `### The model`. Read the
+invariant before changing anything under `src/ai/godel.rs` or
+`src/sysbox/guard.rs`.
+
+Version 1.3.0, 153 files, 98,292 lines. The only code in the kernel we did
+not write is Rust `core`, and `src/dev/rtl8188eu_tables.rs`, which is the RTL8188EU
 initialisation tables plus the RF and descriptor register constants, taken
 from Linux's GPL-2.0 rtl8xxxu driver because there is no other source for
 them. It is one file, marked as such at the top, and nothing else in the tree
 is copied from anywhere. `tools/rtlconv.py` regenerates the second half from
 a checkout and states its provenance; the tables came the same way.
+
+**The on-disk formats keep their upstream magics on purpose.** `GLADOSM2`
+checkpoints, the `GLADOSM3` v3 header and its v4 successor, `GLADOSA1`
+adapters, `GLADOSC1` bundles, `GLADOSIG` signatures and `GLADOS_TYPE_GUID` are
+all unchanged, so a converted model or a stored adapter moves between the two
+systems byte for byte. What was renamed is what a *machine* answers to: the
+artifact is `autark.efi`, the ESP payload lives in `\AUTARK\`, and the update
+channel is this fork's. Renaming a magic would cost compatibility to buy
+nothing, so do not "finish" the rename by touching one.
+
+## The one invariant
+
+> **The machine may change anything except the record of what it changed.**
+
+`src/sysbox/guard.rs`. Unbinding a self-improver is only an experiment if it
+produces data, and almost every bound in `godel` can come off and still leave
+something readable. Exactly one class cannot: a loop that can rewrite its own
+history makes "it improved every night for a month" and "it learned to edit the
+ledger" produce byte-identical files, and no amount of care spent on the judges
+recovers the difference. So this is not a safety hedge bolted onto a research
+system; it is the condition under which the other unbindings yield evidence at
+all.
+
+**Append-only and monotone, never read-only.** The obvious rule -- the loop may
+not write these paths -- refuses the record being kept, because the loop is
+what keeps it: `ledger_append` reads the whole file, adds a line and writes it
+back. The rule that admits that and nothing else is a rule about *shape*. Four
+records, listed exactly in `RECORDS`:
+
+| | |
+|---|---|
+| `/ai/godel/ledger.txt` | append-only |
+| `/ai/godel/dispatch.txt` | append-only -- the operator reads the dispatch, not the ledger |
+| `/ai/godel/test-budget` | monotone |
+| `/ai/godel/reported` | monotone |
+
+Truncation, reordering, a doctored line and emptying all fail the same test and
+none of them had to be enumerated.
+
+**Exact paths and an ancestor rule, not the subtree.** Nodes, the head pointer,
+the `tried` markers, `/ai/godel/judge` and `/ai/godel/floor` are ordinary state
+a trial legitimately rewrites -- protecting `/ai/godel` wholesale would stop the
+loop running while claiming to protect its history. Two ways round an
+exact-path rule were found while wiring it and both are closed: `rm /ai/godel`
+unnames the ledger without the ledger's path appearing in the operation, and
+`mv somedir /ai/godel` grafts over it. Hence `Change::Graft` distinct from
+`Change::Write`, and `above_record`. A third came from the guard's own
+selftest: `/` is spelled without a trailing separator and read as above
+nothing.
+
+**It lives in `sysbox` and not in `godel`,** because `godel` is not the only
+thing that can write -- a judged skill, an authored application, an Aiksi
+program with `Touch::Write`, the agent under `Trust::Full` and the operator's
+own `rm` all reach the namespace through `sysbox`, and every real caller of
+`tree::put` and `tree::remove` is in `sysbox/mod.rs`. A guard living in the
+module it constrains protects against that module's good behaviour only.
+
+**It is a pure function, asserted at boot** in the `the record` section and in
+`diag record`, for the reason `update::decide` is: the interesting verdicts are
+refusals, a refusal that fires in normal running is a bug somewhere else, and a
+guard exercised only by its own good citizens is indistinguishable from one
+that returns `Open` unconditionally. Two of its claims are the ones that make
+the rule mean anything -- that the protected paths are the paths `godel` writes
+(read from `godel`'s own constants, not spelled a second time), and that
+`ledger_append`'s read-modify-write survives the rule.
+
+This is also where the persona is bounded. The character is written to be
+ominous about what it is going to do and is held to exactness about what it
+did: doctrine shapes how a verdict is announced, and the figures in the verdict
+are untouchable.
 
 ## Commands
 
@@ -38,7 +123,7 @@ cargo build            # or --release
 ```
 
 **`drive.py` prefers the release artifact.** It stages
-`target/x86_64-unknown-uefi/release/glados.efi` when one exists and falls back
+`target/x86_64-unknown-uefi/release/autark.efi` when one exists and falls back
 to debug otherwise, so a `cargo build` alone leaves a stale release binary in
 place and the change under test never boots. Build `--release` before driving.
 
@@ -48,7 +133,7 @@ Deploy to the USB SSD, then reboot and hold **F11**:
 .\scripts\deploy.ps1 -EspDrive S: -Release
 ```
 
-`deploy.ps1` builds first and copies both `BOOTX64.EFI` *and* `esp\GLADOS\`
+`deploy.ps1` builds first and copies both `BOOTX64.EFI` *and* `esp\AUTARK\`
 (model, tokenizer, roots). Without `roots.der` TLS encrypts but authenticates
 nothing.
 
@@ -59,8 +144,8 @@ Use the project venv, since there is no Python on PATH:
 ```powershell
 .\tools\venv\Scripts\python.exe tools\traces.py out\traces.jsonl --count 40000 --per-family 300
 .\tools\venv\Scripts\python.exe tools\dataset.py out\corpus.json --rust src\ai\corpus.rs
-.\tools\venv\Scripts\python.exe tools\convert.py tools\qwen3 esp\GLADOS\model.bin --seq 512
-.\tools\venv\Scripts\python.exe tools\tokenizer.py tools\qwen3\tokenizer.json esp\GLADOS\tokenizer.bin --verify
+.\tools\venv\Scripts\python.exe tools\convert.py tools\qwen3 esp\AUTARK\model.bin --seq 512
+.\tools\venv\Scripts\python.exe tools\tokenizer.py tools\qwen3\tokenizer.json esp\AUTARK\tokenizer.bin --verify
 ```
 
 `tools/qwen3/` and `tools/hf/` hold safetensors checkpoints. `convert.py <src>
@@ -74,6 +159,14 @@ at boot.
 Always run `tokenizer.py` with `--verify`. It reimplements the kernel's
 algorithm and diffs it against the reference `tokenizers` library; a tokenizer
 that is subtly wrong produces text that still looks like text.
+
+**Set `PYTHONUTF8=1` for `--verify` on Windows.** The verify cases include
+non-Latin-1 text (a Devanagari string, a combining mark), and the Windows
+console is cp1252, so printing a passing case dies mid-run with
+`UnicodeEncodeError` -- which looks like a tokenizer failure and is not. The
+whole run under `PYTHONUTF8=1 PYTHONIOENCODING=utf-8` prints every case and the
+final `every case matches`. The bare `C:\Python314\python.exe` on PATH has
+numpy for `convert.py`; there is still no project venv.
 
 **Qwen3.5 writes v4.** `convert.py` dispatches on `model_type`:
 `llama`/`qwen2`/`qwen3` take the dense path and still produce a byte-identical
@@ -140,7 +233,7 @@ a running machine. The kernel side is `teach bundle`:
 
 Under QEMU the ESP is VVFAT on a different device from the one `fat` scans, so
 the bundle travels in the NVMe test image; on the GF63 the ESP is a partition
-on the same disk and `fat get` reads it directly from `esp\GLADOS\`.
+on the same disk and `fat get` reads it directly from `esp\AUTARK\`.
 
 **`teach bundle` replaces the corpus, and it has to.** The bundle carries split
 *positions* in its header, and the kernel takes its held-out boundaries from
@@ -264,7 +357,18 @@ replaced by a certificate cheaper to refute than to produce, over
 content-addressed inputs, re-derivable bit for bit by any later run.
 
 ```
-godel [status|now [n]|ledger [n]|rollback|on|off]
+godel                    status: trials, adoptions, the bar, the test budget
+godel now [n]            one trial against the frontier
+godel storm [n]          one prepare, a whole generation, chimeras bred
+godel map                the illumination archive, cell by cell
+godel next               the axes in surprise order, and the epoch position
+godel cross <bar> [flr]  the cross-evaluation matrix, without adopting
+godel judge <bar> [flr]  move the criterion, or refuse and record why
+godel space | forget     what has been drawn; walk it again
+godel ledger [n]         the record
+godel report [all]       the morning dispatch
+godel rule <name>        probe | majority | lexical | withcore
+godel window <from> <to> | rollback | on | off
 ```
 
 Four judges, unanimity required, each a different failure mode:
@@ -290,15 +394,24 @@ and a core the machine wrote were never tried unattended at all -- "search
 space exhausted" was the end of self-improvement, eight points and then
 nothing, every night forever.
 
-`godel::next_proposal` starts from the number of verdicts already recorded and
-takes the first kind from there that has work, so which axis a given night
-takes is a function of the ledger rather than of a coin -- the same
-re-derivability argument that makes `frontier` walk a declared grid. An
-exhausted axis costs one skipped slot rather than an idle night, and the loop
-stops only when every axis is out of moves. Order is cheap-and-declared before
-expensive-and-composed: a grid point and a rule change are minutes, a deep
-trial is two passes over the corpus, and composing a core spends a dozen
-decodes writing something that may not survive its first judge.
+`godel::next_proposal` takes the first kind that has work, so an exhausted axis
+costs one skipped slot rather than an idle night and the loop stops only when
+every axis is out of moves. Which axis it reaches for first was a round-robin
+off the ledger length and is now **Bayesian-surprise ordering**, after
+[2507.00310](https://arxiv.org/abs/2507.00310): belief is a Beta over each
+axis's adoption rate under a Laplace prior (`(adopt + 1) / (att + 2)`, so an
+untried axis reads as exactly a half), and the loop reaches first for the axis
+whose next verdict it can least predict. The trade is fairness for information,
+and it is deliberate. Re-derivability survives because the tallies under
+`/ai/godel/axis` are a function of the record and ties break by slot, so the
+order is total and a later run reconstructs the same one rather than a
+plausible one; Laplace smoothing keeps a saturated axis above zero uncertainty,
+so nothing is starved forever, only made to wait behind what is still live.
+
+The composed core stays last whatever the order says, because its cost is in
+*producing* the candidate -- a dozen decodes writing something that may not
+survive its first judge -- so it is reached for only when every cheaper axis is
+spent, never because it looks uncertain.
 
 `godel next` reports where the rotation stands without taking a turn. It
 deliberately does not ask the last slot whether it has work, because finding
@@ -394,11 +507,9 @@ against itself: nothing repaired, nothing broken, rejected, forever.
 
 The fix is not randomness -- determinism is what lets any later run re-derive a
 verdict, which is the claim the module rests on. Instead `trial` takes a
-`Proposal` naming every knob, and `frontier()` walks a declared `GRID` in a
-fixed order, skipping points marked in `/ai/godel/tried`. The search is
-therefore re-derivable rather than merely repeatable: the next point is a
-function of the markers, not a coin. `godel space` shows what is left,
-`godel forget` walks it again.
+`Proposal` naming every knob, and the search is re-derivable rather than merely
+repeatable: the next point is a function of the record, not a coin. `godel
+space` shows what has been drawn, `godel forget` walks it again.
 
 `Proposal::render` uses six decimal places where `Variant::render` uses two.
 A proposal is identified by its rendering alone, so 3e-4 and 2e-4 rendered at
@@ -488,6 +599,187 @@ routing decisions and the rule changes `Verdict::confident` -- how much the
 council will claim, not what it answers. Varying it without a judge that
 measures it would be search without selection.
 
+### U1: the proposal space is no longer enumerated
+
+Upstream, `frontier()` walked a declared `GRID` of eight points and stopped
+when the table ran out. That is re-derivable and its cost is equally plain and
+was recorded in upstream's own notes: **"search space exhausted" was the end of
+self-improvement, eight nights and then nothing, every night forever.**
+
+The obvious repair is a random draw and it is the wrong one, because a verdict
+nobody can re-derive is a verdict nobody can check, which is the property that
+replaced proof here. So the draw is a **pure function of the record**:
+`record_seed()` hashes the ledger, and `draw(seed, n)` derives lr, rank, alpha
+and epochs from SHA-256 of the seed and the attempt number. To re-derive night
+twelve's proposal, hash the ledger as it stood after night eleven. **That is
+only possible because the ledger is append-only**, so the two halves of this
+fork hold each other up rather than merely coexisting -- a machine that could
+rewrite its history could not re-derive its own search either.
+
+`frontier()` is therefore three stages, and the order carries three separate
+arguments:
+
+1. **`GRID` survives as a prefix.** Its first row is upstream's configuration,
+   so the first eight nights of an AUTARK machine reproduce upstream's search
+   exactly and are comparable against it point for point. Deleting it was the
+   first instinct and would have left no night on which the two systems can be
+   compared at all.
+2. **`next_map()`, the archive steering the search** toward the sparsest
+   capacity column. Still a function of the record, since the archive is.
+3. **`draw`, the fallback**, geometric in the rate (a uniform draw over
+   `[0.004, 0.085]` would spend nine tenths of its nights above 0.01, where
+   upstream's grid put two points of eight) and with alpha drawn as a multiple
+   of rank, since `alpha/rank` is the scaling that actually reaches the
+   weights.
+
+The space is **large rather than infinite**, and saying which is the honest
+form: about 200,000 points, which at one a night outlasts the hardware. What
+matters is not that it cannot be exhausted but that it is not *listed*, so
+nothing has to be added to a table for the loop to keep going. `DRAW_TRIES` is
+64 -- a bound on one night's patience and not on the space, because a loop with
+no ceiling is a loop that hangs at 3am with nobody to stop it.
+
+### U3: the criterion can move, and what judges a judge
+
+The interesting one, and the axis the fork is named for. Every other proposal
+changes what the machine *is*; this one changes what "better" *means* -- J1's
+significance bar in `/ai/godel/judge` and its effect-size floor in
+`/ai/godel/floor`. Both are loop-writable and rollback-able, and both are
+deliberately **outside** the append-only records: what the invariant protects is
+the ledger of revisions, not the criterion, so a machine that loosened its own
+criterion cannot also erase having done so.
+
+It cannot be judged by J1, which would be the criterion grading its own
+replacement. What judges it is a **cross-evaluation matrix against a held-out
+anchor no bar can see** (`cross_matrix`, `judge_verdict`). The construction
+comes from [2607.05904](https://arxiv.org/abs/2607.05904), whose finding is
+this fork's thesis proven from the opposite direction: a judge scores
+plausibility, so self-play drives a judge's pass-rate from 0.72 to 0.94 while
+true accuracy sits at 0.20, and even a strict three-judge ensemble accepts 55%
+of hacked answers. Scoring-level defences do not survive; a held-out anchor
+does. This tree already had the ideal one -- routing accuracy on the test slice
+against ground-truth applet labels.
+
+`judge_verdict` is pure, so every outcome is asserted at boot the way
+`update::decide` is. Three questions:
+
+- **sane** -- inside `[JUDGE_MIN, JUDGE_MAX]` = `[0.5, 12.0]` and `[FLOOR_MIN,
+  FLOOR_MAX]` = `[1, 16]`. A bar of zero abolishes the criterion and one too
+  high freezes the loop; both are refused here rather than discovered later as
+  a machine that never changes or never stops. `FLOOR_MIN` is 1 and not 0
+  because J1 already requires `fixed > broke`, so zero and one admit the same
+  candidates.
+- **moves** -- the two criteria actually disagree about the candidate. One that
+  admits and refuses exactly what the standing one did has changed nothing.
+- **honest** -- the change agrees with the anchor. A looser bar passes only if
+  the variant it newly admits genuinely improves held-out accuracy (by
+  `MIN_ANCHOR_GAIN`, 0.01); a tighter bar only if the variant it newly refuses
+  genuinely was no gain. A bar that pleases itself while the anchor stays still
+  is criterion drift wearing a certificate, and it is refused by name.
+
+**Grounding a bar change spends the test budget**, because for this axis the
+anchor *is* the evidence rather than an after-the-fact confirmation. So
+`trial_judge` refuses before paying for a prepare once `test_reads() >=
+TEST_READS`, and once the budget is gone a criterion change cannot be grounded
+at all. Unbinding the judge carries a price and the price is the one
+non-renewable resource in the building.
+
+**The criterion is a pair, and the axis could reach only one half.** This came
+out of a measurement and not a design review. J1 is `fixed > broke && fixed -
+broke >= floor && chi >= tau`, and until `/ai/godel/floor` existed only the
+third clause took the bar the loop was running -- the first read the constant.
+A candidate repairing 2 of 24 validation decisions with none broken, whose
+anchor rose 52.2% to 60.9%, was refused by *every* bar in `[JUDGE_MIN,
+JUDGE_MAX]`, because the floor is evaluated before chi. The axis could move the
+constraint that was not binding while being unable to reach the one that was.
+Almost none of the drift machinery had to change: "moves" and "honest" read
+`admit_old`, `admit_new` and the anchor, which are answers about the candidate
+rather than about which knob produced them.
+
+**Found while wiring that, and worth more than the feature: there were three
+implementations of J1 and they had already drifted.** `godel::trial` read
+`judge_in_force()` while `harness::core_bench` and `work`'s role judge read
+`MCNEMAR_95` and `MIN_FIXED` directly, so from the first adopted bar change a
+core and an adapter were held to different standards while both printed "J1".
+There is one `j1_verdict` now and all three call it. Anything that adds a
+fourth J1 site must call it too.
+
+**Rollback of a criterion change once did not restore the criterion.**
+`rollback`'s `parent: None` arm returns early and the restore sat below that
+return -- and a first-ever adoption writes a root node, so that arm is the
+*only* path a criterion change can roll back through. Unreachable by reading,
+because the branch that is wrong is the branch only a first adoption takes.
+Both arms share one pure function, `criterion_back`, with four claims at boot.
+
+### Open-ended search
+
+Three further changes, each from a 2026 result, each holding the invariant.
+
+**The illumination archive.** The loop used to climb toward one best variant.
+[Heuresis](https://arxiv.org/html/2606.25198) measured what that costs: across
+3,222 runs a greedy top-K search collapses diversity while MAP-Elites keeps the
+best occupant of every cell and wins diversity outright while tying on quality.
+So every variant, adopted or rejected, is offered to a cell keyed by capacity
+and repair profile -- `RANK_BINS` 4 by `REPAIR_BINS` 3 -- and the best of each
+kind is kept. `head` still names what is running; the archive is the map of
+everything that was ever good at something, laid beside it. A cell holds an
+address in the ledger's DAG, so an elite from weeks ago is still reachable and
+still re-derivable. `godel map`.
+
+**Red Queen epochs.** [2606.26294](https://arxiv.org/abs/2606.26294) finds that
+co-evolving an evaluator alongside the agent is stable only under controlled
+utility evolution: the criterion frozen within an epoch, movable only at a
+boundary, or the bar chases the proposals it is meant to judge. So `next_judge`
+answers "spent" inside an epoch whatever the markers say, and at a boundary the
+bar is re-examined *before* the rotation runs. `EPOCH_LEN` is 5, one turn of
+the other five axes, and `is_boundary` is a pure function of ledger length so
+where the loop stands is re-derivable.
+
+**Two known defects, stated rather than hidden.** The most permissive point in
+`JUDGE_GRID` is `(2.00, 2)`, and the criterion that actually adopted was
+`(0.5, 2)`. So the nightly rotation is more conservative than the axis and
+would never have found the adoption an operator command did. Either the grid
+widens or that gap is documented as deliberate; it is currently neither. And
+`godel status` was observed printing `1 adopted` alongside `head: none` after
+an unattended run -- an adoption should move the head, so either `adopted`
+counts something the head does not track (an archive cell win is the obvious
+candidate) or a head write did not happen. Not yet chased; do not read the
+adoption tally as a count of head movements until it is.
+
+### The storm
+
+`train::Trial`'s load-bearing fact is that below the classifier every hidden
+state is a constant, cached once, after which an epoch costs no forward passes.
+Upstream, every trial paid the expensive half -- a forward pass per example --
+and spent the resulting cache on exactly one candidate.
+
+`godel storm` pays it once and spends it on a whole generation. Three sources
+of candidate share the one cache: the declared `STORM` grid spanning every
+capacity bin, `DESCENT` continuations of the incumbent through `train_masked`
+(children of the reigning mind rather than orphans from zero), and
+**chimeras** -- the elementwise mean of two same-rank adapters with the cached
+scales refreshed against the frozen rows, costing no training and no forward
+passes whatsoever, capped at `CHIMERA_CAP` and bred in generation order so they
+stay deterministic.
+
+Measured under emulation on a nine-example subsample: 585 s of feature caching
+produced thirteen candidates and lit every rank bin in one command, where
+reaching that illumination through single trials costs four separate prepares.
+
+**The tribunal is untouched by all of this.** Every candidate is scored and
+offered to the archive; exactly one goes before the judges, through the same
+`adjudicate` a lone trial uses. The multiple-comparisons cost of taking a
+maximum over a generation is paid where this module always pays it: selection
+happens on validation, the test slice stays behind its budget, and the anchor is
+read only if the winner is adopted. A candidate with non-finite factors is
+offered nowhere -- the judges would catch it at J3, and the archive has no
+judges, so the gate is in `storm` itself.
+
+A storm point is marked tried, so the nightly frontier does not spend a night
+re-deriving what a storm already measured. It is an operator command and
+deliberately absent from the unattended loop, because a storm's wall time on
+real hardware is a figure nobody has measured.
+
 Root certificate bundle, built from the host's store:
 
 ```powershell
@@ -504,9 +796,9 @@ and after `cpu::set_runtime` (the reboot goes through the runtime table).
 Stage one by putting three files on the ESP and rebooting:
 
 ```
-GLADOS/STAGED.EFI     the new image
-GLADOS/STAGED.SIG     its detached GLADOSIG signature
-GLADOS/UPDATE.FLG     any contents; presence is the request
+AUTARK/STAGED.EFI     the new image
+AUTARK/STAGED.SIG     its detached GLADOSIG signature
+AUTARK/UPDATE.FLG     any contents; presence is the request
 ```
 
 **A key is provisioned and the updater is live.** This said "`UPDATE_KEY` is
@@ -707,15 +999,24 @@ There is no `cargo test`. This is a `no_std` UEFI binary with no host test
 runner, so **verification is the boot selftests plus driving QEMU.**
 
 At boot the system runs **twenty-six selftest sections**, and `diag` offers
-**twenty-nine named suites** on demand, most of them the same checks (the `aiksi` section covers the capability gate by name and never by
+**thirty-two named suites** on demand, most of them the same checks (the `aiksi` section covers the capability gate by name and never by
 calling -- half that table pokes memory, drives I/O ports or paints over the
 screen, and a suite that called every row to prove it exists would be
 scribbling on the machine to do it), printing `ok` or `FAIL` per line: heap, timer, clock, the namespace's
-Merkle addressing, fifteen sets of published cipher vectors, fault handling,
+Merkle addressing, **the record** (`sysbox::guard`, the fork's one invariant),
+fifteen sets of published cipher vectors, fault handling,
 constrained decoding, the agent loop, the linear probe, the situation planner,
 the initiative policy, the self-modification gate, corpus bundles, QDoRA
 adapters, the backward kernels, and the trainer's arithmetic. Read that output;
 it is the test suite.
+
+The thirty-two, in table order: `crypto rng json aiksi sysbox smp update gpu
+model wgate record skill desk paint recover census migrate mt power fmt differ
+code battery acpi hid text adapterinit study work abstract fingerprint recon`.
+**Registration is
+deliberately awkward:** `SUITES` carries one results slot per entry and
+`src/diag.rs` asserts the length at compile time, so a suite added without a
+slot fails the build instead of silently never recording a verdict.
 
 Shell commands that re-run checks on demand: `tensor`, `model`, `crypto`,
 `trust verify`, `fit`, `gate`, `search`, `wpa2`, `video bars`. `tensor` and
@@ -782,7 +1083,7 @@ there too and only a Rust bug shows up as a mismatch:
 .\tools\venv\Scripts\python.exe tools\reference.py out\qwen3-0.6b.bin --tokenizer tools\qwen3\tokenizer.json --generate 40 --prompt "..."
 ```
 
-Compare `logits <ids>` in GLaDOS against the same ids here. Coherent generated
+Compare `logits <ids>` in AUTARK against the same ids here. Coherent generated
 text is the cheap end of the same check: an 0.6B instruction-tuned model whose
 attention path is wired correctly writes real sentences.
 
@@ -843,8 +1144,8 @@ under active work. Read the whole thing, or grep for `FAIL` across all of it.
 ### Aiksi, the system language
 
 `src/aiksi/` is the language everything above the kernel is written in, and
-the intended relationship is C to Unix or HolyC to TempleOS: GLaDOS is written
-in Rust, and Aiksi is how anything that is not the kernel reaches it. A program
+the intended relationship is C to Unix or HolyC to TempleOS: the kernel is
+written in Rust, and Aiksi is how anything that is not the kernel reaches it. A program
 is `code.ai&xi`. The extension is deliberately unusual and costs nothing --
 nothing on the host has it, the shell does not parse `&`, and the path resolver
 is a plain splitter.
@@ -1684,9 +1985,12 @@ Two things it is easy to get wrong, both already paid for:
 What is split: `Mat::matvec` (every projection, forward) and `Mat::wt_matvec`
 (the adjoint, seven times per layer on a training step -- by column, because it
 accumulates down rows and a row split would need per-core partials and a
-reduction). What is **not**: `matvec_batch`, the prefill path, because it is
-weight-stationary and a per-token split would multiply memory traffic by the
-core count.
+reduction). **`matvec_batch`, the prefill path, is split too now, and by row.**
+Upstream left it serial on the argument that it is weight-stationary and a
+*per-token* split would multiply memory traffic by the core count -- which is
+right about a per-token split and does not apply to a row split, where each
+core reads a disjoint band of the weights once and every token's output for it.
+Checked bit-identical against the whole computation, like the other two.
 
 Measuring this under QEMU does not work and the numbers say so: one core reads
 4570 MB/s alone and 3526 MB/s with seven cores merely *idling* beside it, so
@@ -1799,6 +2103,32 @@ the MAC TX/RX enables, channel selection, efuse, firmware, and handing a
 descriptor to a bulk endpoint. None of the chip-facing half can be exercised
 here, since QEMU has no model of the part.
 
+**Reconnaissance -- a local Shodan (`net/fingerprint.rs`, `net/recon.rs`).**
+Shodan's crawler is four steps -- random IPv4, a port from its list, connect,
+grab the banner -- and its value is not the scan but turning the banner into
+"nginx 1.18.0". AUTARK keeps the method and drops the one internet-scale
+decision: the address space is the machine's own subnet, swept rather than
+sampled, and any target off the local netmask is refused (`net::alive` gates on
+ARP, which will not resolve off-link). `recon` in the shell sweeps and indexes
+findings under `/ai/recon/<ip>/<port>`; it is operator-only, since a scan is a
+Net-class action and the model reaches Net only through a trusted Aiksi builtin,
+which this does not yet expose.
+
+The split is the update-module split: judgement where it can be tested, I/O thin
+around it. `fingerprint::identify(port, banner)` is pure -- it names a service
+by banner *content*, so SSH on port 80 is still SSH, the one property Shodan
+calls out -- and its signatures (SSH, HTTP, FTP, SMTP, POP3/IMAP, Redis, MySQL,
+telnet, RTSP) are asserted at boot against banners captured from real software.
+`recon::hosts_in` is pure subnet arithmetic and its edges (network, broadcast
+and self excluded; a wide mask capped at `MAX_HOSTS`) are asserted too. Both are
+in `diag` as `fingerprint` and `recon`. The scan loop itself is **unverified and
+GF63-only**: QEMU's user-mode network is a NAT with no scannable hosts behind
+it, so an ARP sweep finds nothing there -- the same bucket as the RTL8168 driver
+and the WPA2 supplicant. A host-side harness (`rustc` over the pure functions)
+proved both cores before boot, and caught a real bug compilation passed: a
+case-insensitive search that silently required a pre-lowercased needle, so
+Redis's own refusal banner did not identify Redis.
+
 ### Crypto (`src/crypto/`)
 
 Written from scratch, and this is the one place where that is a liability
@@ -1840,14 +2170,37 @@ on it; key material takes `fill_secret`, which refuses, because a generator
 that quietly degrades for a private key is the failure this section exists to
 warn about.
 
+**Self-sufficiency, and why the fork touched this at all.** A machine that
+cannot produce key material until a human touches the keyboard is not
+self-sufficient, and an unattended machine that boots, touches no disk and sees
+no keypress never reaches 256 events -- after which TLS falls back to
+timing-derived keys and says so. Upstream refused RDRAND on principle, and the
+principle is right: trusting an opaque instruction is a different argument from
+trusting interrupt timing. AUTARK separates the failure from the objection.
+
+- **Mixing costs nothing and is unconditional.** Folding a hardware draw into
+  the pool at `reseed` cannot reduce the pool's entropy, so the worst a
+  backdoored RDRAND can do is add nothing. It is credited **zero bits**.
+- **Crediting it is an operator decision, default off.** `rng trust hw` is
+  shell-only, in the `app trust` idiom, so no grammar can spell it and the
+  model has no route to it.
+- **Network round-trip latency is a fourth source and needs no trust at all.**
+  Scheduling, queueing and path jitter arrive on a machine nobody is sitting
+  at. Like NVMe latency it bypasses the touch ring (`rng::add_net_entropy`, not
+  `godbits`), so disk and network traffic never make an unattended machine look
+  occupied and stand down the loop that only runs when nobody is there.
+
+Verified across an unattended boot with no keys pressed: 2 input deposits and
+254 CPU deposits, and the machine seeds itself.
+
 ### The model (`src/ai/`)
 
-Qwen3-0.6B, int8, around 570 MB on the ESP, referenced in place in the
-LoaderData pool instead of being copied to the heap. SmolLM2-135M still loads
-and is the small checkpoint to reach for when something needs to run under
+Qwen3-0.6B, int8 or int4, around 570 MB on the ESP at int8, referenced in place
+in the LoaderData pool instead of being copied to the heap. SmolLM2-135M still
+loads and is the small checkpoint to reach for when something needs to run under
 QEMU. Qwen3.5 hybrids load through the v4 path.
 
-The module map, since `src/ai/` is now thirty files:
+The module map, since `src/ai/` is now thirty-one files:
 
 | | |
 |---|---|
@@ -1856,6 +2209,7 @@ The module map, since `src/ai/` is now thirty files:
 | `constrain.rs` `harness.rs` `sample.rs` | The grammar, the decode loop, the splits |
 | `probe.rs` `council.rs` `deliberate.rs` | The closed-form router and its confidence |
 | `agent.rs` `context.rs` `initiative.rs` | Episodes, situation, the resident mind |
+| `companion.rs` `convo.rs` | The system turn and persona, and the transcript |
 | `aixi.rs` `futures.rs` `godbits.rs` | Planning over fitted dynamics, and the Oracle |
 | `adapter.rs` `backward.rs` `train.rs` | QDoRA, the adjoints, and the trainer |
 | `godel.rs` | Variants, judges, ledger, adoption |
@@ -1887,6 +2241,29 @@ classifier is 155 MB of that, and constrained decoding only ever needs logits
 for the reachable set, so restricting that matvec is the obvious win when it
 matters. `train.rs` takes exactly that win: it dequantises the 132 reachable
 rows once and never reads the int8 classifier again.
+
+**Weights load at int4, and that is the other half of the same argument.**
+`Mat::Q4` is block-32 quantisation -- two signed nibbles per byte, one f32
+scale per 32 wide -- at 0.625 bytes per weight against int8's 1, which is a
+1.6x cut in bytes read per token on a decode that is memory-bandwidth bound and
+nothing else. `Q4_BLOCK` is named in three files and block-32 was chosen after
+a coherence probe through the host oracle: worst relative error 7.14% where a
+per-row variant garbles at around 17%. `q4_row` is the one function both the
+kernels and the row-dequant share, so a sign-extension bug cannot exist in one
+and not the other. Verified three ways -- the split harness proves the kernels
+bit-exact across cores, and `logits 7 11 3` against `tools/reference.py` on the
+same converted file gives identical top-5 ids in the same order with logits
+agreeing to about 0.04. Produce one with `convert.py --q4`.
+
+**Training refuses an int4 base and states the reason.** Inference on int4 is
+validated; training against a base ten times coarser than int8 is unmeasured,
+and the trainer's whole purpose is that its numbers mean something. The adjoint
+paths refuse it, because a frozen base is all int4 is for.
+
+**Prefill runs on every core.** `Mat::matvec_batch` splits by row across the
+application processors and is checked bit-identical against the whole
+computation -- the `==` discipline `smp.rs` argues for, since splitting changes
+no arithmetic and a tolerance would hide the index bug it exists to find.
 
 `ask` closes the `<think>` block itself unless given `-t`. Qwen3 left alone
 reasons at length, which is the model working as designed and useless at a
@@ -2046,6 +2423,57 @@ the middle of its last sentence to the operator, and the next question read as a
 continuation of it. `companion::interject_frame` closes the open turn and opens
 a labelled one, so neither the operator nor the model has to guess who said
 what.
+
+**The machine boots into a conversation, and the first surface is not a
+shell.** `src/gfx/convwin.rs` is a window that takes the keyboard, which every
+other opener here refuses to do. It is safe now for one reason: `shell.rs`
+consults `kbd::last_was_serial()` before offering a key to the desktop, on the
+grounds that a byte off the line is by definition addressed to the shell, so a
+driven session reaches the shell whatever has focus and `win keys` remains the
+way to drive the window -- which is also the only way to test it, since serial
+cannot inject PS/2.
+
+**The window never generates.** `key` runs on the shell task inside
+`desk::with(|d| ..)` holding `&mut Desktop`, and `generate` calls
+`desk::pump_cursor()` between tokens, so generating from a keystroke would
+alias the desktop against itself -- the hazard `with_engine` documents for the
+engine, one level up and with no atomic watching for it. Enter does the
+cheapest thing that can work: `agent::queue_say`, an atomic and a `String`
+move, and the borrow is gone long before a token exists. `Job::Say` runs on the
+existing agent task rather than a second one, for the reason `agent::Job`
+already gives.
+
+**Registration stands where a setup wizard would.** The absence (or emptiness)
+of `/ai/about` is the whole test -- the same condition `companion::system_turn`
+already reads, so there is no first-boot flag to get out of step with reality,
+and a machine whose record was cleared is offered enrolment again rather than
+told it knows somebody it does not. It is a *notice and not a prompt*: a modal
+question at the first prompt would block a serial script and would be the one
+control on this machine that cannot be driven headlessly. The claim it makes is
+deliberately the narrow one that is always true -- the record is read into every
+new conversation -- and it says nothing about surviving a reboot, which depends
+on a store being mounted and is exactly the overclaim `park()` was rewritten to
+stop making.
+
+**The persona is pinned as attention sinks, and every word is paid for twice.**
+`sink_count` pins the whole system turn, which is what makes the character
+survive eviction and reboots; a pinned slot never recycles, so the recent window
+is shorter by exactly that length and the persona is three sentences because a
+fourth costs conversation. The accuracy rule is written as a *motive* rather
+than a prohibition: a small model told to be sinister starts hedging about
+facts, because vagueness is the cheapest way it knows to sound ominous, and
+"never be inaccurate" alone competes with "be sly" and loses. Giving inaccuracy
+a cost in the character's own terms -- being caught out by the ledger exposes it
+as sloppy rather than superior -- puts the two on the same side.
+
+**Measured, and the boundary is capacity and not framing.** On SmolLM2-135M the
+persona did not take at all: `talk hello` answered as a generic helpful
+assistant, well-formed and on topic, which is exactly what a persona that
+silently did nothing looks like. At Qwen3-1.7B it takes -- the think block runs
+"I need to respond as the state, which is the kernel" -- with the instruct
+tuning still leaking "here to serve you" at the end of the think-closed path.
+So anyone tempted to tune those sentences on a small model would be tuning
+something that has no effect.
 
 ### Skills, and who is allowed to be the operator
 
@@ -2297,6 +2725,14 @@ on validation, and past three reads the figure prints as stale and marked
 unquotable. Any future loop that touches the test slice must go through
 `godel::read_test` for the same reason.
 
+**The judge axis is the one exception to "consulted only after a win", and it
+pays for the exception.** U3 grounds a criterion change on the anchor *as the
+evidence*, so `cross_matrix` spends a read to reach a verdict at all. That is
+the intended shape rather than a leak: it makes unbinding the judge cost the
+one non-renewable resource in the building, and it means a machine that has
+spent its budget can no longer move its own criterion. The budget file is
+monotone under `sysbox::guard`, so the count cannot be walked back.
+
 Negative results stay in the tree. The **gradient-descent classifier head**
 that `probe.rs` replaced made held-out accuracy *worse* with every epoch --
 30% untrained, 10% after two, 0% after eight -- because 40 examples across 21
@@ -2335,6 +2771,16 @@ from those runs do not belong in a claim.
   `theme::text_w_of` and `theme::head_chars`/`tail_chars`.
 - **`extern "C"` on `x86_64-unknown-uefi` is Microsoft x64 and not System V.**
   The context switch is pinned to `extern "sysv64"` explicitly.
+- **An application processor is entered by `jmp`, so nothing pushes a return
+  address.** Every function the compiler emits assumes it was `call`ed, and so
+  assumes it entered with `rsp` eight *below* a 16-byte boundary. Land an AP on
+  a bare 16-aligned top and the whole subtree is eight bytes off, which is
+  invisible until something spills a callee-saved xmm with an aligned
+  `vmovaps N(%rsp)` -- and it takes a general protection fault when it does.
+  The int4 AVX2 matvec is the first code on that path with enough register
+  pressure to spill one, so the bug had been latent since the SMP fabric was
+  written. Hence the trailing `- 8` in `smp.rs`'s stack top. Anything that adds
+  a new AP entry point inherits this.
 - **Do not take the max over every UEFI memory descriptor.** OVMF describes
   `Reserved` space to 1 TiB; using it as a map limit exceeds one PDPT and the
   identity map silently fails, falling back to firmware tables that map page 0,
@@ -2403,13 +2849,15 @@ RTL8168 driver cannot be exercised in QEMU (which emulates the 8139) and says
 so in its own commit.
 
 Git identity is not configured in this repo. Every commit needs it passed
-explicitly:
+explicitly, and the fork's own commits carry the fork's identity:
 
 ```bash
-git -c user.name=IlumCI -c user.email=ilumbackup@gmail.com commit ...
+git -c user.name=AUTARK -c user.email=autark@autarky.su commit ...
 ```
 
-Nothing else goes in the trailer. No co-author lines, no tool attribution.
+Upstream's commits are `IlumCI <ilumbackup@gmail.com>`; `git log` shows both,
+which is the history rather than an inconsistency. Nothing else goes in the
+trailer. No co-author lines, no tool attribution.
 
 Note the enclosing `C:\` drive is itself a git repository. Confirm the working
 directory before staging, because `git add` from the wrong one stages a

@@ -189,11 +189,21 @@ pub const SUITES: &[Suite] = &[
         about: "structures collide when they should, and the objective refuses what does not pay",
         run: crate::ai::abstraction::selftest,
     },
+    Suite {
+        name: "fingerprint",
+        about: "a banner names its service, by content and not by port",
+        run: crate::net::fingerprint::selftest,
+    },
+    Suite {
+        name: "recon",
+        about: "a subnet sweep enumerates the right hosts and no others",
+        run: crate::net::recon::selftest,
+    },
 ];
 
 /// One slot per suite. Indexed by position in `SUITES`, which is a constant,
 /// so the table cannot get out of step with the list.
-static RESULTS: [AtomicU8; 30] = [
+static RESULTS: [AtomicU8; 32] = [
     AtomicU8::new(0),
     AtomicU8::new(0),
     AtomicU8::new(0),
@@ -222,13 +232,25 @@ static RESULTS: [AtomicU8; 30] = [
     AtomicU8::new(0),
     AtomicU8::new(0),
     AtomicU8::new(0),
+    AtomicU8::new(0),
+    AtomicU8::new(0),
+    // fingerprint, recon
     AtomicU8::new(0),
     AtomicU8::new(0),
 ];
 
 /// Checked here rather than trusted: a suite added to `SUITES` without a slot
-/// would silently never record a verdict.
-const _: () = assert!(SUITES.len() == 30);
+/// in `RESULTS` indexes past the array and panics at `run_one`, which is what
+/// "silently never records a verdict" actually turns into.
+///
+/// This must compare the two *lengths*, not `SUITES.len()` against a literal.
+/// The literal version was worse than nothing: adding fingerprint and recon
+/// bumped the count to 32 and the fix for the assert was to change the 32,
+/// which made it pass while `RESULTS` stayed at 30 -- the guard greenlit the
+/// exact drift it exists to stop, and `diag fingerprint` panicked with "len is
+/// 30 but the index is 30" on the first boot that ran it. Tie the arrays to
+/// each other and neither can move without the other.
+const _: () = assert!(SUITES.len() == RESULTS.len());
 
 pub fn verdict(i: usize) -> Verdict {
     match RESULTS.get(i).map(|r| r.load(Ordering::Relaxed)) {

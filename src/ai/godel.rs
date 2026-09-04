@@ -1381,10 +1381,31 @@ pub fn head() -> Option<[u8; 32]> {
     from_hex32(text.trim())
 }
 
-fn set_head(h: &[u8; 32]) {
+/// Point the head at a node, and say whether the pointer actually moved.
+///
+/// **The return value is the whole reason this is not `()`.** It discarded
+/// `write_text`'s answer, and that made one observable state ambiguous in a way
+/// nothing else in the module could resolve: `godel status` printing `1 adopted`
+/// beside `head: none`.
+///
+/// Exactly two things produce that pairing. A rollback to the frozen model
+/// detaches `HEAD` and never touches `ADOPTIONS`, which is a monotone count of
+/// adoptions *this boot* rather than a count of head movements -- benign, and
+/// the two figures simply measure different things. Or this write failed, in
+/// which case every adoption site increments the counter anyway and the machine
+/// is running an attached variant it cannot name. A silent write turns those
+/// into the same two lines of output, so an operator reading the status has no
+/// way to tell a normal undo from a namespace that stopped accepting writes.
+///
+/// Reporting it here rather than at the six call sites would be wrong: this
+/// function does not know whether its caller is adopting, rolling back or
+/// recording an incumbent, and "the head would not write" means something
+/// different in each. It answers; the caller decides what that is worth.
+#[must_use]
+fn set_head(h: &[u8; 32]) -> bool {
     let mut s = hex32(h);
     s.push('\n');
-    sysbox::write_text(HEAD, &s);
+    sysbox::write_text(HEAD, &s)
 }
 
 /// What one trial concluded, in enough detail that a later run can redo it.
@@ -2181,7 +2202,14 @@ fn ensure_head(e: &mut super::Engine) -> Option<[u8; 32]> {
         born: crate::dev::rtc::now().map(|d| crate::dev::rtc::unix_seconds(&d)).unwrap_or(0),
     };
     let vh = v.store();
-    set_head(&vh);
+    if !set_head(&vh) {
+        // `ensure_head` records what is *already* installed so a trial has a
+        // parent to hang from. Failing here is not a lost adoption, it is a
+        // lineage that will name the wrong parent, so the trial is refused
+        // rather than recorded against a root it did not descend from.
+        crate::kprintln!("  the head would not write -- refusing to record a lineage from nowhere");
+        return None;
+    }
     Some(vh)
 }
 
@@ -2420,7 +2448,11 @@ fn adjudicate(
         // The pointer moves last. A head naming a node that is not written yet
         // is a machine that cannot describe its own mind, and the ordering is
         // the only thing preventing it.
-        set_head(&vhash);
+        if !set_head(&vhash) {
+            // Loud, because the alternative is a machine running a mind it
+            // cannot name while its status line looks like an ordinary undo.
+            crate::kprintln!("  the head would not write -- this variant is attached and unnamed");
+        }
         let _ = e.model.detach_adapters();
         let _ = e.model.attach_adapters_unseeded(adapters);
         ADOPTIONS.fetch_add(1, Ordering::Relaxed);
@@ -2656,7 +2688,11 @@ pub fn trial_core(e: &mut super::Engine, h: &[u8; 32]) -> Result<Certificate, &'
         if !super::voter::install(h) {
             return Err("the core passed but would not install");
         }
-        set_head(&vhash);
+        if !set_head(&vhash) {
+            // Loud, because the alternative is a machine running a mind it
+            // cannot name while its status line looks like an ordinary undo.
+            crate::kprintln!("  the head would not write -- this variant is attached and unnamed");
+        }
         ADOPTIONS.fetch_add(1, Ordering::Relaxed);
     }
 
@@ -2902,7 +2938,11 @@ pub fn trial_deep(
             }
         }
         variant.store();
-        set_head(&vhash);
+        if !set_head(&vhash) {
+            // Loud, because the alternative is a machine running a mind it
+            // cannot name while its status line looks like an ordinary undo.
+            crate::kprintln!("  the head would not write -- this variant is attached and unnamed");
+        }
         ADOPTIONS.fetch_add(1, Ordering::Relaxed);
     } else {
         // Put the machine back. This is the half `deeptrain` never had: it
@@ -3009,7 +3049,11 @@ pub fn trial_skill(h: &[u8; 32]) -> Result<Certificate, &'static str> {
             return Err("it passed and the toolkit would not take it");
         }
         variant.store();
-        set_head(&vhash);
+        if !set_head(&vhash) {
+            // Loud, because the alternative is a machine running a mind it
+            // cannot name while its status line looks like an ordinary undo.
+            crate::kprintln!("  the head would not write -- this variant is attached and unnamed");
+        }
         ADOPTIONS.fetch_add(1, Ordering::Relaxed);
     }
 
@@ -3169,7 +3213,11 @@ pub fn trial_config(e: &mut super::Engine, rule: u8) -> Result<Certificate, &'st
             return Err("it passed and the configuration would not save");
         }
         variant.store();
-        set_head(&vhash);
+        if !set_head(&vhash) {
+            // Loud, because the alternative is a machine running a mind it
+            // cannot name while its status line looks like an ordinary undo.
+            crate::kprintln!("  the head would not write -- this variant is attached and unnamed");
+        }
         ADOPTIONS.fetch_add(1, Ordering::Relaxed);
     }
 
@@ -3474,7 +3522,11 @@ pub fn trial_judge(
             return Err(Refused::Judge("it passed and the new bar would not save"));
         }
         variant.store();
-        set_head(&vhash);
+        if !set_head(&vhash) {
+            // Loud, because the alternative is a machine running a mind it
+            // cannot name while its status line looks like an ordinary undo.
+            crate::kprintln!("  the head would not write -- this variant is attached and unnamed");
+        }
         ADOPTIONS.fetch_add(1, Ordering::Relaxed);
     }
 
@@ -4072,7 +4124,14 @@ pub fn rollback(e: &mut super::Engine) -> Result<Option<[u8; 32]>, &'static str>
             }
         }
     }
-    set_head(&parent);
+    // Everything else about the rollback has already happened -- the adapter is
+    // restored, the core and the rule are back. A head that will not write here
+    // leaves the machine running the parent under a pointer naming the child,
+    // which is the one outcome worse than not rolling back at all, so it is an
+    // error rather than a warning.
+    if !set_head(&parent) {
+        return Err("everything was restored but the head would not write -- it still names the old variant");
+    }
     Ok(Some(parent))
 }
 

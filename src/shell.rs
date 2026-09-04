@@ -2131,6 +2131,41 @@ fn execute(line: &str, boot: &BootInfo, acpi: &Option<Acpi>, interp: &mut aiksi:
                 },
             }
         }
+        "recon" => {
+            // A local Shodan: sweep our own subnet, banner-grab open ports,
+            // name each service by what it said. Operator-only for now -- it is
+            // a Net-class action and the model reaches Net only through a
+            // trusted Aiksi builtin, which this does not yet expose.
+            use crate::net::recon;
+            let mut it = rest.split_whitespace();
+            let cap = it.next().and_then(|s| s.parse::<usize>().ok()).unwrap_or(recon::MAX_HOSTS);
+            let ms = it.next().and_then(|s| s.parse::<u64>().ok()).unwrap_or(600);
+            let cfg = crate::net::config();
+            kprintln!(
+                "  sweeping {}.{}.{}.0/{}  (cap {} hosts, {} ms/port)",
+                cfg.ip[0], cfg.ip[1], cfg.ip[2],
+                cfg.netmask.iter().map(|b| b.count_ones()).sum::<u32>(),
+                cap.min(recon::MAX_HOSTS), ms
+            );
+            match recon::scan(cap, ms) {
+                Err(why) => kprintln!("  {}", why),
+                Ok(found) if found.is_empty() => {
+                    kprintln!("  nothing answered -- an empty segment, or none of the scanned ports are open");
+                }
+                Ok(found) => {
+                    console::set_color(LTGREEN);
+                    kprintln!("  {} service(s) found:", found.len());
+                    console::set_color(LTGRAY);
+                    for f in found.iter() {
+                        kprintln!(
+                            "    {}:{}  {}",
+                            recon::ip_dotted(f.ip), f.port, f.fp.render()
+                        );
+                    }
+                    kprintln!("  indexed under {}", recon::ROOT);
+                }
+            }
+        }
         "dhcp" => crate::net::dhcp::report(),
         "dns" => {
             if rest.is_empty() {
@@ -3008,7 +3043,15 @@ fn execute(line: &str, boot: &BootInfo, acpi: &Option<Acpi>, interp: &mut aiksi:
                         Ok(h) => kprintln!("  eligible now (hour {}, no hardware input)", h),
                         Err(why) => kprintln!("  not eligible: {}", why),
                     }
-                    kprintln!("  {} trial(s), {} adopted", trials, adoptions);
+                    // Said as "since boot", because that is what these are.
+                    // Both are atomics that start at zero every boot, while the
+                    // ledger and the head are namespace state that outlive one,
+                    // so a machine that adopted something last night reads
+                    // `0 trial(s), 0 adopted` beside a head that names it. The
+                    // counters are events; the head is a state. Printing them
+                    // adjacent without saying which is which is what made the
+                    // pairing below look like a defect.
+                    kprintln!("  {} trial(s) since boot, {} adopted", trials, adoptions);
                     // The bar itself, since U3 makes it a thing that can move.
                     // A machine that has loosened its own criterion should say
                     // so where anyone looks, not bury it in the ledger.
@@ -3065,6 +3108,21 @@ fn execute(line: &str, boot: &BootInfo, acpi: &Option<Acpi>, interp: &mut aiksi:
                     let _ = reads;
                     let line = godel::lineage(8);
                     match godel::head() {
+                        // `N adopted` beside no head is consistent and used to
+                        // read as a bug. An adoption is an event that happened;
+                        // the head is what is installed now, and `rollback` to
+                        // the frozen model detaches it without touching a
+                        // counter that only ever rises. The other cause -- a
+                        // head write that failed -- is no longer silent, so it
+                        // announces itself at the moment of adoption and this
+                        // line can state the benign reading without hedging.
+                        None if adoptions > 0 => {
+                            kprintln!("  head: none (the frozen model is the variant)");
+                            kprintln!(
+                                "  {} adoption(s) this boot with nothing installed: rolled back since",
+                                adoptions
+                            );
+                        }
                         None => kprintln!("  head: none (the frozen model is the variant)"),
                         Some(_) => {
                             kprintln!("  lineage, newest first:");

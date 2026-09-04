@@ -1237,6 +1237,16 @@ fn selftest(acpi_ref: &Option<acpi::Acpi>) {
         kprintln!("  ok     css       selectors, at-rules, inline display");
         console::set_color(LTGRAY_IDX);
     }
+    if net::fingerprint::selftest() {
+        console::set_color(LTGREEN);
+        kprintln!("  ok     recon     banners name their service by content");
+        console::set_color(LTGRAY_IDX);
+    }
+    if net::recon::selftest() {
+        console::set_color(LTGREEN);
+        kprintln!("  ok     recon     a subnet sweep hits the right hosts");
+        console::set_color(LTGRAY_IDX);
+    }
 
     console::set_color(LTGREEN);
     kprintln!("\n[selftest] int3 should report and resume:");

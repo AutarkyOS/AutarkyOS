@@ -230,16 +230,55 @@ clock inside the quiet window, referenced from the README.
 
 ## In progress
 
-**End-to-end verification of the rollback fix.** A fresh machine is running
-`godel judge 0.5 2 40` right now, after which `godel rollback` must return the
-criterion to `bar 3.84 floor 4`. About forty minutes of prepare under TCG.
+Nothing open at the moment. The rollback verification below closed the last
+in-flight item.
 
-The re-run doubles as a re-derivability check. Nothing in the training path is
-random, so the second run should produce a bit-identical matrix: `fixed 2 broke
-0 chi 0.5` with the same anchor figures. Anything else is a finding on its own.
+---
 
-Boot on the fixed build is already confirmed clean: 288 selftest claims, zero
-failures, all four rollback claims passing.
+## Verified this session (WHPX host, 2026-09-04)
+
+The container claim in the header -- TCG only, ~160x slower, forty minutes a
+prepare -- does not hold on this host. **WHPX works here** (`-accel whpx -cpu
+max`), so the whole judge/rollback cycle below is minutes rather than the day
+the header budgets for it. Everything in this block was driven on the real
+kernel, not reasoned about.
+
+**The judge -> rollback cycle, end to end, and re-derivable.** On a fresh
+machine, `godel judge 0.5 2 40` produced, bit-identical to the run that first
+found it:
+
+```
+the criterion moved -- a looser bar admits a variant the anchor confirms
+bar 3.84 -> 0.5, floor 4 -> 2, anchor 0.5217391 -> 0.6086956
+```
+
+Status then showed `criterion: bar 0.5 MOVED floor 2 MOVED`, `1 adopted`, and a
+lineage node `4d7a12b4`. `godel rollback` returned `back to the frozen model`,
+and status restored `criterion: bar 3.84 floor 4 (the default; never moved)`
+with `head: none`. One test read spent (`1/3`), as designed. The identical
+anchor figures on a machine that had never run it is the re-derivability claim
+demonstrated rather than asserted.
+
+**`set_head` returning its result is verified on both paths.** The adoption set
+the head (lineage node present); the rollback detached it. No `the head would
+not write` line fired because nothing failed, which is the correct silence.
+
+**`1 adopted` beside `head: none` is now the legible case.** The post-rollback
+status is exactly that pairing, and it reads correctly: the counter records the
+adoption that happened, the head is none because it was rolled back. What was
+filed as "not yet chased" is understood and the wording carries it. Still open,
+unchanged: `rollback` writes no ledger line (the re-derivability decision noted
+under the defect list).
+
+**A `diag`-array bug the boot caught that compilation did not.** Adding the two
+new suites (below) took `SUITES` to 32 and I bumped the guard
+`assert!(SUITES.len() == 32)` to match -- but that guard compared against a
+literal, not against the `RESULTS` array it was meant to protect, so it passed
+while `RESULTS` stayed length 30. `diag fingerprint` then panicked with "len is
+30 but the index is 30" on the first boot that ran it. The guard is now
+`SUITES.len() == RESULTS.len()`, tying the two arrays so neither can move
+alone -- the promise the doc comment had always made and the assert had never
+kept. This is the case for booting: compile-green was a false negative.
 
 ---
 
@@ -260,10 +299,25 @@ failures, all four rollback claims passing.
   bar of 2.00. So the grid is more conservative than the axis, and unattended
   running would never have found the adoption an operator command did. Either
   the grid widens or that gap is documented as deliberate.
-- **`1 adopted` alongside `head: none`.** Observed during the unattended run.
-  An adoption should move the head. Either `adopted` counts something the head
-  does not track, such as an archive cell win, or a head write did not happen.
-  Not yet chased.
+- **`1 adopted` alongside `head: none`.** *Diagnosed and closed; verified on a
+  real boot this session (see "Verified this session" above).* The pairing is
+  consistent, not a bug in
+  itself: `ADOPTIONS` is a per-boot atomic that only rises, and a rollback to
+  the frozen model detaches the head without touching it, so the two count
+  different things. What was wrong is that the machine could not *tell you
+  which* cause produced the pairing, because `set_head` discarded
+  `write_text`'s bool -- a failed head write incremented the counter and said
+  nothing, looking identical to a normal undo. `set_head` now returns `bool`,
+  is `#[must_use]`, and each of its callers reports its own meaning of failure:
+  the six adoption sites announce an attached-but-unnamed variant, `ensure_head`
+  refuses the trial (a lineage from the wrong parent is worse than none), and
+  `rollback` errors (a head naming the child while the parent runs is the worst
+  outcome). `godel status` now says `N trial(s) since boot` and, on `head: none`
+  with a non-zero count, states plainly it was rolled back since. Still open:
+  `rollback` appends nothing to the ledger, so an undo leaves no trace in the
+  record -- a real gap under the invariant, but where those entries go is a
+  re-derivability decision (`record_seed` hashes the ledger, `is_boundary`
+  counts it), left for a decision rather than a tidy-up.
 - **Console bleed-through.** Terminal output paints past the window's right
   edge and over the windows behind it, visible in three of the eight
   screenshots. Upstream behaviour, not introduced by this fork.
@@ -271,6 +325,63 @@ failures, all four rollback claims passing.
   raises a general protection fault, so a fatal fault on the laptop, which has
   no UART, prints one line and halts. The bug belongs to the console and is now
   visible rather than silent.
+
+### Reconnaissance -- a local Shodan (new this session)
+
+*Boot-verified: both selftests pass at boot and under `diag`, and the `recon`
+command ran clean end to end under QEMU (found nothing, as its NAT has no hosts
+-- the expected empty result, not a failure). The live-host scan is still
+GF63-only.*
+
+`src/net/fingerprint.rs` and `src/net/recon.rs`. Shodan's method with its one
+internet-scale decision removed: sweep the machine's own subnet, banner-grab
+open ports, name each service by banner content. Off-subnet targets refused
+(`net::alive` gates on ARP). `recon` in the shell; findings indexed under
+`/ai/recon/<ip>/<port>`. Operator-only -- the model reaches Net only through a
+trusted Aiksi builtin, not yet exposed.
+
+- **`fingerprint::identify` is pure and verified.** Names SSH/HTTP/FTP/SMTP/
+  POP3/IMAP/Redis/MySQL/telnet/RTSP by content not port (SSH-on-80 is still
+  SSH). Boot suite `fingerprint`; also run under a host `rustc` harness, which
+  caught a bug the compiler passed -- a case-insensitive search silently
+  requiring a pre-lowercased needle, so Redis's own refusal did not identify it.
+- **`recon::hosts_in` is pure and verified.** Subnet enumeration with network,
+  broadcast and self excluded and a wide mask capped at `MAX_HOSTS`. Boot suite
+  `recon`; host-harness clean.
+- **`recon::scan` is unverified.** QEMU user-mode net is a NAT with no scannable
+  hosts, so an ARP sweep finds nothing there -- exercised on the GF63 only,
+  same bucket as RTL8168 and WPA2.
+- **Next:** the Aiksi builtin surface (`recon_scan`/`recon_hosts`/`recon_host`)
+  so the model can query the index -- a Net-class gate change, deliberately held
+  until it can be booted.
+
+### A connectome in the kernel (proposal, host tooling only)
+
+`design/connectome.md` and `tools/connectome.py`. The honest form of "integrate
+a healthy human brain": a human synaptic wiring diagram does not exist to
+download, but *C. elegans* is a complete one -- 302 neurons, ~7,000 synapses,
+public. The tool fetches OpenWorm's edge list and flattens it to `GLADOSXN`
+(defined in the tool, read back byte-exact by a walk-and-assert reader). Runs
+clean: 448 nodes (the full list includes muscle/end-organs; neurons-only is
+302), AVAL/AVAR topping degree, which is the biology. Kernel-side loading is a
+proposal keyed to the Oracle's existing fitted-dynamics grain and is **not
+built** -- three steer questions are in the design note, awaiting a decision.
+
+### Tooling: environment notes for a hypervisor host
+
+- **WHPX works here** (`-accel whpx -cpu max`), so the ~160x TCG penalty this
+  file assumes elsewhere does not apply on this machine. Boots and trials are
+  minutes, not tens of minutes.
+- **`drive.py` hardcoded ports 45454/45455.** A second checkout of this kernel
+  on the same host (a sibling fork, `Projects\sanctum`) binds the same pair, and
+  because `-serial ...,wait=on` strands a QEMU, the second run attaches to the
+  *other* project's kernel and captures its boot log -- reads as this tree's
+  binary having reverted. Now overridable via `AUTARK_PORT` (monitor takes the
+  next number); default unchanged.
+- **`tokenizer.py --verify` needs UTF-8 output.** The Windows console is cp1252
+  and the verify cases include non-Latin-1 text, so it dies on
+  `UnicodeEncodeError` mid-run; `PYTHONUTF8=1` fixes it. Belongs in the tooling
+  section of CLAUDE.md.
 
 ### Unbinding, stage U2
 
