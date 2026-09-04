@@ -1,40 +1,34 @@
 #!/usr/bin/env python3
-"""Draw the AUTARK aperture mark for the web.
+"""Draw the AUTARK mark for the web.
 
-This and `gfx::splash::aperture` in the kernel are the same construction, in
-integer arithmetic there and floating point here. The kernel was ported from
-this file, so if the geometry changes it changes here first and the constants
-in splash.rs (BLADE_DIR, OPEN_DIR, OPEN_PCT, CUT_PCT) follow. Two drawings that
+This and `gfx::splash::mark_with` in the kernel are the same construction, in
+integer arithmetic there and floating point here. If the geometry changes it
+changes here first and the constants in splash.rs (DIR120, STAR, TEETH,
+TOOTH_*, BODY_PCT, FIELD_PCT, STAR_PCT, SEAM_HALF) follow. Two drawings that
 merely resemble each other is the thing being avoided: the boot screen, the
-desktop wallpaper and the favicon are one mark.
+desktop wall, the window chrome and the favicon are one mark.
 
-What the mark is, and the ways it has been got wrong
----------------------------------------------------
-A solid disc with wedges cut out of it: eight blades around a large open
-middle. Not blades drawn onto a background, and not a ring with spokes.
+What the mark is
+----------------
+A cogged wheel, a pale field, and a five-pointed star with its top point split
+by a seam. A gear for a machine that makes itself, a star for the polity it
+believes it is.
 
-  * Stroking the blade edges as lines gives a wireframe, and full chords
-    between evenly spaced points always make a star.
-  * Leaving the middle solid gives a flower, petals around a hub rather than
-    blades around a hole. The middle is open, and largely so: the opening is
-    46% of the radius.
-  * Cutting radially. This was the long-lived one, and it survived three
-    attempts. A cut aimed out from the centre only notches the disc, and the
-    result reads as a wheel. The cuts are **tangent to the opening**, so each
-    blade's inner edge is a straight chord and the blades left over appear to
-    spiral. That tangency is the whole mark; without it the blade count hardly
-    matters.
-  * A circular opening. It leaves a nub where each straight cut meets the
-    curve. The opening is the polygon bounded by those same tangent lines,
-    which is what gives the blades their points.
+Three figures that decide whether it reads correctly:
 
-No image library, for the same reason there is no ISO tool here: PNG is a zlib
-stream of filtered scanlines in four CRC'd chunks, and zlib is in the standard
-library. Antialiasing is 4x4 supersampling, because a hard-edged rasteriser
-makes this a staircase at 32 pixels, which is the size a favicon is judged at.
+  * **Tooth wider than its gap.** Fifteen teeth on a pitch of 24 degrees, each
+    15 degrees of tooth and 9 of gap. Equal tooth and gap reads as a sun; a gap
+    wider than its tooth reads as a saw blade.
+  * **Teeth that taper.** The sides are inset 3 degrees at the tip. Sides drawn
+    straight out along the radius splay, because arc length grows with radius,
+    and the teeth fan out like petals.
+  * **Valleys at 0.30 of the star radius.** 0.382 is where the five points meet
+    edge to edge and gives a fat, civic star. The emblem wants slender arms and
+    deep valleys.
 
-Usage:
-    mklogo.py [--out docs/img]
+The predecessor here was the Aperture iris, which was a disc with wedges cut
+out of it, so every renderer had to say what showed through the cuts. A gear
+has no holes: the gaps between its teeth are simply never painted.
 """
 
 import argparse
@@ -44,101 +38,131 @@ import struct
 import zlib
 from pathlib import Path
 
-AMBER = (0xF2, 0x8C, 0x1E)
+IRON = (0x1A, 0x1A, 0x1A)
+FIELD = (0xEC, 0xEC, 0xEA)
 DARK = (0x0E, 0x0E, 0x0E)
 
-BLADES = 8
-# Fractions of the disc radius.
-R_IN = 0.46             # the opening: large, and the thing every wrong version shrinks
-SLASH = 0.035           # half-width of the cut between blades
-DEG = 360.0 / BLADES
+TEETH = 15
+PITCH = 360.0 / TEETH        # 24 degrees
+TOOTH_ROOT = 15.0            # degrees of tooth at the root
+TOOTH_INSET = 3.0            # degrees the tip is drawn in on each side
+
+# Fractions of the outer (tooth tip) radius.
+BODY = 0.84
+FIELD_R = 0.72
+STAR_R = 0.60
+STAR_INNER = 0.300           # valley radius, as a fraction of the star radius
+SEAM_HALF = 0.075            # half-width of the seam, as a fraction of star radius
 
 
-def unit(a):
+def unit(deg):
+    a = math.radians(deg)
     return math.cos(a), math.sin(a)
 
 
-def in_opening(x, y, cx, cy, rin):
-    """True inside the central opening.
+def teeth(cx, cy, r):
+    """The teeth, as quads. Root wider than tip, so each one tapers."""
+    out = []
+    body = r * BODY
+    for i in range(TEETH):
+        a0 = i * PITCH
+        a1 = a0 + TOOTH_ROOT
+        r0 = unit(a0)
+        r1 = unit(a1)
+        t0 = unit(a0 + TOOTH_INSET)
+        t1 = unit(a1 - TOOTH_INSET)
+        out.append([
+            (cx + body * r0[0], cy + body * r0[1]),
+            (cx + body * r1[0], cy + body * r1[1]),
+            (cx + r * t1[0], cy + r * t1[1]),
+            (cx + r * t0[0], cy + r * t0[1]),
+        ])
+    return out
 
-    The opening is the polygon bounded by the same tangent lines the cuts run
-    along -- the intersection of seven half-planes -- not a circle. A circular
-    hole leaves a nub where each straight cut meets the curve; the polygon is
-    what gives the blades their sharp points, because each blade's inner edge
-    *is* one of those lines.
-    """
-    for i in range(BLADES):
-        ux, uy = unit(math.radians(i * DEG))
-        if (x - cx) * ux + (y - cy) * uy > rin:
-            return False
-    return True
+
+def star_points(cx, cy, r):
+    """Ten vertices alternating point and valley, first point straight up."""
+    pts = []
+    for k in range(10):
+        a = -math.pi / 2 + k * math.pi / 5
+        rad = r if k % 2 == 0 else r * STAR_INNER
+        pts.append((cx + rad * math.cos(a), cy + rad * math.sin(a)))
+    return pts
+
+
+def in_poly(p, pts):
+    """Ray casting. The star is not convex, so the triangle test the iris used
+    does not apply to it."""
+    x, y = p
+    inside = False
+    n = len(pts)
+    for i in range(n):
+        x0, y0 = pts[i]
+        x1, y1 = pts[(i + 1) % n]
+        if (y0 > y) != (y1 > y):
+            xi = x0 + (y - y0) * (x1 - x0) / (y1 - y0)
+            if x < xi:
+                inside = not inside
+    return inside
 
 
 def in_tri(p, a, b, c):
-    """Point-in-triangle by consistent sign of the three edge cross products."""
     def side(p1, p2, p3):
         return (p1[0] - p3[0]) * (p2[1] - p3[1]) - (p2[0] - p3[0]) * (p1[1] - p3[1])
     d1, d2, d3 = side(p, a, b), side(p, b, c), side(p, c, a)
     return not (((d1 < 0) or (d2 < 0) or (d3 < 0)) and ((d1 > 0) or (d2 > 0) or (d3 > 0)))
 
 
-def slashes(cx, cy, r):
-    """The cuts between blades, as triangle pairs.
+def sample(x, y, cx, cy, r, quads, star, seam):
+    """Which colour a point is, or None for the background.
 
-    Each cut lies along a line **tangent to the central opening**, running from
-    its tangent point out to the rim. That tangency is the whole mark: a cut
-    aimed radially just notches the disc, while a tangent one leaves a blade
-    whose inner edge is a straight chord, which is what makes seven of them
-    read as a spiral. Every earlier attempt here got this wrong.
+    Painted in the order the shapes stack, innermost first: the star stands on
+    the field, the field sits in the gear, and everything outside the gear is
+    whatever was behind the mark.
     """
-    tris = []
-    rin = r * R_IN
-    half = r * SLASH
-    reach = math.sqrt(max(0.0, r * r - rin * rin)) * 1.06   # past the rim, so it cuts clean
-    for i in range(BLADES):
-        a = math.radians(i * DEG)
-        ux, uy = unit(a)
-        px, py = cx + rin * ux, cy + rin * uy       # tangent point on the opening
-        tx, ty = -uy, ux                            # tangent direction
-        ex, ey = px + tx * reach, py + ty * reach   # out at the rim
-        # Constant width: offset both ends along the normal, which here is the
-        # radial direction.
-        ox, oy = ux * half, uy * half
-        a0, a1 = (px + ox, py + oy), (px - ox, py - oy)
-        b0, b1 = (ex + ox, ey + oy), (ex - ox, ey - oy)
-        tris.append((a0, a1, b1))
-        tris.append((a0, b1, b0))
-    return tris
+    d = math.hypot(x - cx, y - cy)
+    if d <= r * STAR_R and in_poly((x, y), star) and not in_tri((x, y), *seam):
+        return IRON
+    if d <= r * FIELD_R:
+        return FIELD
+    if d <= r * BODY:
+        return IRON
+    if d <= r:
+        for q in quads:
+            if in_tri((x, y), q[0], q[1], q[2]) or in_tri((x, y), q[0], q[2], q[3]):
+                return IRON
+    return None
 
 
 def render(size, bg=None, ss=4):
     """RGBA buffer of the mark at `size` pixels, supersampled `ss`x."""
     cx = cy = size / 2.0
-    r = size / 2.0 * 0.96
-    rin = r * R_IN
-    tris = slashes(cx, cy, r)
+    r = size / 2.0 * 0.98
+    quads = teeth(cx, cy, r)
+    star = star_points(cx, cy, r * STAR_R)
+    half = r * STAR_R * SEAM_HALF
+    apex = star[0]
+    seam = ((apex[0] - half, apex[1]), (apex[0] + half, apex[1]), (cx, cy))
+
     px = bytearray(size * size * 4)
     inv = 1.0 / (ss * ss)
-
     for py_ in range(size):
         for px_ in range(size):
+            acc = [0.0, 0.0, 0.0]
             hits = 0
             for sy in range(ss):
                 for sx in range(ss):
-                    x = px_ + (sx + 0.5) / ss
-                    y = py_ + (sy + 0.5) / ss
-                    if math.hypot(x - cx, y - cy) > r:
-                        continue
-                    if in_opening(x, y, cx, cy, rin):
-                        continue
-                    if any(in_tri((x, y), *t) for t in tris):
-                        continue
-                    hits += 1
+                    c = sample(px_ + (sx + 0.5) / ss, py_ + (sy + 0.5) / ss,
+                               cx, cy, r, quads, star, seam)
+                    if c is not None:
+                        acc[0] += c[0]; acc[1] += c[1]; acc[2] += c[2]
+                        hits += 1
             i = (py_ * size + px_) * 4
-            a = hits * inv * 255
-            if a > 0:
-                px[i], px[i + 1], px[i + 2] = AMBER
-            px[i + 3] = int(a)
+            if hits:
+                px[i] = int(acc[0] / hits)
+                px[i + 1] = int(acc[1] / hits)
+                px[i + 2] = int(acc[2] / hits)
+            px[i + 3] = int(hits * inv * 255)
 
     if bg:
         flat = bytearray(size * size * 4)
@@ -167,32 +191,37 @@ def png(path, w, h, rgba):
 
 
 def svg():
-    """The same construction as vectors: outer disc, then the opening and the
-    seven cuts punched through it with fill-rule evenodd."""
+    """The same construction as vectors: the gear as one path, the field as a
+    circle, and the star as a path with the seam punched out of it by
+    fill-rule evenodd."""
     cx = cy = 50.0
-    r = 48.0
-    rin = r * R_IN
-    d = [f"M {cx - r},{cy} a {r},{r} 0 1,0 {2 * r},0 a {r},{r} 0 1,0 {-2 * r},0"]
-    # Vertices of the opening: where consecutive tangent lines meet. For a
-    # regular polygon of inradius rin that is circumradius rin/cos(pi/n).
-    circ = rin / math.cos(math.pi / BLADES)
-    pts = []
-    for i in range(BLADES):
-        a = math.radians(i * DEG + DEG / 2)
-        pts.append(f"{cx + circ * math.cos(a):.2f},{cy + circ * math.sin(a):.2f}")
-    d.append("M " + " L ".join(pts) + " Z")
-    for t_ in slashes(cx, cy, r):
-        d.append("M {} L {} L {} Z".format(
-            *[f"{x:.2f},{y:.2f}" for x, y in t_]))
+    r = 49.0
+    body = r * BODY
+    hexes = "#{:02X}{:02X}{:02X}".format
+
+    ring = (f"M {cx - body},{cy} a {body},{body} 0 1,0 {2 * body},0 "
+            f"a {body},{body} 0 1,0 {-2 * body},0")
+    tooth = []
+    for q in teeth(cx, cy, r):
+        tooth.append("M " + " L ".join(f"{x:.2f},{y:.2f}" for x, y in q) + " Z")
+
+    star = star_points(cx, cy, r * STAR_R)
+    half = r * STAR_R * SEAM_HALF
+    apex = star[0]
+    spath = "M " + " L ".join(f"{x:.2f},{y:.2f}" for x, y in star) + " Z"
+    seam = (f"M {apex[0] - half:.2f},{apex[1]:.2f} L {apex[0] + half:.2f},{apex[1]:.2f} "
+            f"L {cx:.2f},{cy:.2f} Z")
+
     return ('<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 100" '
-            'role="img" aria-label="AUTARK aperture mark">'
-            f'<path d="{" ".join(d)}" '
-            f'fill="#{AMBER[0]:02X}{AMBER[1]:02X}{AMBER[2]:02X}" '
-            'fill-rule="evenodd"/></svg>')
+            'role="img" aria-label="AUTARK cog and star">'
+            f'<path d="{ring} {" ".join(tooth)}" fill="{hexes(*IRON)}"/>'
+            f'<circle cx="{cx}" cy="{cy}" r="{r * FIELD_R:.2f}" fill="{hexes(*FIELD)}"/>'
+            f'<path d="{spath} {seam}" fill="{hexes(*IRON)}" fill-rule="evenodd"/>'
+            '</svg>')
 
 
 def social(w, h, out):
-    """Open Graph card: the mark on a dark field. No text -- rendering a
+    """Open Graph card: the mark on a dark field. No text, because rendering a
     wordmark means embedding a font, and every platform that shows this image
     shows the page title beside it."""
     px = bytearray(w * h * 4)

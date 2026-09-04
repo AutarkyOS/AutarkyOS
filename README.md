@@ -1,3 +1,5 @@
+<img src="docs/img/icon-192.png" alt="" width="96" align="right">
+
 # AUTARK
 
 A distribution of the [GLaDOS](https://github.com/IlumCI/GLaDOS) kernel: a
@@ -17,6 +19,87 @@ watching, and files a report in the morning. Everything it changes about itself
 is written down in a record it is forbidden to edit.
 
 Version 1.3.0. 153 files of Rust, about 98,000 lines.
+
+---
+
+## What it looks like
+
+Every image below is a `screendump` of AUTARK running under QEMU, taken during
+one boot with the clock set inside the quiet window. Nothing is a mockup and
+nothing is composited.
+
+<p align="center">
+  <img src="docs/screens/01-boot.png" alt="The AUTARK boot splash" width="720">
+</p>
+
+The splash. The cog is the machine and the star is the polity it believes it
+is; the mark is one construction shared by the boot screen, the desktop wall,
+the window chrome and the favicon, drawn in integer arithmetic in the kernel
+and in floating point by `tools/mklogo.py`.
+
+<p align="center">
+  <img src="docs/screens/02-desktop.png" alt="The AUTARK desktop" width="720">
+</p>
+
+The desktop on first boot. Registration stands where a setup wizard would, and
+the conversation window is already open with focus, because a machine whose
+first surface is a shell has decided the operator is a programmer.
+
+<p align="center">
+  <img src="docs/screens/05-storm.png" alt="A storm generation" width="720">
+</p>
+
+`godel storm 8`, the whole loop in one command. One prepare cached the features
+for nine examples and nineteen decisions, then eight grid points were trained
+against them, five chimeras were bred from the survivors by blending their
+low-rank factors, and the tribunal judged the best of the generation. It was
+rejected for no net repair, which is the loop working. Nothing was adopted and
+nothing was quietly kept.
+
+<p align="center">
+  <img src="docs/screens/06-archive.png" alt="The MAP-Elites archive" width="720">
+</p>
+
+The illumination archive that same storm filled. Twelve cells, four rank bands
+crossed with three repair behaviours, holding the best variant found in each.
+A cell is an address in the ledger's DAG, so an elite from a night three weeks
+ago is still reachable and still re-derivable.
+
+<p align="center">
+  <img src="docs/screens/03-godel.png" alt="godel status" width="720">
+</p>
+
+The loop's own state. The judge bar is a number the loop is allowed to move,
+and this line reports whether it has, which is the whole of U3 in one row.
+The test slice read counter is the reason the record is worth anything: three
+reads, then a figure prints as stale and is marked unquotable.
+
+<p align="center">
+  <img src="docs/screens/04-next.png" alt="godel next" width="720">
+</p>
+
+`godel next` answers what tonight would attempt without spending the night
+finding out. Axes are ordered by Bayesian surprise under a Beta prior, so the
+loop chases the axis whose outcome it can predict least well, and an exhausted
+axis costs one skipped slot instead of an idle night.
+
+<p align="center">
+  <img src="docs/screens/07-oracle.png" alt="The Oracle" width="720">
+</p>
+
+The Oracle. A linear dynamical model is fitted from a second-by-second ring of
+real telemetry by the router's own Cholesky, then rolled forward under three
+interventions: left alone, carried on, put under load. The forks are
+counterfactuals over a controlled system that was measured, and prophecy is
+what the first draft of this was and why it was scrapped.
+
+<p align="center">
+  <img src="docs/screens/08-start.png" alt="The Start menu" width="720">
+</p>
+
+The Start menu, with the query row at its foot where the menu opens out of the
+taskbar. Typing anywhere in the menu goes to it and Enter runs `open`, the same
+dispatcher the search panel uses.
 
 ---
 

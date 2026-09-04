@@ -2725,19 +2725,12 @@ fn wallpaper(fb: &Framebuffer) {
         );
     }
 
-    // Filled blades, and the gaps between them filled with the sky that would
-    // have been there. Which is to say the gaps are the sky: a cut here takes
-    // its colour from the same ramp the wall was drawn from, row by row, so
-    // there is nothing standing in for the background because it is the
-    // background.
-    super::splash::mark_with(
-        fb,
-        cx,
-        cy,
-        r,
-        super::splash::Face::Ramp(&theme::SUN),
-        super::splash::Cut::Sky { stops: &theme::WALL, top: 0, height: h },
-    );
+    // Lit metal, and the gaps between the teeth left alone. The iris that used
+    // to sit here was a disc with wedges cut out of it, so the caller had to
+    // hand back the sky for the cuts to be filled with. A cog has no holes: the
+    // gaps are simply never painted, and the wall drawn a moment ago is still
+    // underneath them.
+    super::splash::mark_with(fb, cx, cy, r, super::splash::Face::Ramp(&theme::SUN));
 }
 
 /// A point on the unit circle, scaled by 1024, for step `i` of `n`.

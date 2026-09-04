@@ -597,9 +597,19 @@ fn mark(fb: &Framebuffer, cx: i32, cy: i32, r: i32, fg: Color) {
     if r < 3 {
         return;
     }
+    // The gear reduces to its rim: teeth at this size are a one-pixel fringe
+    // that reads as a blurred edge. The star survives a little further down,
+    // so it is drawn while there is room for its valleys to be visible and
+    // becomes a plain hub below that. A five-pointed star rasterised into six
+    // pixels is a smudge, and a smudge in the middle of a ring reads worse
+    // than a hub does.
     fb.circle_thick(cx, cy, r, 2, fg);
     let inner = (r * 45 / 100).max(2);
-    fb.fill_circle(cx, cy, inner, fg);
+    if r >= 9 {
+        super::splash::star(fb, cx, cy, (r * 62 / 100).max(3), fg);
+    } else {
+        fb.fill_circle(cx, cy, inner, fg);
+    }
 }
 
 /// Where every part of a window is.

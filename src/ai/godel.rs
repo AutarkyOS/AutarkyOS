@@ -3417,7 +3417,10 @@ pub fn archive_cells() -> Vec<(usize, usize, Elite)> {
 /// exploring; QD-score says the cells it found are worth holding.
 pub fn archive_stats() -> (usize, usize, f32) {
     let cells = archive_cells();
-    let qd = cells.iter().map(|(_, _, e)| e.fitness).sum();
+    let qd: f32 = cells.iter().map(|(_, _, e)| e.fitness).sum();
+    // Summing nothing yields negative zero here, which prints as "-0" and reads
+    // as a score that went slightly wrong rather than one that has not started.
+    let qd = if qd == 0.0 { 0.0 } else { qd };
     (cells.len(), RANK_BINS * REPAIR_BINS, qd)
 }
 
