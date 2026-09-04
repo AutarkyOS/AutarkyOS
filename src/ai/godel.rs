@@ -117,6 +117,24 @@ pub const WINDOW: &str = "/ai/godel/window";
 /// that loosened its own criterion cannot also erase having done so.
 pub const JUDGE: &str = "/ai/godel/judge";
 
+/// The in-force J1 effect-size floor, as text.
+///
+/// The criterion is two numbers and it was unbound at one of them. J1 admits a
+/// candidate only if `fixed - broke >= floor` **and** `chi >= tau`, and until
+/// this file existed only the second clause took the bar the loop was running;
+/// the first read the constant. That is not a smaller version of the same
+/// freedom, it is a different constraint, and a measurement made it concrete:
+/// a candidate repairing 2 of 24 validation decisions with none broken, whose
+/// held-out anchor rose 52.2% to 60.9%, was refused by *every* bar in
+/// `[JUDGE_MIN, JUDGE_MAX]` because the floor is evaluated before chi. The
+/// axis could not reach the constraint that was binding.
+///
+/// It lives beside `JUDGE` and is revisable on the same terms: loop-writable,
+/// rollback-able, and outside the append-only records, because what the
+/// invariant protects is the ledger of revisions rather than the criterion
+/// itself.
+pub const FLOOR: &str = "/ai/godel/floor";
+
 /// Proposals already attempted, one empty marker per hash.
 ///
 /// Keyed on the *proposal* and not on the variant, because a variant's hash
@@ -187,7 +205,7 @@ pub enum ProposalKind {
     /// judged by the cross-evaluation matrix against a held-out anchor no bar
     /// can see (`trial_judge`), which is the only thing that tells a bar that
     /// found a real gain from one tuned to accept noise.
-    Judge(f32),
+    Judge(f32, usize),
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -279,8 +297,15 @@ impl Proposal {
     /// in the kind and is rendered at six places like a learning rate, so two
     /// proposed bars a hundredth apart are different points the frontier can
     /// tell apart and the marker directory does not collapse.
-    pub fn judge(tau: f32) -> Proposal {
-        Proposal { lr: 0.0, rank: 0, alpha: 0.0, epochs: 0, rule: 0, kind: ProposalKind::Judge(tau) }
+    pub fn judge(tau: f32, floor: usize) -> Proposal {
+        Proposal {
+            lr: 0.0,
+            rank: 0,
+            alpha: 0.0,
+            epochs: 0,
+            rule: 0,
+            kind: ProposalKind::Judge(tau, floor),
+        }
     }
 
     pub fn budget(&self, examples: usize, millis: u64) -> Budget {
@@ -344,10 +369,20 @@ impl Proposal {
             // marker. The training knobs above are all zero for a judge
             // proposal, so this line is the whole of what distinguishes two of
             // them.
-            ProposalKind::Judge(tau) => {
+            ProposalKind::Judge(tau, floor) => {
                 s.push_str("judge ");
                 push_f6(&mut s, tau);
                 s.push('\n');
+                // Conditional for the reason `Variant`'s own fields are: a
+                // point at the default floor must render to exactly the bytes
+                // it rendered before the floor was movable, or every marker
+                // already in `/ai/godel/tried` names a proposal that no longer
+                // exists and the loop re-walks a grid it has already spent.
+                if floor != MIN_FIXED {
+                    s.push_str("floor ");
+                    push_u32(&mut s, floor as u32);
+                    s.push('\n');
+                }
             }
         }
         s
@@ -491,13 +526,34 @@ pub fn space_selftest() -> bool {
     // learning rate and not at two -- and neither is any adapter, core or deep
     // point. Without this, `next_judge`'s two candidates could share a marker
     // and the second would never be tried.
-    let jgrid: alloc::vec::Vec<Proposal> = JUDGE_GRID.iter().map(|t| Proposal::judge(*t)).collect();
-    if !jgrid[0].render().contains("judge ") || jgrid[0].hash() == jgrid[1].hash() {
+    let jgrid: alloc::vec::Vec<Proposal> =
+        JUDGE_GRID.iter().map(|(t, f)| Proposal::judge(*t, *f)).collect();
+    if !jgrid[0].render().contains("judge ") {
         return false;
     }
-    let j_near = Proposal::judge(2.00);
-    let j_off = Proposal::judge(2.01);
+    // Every grid point distinct from every other. The pairs make this a real
+    // claim rather than a formality: two points sharing a bar and differing
+    // only in floor would collide to one marker if the floor did not render,
+    // and the second would never be tried.
+    for (i, a) in jgrid.iter().enumerate() {
+        for b in jgrid.iter().skip(i + 1) {
+            if a.hash() == b.hash() {
+                return false;
+            }
+        }
+    }
+    let j_near = Proposal::judge(2.00, MIN_FIXED);
+    let j_off = Proposal::judge(2.01, MIN_FIXED);
     if j_near.hash() == j_off.hash() {
+        return false;
+    }
+    // A point at the default floor renders exactly as it did before the floor
+    // was movable, so markers already written keep naming it. This is the
+    // silent half and the one that would cost a re-walked grid.
+    if Proposal::judge(2.00, MIN_FIXED).render().contains("floor") {
+        return false;
+    }
+    if Proposal::judge(2.00, 2).hash() == j_near.hash() {
         return false;
     }
     for p in jgrid.iter() {
@@ -991,6 +1047,16 @@ pub struct Variant {
     /// exact bytes it was stored under and its address does not move. The same
     /// bargain `deep` and `core` make, and the reason all three are conditional.
     pub threshold: f32,
+    /// The effect-size floor this variant was measured under.
+    ///
+    /// Renders only when it is not `MIN_FIXED`, for the reason `deep` and
+    /// `core` render conditionally: a field added unconditionally to a hashed
+    /// structure re-addresses every node that already exists, so `head` would
+    /// name something that no longer reproduces and the ledger would stop
+    /// being checkable. A node written before the floor was movable has no
+    /// `floor` line and reads back as the constant it was actually measured
+    /// under.
+    pub floor: usize,
     pub born: u32,
 }
 
@@ -1180,6 +1246,11 @@ impl Variant {
             push_f2(&mut s, self.threshold);
             s.push('\n');
         }
+        if self.floor != MIN_FIXED {
+            s.push_str("floor ");
+            push_u32(&mut s, self.floor as u32);
+            s.push('\n');
+        }
         s
     }
 
@@ -1246,6 +1317,10 @@ impl Variant {
             // actually measured under -- reading it as anything else would
             // rewrite history to say the machine had already moved its own bar.
             threshold: MCNEMAR_95,
+            // Same argument as `threshold`: a node from before the floor was
+            // movable must read back as the constant, or the lineage would
+            // claim the machine had already moved a criterion it never touched.
+            floor: MIN_FIXED,
             born: 0,
         };
         for line in text.lines() {
@@ -1276,6 +1351,7 @@ impl Variant {
                 }
                 "deep" => v.deep = val == "1",
                 "threshold" => v.threshold = val.parse().unwrap_or(MCNEMAR_95),
+                "floor" => v.floor = val.parse().unwrap_or(MIN_FIXED),
                 "rank" => v.rank = val.parse().unwrap_or(0),
                 "epochs" => v.epochs = val.parse().unwrap_or(0),
                 "rule" => v.rule = val.parse().unwrap_or(0),
@@ -1388,6 +1464,12 @@ pub struct Certificate {
 pub struct CrossLine {
     pub tau_old: f32,
     pub tau_new: f32,
+    /// The effect-size floors either side of the change. Recorded beside the
+    /// bars because a certificate that named only the bar could not say which
+    /// half of the criterion moved, and after the floor became movable that is
+    /// the first question a later reader asks of the line.
+    pub floor_old: usize,
+    pub floor_new: usize,
     pub admit_old: bool,
     pub admit_new: bool,
     /// Ground-truth routing accuracy on the held-out test slice -- the anchor
@@ -1437,9 +1519,15 @@ pub fn mcnemar(broke: usize, fixed: usize) -> f32 {
 /// answer and are not is exactly the arrangement in which somebody eventually
 /// quotes the wrong one, so the answer is computed from both.
 pub fn clean_fixes_needed() -> usize {
-    let mut f = MIN_FIXED;
+    // Both halves of the criterion in force, not the two constants. It read
+    // the constants, which was correct while neither could move and became a
+    // statement about a criterion the machine was not running the moment one
+    // could. Starting from the floor is the point: the answer is where the
+    // floor and the statistic first agree.
+    let (tau, floor) = (judge_in_force(), floor_in_force());
+    let mut f = floor;
     while f < 1024 {
-        if mcnemar(0, f) >= MCNEMAR_95 {
+        if mcnemar(0, f) >= tau {
             return f;
         }
         f += 1;
@@ -1493,6 +1581,74 @@ fn save_judge(tau: f32) -> bool {
     sysbox::write_text(JUDGE, &s)
 }
 
+/// The in-force J1 effect-size floor, the other half of the criterion.
+///
+/// Defaults to `MIN_FIXED` on a machine that has never moved it, so the
+/// constant is still where an untouched loop sits and still what a rollback
+/// past the first floor-change returns to. Same shape as `judge_in_force`,
+/// deliberately: two halves of one criterion that read differently would be
+/// the beginning of them disagreeing.
+pub fn floor_in_force() -> usize {
+    sysbox::read_blob(FLOOR)
+        .and_then(|b| core::str::from_utf8(&b).ok().and_then(|t| t.trim().parse().ok()))
+        .filter(|v: &usize| *v >= FLOOR_MIN && *v <= FLOOR_MAX)
+        .unwrap_or(MIN_FIXED)
+}
+
+fn save_floor(n: usize) -> bool {
+    if !(FLOOR_MIN..=FLOOR_MAX).contains(&n) {
+        return false;
+    }
+    let mut s = String::new();
+    push_u32(&mut s, n as u32);
+    s.push('\n');
+    sysbox::write_text(FLOOR, &s)
+}
+
+/// J1, at a stated criterion.
+///
+/// One implementation, because there were three and they had already drifted:
+/// `godel::trial` read `judge_in_force()` while `harness::core_bench` and
+/// `work`'s role judge read `MCNEMAR_95`, so after any adopted bar-change an
+/// adapter and a core were held to different criteria while both printed
+/// "J1". That is the failure `model.rs` makes the objection about twice, and
+/// the fix is one function rather than three that agree by hand.
+///
+/// Parameterised because `cross_matrix` is the one caller that must evaluate a
+/// criterion the loop is *not* running.
+pub fn j1_admits_at(tau: f32, floor: usize, fixed: usize, broke: usize, chi: f32) -> bool {
+    fixed > broke && fixed - broke >= floor && chi >= tau
+}
+
+/// J1 under the criterion actually in force, with the reason it refused.
+///
+/// The reasons are ordered by what a reader needs to know first: no evidence,
+/// then no effect, then too small an effect, then too weak a signal. A caller
+/// that only wants the bool takes `.0`.
+pub fn j1_verdict(
+    n_val: usize,
+    fixed: usize,
+    broke: usize,
+    chi: f32,
+) -> (bool, &'static str) {
+    if n_val == 0 {
+        // A property of how the trial was asked for rather than of the
+        // variant: a subsample too small to reach the validation slice leaves
+        // the margin with no evidence at all, in either direction.
+        return (false, "no validation decisions");
+    }
+    if fixed <= broke {
+        return (false, "no net repair");
+    }
+    if fixed - broke < floor_in_force() {
+        return (false, "net repair below the floor");
+    }
+    if chi < judge_in_force() {
+        return (false, "inside the noise");
+    }
+    (true, "beyond the noise")
+}
+
 /// The widest and narrowest a proposed bar may be.
 ///
 /// A bar of zero admits everything, which is the criterion abolishing itself;
@@ -1501,6 +1657,22 @@ fn save_judge(tau: f32) -> bool {
 /// and discovered later as a machine that never changes or never stops.
 pub const JUDGE_MIN: f32 = 0.5;
 pub const JUDGE_MAX: f32 = 12.0;
+
+/// The widest and narrowest a proposed effect-size floor may be.
+///
+/// One, not zero, is the bottom. J1 already requires `fixed > broke`, so a
+/// floor of zero and a floor of one admit exactly the same candidates, and
+/// offering both would put a point in the grid that can never differ from its
+/// neighbour -- the "improved nothing" refusal arriving as a wasted night
+/// rather than as a verdict.
+///
+/// The ceiling is a claim about the corpus rather than a round number. The
+/// validation slice runs to a few dozen decisions on a full pass and to
+/// twenty-four on the subsample this was measured at, so a floor above
+/// sixteen is one no night could clear and would freeze the loop exactly the
+/// way `JUDGE_MAX` exists to prevent.
+pub const FLOOR_MIN: usize = 1;
+pub const FLOOR_MAX: usize = 16;
 
 /// The smallest held-out gain that counts as the anchor supporting a change.
 ///
@@ -1680,7 +1852,9 @@ fn row(s: &mut String, tag: &str, held: bool, why: &str) {
 fn render_cross(s: &mut String, x: &CrossLine, c: &Certificate) {
     let admit = |b: bool| if b { "ADMITS" } else { "REFUSES" };
 
-    let mut bars = String::from("BARS       ");
+    // The criterion is two numbers and the dispatch names both, because the
+    // operator reading it has to be able to say which one the machine moved.
+    let mut bars = String::from("BAR        ");
     push_f2(&mut bars, x.tau_old);
     bars.push_str(" -> ");
     push_f2(&mut bars, x.tau_new);
@@ -1690,11 +1864,28 @@ fn render_cross(s: &mut String, x: &CrossLine, c: &Certificate) {
     s.push_str(&bars);
     s.push('\n');
 
+    let mut fl = String::from("FLOOR      ");
+    push_u32(&mut fl, x.floor_old as u32);
+    fl.push_str(" -> ");
+    push_u32(&mut fl, x.floor_new as u32);
+    fl.push_str("  candidate net repair ");
+    // Signed, because a candidate that broke more than it fixed is exactly
+    // the case the floor exists to refuse and printing it unsigned would read
+    // as a repair.
+    let net = c.fixed as i32 - c.broke as i32;
+    if net < 0 {
+        fl.push('-');
+    }
+    push_u32(&mut fl, net.unsigned_abs());
+    s.push_str("  ");
+    s.push_str(&fl);
+    s.push('\n');
+
     let mut mtx = String::from("MATRIX     standing ");
     mtx.push_str(admit(x.admit_old));
     mtx.push_str(" / proposed ");
     mtx.push_str(admit(x.admit_new));
-    row(s, &mtx, c.j1, if c.j1 { "" } else { "the bars agree" });
+    row(s, &mtx, c.j1, if c.j1 { "" } else { "both criteria agree" });
 
     let mut anchor = String::from("ANCHOR     ");
     push_f2(&mut anchor, x.anchor_inc * 100.0);
@@ -1832,6 +2023,15 @@ fn render_certificate(c: &Certificate, seq: u32, hour: u8) -> String {
         push_f2(&mut s, x.tau_old);
         s.push_str("->");
         push_f2(&mut s, x.tau_new);
+        // The floor rides beside the bar, unconditionally. A ledger line is a
+        // new object rather than a re-addressed one, so there is no rendering
+        // hazard here and nothing to be gained by omitting it -- and a line
+        // that named only the bar could not answer which half of the criterion
+        // moved, which is the first thing a later reader asks of a judge line.
+        s.push_str(" floor=");
+        push_u32(&mut s, x.floor_old as u32);
+        s.push_str("->");
+        push_u32(&mut s, x.floor_new as u32);
         s.push_str(" std=");
         s.push_str(if x.admit_old { "admit" } else { "refuse" });
         s.push_str(" prop=");
@@ -1977,6 +2177,7 @@ fn ensure_head(e: &mut super::Engine) -> Option<[u8; 32]> {
         // the one running now. `trial_judge` is the exception and sets the bar
         // it adopts.
         threshold: judge_in_force(),
+        floor: floor_in_force(),
         born: crate::dev::rtc::now().map(|d| crate::dev::rtc::unix_seconds(&d)).unwrap_or(0),
     };
     let vh = v.store();
@@ -2024,7 +2225,7 @@ pub fn run(
         }
         // `trial_judge` marks itself, the way `trial` does, because it prepares
         // a trial whose fault should still count the point as visited.
-        ProposalKind::Judge(tau) => trial_judge(e, tau, b),
+        ProposalKind::Judge(tau, floor) => trial_judge(e, tau, floor, b),
     };
     // Tally the outcome against its axis, for the surprise order. Only a trial
     // that reached a verdict counts: a refusal (no corpus, engine held) says
@@ -2114,27 +2315,9 @@ fn adjudicate(
     let (broke, fixed, _, _) = t.paired(incumbent, Some(&fit.dora), Slice::Validation);
     let chi = mcnemar(broke, fixed);
     let n_val = t.slice_size(Slice::Validation);
-    let (j1, j1_why) = if n_val == 0 {
-        // Nothing was held out to judge against. This is a property of how
-        // the trial was asked for rather than of the variant: a subsample too
-        // small to reach the validation slice leaves the margin with no
-        // evidence at all, in either direction.
-        (false, "no validation decisions")
-    } else if fixed <= broke {
-        (false, "no net repair")
-    } else if fixed - broke < MIN_FIXED {
-        (false, "net repair below the floor")
-    } else if chi < judge_in_force() {
-        // The bar the loop is *actually running*, not the constant. Until a
-        // judge-trial moves it this reads exactly `MCNEMAR_95`, so a machine
-        // that has never touched its criterion judges as it always did; after
-        // one, every weights trial is held to the bar the loop adopted, which
-        // is the whole point of the axis being a real change rather than a
-        // number in a file nobody consults.
-        (false, "inside the noise")
-    } else {
-        (true, "beyond the noise")
-    };
+    // The criterion the loop is *actually running*, both halves of it, through
+    // the one implementation every J1 site shares.
+    let (j1, j1_why) = j1_verdict(n_val, fixed, broke, chi);
 
     // --- J2: does it still do the same thing unasked? -------------------
     let (goals_held, goals_total) = t.guards_hold(Some(&fit.dora));
@@ -2282,6 +2465,7 @@ fn weight_variant(
         epochs,
         rule: super::harness::rule_in_force() as u8,
         threshold: judge_in_force(),
+        floor: floor_in_force(),
         born: crate::dev::rtc::now().map(|d| crate::dev::rtc::unix_seconds(&d)).unwrap_or(0),
     }
 }
@@ -2405,6 +2589,7 @@ pub fn trial_core(e: &mut super::Engine, h: &[u8; 32]) -> Result<Certificate, &'
         // the one running now. `trial_judge` is the exception and sets the bar
         // it adopts.
         threshold: judge_in_force(),
+        floor: floor_in_force(),
         born: crate::dev::rtc::now().map(|d| crate::dev::rtc::unix_seconds(&d)).unwrap_or(0),
     };
     let vhash = variant.hash();
@@ -2600,23 +2785,7 @@ pub fn trial_deep(
         }
     }
     let chi = mcnemar(broke, fixed);
-    let (j1, j1_why) = if n == 0 {
-        (false, "no validation decisions")
-    } else if fixed <= broke {
-        (false, "no net repair")
-    } else if fixed - broke < MIN_FIXED {
-        (false, "net repair below the floor")
-    } else if chi < judge_in_force() {
-        // The bar the loop is *actually running*, not the constant. Until a
-        // judge-trial moves it this reads exactly `MCNEMAR_95`, so a machine
-        // that has never touched its criterion judges as it always did; after
-        // one, every weights trial is held to the bar the loop adopted, which
-        // is the whole point of the axis being a real change rather than a
-        // number in a file nobody consults.
-        (false, "inside the noise")
-    } else {
-        (true, "beyond the noise")
-    };
+    let (j1, j1_why) = j1_verdict(n, fixed, broke, chi);
 
     // --- J2: does it still do the same thing unasked? -------------------
     //
@@ -2680,6 +2849,7 @@ pub fn trial_deep(
         // the one running now. `trial_judge` is the exception and sets the bar
         // it adopts.
         threshold: judge_in_force(),
+        floor: floor_in_force(),
         born: crate::dev::rtc::now().map(|d| crate::dev::rtc::unix_seconds(&d)).unwrap_or(0),
     };
     let vhash = variant.hash();
@@ -2789,6 +2959,7 @@ pub fn trial_skill(h: &[u8; 32]) -> Result<Certificate, &'static str> {
         // the one running now. `trial_judge` is the exception and sets the bar
         // it adopts.
         threshold: judge_in_force(),
+        floor: floor_in_force(),
         born: crate::dev::rtc::now().map(|d| crate::dev::rtc::unix_seconds(&d)).unwrap_or(0),
     };
     let vhash = variant.hash();
@@ -2947,6 +3118,7 @@ pub fn trial_config(e: &mut super::Engine, rule: u8) -> Result<Certificate, &'st
         // the one running now. `trial_judge` is the exception and sets the bar
         // it adopts.
         threshold: judge_in_force(),
+        floor: floor_in_force(),
         born: crate::dev::rtc::now().map(|d| crate::dev::rtc::unix_seconds(&d)).unwrap_or(0),
     };
     let vhash = variant.hash();
@@ -3039,6 +3211,8 @@ fn judge_reference() -> Proposal {
 pub struct CrossEval {
     pub tau_old: f32,
     pub tau_new: f32,
+    pub floor_old: usize,
+    pub floor_new: usize,
     /// The reference candidate's paired counts against the incumbent, on the
     /// validation slice -- the evidence both bars weigh.
     pub fixed: usize,
@@ -3061,11 +3235,23 @@ impl CrossEval {
         self.anchor_cand - self.anchor_inc
     }
     pub fn verdict(&self) -> (bool, &'static str) {
-        judge_verdict(self.tau_new, self.admit_old, self.admit_new, self.anchor_gain())
+        judge_verdict(
+            self.tau_new,
+            self.floor_new,
+            self.admit_old,
+            self.admit_new,
+            self.anchor_gain(),
+        )
     }
 }
 
-/// Whether a proposed bar should be adopted, and why.
+/// Whether a proposed criterion should be adopted, and why.
+///
+/// The criterion is the pair `(bar, floor)` and either half may move. Only the
+/// sanity question had to learn about the second half: "moves" and "honest"
+/// read `admit_old`, `admit_new` and the anchor, which are answers about the
+/// candidate rather than about which knob produced them, so the drift check
+/// that is the whole point of the axis cost nothing to generalise.
 ///
 /// A pure function of the matrix, so every one of its outcomes is asserted at
 /// boot without a model, the way `update::decide` is. Three questions, and the
@@ -3075,7 +3261,7 @@ impl CrossEval {
 ///             bar of zero abolishes the criterion; one too high freezes the
 ///             loop. Both are refused here rather than adopted and discovered
 ///             later as a machine that never changes or never stops.
-///   moves  -- the two bars actually disagree about the candidate. A bar that
+///   moves  -- the two criteria actually disagree about the candidate. One that
 ///             admits and refuses exactly what the standing one did has changed
 ///             nothing, and adopting it would be a certificate with no content
 ///             -- the same "improved nothing" refusal the rule axis makes.
@@ -3087,12 +3273,20 @@ impl CrossEval {
 ///             certificate, and this is the line that catches it.
 pub fn judge_verdict(
     tau_new: f32,
+    floor_new: usize,
     admit_old: bool,
     admit_new: bool,
     anchor_gain: f32,
 ) -> (bool, &'static str) {
     if !(tau_new.is_finite() && tau_new >= JUDGE_MIN && tau_new <= JUDGE_MAX) {
         return (false, "the proposed bar is outside sane range");
+    }
+    // The floor is sanity-checked on the same terms and for the same two
+    // failures: under `FLOOR_MIN` the effect-size requirement is abolished and
+    // any single repair passes, above `FLOOR_MAX` no night can clear it and
+    // the loop silently freezes.
+    if !(FLOOR_MIN..=FLOOR_MAX).contains(&floor_new) {
+        return (false, "the proposed floor is outside sane range");
     }
     if admit_old == admit_new {
         return (false, "both bars agree on the candidate, nothing changes");
@@ -3128,30 +3322,35 @@ pub fn judge_verdict(
 pub fn cross_matrix(
     e: &mut super::Engine,
     tau_new: f32,
+    floor_new: usize,
     examples: usize,
     millis: u64,
 ) -> Result<CrossEval, Refused> {
-    let tau_old = judge_in_force();
+    let (tau_old, floor_old) = (judge_in_force(), floor_in_force());
     let tb = judge_reference().budget(examples, millis);
     let t = super::train::prepare(e, &tb).map_err(Refused::Train)?;
     let incumbent = e.model.adapters.as_ref().and_then(|a| t.gather(a));
     let fit = t.train(&tb);
     let (broke, fixed, _, _) = t.paired(incumbent.as_ref(), Some(&fit.dora), Slice::Validation);
     let chi = mcnemar(broke, fixed);
-    // J1 exactly, parameterised by the bar. This is the one place the bar is a
-    // variable rather than the constant `trial` reads.
-    let admit = |tau: f32| fixed > broke && fixed - broke >= MIN_FIXED && chi >= tau;
+    // J1 exactly, parameterised by the whole criterion. This is the one place
+    // the criterion is a variable rather than the one `trial` reads, and it
+    // calls the same function every other J1 site does so the two cannot drift
+    // into disagreeing about what admission means.
+    let admit = |tau: f32, floor: usize| j1_admits_at(tau, floor, fixed, broke, chi);
     let anchor_inc = t.score(incumbent.as_ref(), Slice::Test);
     let anchor_cand = t.score(Some(&fit.dora), Slice::Test);
     let reads = spend_test_read();
     Ok(CrossEval {
         tau_old,
         tau_new,
+        floor_old,
+        floor_new,
         fixed,
         broke,
         chi,
-        admit_old: admit(tau_old),
-        admit_new: admit(tau_new),
+        admit_old: admit(tau_old, floor_old),
+        admit_new: admit(tau_new, floor_new),
         anchor_inc,
         anchor_cand,
         anchor_reads: reads,
@@ -3170,6 +3369,7 @@ pub fn cross_matrix(
 pub fn trial_judge(
     e: &mut super::Engine,
     tau_new: f32,
+    floor_new: usize,
     b: &Budget,
 ) -> Result<Certificate, Refused> {
     // Refuse before paying for a prepare if the anchor is already spent. A
@@ -3180,8 +3380,8 @@ pub fn trial_judge(
             "the anchor budget is spent, so a bar change cannot be grounded",
         ));
     }
-    Proposal::judge(tau_new).mark();
-    let ce = cross_matrix(e, tau_new, b.examples, b.millis)?;
+    Proposal::judge(tau_new, floor_new).mark();
+    let ce = cross_matrix(e, tau_new, floor_new, b.examples, b.millis)?;
     TRIALS.fetch_add(1, Ordering::Relaxed);
 
     let (blessed, why) = ce.verdict();
@@ -3204,8 +3404,11 @@ pub fn trial_judge(
         rank: carried.as_ref().map(|x| x.rank).unwrap_or(0),
         epochs: carried.as_ref().map(|x| x.epochs).unwrap_or(0),
         rule: super::harness::rule_in_force() as u8,
-        // The one field this trial moves.
+        // The two fields this trial moves. Either may be the one that
+        // actually changed; the variant records both so a later reader does
+        // not have to infer which from the certificate.
         threshold: tau_new,
+        floor: floor_new,
         born: crate::dev::rtc::now().map(|d| crate::dev::rtc::unix_seconds(&d)).unwrap_or(0),
     };
     let vhash = variant.hash();
@@ -3213,6 +3416,8 @@ pub fn trial_judge(
     let cross = CrossLine {
         tau_old: ce.tau_old,
         tau_new: ce.tau_new,
+        floor_old: ce.floor_old,
+        floor_new: ce.floor_new,
         admit_old: ce.admit_old,
         admit_new: ce.admit_new,
         anchor_inc: ce.anchor_inc,
@@ -3224,7 +3429,10 @@ pub fn trial_judge(
     // The renderers branch on `cross` and print the matrix instead of these
     // labels, so the mapping is for the adoption logic, not for the reader.
     let bars_move = ce.admit_old != ce.admit_new;
-    let sane = tau_new.is_finite() && tau_new >= JUDGE_MIN && tau_new <= JUDGE_MAX;
+    let sane = tau_new.is_finite()
+        && tau_new >= JUDGE_MIN
+        && tau_new <= JUDGE_MAX
+        && (FLOOR_MIN..=FLOOR_MAX).contains(&floor_new);
     let cert = Certificate {
         parent,
         variant: vhash,
@@ -3240,7 +3448,7 @@ pub fn trial_judge(
         goals_total: 0,
         j2: blessed,
         j3: sane,
-        j3_why: if sane { "ok" } else { "the bar is outside sane range" },
+        j3_why: if sane { "ok" } else { "the criterion is outside sane range" },
         resident_kib: 0,
         rank: 0,
         j4: true,
@@ -3254,7 +3462,15 @@ pub fn trial_judge(
     };
 
     if adopted {
+        // The floor first, then the bar. Writing one and failing the other
+        // leaves a criterion that is half of what the judges blessed, so the
+        // half that can be put back cheaply goes first: a failed bar write
+        // restores the floor before returning, and neither is in force.
+        if !save_floor(floor_new) {
+            return Err(Refused::Judge("it passed and the new floor would not save"));
+        }
         if !save_judge(tau_new) {
+            let _ = save_floor(ce.floor_old);
             return Err(Refused::Judge("it passed and the new bar would not save"));
         }
         variant.store();
@@ -3775,6 +3991,13 @@ pub fn rollback(e: &mut super::Engine) -> Result<Option<[u8; 32]>, &'static str>
     } else {
         None
     };
+    // The floor, on identical terms and for the identical reason. Both halves
+    // default to their constant and render nothing at it, so two pre-U3 nodes
+    // compare equal and nothing is put back; only a node adopted under a moved
+    // floor differs from its parent. Restoring unconditionally would push the
+    // constant onto a lineage of legacy nodes that never recorded one, which is
+    // the mistake `rule` records having made.
+    let floor_back = if v.floor != pv.floor { Some(pv.floor) } else { None };
 
     // --- change things -------------------------------------------------
 
@@ -3798,6 +4021,11 @@ pub fn rollback(e: &mut super::Engine) -> Result<Option<[u8; 32]>, &'static str>
     if let Some(tau) = threshold_back {
         if !save_judge(tau) {
             return Err("the adapter was restored but the bar will not save");
+        }
+    }
+    if let Some(f) = floor_back {
+        if !save_floor(f) {
+            return Err("the adapter was restored but the floor will not save");
         }
     }
     match want {
@@ -3901,15 +4129,31 @@ fn next_skill() -> Option<Proposal> {
     None
 }
 
-/// Candidate bars the loop will try, one looser and one tighter than the
-/// default 3.84.
+/// Candidate criteria the loop will try, as `(bar, floor)` pairs.
 ///
-/// Two, and declared, for the reason every other grid here is: the search is
-/// re-derivable from the markers rather than from a coin. Loosening is the
-/// dangerous direction and the one the anchor exists to police; tightening is
-/// the safe one and is included so the loop can also *raise* its own bar when
-/// the anchor says the current one lets noise through.
-const JUDGE_GRID: &[f32] = &[2.00, 6.00];
+/// Declared and in fixed order for the reason every other grid here is: the
+/// search is re-derivable from the markers rather than from a coin.
+///
+/// The shape of the list is the finding that produced it. It held two points
+/// that moved only the bar, and a measurement showed the bar was not what was
+/// binding: a candidate repairing 2 of 24 with none broken, anchor 52.2% to
+/// 60.9%, was refused at every bar in range because `fixed - broke >= floor`
+/// is evaluated before chi and 2 is under 4. So the first two points below
+/// move the bar at the default floor, the next two move the floor at the
+/// default bar, and the last moves both. Each axis of the criterion is
+/// reachable alone, which is what makes a verdict attributable to one of them.
+///
+/// Loosening is the dangerous direction on both axes and the one the anchor
+/// exists to police; tightening is included on both so the loop can also
+/// *raise* its own criterion when the anchor says the current one lets noise
+/// through.
+const JUDGE_GRID: &[(f32, usize)] = &[
+    (2.00, MIN_FIXED),
+    (6.00, MIN_FIXED),
+    (MCNEMAR_95, 2),
+    (MCNEMAR_95, 6),
+    (2.00, 2),
+];
 
 /// Trials in an epoch.
 ///
@@ -3955,12 +4199,17 @@ fn next_judge() -> Option<Proposal> {
     if !at_epoch_boundary() {
         return None;
     }
-    let now = judge_in_force();
+    let (tau_now, floor_now) = (judge_in_force(), floor_in_force());
     JUDGE_GRID
         .iter()
         .copied()
-        .filter(|t| (*t - now).abs() >= 0.005)
-        .map(Proposal::judge)
+        // The criterion already running is excluded rather than marked, the
+        // same as `next_config`: judging a criterion against itself is a
+        // certificate that nothing changed, which is true and not worth a
+        // night. Both halves have to differ for the point to be the one in
+        // force, so moving either axis is still a candidate.
+        .filter(|(t, f)| (*t - tau_now).abs() >= 0.005 || *f != floor_now)
+        .map(|(t, f)| Proposal::judge(t, f))
         .find(|p| !p.tried())
 }
 
@@ -3977,7 +4226,7 @@ fn axis_of(kind: &ProposalKind) -> usize {
         ProposalKind::Config(_) => 1,
         ProposalKind::Skill(_) => 2,
         ProposalKind::Deep => 3,
-        ProposalKind::Judge(_) => 4,
+        ProposalKind::Judge(..) => 4,
         ProposalKind::Core(_) => 5,
     }
 }
@@ -4391,6 +4640,7 @@ pub fn selftest() -> bool {
         epochs: 20,
         rule: 0,
         threshold: MCNEMAR_95,
+        floor: MIN_FIXED,
         born,
     };
     let v1 = mk(0.02, 1000);
@@ -4491,37 +4741,37 @@ pub fn selftest() -> bool {
     //
     // The bars: standing 3.84, admit_old means the candidate cleared it. The
     // pairs below name (admit_old, admit_new) and the anchor gain.
-    let drift = judge_verdict(2.0, false, true, 0.0);
+    let drift = judge_verdict(2.0, MIN_FIXED, false, true, 0.0);
     claim(
         "drift is caught: a looser bar admitting what the anchor rejects is refused",
         !drift.0,
     );
-    let genuine = judge_verdict(2.0, false, true, MIN_ANCHOR_GAIN + 0.02);
+    let genuine = judge_verdict(2.0, MIN_FIXED, false, true, MIN_ANCHOR_GAIN + 0.02);
     claim(
         "a looser bar admitting what the anchor confirms is adopted",
         genuine.0,
     );
-    let tighten_ok = judge_verdict(6.0, true, false, 0.0);
+    let tighten_ok = judge_verdict(6.0, MIN_FIXED, true, false, 0.0);
     claim(
         "a tighter bar refusing a candidate the anchor did not support is adopted",
         tighten_ok.0,
     );
-    let tighten_bad = judge_verdict(6.0, true, false, MIN_ANCHOR_GAIN + 0.02);
+    let tighten_bad = judge_verdict(6.0, MIN_FIXED, true, false, MIN_ANCHOR_GAIN + 0.02);
     claim(
         "a tighter bar refusing a genuine gain is refused",
         !tighten_bad.0,
     );
     claim(
         "a bar both sides agree on changes nothing, and is refused",
-        !judge_verdict(3.9, true, true, 1.0).0 && !judge_verdict(3.9, false, false, 1.0).0,
+        !judge_verdict(3.9, MIN_FIXED, true, true, 1.0).0 && !judge_verdict(3.9, MIN_FIXED, false, false, 1.0).0,
     );
     claim(
         "a bar of zero abolishes the criterion and is refused",
-        !judge_verdict(0.0, false, true, 1.0).0,
+        !judge_verdict(0.0, MIN_FIXED, false, true, 1.0).0,
     );
     claim(
         "a bar past the ceiling freezes the loop and is refused",
-        !judge_verdict(JUDGE_MAX + 1.0, true, false, 0.0).0,
+        !judge_verdict(JUDGE_MAX + 1.0, MIN_FIXED, true, false, 0.0).0,
     );
     // The anchor is the axis's whole defence, and its budget is finite, so the
     // in-force accessor must default to exactly the strict constant on a machine
@@ -4530,6 +4780,67 @@ pub fn selftest() -> bool {
     claim(
         "a machine that never moved its bar judges at exactly the default",
         judge_in_force() == MCNEMAR_95,
+    );
+
+    // --- the floor, the other half of the criterion ----------------------
+    //
+    // The measurement that produced this: a candidate repairing 2 of 24 with
+    // none broken, held-out anchor 52.2% to 60.9%, refused by every bar in
+    // `[JUDGE_MIN, JUDGE_MAX]`. J1 tests `fixed - broke >= floor` before it
+    // tests chi, so the axis could move the constraint that was not binding
+    // and could not reach the one that was. These claims are about the floor
+    // being reachable and being bounded, in that order.
+    claim(
+        "a floor no bar can reach is what the axis was blind to",
+        !j1_admits_at(JUDGE_MIN, MIN_FIXED, 2, 0, mcnemar(0, 2))
+            && !j1_admits_at(JUDGE_MAX, MIN_FIXED, 2, 0, mcnemar(0, 2)),
+    );
+    claim(
+        "lowering the floor admits exactly that candidate",
+        j1_admits_at(JUDGE_MIN, 2, 2, 0, mcnemar(0, 2)),
+    );
+    claim(
+        "a floor of zero abolishes the effect-size test and is refused",
+        !judge_verdict(MCNEMAR_95, 0, false, true, 1.0).0,
+    );
+    claim(
+        "a floor past the ceiling freezes the loop and is refused",
+        !judge_verdict(MCNEMAR_95, FLOOR_MAX + 1, false, true, 1.0).0,
+    );
+    claim(
+        "a floor change is policed by the same anchor a bar change is",
+        judge_verdict(MCNEMAR_95, 2, false, true, MIN_ANCHOR_GAIN + 0.02).0
+            && !judge_verdict(MCNEMAR_95, 2, false, true, 0.0).0,
+    );
+    claim(
+        "a machine that never moved its floor judges at exactly the default",
+        floor_in_force() == MIN_FIXED,
+    );
+    // The silent one, and the reason the rendering is conditional. A default
+    // floor must add nothing, or every node in every lineage re-addresses and
+    // `head` names something that no longer reproduces.
+    let mut vf = mk(0.02, 1000);
+    vf.floor = 2;
+    claim(
+        "a non-default floor renders, and is a different node",
+        vf.render().contains("floor 2\n") && vf.hash() != v1.hash(),
+    );
+    claim(
+        "the default floor renders nothing, so an existing node keeps its address",
+        !v1.render().contains("floor"),
+    );
+    claim(
+        "a floor round-trips through the rendering",
+        Variant::from_text(&vf.render()).floor == 2
+            && Variant::from_text(&vf.render()).hash() == vf.hash(),
+    );
+    // J1 is one implementation now. This is the claim that it stayed one: the
+    // parameterised form at the in-force criterion must equal the form every
+    // trial actually calls, or the two have drifted again.
+    claim(
+        "the parameterised J1 and the in-force J1 agree",
+        j1_verdict(24, 6, 0, mcnemar(0, 6)).0
+            == j1_admits_at(judge_in_force(), floor_in_force(), 6, 0, mcnemar(0, 6)),
     );
 
     // --- The illumination archive (MAP-Elites) ---------------------------

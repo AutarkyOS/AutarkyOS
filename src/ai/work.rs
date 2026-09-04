@@ -1334,17 +1334,9 @@ pub fn train_role(role: &str, b: &super::train::Budget) -> Result<RoleFit, RoleE
             t.paired(incumbent.as_ref(), Some(&fit.dora), Slice::Validation);
         let chi = super::godel::mcnemar(broke, fixed);
         let n_val = t.slice_size(Slice::Validation);
-        let (j1, j1_why) = if n_val == 0 {
-            (false, "no validation decisions")
-        } else if fixed <= broke {
-            (false, "no net repair")
-        } else if fixed - broke < super::godel::MIN_FIXED {
-            (false, "net repair below the floor")
-        } else if chi < super::godel::MCNEMAR_95 {
-            (false, "inside the noise")
-        } else {
-            (true, "beyond the noise")
-        };
+        // Through godel's own J1 rather than a fourth copy of the ladder, so a
+        // role adapter is admitted on exactly the terms an adapter trial is.
+        let (j1, j1_why) = super::godel::j1_verdict(n_val, fixed, broke, chi);
 
         // J2 is the one that earns its keep here, and it is free. A role
         // adapter trained on a few dozen steps is exactly the object most

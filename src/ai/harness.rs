@@ -2831,11 +2831,12 @@ pub fn core_bench_core(
             return Err(String::from("nothing in that slice to judge against"));
         }
         v.chi = super::godel::mcnemar(v.broke, v.fixed);
-        // J1, the same shape the adapter judge uses: a net repair above the
-        // floor and beyond the noise.
-        v.j1 = v.fixed > v.broke
-            && v.fixed - v.broke >= super::godel::MIN_FIXED
-            && v.chi >= super::godel::MCNEMAR_95;
+        // J1, and now literally the same function the adapter judge uses
+        // rather than the same shape. It read the two constants while
+        // `godel::trial` read the in-force criterion, so from the first
+        // adopted bar-change a core and an adapter were held to different
+        // standards while both printed "J1".
+        v.j1 = super::godel::j1_verdict(v.n, v.fixed, v.broke, v.chi).0;
         // J5, cost.
         v.j5 = v.worst_steps <= CORE_STEP_CEILING;
         // J6, independence. A core that never differs from lexical is lexical.

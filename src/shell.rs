@@ -3013,14 +3013,45 @@ fn execute(line: &str, boot: &BootInfo, acpi: &Option<Acpi>, interp: &mut aiksi:
                     // A machine that has loosened its own criterion should say
                     // so where anyone looks, not bury it in the ledger.
                     {
+                        // Both halves, and each says on its own whether it
+                        // moved. Printing only the bar was accurate and
+                        // incomplete in the way that matters: a machine can
+                        // now have loosened the half this line never named.
                         let t = godel::judge_in_force();
-                        if (t - godel::MCNEMAR_95).abs() < 0.005 {
-                            kprintln!("  judge bar {} (the default; never moved)", t);
+                        let f = godel::floor_in_force();
+                        let t_moved = (t - godel::MCNEMAR_95).abs() >= 0.005;
+                        let f_moved = f != godel::MIN_FIXED;
+                        if !t_moved && !f_moved {
+                            kprintln!(
+                                "  criterion: bar {} floor {} (the default; never moved)",
+                                t, f
+                            );
                         } else {
                             console::set_color(YELLOW);
-                            kprintln!("  judge bar {} -- MOVED from the default {}", t, godel::MCNEMAR_95);
+                            kprintln!(
+                                "  criterion: bar {}{} floor {}{}",
+                                t,
+                                if t_moved { " MOVED" } else { "" },
+                                f,
+                                if f_moved { " MOVED" } else { "" }
+                            );
+                            kprintln!(
+                                "  the default was bar {} floor {}",
+                                godel::MCNEMAR_95,
+                                godel::MIN_FIXED
+                            );
                             console::set_color(LTGRAY);
                         }
+                        // What the criterion in force actually demands of a
+                        // clean run, which is not either constant: Yates
+                        // subtracts one before squaring, so at bar 3.84 the
+                        // floor of 4 scores 2.25 and six clean repairs is the
+                        // real requirement. Two numbers that look like the
+                        // answer and are not is how the wrong one gets quoted.
+                        kprintln!(
+                            "  in practice that needs {} clean repairs",
+                            godel::clean_fixes_needed()
+                        );
                     }
                     // The test slice is the one resource a self-improving loop
                     // spends without noticing, so its balance is status, not
@@ -3161,19 +3192,16 @@ fn execute(line: &str, boot: &BootInfo, acpi: &Option<Acpi>, interp: &mut aiksi:
                 // obeys.
                 "cross" => {
                     let tau = words.next().and_then(|w| w.parse::<f32>().ok());
+                    // The floor is a required argument rather than an optional
+                    // one. `<bar> [floor] [examples]` cannot be parsed: both
+                    // trailing words are numbers, so a two-argument call is
+                    // ambiguous and would silently read a sample size as a
+                    // criterion. The criterion is one object and is typed whole.
+                    let floor = words.next().and_then(|w| w.parse::<usize>().ok());
                     let n = words.next().and_then(|w| w.parse::<usize>().ok()).unwrap_or(0);
-                    match tau {
-                        None => {
-                            kprintln!("  usage: godel cross <bar> [examples]");
-                            kprintln!("  bar in force: {}", {
-                                let mut s = alloc::string::String::new();
-                                let t = godel::judge_in_force();
-                                s.push_str(if (t - godel::MCNEMAR_95).abs() < 0.005 { "3.84 (default)" } else { "moved" });
-                                s
-                            });
-                        }
-                        Some(t) => {
-                            match crate::ai::with_engine(|e| godel::cross_matrix(e, t, n, 120_000)) {
+                    match (tau, floor) {
+                        (Some(t), Some(f)) => {
+                            match crate::ai::with_engine(|e| godel::cross_matrix(e, t, f, n, 120_000)) {
                                 None => kprintln!("  {}", crate::ai::engine_refusal()),
                                 Some(Err(why)) => kprintln!("  refused: {}", why.why()),
                                 Some(Ok(ce)) => {
@@ -3186,15 +3214,30 @@ fn execute(line: &str, boot: &BootInfo, acpi: &Option<Acpi>, interp: &mut aiksi:
                                         ce.fixed, ce.broke, ce.chi, ce.validation
                                     );
                                     kprintln!(
-                                        "  standing bar {}: {}",
-                                        ce.tau_old,
+                                        "  standing  bar {} floor {}: {}",
+                                        ce.tau_old, ce.floor_old,
                                         if ce.admit_old { "ADMITS" } else { "REFUSES" }
                                     );
                                     kprintln!(
-                                        "  proposed bar {}: {}",
-                                        ce.tau_new,
+                                        "  proposed  bar {} floor {}: {}",
+                                        ce.tau_new, ce.floor_new,
                                         if ce.admit_new { "ADMITS" } else { "REFUSES" }
                                     );
+                                    // Which clause actually decided. J1 tests
+                                    // the floor before the statistic, so a
+                                    // candidate under the floor is refused by
+                                    // every bar in range and the chi printed
+                                    // above is irrelevant to the verdict. That
+                                    // was invisible until it cost a measurement.
+                                    if ce.fixed <= ce.broke
+                                        || ce.fixed - ce.broke < ce.floor_old.min(ce.floor_new)
+                                    {
+                                        kprintln!(
+                                            "  the floor decided, not the bar -- net repair {} is under {}",
+                                            ce.fixed as i32 - ce.broke as i32,
+                                            ce.floor_old.min(ce.floor_new)
+                                        );
+                                    }
                                     kprintln!(
                                         "  anchor (held-out): incumbent {} -> candidate {}{}",
                                         ce.anchor_inc, ce.anchor_cand,
@@ -3206,6 +3249,14 @@ fn execute(line: &str, boot: &BootInfo, acpi: &Option<Acpi>, interp: &mut aiksi:
                                 }
                             }
                         }
+                        _ => {
+                            kprintln!("  usage: godel cross <bar> <floor> [examples]");
+                            kprintln!(
+                                "  in force: bar {} floor {}",
+                                godel::judge_in_force(),
+                                godel::floor_in_force()
+                            );
+                        }
                     }
                 }
                 // U3: run a real judge-trial -- move the bar, or refuse and
@@ -3213,32 +3264,35 @@ fn execute(line: &str, boot: &BootInfo, acpi: &Option<Acpi>, interp: &mut aiksi:
                 // command is how it is driven and tested.
                 "judge" => {
                     let tau = words.next().and_then(|w| w.parse::<f32>().ok());
+                    let floor = words.next().and_then(|w| w.parse::<usize>().ok());
                     let n = words.next().and_then(|w| w.parse::<usize>().ok()).unwrap_or(0);
-                    match tau {
-                        None => kprintln!("  usage: godel judge <bar> [examples]"),
-                        Some(t) => {
-                            let b = godel::Proposal::judge(t).budget(n, 120_000);
-                            match crate::ai::with_engine(|e| godel::trial_judge(e, t, &b)) {
+                    match (tau, floor) {
+                        (Some(t), Some(f)) => {
+                            let b = godel::Proposal::judge(t, f).budget(n, 120_000);
+                            match crate::ai::with_engine(|e| godel::trial_judge(e, t, f, &b)) {
                                 None => kprintln!("  {}", crate::ai::engine_refusal()),
                                 Some(Err(why)) => kprintln!("  refused: {}", why.why()),
                                 Some(Ok(c)) => {
                                     console::set_color(if c.adopted { LTGREEN } else { YELLOW });
                                     kprintln!(
                                         "  {} -- {}",
-                                        if c.adopted { "the bar moved" } else { "the bar stands" },
+                                        if c.adopted { "the criterion moved" } else { "the criterion stands" },
                                         c.j1_why
                                     );
                                     console::set_color(LTGRAY);
                                     if let Some(x) = c.cross {
                                         kprintln!(
-                                            "  {} -> {}, anchor {} -> {}",
-                                            x.tau_old, x.tau_new, x.anchor_inc, x.anchor_cand
+                                            "  bar {} -> {}, floor {} -> {}, anchor {} -> {}",
+                                            x.tau_old, x.tau_new,
+                                            x.floor_old, x.floor_new,
+                                            x.anchor_inc, x.anchor_cand
                                         );
                                     }
-                                    kprintln!("  'godel rollback' restores the prior bar");
+                                    kprintln!("  'godel rollback' restores the prior criterion");
                                 }
                             }
                         }
+                        _ => kprintln!("  usage: godel judge <bar> <floor> [examples]"),
                     }
                 }
                 // The illumination archive: the best mind of every kind, not
