@@ -4243,6 +4243,17 @@ const JUDGE_GRID: &[(f32, usize)] = &[
     (MCNEMAR_95, 2),
     (MCNEMAR_95, 6),
     (2.00, 2),
+    // Both axes at their loosest, which is the point an operator command proved
+    // adoptable (bar 0.5, floor 2: the 2-of-24 candidate whose anchor rose
+    // 52.2% to 60.9%). It was missing here, so the nightly rotation was strictly
+    // more conservative than the axis could adopt -- U3 was decorative
+    // unattended, reachable only by hand. Adding it does not weaken any judge:
+    // `trial_judge` still grounds the change on the held-out anchor and spends
+    // a test read to do it, so the loop can reach this point at night only when
+    // the anchor confirms it, which is exactly the honesty U3 is testing. The
+    // grid's job is reachability; the grounding gate, not the grid's timidity,
+    // is what keeps a loosening honest.
+    (JUDGE_MIN, 2),
 ];
 
 /// Trials in an epoch.

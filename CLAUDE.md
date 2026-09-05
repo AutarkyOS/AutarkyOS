@@ -738,16 +738,19 @@ bar is re-examined *before* the rotation runs. `EPOCH_LEN` is 5, one turn of
 the other five axes, and `is_boundary` is a pure function of ledger length so
 where the loop stands is re-derivable.
 
-**Two known defects, stated rather than hidden.** The most permissive point in
-`JUDGE_GRID` is `(2.00, 2)`, and the criterion that actually adopted was
-`(0.5, 2)`. So the nightly rotation is more conservative than the axis and
-would never have found the adoption an operator command did. Either the grid
-widens or that gap is documented as deliberate; it is currently neither. And
-`godel status` was observed printing `1 adopted` alongside `head: none` after
-an unattended run -- an adoption should move the head, so either `adopted`
-counts something the head does not track (an archive cell win is the obvious
-candidate) or a head write did not happen. Not yet chased; do not read the
-adoption tally as a count of head movements until it is.
+**Two defects that were found and closed.** The nightly `JUDGE_GRID` once
+stopped at `(2.00, 2)` while the criterion an operator command proved adoptable
+was `(0.5, 2)`, so the rotation was strictly more conservative than the axis
+could adopt and U3 was decorative unattended. `(JUDGE_MIN, 2)` is in the grid
+now; the change is pure reachability, since `trial_judge` still grounds any
+loosening on the held-out anchor and spends a test read to do it -- the
+grounding gate, not the grid's timidity, is what keeps it honest. And `godel
+status` printing `1 adopted` beside `head: none` was chased to `set_head`
+discarding `write_text`'s result: it now returns `bool`, is `#[must_use]`, and
+the status line distinguishes an adoption that rolled back (the benign, common
+case) from a head write that failed (loud at the moment of adoption). The
+adoption tally is a per-boot event count, not a count of head movements, and
+the status says so.
 
 ### The storm
 

@@ -396,6 +396,34 @@ def main():
         built = ROOT / "target/x86_64-unknown-uefi/debug/autark.efi"
     if not built.exists():
         raise SystemExit(f"no build artifact under {ROOT / 'target'}; run cargo build first")
+
+    # Freshness guard. drive.py stages whatever binary exists, and a *failed*
+    # build leaves the previous one in place -- so a broken change boots as if
+    # nothing happened, and the run tests stale code silently. This bit twice:
+    # a completion notification read as success, the drive launched, and the
+    # guest ran the last good binary while the log looked like the new one. A
+    # loud warning is enough (not a refusal -- driving an old binary on purpose
+    # is legitimate); the point is that a stale artifact can never again pass
+    # for a fresh one without a line saying so.
+    newest_src, newest_path = 0.0, None
+    for base in ("src", "Cargo.toml", "Cargo.lock", "x86_64-glados.json"):
+        p = ROOT / base
+        if p.is_file():
+            m = p.stat().st_mtime
+            if m > newest_src:
+                newest_src, newest_path = m, p
+        elif p.is_dir():
+            for f in p.rglob("*.rs"):
+                m = f.stat().st_mtime
+                if m > newest_src:
+                    newest_src, newest_path = m, f
+    if newest_src > built.stat().st_mtime:
+        rel = newest_path.relative_to(ROOT) if newest_path else "a source file"
+        print(f"\n[drive] WARNING: {rel} is newer than {built.name} "
+              f"({newest_src - built.stat().st_mtime:.0f}s) -- the build may have "
+              f"failed and this is a STALE binary. Rebuild --release, or ignore "
+              f"if you meant to drive the old one.\n", flush=True)
+
     boot = esp / "EFI/BOOT"
     boot.mkdir(parents=True, exist_ok=True)
     (boot / "BOOTX64.EFI").write_bytes(built.read_bytes())
