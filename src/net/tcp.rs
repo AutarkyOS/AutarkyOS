@@ -72,6 +72,20 @@ const RTO_MIN_TICKS: u64 = crate::TIMER_HZ as u64;
 const RTO_MAX_TICKS: u64 = 60 * crate::TIMER_HZ as u64;
 const TIME_WAIT_TICKS: u64 = 2 * crate::TIMER_HZ as u64;
 
+/// How often a tarpit dribbles its next line, in ticks. One second here, which
+/// is observably slow and testable; a real deployment would drip far slower
+/// (endlessh's default is ten seconds), the point being to hold the peer's
+/// connection open, not to move data. Slower is strictly better for the tarpit
+/// and the number is the one knob.
+const TARPIT_DRIP_TICKS: u64 = crate::TIMER_HZ as u64;
+
+/// How many drips before the tarpit gives the single TCB back. A tarpit "wants"
+/// to hold forever, but this stack has one control block, so a cap frees it for
+/// the next victim rather than letting one attacker deny the trap to all others
+/// -- the single-TCB trade, made explicit. `honeypot stop` and the peer giving
+/// up (RST/FIN) also end it sooner.
+const TARPIT_MAX_DRIPS: u32 = 64;
+
 /// After this many retransmissions of the same segment, give up and reset.
 const MAX_RETRIES: u32 = 8;
 
@@ -211,6 +225,16 @@ struct Tcb {
     /// happens when the connection ends: a honeypot session is logged and its
     /// captured bytes recorded, where a client connection is not.
     honeypot: bool,
+
+    /// A tarpit connection: instead of serving a banner and closing, it holds
+    /// the line open and dribbles a plausible preamble line every
+    /// `TARPIT_DRIP_TICKS`, never completing, so the peer's client blocks.
+    tarpit: bool,
+    /// The tick at which the next drip is due.
+    tarpit_next: u64,
+    /// Drips sent so far, against `TARPIT_MAX_DRIPS`. Also the number logged as
+    /// the cost imposed when the tarpit releases.
+    tarpit_drips: u32,
 }
 
 static TCB: Racy<Option<Tcb>> = Racy::new(None);
@@ -426,11 +450,15 @@ pub fn pump() {
     let done = with_tcb(|t| t.state == State::Closed).unwrap_or(false);
     if done {
         let keep = with_tcb(|t| core::mem::take(&mut t.recv_buf)).unwrap_or_default();
-        let info = with_tcb(|t| (t.reset, t.honeypot, t.remote));
-        if let Some((reset, honeypot, remote)) = info {
+        let info = with_tcb(|t| (t.reset, t.honeypot, t.tarpit, t.tarpit_drips, t.remote));
+        if let Some((reset, honeypot, tarpit, drips, remote)) = info {
             unsafe { *TCB.get() = None };
             LAST_RESET.set(reset);
-            if honeypot {
+            if tarpit {
+                // A released tarpit logs the cost it imposed -- how many drips
+                // the peer waited through -- rather than captured bytes.
+                super::honeypot::log_tarpit(remote, drips);
+            } else if honeypot {
                 // A honeypot session has no caller waiting on `recv`; its sink
                 // is the log. Recorded outside the borrow, since logging writes
                 // the namespace.
@@ -551,6 +579,9 @@ fn passive_open(src: Ipv4, seg: &[u8]) -> Option<Outbox> {
         reset: false,
         deadline_wait: 0,
         honeypot: true,
+        tarpit: false,
+        tarpit_next: 0,
+        tarpit_drips: 0,
     };
     unsafe { *TCB.get() = Some(tcb) };
     let mut out = Outbox::new();
@@ -601,21 +632,32 @@ fn on_segment(t: &mut Tcb, src: Ipv4, seg: &[u8]) -> Outbox {
         // send data; `queue_pending` at the foot of this function transmits it.
         // A client-opened block is never honeypot, so this cannot fire on one.
         if t.honeypot {
-            let banner = super::honeypot::banner();
-            t.send_buf.extend_from_slice(&banner);
-            // Say the line and hang up. Begin the orderly close exactly as
-            // `close()` does -- `closing` plus the move to FinWait1 -- so
-            // `queue_pending` sends the banner then a FIN and the connection
-            // walks FinWait1 -> TimeWait -> Closed on its own, freeing the
-            // single TCB for the next victim and reaching the `pump` close
-            // branch that logs the session. Setting `closing` alone (the first
-            // attempt) sent a FIN while the state stayed Established, so the
-            // machine stuck in CloseWait, never Closed, and served the banner
-            // but logged nothing. Whatever the peer piggybacks here or sends
-            // before its own FIN is still captured. A slow, interactive tarpit
-            // that holds the line open is phase 4, not this.
-            t.closing = true;
-            t.state = State::FinWait1;
+            if super::honeypot::is_tarpit() {
+                // Do NOT close. Dribble a first preamble line now and arm the
+                // drip timer; `on_tick` sends one line per `TARPIT_DRIP_TICKS`
+                // and never a completing banner, so the peer's client blocks
+                // reading and its connection budget drains against a service
+                // that never finishes. The line is deliberately not the real
+                // banner -- for SSH it is RFC 4253 preamble a client must read
+                // and ignore, so the client waits forever for the version line.
+                t.tarpit = true;
+                t.tarpit_next = ticks() + TARPIT_DRIP_TICKS;
+                t.send_buf.extend_from_slice(&super::honeypot::tarpit_line());
+                t.tarpit_drips = 1;
+            } else {
+                // Capture mode: say the line and hang up. Begin the orderly
+                // close exactly as `close()` does -- `closing` plus the move to
+                // FinWait1 -- so `queue_pending` sends the banner then a FIN and
+                // the connection walks FinWait1 -> TimeWait -> Closed on its
+                // own, freeing the single TCB and reaching the `pump` close
+                // branch that logs the session. Setting `closing` alone (the
+                // first attempt) sent a FIN while the state stayed Established,
+                // so the machine stuck in CloseWait and logged nothing.
+                let banner = super::honeypot::banner();
+                t.send_buf.extend_from_slice(&banner);
+                t.closing = true;
+                t.state = State::FinWait1;
+            }
         }
         // Fall through: this same ACK may carry the peer's first request bytes,
         // and the data and state-transition paths below handle them.
@@ -806,6 +848,37 @@ fn on_tick(t: &mut Tcb) -> Outbox {
         return out;
     }
 
+    // A tarpit whose peer has already left (sent its FIN, so we sit in
+    // CloseWait) closes and is logged, rather than holding the single TCB for a
+    // connection nobody is on. This is the FIN twin of the capture-mode
+    // CloseWait bug: without it, an attacker who disconnects cleanly leaks the
+    // trap. A peer RST takes the connection straight to Closed and needs none
+    // of this.
+    if t.tarpit && t.state == State::CloseWait && !t.closing {
+        t.closing = true;
+        t.state = State::LastAck;
+        queue_pending(t, &mut out);
+        return out;
+    }
+
+    // The tarpit drip, checked before the retransmit early-return because a
+    // tarpit that has already sent its line has nothing unacknowledged and so
+    // no retransmit timer armed -- the drip is its own clock. One preamble line
+    // per interval, up to the cap, then an orderly close so the single TCB is
+    // freed and the hold is logged as cost imposed.
+    if t.tarpit && t.state == State::Established && now >= t.tarpit_next {
+        if t.tarpit_drips >= TARPIT_MAX_DRIPS {
+            t.closing = true;
+            t.state = State::FinWait1;
+        } else {
+            t.send_buf.extend_from_slice(&super::honeypot::tarpit_line());
+            t.tarpit_drips += 1;
+            t.tarpit_next = now + TARPIT_DRIP_TICKS;
+        }
+        queue_pending(t, &mut out);
+        return out;
+    }
+
     if t.retx_deadline == 0 || now < t.retx_deadline {
         return out;
     }
@@ -923,6 +996,9 @@ pub fn connect(dst: Ipv4, port: u16, timeout_ms: u64) -> Result<(), Error> {
         reset: false,
         deadline_wait: 0,
         honeypot: false,
+        tarpit: false,
+        tarpit_next: 0,
+        tarpit_drips: 0,
     };
     unsafe { *TCB.get() = Some(tcb) };
 

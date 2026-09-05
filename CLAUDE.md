@@ -2143,7 +2143,7 @@ rotating decoy banner and begins an orderly close (the honeypot path sets
 `closing` alone strands the machine in CloseWait, which is a live bug found and
 fixed under QEMU), so the single TCB frees for the next victim and the peer's
 bytes are captured to `/ai/mirror/sessions`, a sixth `guard` record. One victim
-at a time, by the single-TCB design. `honeypot listen <proto> <port>` in the
+at a time, by the single-TCB design. `honeypot listen <proto> <port>` (or `honeypot tarpit ...` for the hold-and-dribble cost mode) in the
 shell, operator-only. **This is the first Mirror piece testable live here:**
 `drive.py --hostfwd <host>:<guest>` forwards a host port into the guest, so a
 host socket can connect into the trap -- verified end to end, banner served and

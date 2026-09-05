@@ -1,8 +1,9 @@
 # The Mirror: deception as the security posture
 
-Status: **phase 1 built and verified; the rest is design.** `src/net/decoy.rs`
-exists, round-trips through the recon engine, and is a boot suite. Everything
-below phase 1 is proposal.
+Status: **phases 1-4 built and verified; the maze (part of phase 4) is the only
+piece left as design.** Decoy banners, honeytokens, the listening honeypot and
+the tarpit are all in the tree with boot suites, and the three network-facing
+pieces were driven live under QEMU via `hostfwd`.
 
 ## The thesis
 
@@ -111,14 +112,28 @@ Attribution -- peer address, protocol, the first line of what they sent -- is
 the product, and it is the frozen-base argument in a new place: the capture is
 data the loop could later learn from, recorded re-derivably.
 
-### 4. The tarpit and the maze (design)
+### 4. The tarpit (built), and the maze (design)
 
-Cost imposition, still on our turf. A tarpit answers a byte at a time on a long
-timer so a scanner's connection budget drains against a service that never
-finishes (endlessh's method). A maze serves infinite plausible depth -- a
-filesystem or a service tree that never bottoms out -- so an automated crawler
-spends itself mapping a structure with no end. Both waste the attacker's
-resources and none of ours beyond a socket.
+Cost imposition, still on our turf. The **tarpit** (`honeypot tarpit <proto>
+<port>`) holds a connection open and dribbles one plausible preamble line per
+interval, never a completing banner, so the peer's client blocks reading and its
+connection budget drains against a service that never finishes (endlessh's
+method). On the single-TCB stack it holds one victim at a time and releases
+after a drip cap, logging the count of lines the peer waited through as the cost
+imposed -- not a seconds figure, which would be a guess at guest-timer
+calibration. Built on the phase-3 passive open: the establish path branches on
+`honeypot::is_tarpit()`, and `on_tick` drives the drip and closes the trap when
+the peer leaves (a FIN into CloseWait is closed and logged, the same fix the
+capture path needed).
+
+Verified live under QEMU: a host client watched the trap dribble 10+ distinct
+lines over several seconds with the connection held open, and on a clean client
+FIN the guest logged `10.0.2.2 tarpit drips=11`.
+
+The **maze** -- infinite plausible depth, a filesystem or service tree that
+never bottoms out so a crawler spends itself mapping nothing -- is not built. It
+needs per-connection content generation on top of the listener, which is a
+larger addition than the tarpit's timer.
 
 ## How it ties to the RSI loop
 

@@ -359,7 +359,22 @@ and boot-verified this session:
   CloseWait, banner served but nothing logged); and an RTSP Server-header split
   asserted wrong in a selftest that only fails on a real boot.
 
-Not yet built: phase 4 (tarpit/maze). The doctrine for the eventual
+- **Phase 4, the tarpit (`honeypot tarpit <proto> <port>`).** Cost imposition:
+  holds a connection open and dribbles one plausible preamble line per interval,
+  never a completing banner, so the peer's client blocks and its connection
+  budget drains (endlessh-style). Built on the phase-3 passive open -- the
+  establish path branches on `is_tarpit()`, `on_tick` drives the drip and closes
+  the trap when the peer leaves. Releases after a drip cap; logs the line count
+  as the exact cost proxy (not a seconds figure -- guest-timer calibration is
+  not something to guess at). **Verified live**: a host client watched 10+
+  distinct lines dribble with the connection held open, and a clean FIN produced
+  `10.0.2.2 tarpit drips=11` in the log. A CloseWait-on-FIN leak (the tarpit
+  twin of the capture-mode close bug) was found reviewing the first run and
+  fixed before commit.
+
+Not yet built: the **maze** (the other half of phase 4) -- infinite plausible
+depth so a crawler spends itself; needs per-connection content generation on the
+listener, a larger addition than the tarpit's timer. The doctrine for the eventual
 aggressive-security network-stack rewrite and the reverse-engineering-over-
 compatibility direction for foreign binaries are recorded in
 `design/doctrine.md` (direction, not code).

@@ -2192,21 +2192,26 @@ fn execute(line: &str, boot: &BootInfo, acpi: &Option<Acpi>, interp: &mut aiksi:
             use crate::net::honeypot;
             let mut it = rest.split_whitespace();
             match it.next().unwrap_or("") {
-                "listen" => {
+                verb @ ("listen" | "tarpit") => {
+                    let tarpit = verb == "tarpit";
                     let proto = it.next().unwrap_or("");
                     let port = it.next().and_then(|s| s.parse::<u16>().ok());
                     match port {
-                        Some(p) if honeypot::listen(proto, p) => {
+                        Some(p) if honeypot::listen(proto, p, tarpit) => {
                             console::set_color(LTGREEN);
-                            kprintln!("  listening: {} decoy on port {}", proto, p);
+                            if tarpit {
+                                kprintln!("  tarpit: {} on port {} -- connections held, not answered", proto, p);
+                            } else {
+                                kprintln!("  listening: {} decoy on port {}", proto, p);
+                            }
                             console::set_color(LTGRAY);
-                            kprintln!("  connections are captured to {}", honeypot::SESSIONS);
+                            kprintln!("  activity is logged to {}", honeypot::SESSIONS);
                         }
                         Some(_) => kprintln!(
                             "  refused -- unknown protocol '{}'. try: {}",
                             proto, crate::net::decoy::KINDS.join(" ")
                         ),
-                        None => kprintln!("  usage: honeypot listen <proto> <port>"),
+                        None => kprintln!("  usage: honeypot listen|tarpit <proto> <port>"),
                     }
                 }
                 "stop" => {
@@ -2228,16 +2233,17 @@ fn execute(line: &str, boot: &BootInfo, acpi: &Option<Acpi>, interp: &mut aiksi:
                 }
                 "" | "status" => {
                     match honeypot::status() {
-                        Some((proto, port)) => {
+                        Some((proto, port, tarpit)) => {
                             console::set_color(LTGREEN);
-                            kprintln!("  armed: {} decoy on port {}", proto, port);
+                            kprintln!("  armed: {} {} on port {}",
+                                proto, if tarpit { "tarpit" } else { "decoy" }, port);
                             console::set_color(LTGRAY);
                         }
                         None => kprintln!("  disarmed"),
                     }
                     kprintln!("  {} session(s) captured since boot", honeypot::seen());
                 }
-                _ => kprintln!("  usage: honeypot listen <proto> <port> | stop | sessions | status"),
+                _ => kprintln!("  usage: honeypot listen|tarpit <proto> <port> | stop | sessions | status"),
             }
         }
         "decoy" => {

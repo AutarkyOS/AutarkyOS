@@ -15,13 +15,19 @@
 //! for exactly the memory-safety faults an attacker is hunting for. A second
 //! attacker meets silence, which is cheaper to serve than a race.
 //!
-//! ### Why it says its line and hangs up
+//! ### Two modes: capture, and tarpit
 //!
-//! On the handshake completing, `tcp` queues the banner and a FIN together: the
-//! trap greets, captures what rode in on the handshake or arrives before the
-//! peer's own FIN, and closes through the same tested path a client uses. A
-//! slow, interactive tarpit that holds the line open to burn an attacker's time
-//! is phase 4; this is the capture, not the cruelty.
+//! **Capture** (the default) greets and hangs up: `tcp` queues the banner and a
+//! FIN together, captures what rode in on the handshake or arrives before the
+//! peer's own FIN, and closes through the same tested path a client uses. Cheap
+//! attribution -- learn who is probing and move on.
+//!
+//! **Tarpit** does the opposite: it holds the line open and dribbles a plausible
+//! preamble line every second, never a completing banner, so the peer's client
+//! blocks reading and its connection budget drains against a service that never
+//! finishes (the endlessh technique). The cost imposed -- how long the peer was
+//! held -- is what gets logged. On the single-TCB stack a tarpit holds one
+//! victim at a time and releases after a cap, which is the trade `tcp` states.
 //!
 //! ### Attribution is the product
 //!
@@ -46,6 +52,10 @@ pub const SESSIONS: &str = "/ai/mirror/sessions";
 struct Listener {
     proto: String,
     port: u16,
+    /// Capture (greet and log) or tarpit (hold and dribble forever). The two
+    /// ends of the cost spectrum: capture learns who is probing cheaply, tarpit
+    /// spends the attacker's time and connection budget.
+    tarpit: bool,
 }
 
 static LISTEN: Racy<Option<Listener>> = Racy::new(None);
@@ -66,14 +76,47 @@ static SEEN: AtomicU32 = AtomicU32::new(0);
 /// Arm the trap: impersonate `proto` on `port`. Refuses a protocol the decoy
 /// layer cannot dress as, because a banner the recon engine would see through
 /// is worse than no trap. Operator-only.
-pub fn listen(proto: &str, port: u16) -> bool {
+pub fn listen(proto: &str, port: u16, tarpit: bool) -> bool {
     if super::decoy::banner(proto, 0).is_none() || port == 0 {
         return false;
     }
-    let l = Listener { proto: proto.to_string(), port };
+    let l = Listener { proto: proto.to_string(), port, tarpit };
     unsafe { *LISTEN.get() = Some(l) };
     ARMED.store(true, Ordering::Relaxed);
     true
+}
+
+/// Is the armed listener a tarpit? Read by `tcp` when a connection establishes.
+pub fn is_tarpit() -> bool {
+    if !ARMED.load(Ordering::Relaxed) {
+        return false;
+    }
+    unsafe { (*LISTEN.get()).as_ref().map(|l| l.tarpit).unwrap_or(false) }
+}
+
+/// The next line a tarpit dribbles: a short run of printable filler ending in
+/// CRLF, deterministically varied by the drip counter so it does not repeat
+/// byte-for-byte. It is never a completing banner -- for SSH this is exactly
+/// the pre-version preamble RFC 4253 says a client must read and ignore, so the
+/// client keeps waiting for a version line that never comes. Endless nonsense
+/// is the whole technique (endlessh); the only requirement is that it is not
+/// the token the client is waiting for.
+pub fn tarpit_line() -> Vec<u8> {
+    let n = SEED.fetch_add(1, Ordering::Relaxed);
+    // A line length that wanders between 4 and 19, from the counter alone.
+    let len = 4 + (n as usize % 16);
+    let mut out = Vec::with_capacity(len + 2);
+    let mut x = n.wrapping_mul(2654435761).wrapping_add(1);
+    for _ in 0..len {
+        x = x.wrapping_mul(1103515245).wrapping_add(12345);
+        // Printable ASCII, avoiding the SSH-version prefix by construction:
+        // a client only advances on a line beginning "SSH-", and these are
+        // drawn from the whole printable range with no such guarantee to start.
+        let c = 0x21 + ((x >> 16) % 0x5e) as u8; // '!'..'~'
+        out.push(c);
+    }
+    out.extend_from_slice(b"\r\n");
+    out
 }
 
 /// Disarm. In-flight connections finish on their own; no new ones are accepted.
@@ -104,9 +147,9 @@ pub fn banner() -> Vec<u8> {
     }
 }
 
-/// What is armed, for the operator's status line.
-pub fn status() -> Option<(String, u16)> {
-    unsafe { (*LISTEN.get()).as_ref().map(|l| (l.proto.clone(), l.port)) }
+/// What is armed, for the operator's status line: (proto, port, tarpit?).
+pub fn status() -> Option<(String, u16, bool)> {
+    unsafe { (*LISTEN.get()).as_ref().map(|l| (l.proto.clone(), l.port, l.tarpit)) }
 }
 
 /// Sessions captured since boot.
@@ -122,7 +165,7 @@ pub fn log_session(peer: Ipv4, captured: &[u8]) {
     let when = crate::dev::rtc::now()
         .map(|d| crate::dev::rtc::unix_seconds(&d) as u64)
         .unwrap_or(0);
-    let proto = status().map(|(p, _)| p).unwrap_or_else(|| "?".to_string());
+    let proto = status().map(|(p, _, _)| p).unwrap_or_else(|| "?".to_string());
 
     let mut line = String::new();
     push_u64(&mut line, when);
@@ -157,6 +200,36 @@ pub fn log_session(peer: Ipv4, captured: &[u8]) {
         super::recon::ip_dotted(peer),
         proto,
         captured.len()
+    );
+}
+
+/// Record a released tarpit: the number of dribbled lines the peer waited
+/// through, which is the exact cost proxy. Deliberately not a seconds figure --
+/// the drip interval is a count of guest timer ticks, and turning that into
+/// wall-clock seconds is a calibration this does not have, so the log states
+/// the count it knows rather than a duration it would be guessing. Same
+/// append-only log as a capture; neither can be erased.
+pub fn log_tarpit(peer: Ipv4, drips: u32) {
+    SEEN.fetch_add(1, Ordering::Relaxed);
+    let when = crate::dev::rtc::now()
+        .map(|d| crate::dev::rtc::unix_seconds(&d) as u64)
+        .unwrap_or(0);
+    let mut line = String::new();
+    push_u64(&mut line, when);
+    line.push(' ');
+    line.push_str(&super::recon::ip_dotted(peer));
+    line.push_str(" tarpit drips=");
+    push_u64(&mut line, drips as u64);
+    line.push('\n');
+
+    let mut next = crate::sysbox::read_blob_raw(SESSIONS).unwrap_or_default();
+    next.extend_from_slice(line.as_bytes());
+    crate::sysbox::write_text(SESSIONS, core::str::from_utf8(&next).unwrap_or(""));
+
+    crate::kprintln!(
+        "  [honeypot] tarpit released {} after {} dribbled line(s)",
+        super::recon::ip_dotted(peer),
+        drips
     );
 }
 
@@ -210,13 +283,13 @@ pub fn selftest() -> bool {
     };
 
     // Arming refuses a protocol the decoy layer cannot dress as, and port 0.
-    check(!listen("gopher", 22), "an undisguisable protocol is refused");
-    check(!listen("ssh", 0), "port 0 is refused");
+    check(!listen("gopher", 22, false), "an undisguisable protocol is refused");
+    check(!listen("ssh", 0, false), "port 0 is refused");
     check(port().is_none(), "a refused listen arms nothing");
 
     // A real arming takes, and the served banner is one the recon engine reads
     // back as the impersonated service -- the phase-1 contract, on this path.
-    check(listen("ssh", 2222), "ssh on 2222 arms");
+    check(listen("ssh", 2222, false), "ssh on 2222 arms");
     check(port() == Some(2222), "the armed port is reported");
     let b = banner();
     let fp = super::fingerprint::identify(22, &b);
