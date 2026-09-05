@@ -181,6 +181,19 @@ pub fn identify(port: u16, banner: &[u8]) -> Fingerprint {
         return fp;
     }
 
+    // RTSP before HTTP, and the order is the whole point. RTSP (cameras,
+    // streamers) carries a `Server:` header exactly as HTTP does, so the
+    // header-sniff below would claim it as HTTP if it ran first -- the version
+    // line is the only discriminator, and "RTSP/" is unambiguous. Found by
+    // round-tripping an RTSP decoy through this function: it came back "http".
+    if t.starts_with("RTSP/") {
+        let mut fp = Fingerprint::bare("rtsp");
+        if let Some(v) = header_value(t, "server") {
+            fp.product = first_token(v.trim()).to_string();
+        }
+        return fp;
+    }
+
     // HTTP: either a status line or, on a proxy, a Server header without one.
     if t.starts_with("HTTP/") || contains_ci(t, "\nserver:") || starts_ci(t, "server:") {
         let mut fp = Fingerprint::bare("http");
@@ -263,15 +276,6 @@ pub fn identify(port: u16, banner: &[u8]) -> Fingerprint {
     // Telnet announces itself with IAC command bytes (0xFF) rather than text.
     if banner.first() == Some(&0xFF) || port == 23 {
         return Fingerprint::bare("telnet");
-    }
-
-    // RTSP for cameras and streamers: "RTSP/1.0 200 OK".
-    if t.starts_with("RTSP/") {
-        let mut fp = Fingerprint::bare("rtsp");
-        if let Some(v) = header_value(t, "server") {
-            fp.product = first_token(v.trim()).to_string();
-        }
-        return fp;
     }
 
     // Nothing matched. If a banner came at all, it is worth keeping raw; if not,
@@ -486,6 +490,12 @@ pub fn selftest() -> bool {
     let mysql = identify(3306, b"\x4a\x00\x00\x00\x0a5.7.33-log\x00mysql_native_password\x00");
     check(mysql.proto == "mysql", "mysql from handshake");
     check(mysql.version == "5.7.33", "mysql version before the NUL");
+
+    // RTSP carries a Server header like HTTP; the "RTSP/" line must win. This
+    // regressed once because the HTTP header-sniff ran first.
+    let rtsp = identify(554, b"RTSP/1.0 200 OK\r\nServer: Wowza/4.8.5\r\n\r\n");
+    check(rtsp.proto == "rtsp", "rtsp beats the http header-sniff");
+    check(rtsp.product == "Wowza", "rtsp product from Server header");
 
     let telnet = identify(23, &[0xFF, 0xFD, 0x18]);
     check(telnet.proto == "telnet", "telnet from IAC bytes");

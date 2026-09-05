@@ -199,11 +199,16 @@ pub const SUITES: &[Suite] = &[
         about: "a subnet sweep enumerates the right hosts and no others",
         run: crate::net::recon::selftest,
     },
+    Suite {
+        name: "decoy",
+        about: "every decoy banner the recon engine reads back as the real thing",
+        run: crate::net::decoy::selftest,
+    },
 ];
 
 /// One slot per suite. Indexed by position in `SUITES`, which is a constant,
 /// so the table cannot get out of step with the list.
-static RESULTS: [AtomicU8; 32] = [
+static RESULTS: [AtomicU8; 33] = [
     AtomicU8::new(0),
     AtomicU8::new(0),
     AtomicU8::new(0),
@@ -234,7 +239,8 @@ static RESULTS: [AtomicU8; 32] = [
     AtomicU8::new(0),
     AtomicU8::new(0),
     AtomicU8::new(0),
-    // fingerprint, recon
+    // fingerprint, recon, decoy
+    AtomicU8::new(0),
     AtomicU8::new(0),
     AtomicU8::new(0),
 ];

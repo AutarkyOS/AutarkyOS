@@ -48,6 +48,7 @@ const ICMP_ECHO_REPLY: u8 = 0;
 pub mod css;
 pub mod dhcp;
 pub mod dns;
+pub mod decoy;
 pub mod fingerprint;
 pub mod recon;
 pub mod html;

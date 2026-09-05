@@ -2131,6 +2131,34 @@ fn execute(line: &str, boot: &BootInfo, acpi: &Option<Acpi>, interp: &mut aiksi:
                 },
             }
         }
+        "decoy" => {
+            // Show the banner a decoy service would emit, and prove it against
+            // the recon engine in the same breath. No listener yet -- this is
+            // the camouflage, viewable before anything serves it.
+            use crate::net::{decoy, fingerprint};
+            let mut it = rest.split_whitespace();
+            match it.next() {
+                None | Some("list") => {
+                    kprintln!("  decoy <service> [seed]   -- services: {}", decoy::KINDS.join(" "));
+                }
+                Some(proto) => {
+                    let seed = it.next().and_then(|s| s.parse::<u32>().ok()).unwrap_or(0);
+                    match decoy::banner(proto, seed) {
+                        None => kprintln!("  no decoy for '{}' -- try: {}", proto, decoy::KINDS.join(" ")),
+                        Some(b) => {
+                            let fp = fingerprint::identify(decoy::port_of(proto), &b);
+                            for line in core::str::from_utf8(&b).unwrap_or("<binary>").lines().take(4) {
+                                kprintln!("  | {}", line);
+                            }
+                            let verdict = if fp.proto == proto { LTGREEN } else { LTRED };
+                            console::set_color(verdict);
+                            kprintln!("  recon reads it as: {} {} {}", fp.proto, fp.product, fp.version);
+                            console::set_color(WHITE);
+                        }
+                    }
+                }
+            }
+        }
         "recon" => {
             // A local Shodan: sweep our own subnet, banner-grab open ports,
             // name each service by what it said. Operator-only for now -- it is
