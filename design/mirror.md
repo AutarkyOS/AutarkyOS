@@ -62,14 +62,23 @@ HTTP, and the generic header-sniff classified an RTSP banner as HTTP before the
 `RTSP/` marker was ever checked. The inverse stress-tests the classifier, which
 is a second reason to have it.
 
-### 2. Honeytokens / canaries (design)
+### 2. Honeytokens / canaries (built, `src/sysbox/canary.rs`)
 
 Decoy secrets planted in the namespace -- fake credentials, fake keys, fake
 config -- whose defining property is that no legitimate path ever reads them, so
-*any* read is an intrusion signal. The alarm goes to the ledger, which is
-append-only, so an attacker who trips a canary cannot erase having done so: the
-one invariant is what makes the canary trustworthy. Pure, in-kernel,
-boot-testable, no network. This is the data-plane twin of phase 1.
+*any* read is an intrusion signal. `read_blob` gains a hook: a read of a planted
+path trips, appending to `/ai/mirror/alarms`, which is now a fifth record under
+`sysbox::guard` -- append-only, so an attacker who trips a canary cannot erase
+having done so. The one invariant, written for the self-modification history,
+turns out to be exactly the property a tripwire needs.
+
+Verified end to end on a real boot: planted `/ai/secrets/aws`; `read()` of it
+returned the decoy keys *and* printed `[canary] tripped`; `canary alarms` showed
+`1 trip, 1 alarm`; `rm /ai/mirror/alarms` was refused (`the record may not lose
+its name`) and `write()` to overwrite it changed nothing -- the alarm survived
+both. The armed flag keeps an unarmed machine's read path to a single relaxed
+atomic load. Planting and listing are operator-only (shell `canary`), never an
+Aiksi builtin: the model can spring a trap but never enumerate the traps.
 
 ### 3. The listener and the honeypot (design)
 

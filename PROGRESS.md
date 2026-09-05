@@ -326,6 +326,30 @@ kept. This is the case for booting: compile-green was a false negative.
   no UART, prints one line and halts. The bug belongs to the console and is now
   visible rather than silent.
 
+### The Mirror -- deception as the posture (new)
+
+The distro's security stance: not concealment but deception and cost-imposition,
+on our own turf only. `design/mirror.md` has the four phases and the boundary
+(no hack-back, no deploying onto infrastructure we do not own). Two phases built
+and boot-verified this session:
+
+- **Phase 1, decoy banners (`net/decoy.rs`).** The inverse of `fingerprint`:
+  synthesise a banner the recon engine reads back *as* the named service, proven
+  by a boot round-trip through `identify`. Ten protocols, seed-diverse for a
+  heterogeneous fleet. Found and fixed a real `identify` ordering bug (RTSP
+  misread as HTTP). Suite `decoy`; committed `e9bcc6f`.
+- **Phase 2, honeytokens (`sysbox/canary.rs`).** A planted secret nothing
+  legitimate reads; any read trips an alarm appended to `/ai/mirror/alarms`,
+  now a fifth append-only record under `guard`, so the trip cannot be erased.
+  Verified live: read the bait -> got the decoy keys + `[canary] tripped`;
+  `rm`/`write` on the alarm log both refused; alarm survived. Suite `canary`;
+  operator-only shell verb. The armed flag keeps the read path near-free when
+  nothing is planted.
+
+Not yet built: phase 3 (a listening honeypot -- the stack is client-only, and
+this is the first Mirror piece testable live under QEMU via `hostfwd`) and
+phase 4 (tarpit/maze).
+
 ### Reconnaissance -- a local Shodan (new this session)
 
 *Boot-verified: both selftests pass at boot and under `diag`, and the `recon`

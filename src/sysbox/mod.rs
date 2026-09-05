@@ -19,6 +19,7 @@
 //! step, `rm` cannot destroy content, and a snapshot costs nothing. Those are
 //! not features bolted on, they are what content addressing already implies.
 
+pub mod canary;
 pub mod guard;
 pub mod tree;
 
@@ -169,6 +170,10 @@ pub fn init() {
     if moved > 0 {
         kprintln!("  [app] carried {} program(s) to code.ai&xi", moved);
     }
+    // Load any planted canaries from the namespace so the read-path hook is
+    // armed before the first thing reads anything. On a fresh machine the
+    // registry is absent and this arms nothing.
+    canary::arm_from_namespace();
 }
 
 /// The starter skills. Shipped rather than documented, so the convention is
@@ -894,6 +899,30 @@ pub fn write_blob(path: &str, data: Vec<u8>) -> bool {
 }
 
 pub fn read_blob(path: &str) -> Option<Vec<u8>> {
+    // Resolve inside the borrow, then check the canary registry *outside* it:
+    // a trip writes the alarm log, which takes the borrow again, so springing
+    // the trap from within this one would double-borrow. The absolute path is
+    // carried out so the check does not re-parse.
+    let (out, abs) = with(|s| {
+        let p = parse(&s.cwd, path);
+        let abs = show(&p);
+        let out = match tree::resolve(&s.root, &p) {
+            Some(Node::Blob(b)) => Some(b.clone()),
+            _ => None,
+        };
+        (out, abs)
+    })
+    .unwrap_or((None, String::new()));
+    if out.is_some() {
+        canary::on_read(&abs);
+    }
+    out
+}
+
+/// A read with no canary hook, for the canary layer's own use. Reading the
+/// alarm log to append to it must not spring a trap; this is the path that
+/// cannot, structurally, rather than by relying on the eligibility rule.
+pub(crate) fn read_blob_raw(path: &str) -> Option<Vec<u8>> {
     with(|s| {
         let p = parse(&s.cwd, path);
         match tree::resolve(&s.root, &p) {

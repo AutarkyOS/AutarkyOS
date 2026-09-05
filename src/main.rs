@@ -1252,6 +1252,11 @@ fn selftest(acpi_ref: &Option<acpi::Acpi>) {
         kprintln!("  ok     decoy     every decoy reads back as the service it fakes");
         console::set_color(LTGRAY_IDX);
     }
+    if sysbox::canary::selftest() {
+        console::set_color(LTGREEN);
+        kprintln!("  ok     canary    a honeytoken's alarm cannot be erased");
+        console::set_color(LTGRAY_IDX);
+    }
 
     console::set_color(LTGREEN);
     kprintln!("\n[selftest] int3 should report and resume:");

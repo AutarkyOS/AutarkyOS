@@ -57,7 +57,7 @@ use alloc::vec::Vec;
 /// head pointer and the `tried` markers under there are ordinary state that a
 /// trial legitimately rewrites; protecting the directory wholesale would make
 /// the loop unable to run while claiming to protect its history.
-const RECORDS: [(&str, Kind); 4] = [
+const RECORDS: [(&str, Kind); 5] = [
     ("/ai/godel/ledger.txt", Kind::AppendOnly),
     ("/ai/godel/test-budget", Kind::Monotone),
     // The operator reads the dispatch, not the ledger. Guarding only the
@@ -65,6 +65,12 @@ const RECORDS: [(&str, Kind); 4] = [
     // do rewritable, which is the honesty story pointing at the wrong target.
     ("/ai/godel/dispatch.txt", Kind::AppendOnly),
     ("/ai/godel/reported", Kind::Monotone),
+    // The Mirror's canary alarm log. A tripwire an intruder can erase is no
+    // tripwire, so an alarm is as unrewritable as a self-modification verdict
+    // -- the same invariant, extended to the same shape of evidence. The
+    // *registry* of planted canaries is deliberately not here: a trap is
+    // retractable, the record that one was sprung is not.
+    ("/ai/mirror/alarms", Kind::AppendOnly),
 ];
 
 /// How a record is allowed to change.
@@ -254,7 +260,18 @@ pub fn selftest() -> bool {
     let mut ok = kind_of(crate::ai::godel::LEDGER) == Kind::AppendOnly
         && kind_of(crate::ai::godel::BUDGET) == Kind::Monotone
         && kind_of(crate::ai::godel::DISPATCH) == Kind::AppendOnly
-        && kind_of(crate::ai::godel::REPORTED) == Kind::Monotone;
+        && kind_of(crate::ai::godel::REPORTED) == Kind::Monotone
+        // The canary alarm log is under the same rule, read from the canary
+        // module's own constant so the two spellings cannot drift.
+        && kind_of(crate::sysbox::canary::ALARMS) == Kind::AppendOnly;
+
+    // A sprung alarm can be added to and never rewritten or unnamed, and the
+    // directory it lives in cannot be removed out from under it.
+    ok &= judge(crate::sysbox::canary::ALARMS, Some(b"1725 /ai/secrets/x\n"),
+                Change::Write(b"")) == Verdict::Rewrite;
+    ok &= judge(crate::sysbox::canary::ALARMS, Some(b"1725 /ai/secrets/x\n"),
+                Change::Write(b"1725 /ai/secrets/x\n1726 /ai/secrets/y\n")) == Verdict::Extends;
+    ok &= judge("/ai/mirror", None, Change::Remove) == Verdict::Unname;
 
     // What the operator is shown is under the same rule as what is recorded.
     ok &= judge(crate::ai::godel::DISPATCH, Some(b"SITTING 1\n"), Change::Write(b"x"))

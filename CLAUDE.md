@@ -68,9 +68,12 @@ records, listed exactly in `RECORDS`:
 | `/ai/godel/dispatch.txt` | append-only -- the operator reads the dispatch, not the ledger |
 | `/ai/godel/test-budget` | monotone |
 | `/ai/godel/reported` | monotone |
+| `/ai/mirror/alarms` | append-only -- the Mirror's canary log (see `### The Mirror`) |
 
 Truncation, reordering, a doctored line and emptying all fail the same test and
-none of them had to be enumerated.
+none of them had to be enumerated. The fifth record is the same invariant put
+to a second use: a honeytoken tripwire an intruder could erase is no tripwire,
+so a canary alarm is as unrewritable as a self-modification verdict.
 
 **Exact paths and an ancestor rule, not the subtree.** Nodes, the head pointer,
 the `tried` markers, `/ai/godel/judge` and `/ai/godel/floor` are ordinary state
@@ -999,7 +1002,7 @@ There is no `cargo test`. This is a `no_std` UEFI binary with no host test
 runner, so **verification is the boot selftests plus driving QEMU.**
 
 At boot the system runs **twenty-six selftest sections**, and `diag` offers
-**thirty-two named suites** on demand, most of them the same checks (the `aiksi` section covers the capability gate by name and never by
+**thirty-four named suites** on demand, most of them the same checks (the `aiksi` section covers the capability gate by name and never by
 calling -- half that table pokes memory, drives I/O ports or paints over the
 screen, and a suite that called every row to prove it exists would be
 scribbling on the machine to do it), printing `ok` or `FAIL` per line: heap, timer, clock, the namespace's
@@ -1010,9 +1013,10 @@ the initiative policy, the self-modification gate, corpus bundles, QDoRA
 adapters, the backward kernels, and the trainer's arithmetic. Read that output;
 it is the test suite.
 
-The thirty-two, in table order: `crypto rng json aiksi sysbox smp update gpu
+The thirty-four, in table order: `crypto rng json aiksi sysbox smp update gpu
 model wgate record skill desk paint recover census migrate mt power fmt differ
-code battery acpi hid text adapterinit study work abstract fingerprint recon`.
+code battery acpi hid text adapterinit study work abstract fingerprint recon
+decoy canary`.
 **Registration is
 deliberately awkward:** `SUITES` carries one results slot per entry and
 `src/diag.rs` asserts the length at compile time, so a suite added without a

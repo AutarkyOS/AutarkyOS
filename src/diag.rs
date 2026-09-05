@@ -204,11 +204,16 @@ pub const SUITES: &[Suite] = &[
         about: "every decoy banner the recon engine reads back as the real thing",
         run: crate::net::decoy::selftest,
     },
+    Suite {
+        name: "canary",
+        about: "a honeytoken trips once and its alarm cannot be erased",
+        run: crate::sysbox::canary::selftest,
+    },
 ];
 
 /// One slot per suite. Indexed by position in `SUITES`, which is a constant,
 /// so the table cannot get out of step with the list.
-static RESULTS: [AtomicU8; 33] = [
+static RESULTS: [AtomicU8; 34] = [
     AtomicU8::new(0),
     AtomicU8::new(0),
     AtomicU8::new(0),
@@ -239,7 +244,8 @@ static RESULTS: [AtomicU8; 33] = [
     AtomicU8::new(0),
     AtomicU8::new(0),
     AtomicU8::new(0),
-    // fingerprint, recon, decoy
+    // fingerprint, recon, decoy, canary
+    AtomicU8::new(0),
     AtomicU8::new(0),
     AtomicU8::new(0),
     AtomicU8::new(0),

@@ -2131,6 +2131,60 @@ fn execute(line: &str, boot: &BootInfo, acpi: &Option<Acpi>, interp: &mut aiksi:
                 },
             }
         }
+        "canary" => {
+            // Honeytokens: plant a secret nothing legitimate reads, and any
+            // read trips an alarm that cannot be erased. Operator-only -- the
+            // model must never learn which paths are bait, only spring them.
+            use crate::sysbox::canary;
+            let mut it = rest.splitn(2, ' ');
+            match (it.next().unwrap_or(""), it.next().unwrap_or("").trim()) {
+                ("plant", args) if !args.is_empty() => {
+                    let mut a = args.splitn(2, ' ');
+                    let path = a.next().unwrap_or("");
+                    // A default lure if none given -- a plausible secret is more
+                    // convincing bait than an empty file.
+                    let content = a.next().unwrap_or(
+                        "[default]\naws_access_key_id = AKIA7X9QF2NPLZ4DVHE1\naws_secret_access_key = wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY\n",
+                    );
+                    if canary::plant(path, content.as_bytes()) {
+                        console::set_color(LTGREEN);
+                        kprintln!("  planted at {} -- any read now trips an alarm", path);
+                        console::set_color(WHITE);
+                    } else {
+                        kprintln!("  refused (a reserved path, or the write was blocked)");
+                    }
+                }
+                ("retire", path) if !path.is_empty() => {
+                    if canary::retire(path) {
+                        kprintln!("  retired {} -- the alarms it raised stay", path);
+                    } else {
+                        kprintln!("  no such canary");
+                    }
+                }
+                ("list", _) => {
+                    let ps = canary::list();
+                    if ps.is_empty() {
+                        kprintln!("  no canaries planted");
+                    } else {
+                        kprintln!("  {} planted:", ps.len());
+                        for p in ps.iter() {
+                            kprintln!("    {}", p);
+                        }
+                    }
+                }
+                ("alarms", _) | ("status", _) | ("", _) => {
+                    let al = canary::alarms();
+                    kprintln!("  {} planted, {} trip(s) since boot, {} alarm(s) on record",
+                        canary::list().len(), canary::trips(), al.len());
+                    for l in al.iter().rev().take(10) {
+                        console::set_color(LTRED);
+                        kprintln!("    {}", l);
+                        console::set_color(LTGRAY);
+                    }
+                }
+                _ => kprintln!("  usage: canary plant <path> [content] | retire <path> | list | alarms"),
+            }
+        }
         "decoy" => {
             // Show the banner a decoy service would emit, and prove it against
             // the recon engine in the same breath. No listener yet -- this is
