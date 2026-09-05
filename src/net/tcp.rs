@@ -83,6 +83,10 @@ const MAX_INBOX: usize = 64;
 pub enum State {
     Closed,
     SynSent,
+    /// Passive open, half-way: we answered an inbound SYN with a SYN-ACK and
+    /// wait for the peer's ACK. The honeypot's entry state; the active client
+    /// never sits here (it opens with `SynSent`).
+    SynRcvd,
     Established,
     FinWait1,
     FinWait2,
@@ -97,6 +101,7 @@ impl State {
         match self {
             State::Closed => "CLOSED",
             State::SynSent => "SYN_SENT",
+            State::SynRcvd => "SYN_RCVD",
             State::Established => "ESTABLISHED",
             State::FinWait1 => "FIN_WAIT_1",
             State::FinWait2 => "FIN_WAIT_2",
@@ -200,6 +205,12 @@ struct Tcb {
     reset: bool,
 
     deadline_wait: u64,
+
+    /// This block was opened passively by the honeypot rather than by an
+    /// outbound `connect`. It changes nothing in the state machine except what
+    /// happens when the connection ends: a honeypot session is logged and its
+    /// captured bytes recorded, where a client connection is not.
+    honeypot: bool,
 }
 
 static TCB: Racy<Option<Tcb>> = Racy::new(None);
@@ -390,9 +401,15 @@ pub fn pump() {
         let (remote, out) = match with_tcb(|t| (t.remote, on_segment(t, src, &seg))) {
             Some(v) => v,
             None => {
-                // Nothing is listening. Tell the peer rather than making it
-                // wait for a timeout, but never answer a reset with a reset.
-                reject(src, &seg);
+                // No active connection. If a honeypot is listening on this
+                // port and this is a fresh SYN, open passively and answer with
+                // a SYN-ACK; otherwise tell the peer nothing is here rather
+                // than making it wait for a timeout.
+                if let Some(out) = passive_open(src, &seg) {
+                    flush(src, out);
+                } else {
+                    reject(src, &seg);
+                }
                 continue;
             }
         };
@@ -409,11 +426,18 @@ pub fn pump() {
     let done = with_tcb(|t| t.state == State::Closed).unwrap_or(false);
     if done {
         let keep = with_tcb(|t| core::mem::take(&mut t.recv_buf)).unwrap_or_default();
-        let last = with_tcb(|t| (t.state, t.reset));
-        if let Some((_, reset)) = last {
+        let info = with_tcb(|t| (t.reset, t.honeypot, t.remote));
+        if let Some((reset, honeypot, remote)) = info {
             unsafe { *TCB.get() = None };
             LAST_RESET.set(reset);
-            LAST_DATA.set(keep);
+            if honeypot {
+                // A honeypot session has no caller waiting on `recv`; its sink
+                // is the log. Recorded outside the borrow, since logging writes
+                // the namespace.
+                super::honeypot::log_session(remote, &keep);
+            } else {
+                LAST_DATA.set(keep);
+            }
         }
     }
 }
@@ -473,6 +497,70 @@ fn reject(src: Ipv4, seg: &[u8]) {
     send_ipv4(src, PROTO_TCP, &r);
 }
 
+/// Answer an inbound SYN to a honeypot's listening port with a SYN-ACK, and
+/// install a half-open control block. Returns the SYN-ACK to send, or `None`
+/// when this segment is not a fresh SYN to a port something is listening on --
+/// in which case `pump` falls back to `reject`, so a probe to a dead port still
+/// gets the honest RST.
+///
+/// Only ever called when there is no active TCB, so it cannot clobber a live
+/// connection: the single-TCB stack serves one victim at a time, which for a
+/// honeypot is a feature rather than a limit -- a second attacker meets
+/// silence, which is cheaper to serve than a second stack to audit.
+fn passive_open(src: Ipv4, seg: &[u8]) -> Option<Outbox> {
+    let dst_port = u16::from_be_bytes([seg[2], seg[3]]);
+    let flags = seg[13];
+    // A fresh connection is a bare SYN. A segment carrying ACK/RST/FIN is not
+    // the start of one, and answering it with a SYN-ACK would be a stack that
+    // opens connections nobody asked for.
+    if flags & SYN == 0 || flags & (ACK | RST | FIN) != 0 {
+        return None;
+    }
+    if super::honeypot::port() != Some(dst_port) {
+        return None;
+    }
+
+    let src_port = u16::from_be_bytes([seg[0], seg[1]]);
+    let their_seq = u32::from_be_bytes([seg[4], seg[5], seg[6], seg[7]]);
+    let iss = entropy();
+    let tcb = Tcb {
+        state: State::SynRcvd,
+        remote: src,
+        remote_port: src_port,
+        local_ip: super::local_addr_for(src),
+        local_port: dst_port,
+        snd_una: iss,
+        snd_nxt: iss.wrapping_add(1),
+        snd_wnd: MSS as u16,
+        iss,
+        rcv_nxt: their_seq.wrapping_add(1),
+        send_buf: Vec::new(),
+        recv_buf: Vec::new(),
+        closing: false,
+        fin_sent: false,
+        fin_seq: 0,
+        peer_fin: false,
+        retx_deadline: 0,
+        rto: RTO_MIN_TICKS,
+        retries: 0,
+        srtt: 0,
+        rttvar: 0,
+        timing: false,
+        timed_seq: 0,
+        timed_at: 0,
+        reset: false,
+        deadline_wait: 0,
+        honeypot: true,
+    };
+    unsafe { *TCB.get() = Some(tcb) };
+    let mut out = Outbox::new();
+    with_tcb(|t| {
+        t.arm_retx();
+        out.push(t.segment(SYN | ACK, t.iss, &[], true));
+    });
+    Some(out)
+}
+
 fn on_segment(t: &mut Tcb, src: Ipv4, seg: &[u8]) -> Outbox {
     let mut out = Outbox::new();
 
@@ -496,6 +584,41 @@ fn on_segment(t: &mut Tcb, src: Ipv4, seg: &[u8]) -> Outbox {
         t.state = State::Closed;
         t.reset = true;
         return out;
+    }
+
+    if t.state == State::SynRcvd {
+        // The passive handshake completes with an ACK of our ISS+1. Anything
+        // else here is a stray or a retransmitted SYN; ignore it and let the
+        // retransmit timer resend the SYN-ACK.
+        if flags & ACK == 0 || seg_ack != t.iss.wrapping_add(1) {
+            return out;
+        }
+        t.snd_una = seg_ack;
+        t.snd_wnd = wnd;
+        t.state = State::Established;
+        t.disarm_retx();
+        // Serve the decoy banner -- the whole purpose of the trap. Queued as
+        // send data; `queue_pending` at the foot of this function transmits it.
+        // A client-opened block is never honeypot, so this cannot fire on one.
+        if t.honeypot {
+            let banner = super::honeypot::banner();
+            t.send_buf.extend_from_slice(&banner);
+            // Say the line and hang up. Begin the orderly close exactly as
+            // `close()` does -- `closing` plus the move to FinWait1 -- so
+            // `queue_pending` sends the banner then a FIN and the connection
+            // walks FinWait1 -> TimeWait -> Closed on its own, freeing the
+            // single TCB for the next victim and reaching the `pump` close
+            // branch that logs the session. Setting `closing` alone (the first
+            // attempt) sent a FIN while the state stayed Established, so the
+            // machine stuck in CloseWait, never Closed, and served the banner
+            // but logged nothing. Whatever the peer piggybacks here or sends
+            // before its own FIN is still captured. A slow, interactive tarpit
+            // that holds the line open is phase 4, not this.
+            t.closing = true;
+            t.state = State::FinWait1;
+        }
+        // Fall through: this same ACK may carry the peer's first request bytes,
+        // and the data and state-transition paths below handle them.
     }
 
     if t.state == State::SynSent {
@@ -702,6 +825,12 @@ fn on_tick(t: &mut Tcb) -> Outbox {
         State::SynSent => {
             out.push(t.segment(SYN, t.iss, &[], true));
         }
+        State::SynRcvd => {
+            // Resend the SYN-ACK; the peer's ACK was lost or is still in
+            // flight. MAX_RETRIES above eventually abandons a half-open block
+            // rather than holding the single TCB against the next victim.
+            out.push(t.segment(SYN | ACK, t.iss, &[], true));
+        }
         _ => {
             // Go back to the oldest unacknowledged byte and resend from there.
             let n = t.send_buf.len().min(MSS);
@@ -793,6 +922,7 @@ pub fn connect(dst: Ipv4, port: u16, timeout_ms: u64) -> Result<(), Error> {
         timed_at: now_us(),
         reset: false,
         deadline_wait: 0,
+        honeypot: false,
     };
     unsafe { *TCB.get() = Some(tcb) };
 

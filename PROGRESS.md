@@ -346,9 +346,23 @@ and boot-verified this session:
   operator-only shell verb. The armed flag keeps the read path near-free when
   nothing is planted.
 
-Not yet built: phase 3 (a listening honeypot -- the stack is client-only, and
-this is the first Mirror piece testable live under QEMU via `hostfwd`) and
-phase 4 (tarpit/maze).
+- **Phase 3, the honeypot (`net/honeypot.rs` + a passive open in `tcp`).**
+  `tcp` gained a `SynRcvd` state and `passive_open`, turning the client-only
+  stack into one that accepts on a listening port, serves a rotating decoy
+  banner, captures the peer's bytes, and logs to `/ai/mirror/sessions` (a sixth
+  `guard` record). Operator-only `honeypot listen <proto> <port>`. **Verified
+  live under QEMU** via a new `drive.py --hostfwd`: a host socket connected in,
+  got `SSH-2.0-OpenSSH_9.2p1 ...` (and a different identity on the next
+  connect -- the seed rotating), and the guest logged `10.0.2.2 ssh bytes=14
+  first=id; uname -a`. Two bugs the live run surfaced and nothing else could:
+  the passive close set `closing` without moving to `FinWait1` (stuck in
+  CloseWait, banner served but nothing logged); and an RTSP Server-header split
+  asserted wrong in a selftest that only fails on a real boot.
+
+Not yet built: phase 4 (tarpit/maze). The doctrine for the eventual
+aggressive-security network-stack rewrite and the reverse-engineering-over-
+compatibility direction for foreign binaries are recorded in
+`design/doctrine.md` (direction, not code).
 
 ### Reconnaissance -- a local Shodan (new this session)
 

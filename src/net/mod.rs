@@ -50,6 +50,7 @@ pub mod dhcp;
 pub mod dns;
 pub mod decoy;
 pub mod fingerprint;
+pub mod honeypot;
 pub mod recon;
 pub mod html;
 pub mod ieee80211;

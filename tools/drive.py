@@ -231,6 +231,20 @@ def main():
         i = argv.index("--timeout")
         timeout = int(argv[i + 1])
         del argv[i:i + 2]
+    # Forward a host port into the guest's user-mode network, so a listener
+    # inside the guest -- the honeypot -- can be reached from the host. Repeat
+    # the flag for several. Form: --hostfwd 2222:2222 means host 127.0.0.1:2222
+    # -> guest :2222. This is the only way to drive a passive-open path under
+    # QEMU: the recon *scanner* has no hosts to find behind the NAT, but a
+    # *listener* the host connects into is exactly what user-mode forwarding is
+    # for.
+    hostfwds = []
+    while "--hostfwd" in argv:
+        i = argv.index("--hostfwd")
+        spec = argv[i + 1]
+        del argv[i:i + 2]
+        hp, gp = spec.split(":")
+        hostfwds.append(f"hostfwd=tcp:127.0.0.1:{hp}-:{gp}")
     # A real, writable ESP on a real block device.
     #
     # VVFAT's read-write mode cannot create or delete files, so anything that
@@ -521,7 +535,7 @@ def main():
         # Something to enumerate. usb-net is also the eventual goal: a USB
         # network device is what the dongle will look like once its driver
         # exists, so proving enumeration against one is not a detour.
-        "-netdev", "user,id=usbnet",
+        "-netdev", ",".join(["user", "id=usbnet"] + hostfwds),
         "-device", "usb-net,bus=xhci.0,netdev=usbnet",
         "-serial", f"tcp:127.0.0.1:{PORT},server=on,wait=on",
         # The monitor is how a screenshot happens. The serial transcript proves

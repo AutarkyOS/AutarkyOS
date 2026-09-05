@@ -57,7 +57,7 @@ use alloc::vec::Vec;
 /// head pointer and the `tried` markers under there are ordinary state that a
 /// trial legitimately rewrites; protecting the directory wholesale would make
 /// the loop unable to run while claiming to protect its history.
-const RECORDS: [(&str, Kind); 5] = [
+const RECORDS: [(&str, Kind); 6] = [
     ("/ai/godel/ledger.txt", Kind::AppendOnly),
     ("/ai/godel/test-budget", Kind::Monotone),
     // The operator reads the dispatch, not the ledger. Guarding only the
@@ -71,6 +71,10 @@ const RECORDS: [(&str, Kind); 5] = [
     // *registry* of planted canaries is deliberately not here: a trap is
     // retractable, the record that one was sprung is not.
     ("/ai/mirror/alarms", Kind::AppendOnly),
+    // The honeypot's session log, for the same reason: an attacker captured by
+    // a decoy service cannot un-capture themselves by rewriting the record of
+    // the session they had.
+    ("/ai/mirror/sessions", Kind::AppendOnly),
 ];
 
 /// How a record is allowed to change.
@@ -261,9 +265,11 @@ pub fn selftest() -> bool {
         && kind_of(crate::ai::godel::BUDGET) == Kind::Monotone
         && kind_of(crate::ai::godel::DISPATCH) == Kind::AppendOnly
         && kind_of(crate::ai::godel::REPORTED) == Kind::Monotone
-        // The canary alarm log is under the same rule, read from the canary
-        // module's own constant so the two spellings cannot drift.
-        && kind_of(crate::sysbox::canary::ALARMS) == Kind::AppendOnly;
+        // The canary alarm log and the honeypot session log are under the same
+        // rule, read from their modules' own constants so the spellings cannot
+        // drift.
+        && kind_of(crate::sysbox::canary::ALARMS) == Kind::AppendOnly
+        && kind_of(crate::net::honeypot::SESSIONS) == Kind::AppendOnly;
 
     // A sprung alarm can be added to and never rewritten or unnamed, and the
     // directory it lives in cannot be removed out from under it.

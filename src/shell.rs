@@ -2185,6 +2185,61 @@ fn execute(line: &str, boot: &BootInfo, acpi: &Option<Acpi>, interp: &mut aiksi:
                 _ => kprintln!("  usage: canary plant <path> [content] | retire <path> | list | alarms"),
             }
         }
+        "honeypot" => {
+            // A listening decoy: accept a connection, serve a convincing
+            // banner, capture what the peer sends, log it unerasably. Operator
+            // -only -- the model can neither arm a trap nor read the sessions.
+            use crate::net::honeypot;
+            let mut it = rest.split_whitespace();
+            match it.next().unwrap_or("") {
+                "listen" => {
+                    let proto = it.next().unwrap_or("");
+                    let port = it.next().and_then(|s| s.parse::<u16>().ok());
+                    match port {
+                        Some(p) if honeypot::listen(proto, p) => {
+                            console::set_color(LTGREEN);
+                            kprintln!("  listening: {} decoy on port {}", proto, p);
+                            console::set_color(LTGRAY);
+                            kprintln!("  connections are captured to {}", honeypot::SESSIONS);
+                        }
+                        Some(_) => kprintln!(
+                            "  refused -- unknown protocol '{}'. try: {}",
+                            proto, crate::net::decoy::KINDS.join(" ")
+                        ),
+                        None => kprintln!("  usage: honeypot listen <proto> <port>"),
+                    }
+                }
+                "stop" => {
+                    honeypot::stop();
+                    kprintln!("  disarmed");
+                }
+                "sessions" => {
+                    let s = honeypot::sessions();
+                    if s.is_empty() {
+                        kprintln!("  no sessions captured");
+                    } else {
+                        kprintln!("  {} session(s) on record:", s.len());
+                        for l in s.iter().rev().take(15) {
+                            console::set_color(LTRED);
+                            kprintln!("    {}", l);
+                            console::set_color(LTGRAY);
+                        }
+                    }
+                }
+                "" | "status" => {
+                    match honeypot::status() {
+                        Some((proto, port)) => {
+                            console::set_color(LTGREEN);
+                            kprintln!("  armed: {} decoy on port {}", proto, port);
+                            console::set_color(LTGRAY);
+                        }
+                        None => kprintln!("  disarmed"),
+                    }
+                    kprintln!("  {} session(s) captured since boot", honeypot::seen());
+                }
+                _ => kprintln!("  usage: honeypot listen <proto> <port> | stop | sessions | status"),
+            }
+        }
         "decoy" => {
             // Show the banner a decoy service would emit, and prove it against
             // the recon engine in the same breath. No listener yet -- this is

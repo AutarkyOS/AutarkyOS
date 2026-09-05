@@ -80,16 +80,36 @@ both. The armed flag keeps an unarmed machine's read path to a single relaxed
 atomic load. Planting and listing are operator-only (shell `canary`), never an
 Aiksi builtin: the model can spring a trap but never enumerate the traps.
 
-### 3. The listener and the honeypot (design)
+### 3. The listener and the honeypot (built, `src/net/honeypot.rs`)
 
-AUTARK's TCP stack is client-only today: one TCB, `connect` aborts whatever was
-open, no accept path. A honeypot needs to listen, accept, and hold several
-connections, emitting phase-1 banners and logging everything the peer sends.
-This is a real addition to the stack. Unlike the recon scanner it is
-*testable under QEMU*: user-mode networking forwards host ports into the guest
-(`hostfwd`), so a listener can be driven from the host, which the scanner cannot
-be. Attribution -- peer address, timing, the exact bytes and tooling
-signatures -- is the product.
+AUTARK's TCP was client-only: one TCB, `connect` aborts whatever was open, no
+accept path. `tcp` gained a passive open -- a `SynRcvd` state and a
+`passive_open` that answers an inbound SYN to a listening port with a SYN-ACK
+and installs a half-open block, where before `pump` sent a bare RST. On the
+handshake completing it serves a phase-1 decoy banner (rotating the identity per
+connection) and begins an orderly close, so the single TCB frees for the next
+victim through the fully-tested FIN path; the peer's bytes are captured and, at
+`Closed`, logged to `/ai/mirror/sessions` -- a sixth `guard` record, so a
+captured session cannot be un-captured.
+
+One victim at a time, by the single-TCB design, which for a honeypot is a
+feature: a second attacker meets silence, cheaper than a second stack to audit.
+
+**Verified live under QEMU** -- the first Mirror piece that could be, via
+`hostfwd` (a `--hostfwd` flag added to `drive.py`). A host socket connected into
+the guest and received a real decoy banner (`SSH-2.0-OpenSSH_9.2p1
+Debian-2+deb12u3`, then `SSH-2.0-OpenSSH_7.4` on the next connect -- the seed
+rotating), and the guest logged both: `10.0.2.2 ssh bytes=14 first=id; uname
+-a`. Two bugs fell out of the live run and neither was reachable any other way:
+the passive close set `closing` without moving to `FinWait1`, so the machine
+served the banner and then stuck in CloseWait, logging nothing (the client
+`close()` moves the state; the honeypot path now does too); and the RTSP
+Server-header split was asserted wrong in a selftest that only failed on a real
+boot, the exact "grep the whole selftest for FAIL" lesson, caught late.
+
+Attribution -- peer address, protocol, the first line of what they sent -- is
+the product, and it is the frozen-base argument in a new place: the capture is
+data the loop could later learn from, recorded re-derivably.
 
 ### 4. The tarpit and the maze (design)
 

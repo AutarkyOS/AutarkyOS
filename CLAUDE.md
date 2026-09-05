@@ -1002,7 +1002,7 @@ There is no `cargo test`. This is a `no_std` UEFI binary with no host test
 runner, so **verification is the boot selftests plus driving QEMU.**
 
 At boot the system runs **twenty-six selftest sections**, and `diag` offers
-**thirty-four named suites** on demand, most of them the same checks (the `aiksi` section covers the capability gate by name and never by
+**thirty-five named suites** on demand, most of them the same checks (the `aiksi` section covers the capability gate by name and never by
 calling -- half that table pokes memory, drives I/O ports or paints over the
 screen, and a suite that called every row to prove it exists would be
 scribbling on the machine to do it), printing `ok` or `FAIL` per line: heap, timer, clock, the namespace's
@@ -1013,10 +1013,10 @@ the initiative policy, the self-modification gate, corpus bundles, QDoRA
 adapters, the backward kernels, and the trainer's arithmetic. Read that output;
 it is the test suite.
 
-The thirty-four, in table order: `crypto rng json aiksi sysbox smp update gpu
+The thirty-five, in table order: `crypto rng json aiksi sysbox smp update gpu
 model wgate record skill desk paint recover census migrate mt power fmt differ
 code battery acpi hid text adapterinit study work abstract fingerprint recon
-decoy canary`.
+decoy canary honeypot`.
 **Registration is
 deliberately awkward:** `SUITES` carries one results slot per entry and
 `src/diag.rs` asserts the length at compile time, so a suite added without a
@@ -2132,6 +2132,24 @@ and the WPA2 supplicant. A host-side harness (`rustc` over the pure functions)
 proved both cores before boot, and caught a real bug compilation passed: a
 case-insensitive search that silently required a pre-lowercased needle, so
 Redis's own refusal banner did not identify Redis.
+
+**The honeypot listens (`net/honeypot.rs`, and a passive open in `tcp`).** The
+Mirror's third piece and the first that serves rather than describes. `tcp` was
+client-only -- one TCB, no accept -- and now has a `SynRcvd` state and a
+`passive_open` that answers a SYN to a listening port with a SYN-ACK, where
+`pump` previously sent a bare RST. On the handshake completing it serves a
+rotating decoy banner and begins an orderly close (the honeypot path sets
+`closing` **and** moves to `FinWait1`, exactly as `close()` does -- setting
+`closing` alone strands the machine in CloseWait, which is a live bug found and
+fixed under QEMU), so the single TCB frees for the next victim and the peer's
+bytes are captured to `/ai/mirror/sessions`, a sixth `guard` record. One victim
+at a time, by the single-TCB design. `honeypot listen <proto> <port>` in the
+shell, operator-only. **This is the first Mirror piece testable live here:**
+`drive.py --hostfwd <host>:<guest>` forwards a host port into the guest, so a
+host socket can connect into the trap -- verified end to end, banner served and
+session logged with the attacker's address and first command. See
+`design/mirror.md` for the phases and `design/doctrine.md` for where the network
+stack and the reverse-engineering direction go next.
 
 ### Crypto (`src/crypto/`)
 

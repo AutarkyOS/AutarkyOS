@@ -189,7 +189,18 @@ pub fn identify(port: u16, banner: &[u8]) -> Fingerprint {
     if t.starts_with("RTSP/") {
         let mut fp = Fingerprint::bare("rtsp");
         if let Some(v) = header_value(t, "server") {
-            fp.product = first_token(v.trim()).to_string();
+            // RTSP's Server header uses HTTP's product/version convention, so
+            // split it the same way rather than keeping "Wowza/4.8.5" as one
+            // token -- a version is worth having here as much as it is there.
+            let v = v.trim();
+            if let Some(slash) = v.find('/') {
+                fp.product = v[..slash].to_string();
+                let (ver, extra) = split_at_space(&v[slash + 1..]);
+                fp.version = ver.to_string();
+                fp.extra = extra.trim().to_string();
+            } else {
+                fp.product = first_token(v).to_string();
+            }
         }
         return fp;
     }
