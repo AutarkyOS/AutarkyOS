@@ -294,11 +294,15 @@ kept. This is the case for booting: compile-green was a false negative.
 
 ### Known defects, stated rather than hidden
 
-- **The nightly rotation cannot reach the criterion that adopted.** The most
-  permissive point in `JUDGE_GRID` is `(2.00, 2)`, and `chi` of 0.5 is under a
-  bar of 2.00. So the grid is more conservative than the axis, and unattended
-  running would never have found the adoption an operator command did. Either
-  the grid widens or that gap is documented as deliberate.
+- **The nightly rotation could not reach the criterion that adopted.** *Closed
+  (`c8331e1`).* The most permissive point in `JUDGE_GRID` stopped at `(2.00, 2)`
+  while the criterion an operator command proved adoptable was `(0.5, 2)`, so
+  the loop was strictly more conservative than the axis and would never have
+  found that adoption unattended -- U3 decorative except by hand. `(JUDGE_MIN,
+  2)` is in the grid now; the change is reachability only, since `trial_judge`
+  still grounds any loosening on the held-out anchor and spends a test read, so
+  the loop reaches the point at night only when the anchor confirms it.
+  Boot-verified: `godel next` consumes the widened grid, all godel claims pass.
 - **`1 adopted` alongside `head: none`.** *Diagnosed and closed; verified on a
   real boot this session (see "Verified this session" above).* The pairing is
   consistent, not a bug in
