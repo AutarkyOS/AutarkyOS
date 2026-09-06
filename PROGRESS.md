@@ -221,6 +221,33 @@ adopted.
 Fixed with one pure function both arms share, `criterion_back`. Four claims,
 all passing at boot.
 
+### The rollback record (option B)
+
+*Built and driven live under WHPX this session.* `godel rollback` wrote nothing
+to the ledger, so the record showed "adopted X" and never "…then reverted X" --
+an incomplete history of what the machine changed, under a machine whose one
+invariant is that that history cannot be lost. Now it appends a `revert
+variant=<from> to=<to>` line (`root....` when it detaches to the frozen model),
+after every restoration has succeeded, so a revert the machine could not honour
+never reaches the record.
+
+Chosen over three alternatives (append plainly / dispatch-only / leave it) for
+one reason: the ledger is also the search substrate. `record_seed` hashes it to
+draw the next proposal (U1) and `ledger_len` counts it to place the epoch
+boundary (Red Queen). So both now read *verdict lines only* -- `verdict_bytes`
+drops revert lines before the hash and `verdict_count` before the count -- and
+the filter is byte-identical to the raw blob when there are no reverts, so every
+existing lineage re-derives the seed it always did. The undo is on the
+permanent, append-only record but invisible to the search: recording it cannot
+redirect what the loop tries next.
+
+Verified live: after `godel judge 0.5 2 40` adopted, `godel ledger` showed the
+`ADOPT` line; after `godel rollback`, it showed both that line and `revert
+variant=4d7a12b4 to=root....`, while `godel next` still reported `1 verdict(s)
+recorded, trial 1 of 5` -- the revert on the record, absent from the clock. Four
+pure claims in the godel selftest check the filter on synthetic ledgers, since
+the live one is append-only and a test must not write to it.
+
 ### Screenshots
 
 Eight `screendump` captures in `docs/screens/`, taken in one boot with the
@@ -266,9 +293,9 @@ not write` line fired because nothing failed, which is the correct silence.
 **`1 adopted` beside `head: none` is now the legible case.** The post-rollback
 status is exactly that pairing, and it reads correctly: the counter records the
 adoption that happened, the head is none because it was rolled back. What was
-filed as "not yet chased" is understood and the wording carries it. Still open,
-unchanged: `rollback` writes no ledger line (the re-derivability decision noted
-under the defect list).
+filed as "not yet chased" is understood and the wording carries it. The one
+piece then left open -- `rollback` writing no ledger line -- is now closed;
+see "The rollback record (option B)" above.
 
 **A `diag`-array bug the boot caught that compilation did not.** Adding the two
 new suites (below) took `SUITES` to 32 and I bumped the guard

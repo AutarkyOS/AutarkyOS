@@ -494,6 +494,27 @@ and an unbounded one would take the terminal away.
 Adoption is a pointer swap; the parent stays addressed and `godel rollback`
 costs a pointer write. `/ai/godel/ledger.txt` gets a line per trial either way.
 
+**A rollback records itself, and that is a decision about shape rather than a
+line append.** `rollback` used to write nothing, so the record said "adopted X"
+and never "…then reverted X" -- an incomplete history of what the machine
+changed, under a machine whose one invariant is that the record of what it
+changed cannot be lost. It now appends a `revert variant=<from> to=<to>` line
+(`root....` when it detaches to the frozen model), after every restoration has
+succeeded, so a revert the machine could not honour never reaches the record.
+The subtlety is that the ledger is not only a log: `record_seed` hashes it to
+draw the next proposal (U1) and `ledger_len` counts it to place the epoch
+boundary (Red Queen). So both read *verdict lines only* -- `verdict_bytes`
+drops revert lines before the hash and `verdict_count` before the count -- and
+the filter is byte-identical to the raw blob when there are no reverts, so
+every existing lineage re-derives the seed it always did. A revert is on the
+permanent record (`godel ledger` shows it, and it is as append-only as any
+verdict) but invisible to the search, so undoing a thing cannot redirect what
+the loop tries next. Verified live: after a judge adoption and `godel
+rollback`, `godel ledger` shows both the `ADOPT` line and the `revert` line
+while `godel next` still reports one verdict at the same epoch position. A pure
+selftest checks the filter on synthetic ledgers, since the live one is
+append-only and a test must not write to it.
+
 **The test slice carries a budget.** It is consulted only after a variant has
 already won on validation, never to decide whether it won, and the ledger
 counts the reads. Past three, a test figure is printed as stale and marked
@@ -612,12 +633,16 @@ self-improvement, eight nights and then nothing, every night forever.**
 The obvious repair is a random draw and it is the wrong one, because a verdict
 nobody can re-derive is a verdict nobody can check, which is the property that
 replaced proof here. So the draw is a **pure function of the record**:
-`record_seed()` hashes the ledger, and `draw(seed, n)` derives lr, rank, alpha
-and epochs from SHA-256 of the seed and the attempt number. To re-derive night
-twelve's proposal, hash the ledger as it stood after night eleven. **That is
-only possible because the ledger is append-only**, so the two halves of this
-fork hold each other up rather than merely coexisting -- a machine that could
-rewrite its history could not re-derive its own search either.
+`record_seed()` hashes the ledger's **verdict lines** (see the rollback
+paragraph above: a `revert` line is on the record but excluded from the seed, so
+an undo cannot redirect the draw, and the hash is byte-identical to the whole
+blob on a ledger that has never rolled back), and `draw(seed, n)` derives lr,
+rank, alpha and epochs from SHA-256 of the seed and the attempt number. To
+re-derive night twelve's proposal, hash the verdicts as they stood after night
+eleven. **That is only possible because the ledger is append-only**, so the two
+halves of this fork hold each other up rather than merely coexisting -- a
+machine that could rewrite its history could not re-derive its own search
+either.
 
 `frontier()` is therefore three stages, and the order carries three separate
 arguments:
