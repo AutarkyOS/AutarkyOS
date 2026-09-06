@@ -412,17 +412,40 @@ trusted Aiksi builtin, not yet exposed.
   so the model can query the index -- a Net-class gate change, deliberately held
   until it can be booted.
 
-### A connectome in the kernel (proposal, host tooling only)
+### A connectome in the kernel (built + verified this session)
 
-`design/connectome.md` and `tools/connectome.py`. The honest form of "integrate
-a healthy human brain": a human synaptic wiring diagram does not exist to
-download, but *C. elegans* is a complete one -- 302 neurons, ~7,000 synapses,
-public. The tool fetches OpenWorm's edge list and flattens it to `GLADOSXN`
-(defined in the tool, read back byte-exact by a walk-and-assert reader). Runs
-clean: 448 nodes (the full list includes muscle/end-organs; neurons-only is
-302), AVAL/AVAR topping degree, which is the biology. Kernel-side loading is a
-proposal keyed to the Oracle's existing fitted-dynamics grain and is **not
-built** -- three steer questions are in the design note, awaiting a decision.
+*Boot-verified and driven live under WHPX against the real `out/connectome.bin`.*
+
+`design/connectome.md`, `tools/connectome.py`, and now `src/ai/connectome.rs`
+plus a `connectome` shell verb. The honest form of "integrate a healthy human
+brain": a human synaptic wiring diagram does not exist to download, but *C.
+elegans* is a complete one, and at ~84 KB it lives in the kernel heap as an
+ordinary graph. The steer was **full + runnable**, and both are done.
+
+- **The loader walks and asserts.** `parse` bounds-checks every field of the
+  `GLADOSXN` body and requires landing exactly on the last byte, the same bargain
+  `tools/v4.py` makes -- a body with no internal offsets cannot be trusted to a
+  reader that seeks. `tools/connectome.py --verify` is the separate second reader.
+- **The simulator is a toy, labelled one.** `x_next[i] = tanh(gain * (W x)[i] /
+  in_scale[i])`, chemical edges directed and taken excitatory (the dataset has no
+  sign), electrical symmetric. It departs from the design sketch in two recorded
+  ways: a sparse edge-list walk, not a dense `Mat::matvec` (1.6% density, so sixty
+  times less arithmetic and no dense adjacency to materialise); and a per-node
+  `in_scale` divisor the sketch lacked, without which a hub like AVAL saturates
+  the graph on step one. What the selftest asserts is the machinery -- parse,
+  determinism, an excitatory edge driving its target -- never worm behaviour.
+- **Wired to nothing that decides.** Loaded on demand from a namespace path
+  (`connectome load`), not compiled in; `LOADED`/`STATE` are read by the shell
+  and the selftest and by no router, council or `godel`. As far from a decision
+  as the Oracle.
+- **Suite 36.** Boot selftest line + `diag connectome`; the compile-time
+  `SUITES.len() == RESULTS.len()` tie was bumped 35 -> 36.
+
+Live: `load` -> 448 neurons / 7379 connections (4681 chemical, 2698 electrical);
+`neigh AVAL` -> its 132 outgoing synapses; `stim AVAL 100` then `step 1 4` lights
+the VA/DA/AS motor neurons AVAL is known to drive, and `step 4 4` reaches the
+body-wall muscles (dBWM/vBWM) and D-class motor neurons -- the backward-locomotion
+motor pathway traced through the loaded graph, which is the biology and not luck.
 
 ### Tooling: environment notes for a hypervisor host
 

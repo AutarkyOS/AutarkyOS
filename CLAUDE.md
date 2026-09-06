@@ -1005,7 +1005,7 @@ There is no `cargo test`. This is a `no_std` UEFI binary with no host test
 runner, so **verification is the boot selftests plus driving QEMU.**
 
 At boot the system runs **twenty-six selftest sections**, and `diag` offers
-**thirty-five named suites** on demand, most of them the same checks (the `aiksi` section covers the capability gate by name and never by
+**thirty-six named suites** on demand, most of them the same checks (the `aiksi` section covers the capability gate by name and never by
 calling -- half that table pokes memory, drives I/O ports or paints over the
 screen, and a suite that called every row to prove it exists would be
 scribbling on the machine to do it), printing `ok` or `FAIL` per line: heap, timer, clock, the namespace's
@@ -1016,10 +1016,10 @@ the initiative policy, the self-modification gate, corpus bundles, QDoRA
 adapters, the backward kernels, and the trainer's arithmetic. Read that output;
 it is the test suite.
 
-The thirty-five, in table order: `crypto rng json aiksi sysbox smp update gpu
+The thirty-six, in table order: `crypto rng json aiksi sysbox smp update gpu
 model wgate record skill desk paint recover census migrate mt power fmt differ
 code battery acpi hid text adapterinit study work abstract fingerprint recon
-decoy canary honeypot`.
+decoy canary honeypot connectome`.
 **Registration is
 deliberately awkward:** `SUITES` carries one results slot per entry and
 `src/diag.rs` asserts the length at compile time, so a suite added without a
@@ -2225,7 +2225,7 @@ in the LoaderData pool instead of being copied to the heap. SmolLM2-135M still
 loads and is the small checkpoint to reach for when something needs to run under
 QEMU. Qwen3.5 hybrids load through the v4 path.
 
-The module map, since `src/ai/` is now thirty-one files:
+The module map, since `src/ai/` is now thirty-two files:
 
 | | |
 |---|---|
@@ -2240,6 +2240,7 @@ The module map, since `src/ai/` is now thirty-one files:
 | `godel.rs` | Variants, judges, ledger, adoption |
 | `work.rs` | Workflows: the plan graph, the manager, roles, autonomy |
 | `skill.rs` `study.rs` `abstraction.rs` `voter.rs` | Judged skills, the corpus study, abstraction, the cores |
+| `connectome.rs` | A whole animal's wiring, loaded and run as a toy dynamical system, wired to nothing that decides (see `design/connectome.md`) |
 
 **Qwen3 differs from Llama in two ways and neither fails loudly.** Its head
 width is *stated* (128) instead of derived (1024/16 = 64), so `wq` is

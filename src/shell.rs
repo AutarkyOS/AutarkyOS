@@ -2309,6 +2309,107 @@ fn execute(line: &str, boot: &BootInfo, acpi: &Option<Acpi>, interp: &mut aiksi:
                 }
             }
         }
+        "connectome" => {
+            // Load a whole nervous system as a graph and run a toy dynamics
+            // over it. Operator-only, loaded on demand, wired to nothing that
+            // decides -- see src/ai/connectome.rs and design/connectome.md. The
+            // real file is tools/connectome.py's GLADOSXN (C. elegans, 448
+            // neurons); under QEMU it arrives via `fat get` into the namespace.
+            use crate::ai::connectome as cx;
+            // Activations live in [-1, 1]; this core has no float Display, so
+            // everything prints as hundredths (76 means 0.76), the `bench` idiom.
+            let mut it = rest.split_whitespace();
+            match it.next().unwrap_or("") {
+                "load" => {
+                    let path = it.next().unwrap_or("");
+                    if path.is_empty() {
+                        kprintln!("  usage: connectome load <path>   (a GLADOSXN blob in the namespace)");
+                    } else {
+                        match crate::sysbox::read_blob(path) {
+                            None => kprintln!("  no such blob: {}", path),
+                            Some(bytes) => match cx::load(&bytes) {
+                                Ok((n, e)) => {
+                                    console::set_color(LTGREEN);
+                                    kprintln!("  loaded {} neurons, {} connections from {}", n, e, path);
+                                    console::set_color(LTGRAY);
+                                }
+                                Err(why) => {
+                                    console::set_color(LTRED);
+                                    kprintln!("  refused: {}", why);
+                                    console::set_color(LTGRAY);
+                                }
+                            },
+                        }
+                    }
+                }
+                "neigh" => {
+                    let name = it.next().unwrap_or("");
+                    match cx::neighbours_of(name) {
+                        None if !cx::loaded() => kprintln!("  nothing loaded -- 'connectome load <path>' first"),
+                        None => kprintln!("  no such neuron: {}", name),
+                        Some(ns) => {
+                            kprintln!("  {} connects to {}:", name, ns.len());
+                            for (n, w, elec) in ns.iter().take(40) {
+                                kprintln!("    {:<8} w{:<4} {}", n, w, if *elec { "gap" } else { "chem" });
+                            }
+                        }
+                    }
+                }
+                "stim" => {
+                    let name = it.next().unwrap_or("");
+                    let v = it.next().and_then(|s| s.parse::<i32>().ok()).unwrap_or(100);
+                    if cx::stim(name, v as f32 / 100.0) {
+                        kprintln!("  {} set to {} (x100)", name, v.clamp(-100, 100));
+                    } else if !cx::loaded() {
+                        kprintln!("  nothing loaded -- 'connectome load <path>' first");
+                    } else {
+                        kprintln!("  no such neuron: {}", name);
+                    }
+                }
+                "step" => {
+                    let n = it.next().and_then(|s| s.parse::<usize>().ok()).unwrap_or(1);
+                    // Gain scales the normalised input to tanh; a stimulus barely
+                    // spreads below ~2 and saturates the graph above ~8, so 4 is
+                    // a visible middle. Tunable because the honest answer to
+                    // "what gain" is "it is a toy, watch what it does".
+                    let gain = it.next().and_then(|s| s.parse::<i32>().ok()).unwrap_or(4).max(1) as f32;
+                    match cx::advance(n, gain) {
+                        None => kprintln!("  nothing loaded -- 'connectome load <path>' first"),
+                        Some(active) => {
+                            kprintln!("  {} step(s) at gain {}: {} neuron(s) active", n, gain as i32, active);
+                            for (name, v) in cx::top(8) {
+                                kprintln!("    {:<8} {}", name, (v * 100.0) as i32);
+                            }
+                        }
+                    }
+                }
+                "show" => {
+                    let k = it.next().and_then(|s| s.parse::<usize>().ok()).unwrap_or(12);
+                    let top = cx::top(k);
+                    if top.is_empty() {
+                        kprintln!("  quiet -- nothing active (stim a neuron, then step)");
+                    } else {
+                        for (name, v) in top {
+                            kprintln!("    {:<8} {}", name, (v * 100.0) as i32);
+                        }
+                    }
+                }
+                "reset" => {
+                    cx::reset();
+                    kprintln!("  state zeroed (the graph stays loaded)");
+                }
+                "" | "info" | "status" => match cx::info() {
+                    None => kprintln!("  nothing loaded -- 'connectome load <path>' first"),
+                    Some((n, e, chem, elec)) => {
+                        console::set_color(LTGREEN);
+                        kprintln!("  {} neurons, {} connections ({} chemical, {} electrical)", n, e, chem, elec);
+                        console::set_color(LTGRAY);
+                        kprintln!("  neigh <n> | stim <n> [v] | step [n] [gain] | show [k] | reset");
+                    }
+                },
+                _ => kprintln!("  usage: connectome load <path> | info | neigh <n> | stim <n> [v] | step [n] [gain] | show [k] | reset"),
+            }
+        }
         "dhcp" => crate::net::dhcp::report(),
         "dns" => {
             if rest.is_empty() {

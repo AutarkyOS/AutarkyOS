@@ -7,6 +7,7 @@ pub mod abstraction;
 pub mod work;
 pub mod aixi;
 pub mod backward;
+pub mod connectome;
 pub mod constrain;
 pub mod context;
 pub mod convo;

@@ -214,11 +214,16 @@ pub const SUITES: &[Suite] = &[
         about: "a served decoy reads back as its service and the seed rotates",
         run: crate::net::honeypot::selftest,
     },
+    Suite {
+        name: "connectome",
+        about: "a whole nervous system parses walking-and-asserting, and one step is deterministic",
+        run: crate::ai::connectome::selftest,
+    },
 ];
 
 /// One slot per suite. Indexed by position in `SUITES`, which is a constant,
 /// so the table cannot get out of step with the list.
-static RESULTS: [AtomicU8; 35] = [
+static RESULTS: [AtomicU8; 36] = [
     AtomicU8::new(0),
     AtomicU8::new(0),
     AtomicU8::new(0),
@@ -249,7 +254,8 @@ static RESULTS: [AtomicU8; 35] = [
     AtomicU8::new(0),
     AtomicU8::new(0),
     AtomicU8::new(0),
-    // fingerprint, recon, decoy, canary, honeypot
+    // fingerprint, recon, decoy, canary, honeypot, connectome
+    AtomicU8::new(0),
     AtomicU8::new(0),
     AtomicU8::new(0),
     AtomicU8::new(0),
