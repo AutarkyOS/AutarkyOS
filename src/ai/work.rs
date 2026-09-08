@@ -1340,7 +1340,10 @@ pub fn train_role(role: &str, b: &super::train::Budget) -> Result<RoleFit, RoleE
             (false, "no net repair")
         } else if fixed - broke < super::godel::MIN_FIXED {
             (false, "net repair below the floor")
-        } else if chi < super::godel::MCNEMAR_95 {
+        } else if chi < super::godel::bar_in_force() {
+            // Read rather than constant, for the reason the core judge now
+            // does: an adopted bar that reaches four judges and not the other
+            // two is two different definitions of "beyond the noise".
             (false, "inside the noise")
         } else {
             (true, "beyond the noise")

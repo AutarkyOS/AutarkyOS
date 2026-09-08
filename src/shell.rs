@@ -3050,6 +3050,28 @@ fn execute(line: &str, boot: &BootInfo, acpi: &Option<Acpi>, interp: &mut aiksi:
                     }
                     godel::report_trial(&b);
                 }
+                // `godel judge <bar>` -- drive the criterion axis by hand.
+                // The one axis with no operator path until now, which is most
+                // of why it went so long unable to adopt anything.
+                "judge" => {
+                    let mut bar = None;
+                    let mut b = crate::ai::train::Budget::default();
+                    let mut nth = 0usize;
+                    for w in words.clone() {
+                        if let Ok(v) = w.parse::<f32>() {
+                            if nth == 0 {
+                                bar = Some(v);
+                                nth += 1;
+                            } else if let Ok(n) = w.parse::<usize>() {
+                                b.examples = n;
+                            }
+                        }
+                    }
+                    match bar {
+                        Some(v) => godel::report_judge(v, &b),
+                        None => kprintln!("  usage: godel judge <bar> [examples]"),
+                    }
+                }
                 // The whole apparatus in one command: a generation trained
                 // against one set of cached features, bred, filed, and the
                 // best of it put in front of the same judge the nightly loop

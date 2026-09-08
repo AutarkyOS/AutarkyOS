@@ -250,13 +250,36 @@ impl Proposal {
     /// A proposal to change how the council combines its cores.
     /// A proposal to move the bar the other judges answer to.
     ///
-    /// The training knobs are zero for the reason a core's are: nothing is
-    /// trained. `rule` is zero rather than the one in force, so a bar is
-    /// identified by the bar alone -- otherwise the same criterion proposed
-    /// under two routing rules would be two points, and the marker directory
-    /// would let the loop propose it twice.
+    /// `rule` is zero rather than the one in force, so a bar is identified by
+    /// the bar alone -- otherwise the same criterion proposed under two
+    /// routing rules would be two points, and the marker directory would let
+    /// the loop propose it twice.
+    ///
+    /// **The training knobs are not zero, and they were, and that made this
+    /// axis incapable of adopting anything.** The reasoning for zeroing them
+    /// was copied from `core` and `skill`, where nothing is trained and the
+    /// candidate already exists. Here something *is* trained: `trial_judge`
+    /// builds the budget from this proposal and calls `Trial::train` with it,
+    /// so `epochs: 0` ran the optimiser zero times and `rank: 0` left
+    /// `Dora::refresh` with an empty low-rank factor and every scale at one.
+    /// The candidate came out numerically identical to the incumbent, giving
+    /// `fixed == broke == 0`; `Cross::admits` requires `fixed > broke`, so
+    /// both bars refused it, `judge_verdict` answered "admits and refuses what
+    /// the standing one did", and adoption was unreachable for every input.
+    ///
+    /// The values are `Budget::default()`'s, which is what `godel now` and
+    /// `godel storm` already start from. They are *constant* rather than
+    /// varied, which is what keeps the identity argument above intact: the
+    /// bar is still the only thing that distinguishes two judge proposals.
     pub fn judge(bar: f32) -> Proposal {
-        Proposal { lr: 0.0, rank: 0, alpha: 0.0, epochs: 0, rule: 0, kind: ProposalKind::Judge(bar) }
+        Proposal {
+            lr: 0.02,
+            rank: 8,
+            alpha: 16.0,
+            epochs: 20,
+            rule: 0,
+            kind: ProposalKind::Judge(bar),
+        }
     }
 
     pub fn config(rule: u8) -> Proposal {
@@ -1657,7 +1680,14 @@ pub fn storm(e: &mut super::Engine, b: &Budget, points: usize) -> Result<StormRe
             lambda: b.lr,
             rank: *rank as u8,
             epochs: 0,
-            rule: b.rank as u8,
+            // `b.rank as u8` was here, which is the *budget's rank* -- 8 by
+            // default -- landing in the slot that holds a routing rule.
+            // `Rule::from_u8(8)` is `None`, so every node a storm ever wrote
+            // was unparseable, and `rollback` onto one would have failed with
+            // "the parent names a routing rule this kernel does not have".
+            // It stayed invisible because the only route to these nodes is the
+            // archive, and nothing reads the archive back.
+            rule: super::harness::rule_in_force() as u8,
             born: crate::dev::rtc::now().map(|d| crate::dev::rtc::unix_seconds(&d)).unwrap_or(0),
         };
         let vh = v.hash();
@@ -2185,17 +2215,12 @@ pub fn trial_deep(
         }
     }
     let chi = mcnemar(broke, fixed);
-    let (j1, j1_why) = if n == 0 {
-        (false, "no validation decisions")
-    } else if fixed <= broke {
-        (false, "no net repair")
-    } else if fixed - broke < MIN_FIXED {
-        (false, "net repair below the floor")
-    } else if chi < bar_in_force() {
-        (false, "inside the noise")
-    } else {
-        (true, "beyond the noise")
-    };
+    // Called rather than written out again. This ladder was a hand-inlined
+    // copy of `judge_one`, which is the exact thing `judge_one`'s own doc
+    // comment exists to forbid: a second definition of "better beyond noise",
+    // free to drift from the nightly one with nothing to say the two had
+    // parted. The two happened to agree; that is luck, not a property.
+    let (j1, j1_why) = judge_one(n, fixed, broke);
 
     // --- J2: does it still do the same thing unasked? -------------------
     //
@@ -2253,7 +2278,13 @@ pub fn trial_deep(
         lambda: b.lr,
         rank: b.rank as u8,
         epochs: report.epochs as u32,
-        rule: p.rule,
+        // The rule in force, not the proposal's. `Proposal::deep` always sets
+        // `rule: 0` -- `ProbeOnly` -- while the machine has been routing under
+        // the default `Majority` throughout, so every deep node ever written
+        // recorded a routing rule its variant was never measured under. This
+        // is the same defect `trial` carries ten lines of comment about having
+        // fixed; the deep path was not updated with it.
+        rule: super::harness::rule_in_force() as u8,
         born: crate::dev::rtc::now().map(|d| crate::dev::rtc::unix_seconds(&d)).unwrap_or(0),
     };
     let vhash = variant.hash();
@@ -2875,19 +2906,37 @@ impl Cross {
 ///
 /// Without the third this axis is a machine for lowering its own bar and
 /// recording the result as progress.
-pub fn judge_verdict(c: &Cross) -> (bool, &'static str) {
+///
+/// **The two questions that need no anchor, answered separately so the read
+/// can be withheld.** `sane` is a property of the proposed number and `moves`
+/// is a property of the paired counts; neither looks at held-out accuracy. The
+/// caller spends one of three lifetime test reads to obtain that accuracy, and
+/// spending it to learn something already decided is spending it for nothing.
+///
+/// `Some(verdict)` means settled without evidence; `None` means the anchor is
+/// now genuinely the question, which is the case the module header argues
+/// should be billed.
+pub fn judge_precheck(c: &Cross) -> Option<(bool, &'static str)> {
     if !sane_bar(c.proposed) {
-        return (false, "the proposed bar is outside the range a criterion may take");
+        return Some((false, "the proposed bar is outside the range a criterion may take"));
     }
-    let now = c.admits(c.standing);
+    if c.admits(c.standing) == c.admits(c.proposed) {
+        return Some((false, "the proposed bar admits and refuses what the standing one did"));
+    }
+    None
+}
+
+pub fn judge_verdict(c: &Cross) -> (bool, &'static str) {
+    if let Some(settled) = judge_precheck(c) {
+        return settled;
+    }
+    // Admission is monotone in the bar, and the precheck has already
+    // established that the two bars disagree about this candidate -- so the
+    // proposed bar admitting it is exactly a loosening, and not admitting it
+    // exactly a tightening. Derived from the matrix rather than from comparing
+    // the two numbers, so the direction and the effect can never disagree
+    // about which case this is.
     let then = c.admits(c.proposed);
-    if now == then {
-        return (false, "the proposed bar admits and refuses what the standing one did");
-    }
-    // Admission is monotone in the bar, so `then && !now` is a loosening and
-    // the other way round a tightening. Derived from the matrix rather than
-    // from comparing the two numbers, so the direction and the effect can
-    // never disagree about which case this is.
     if then {
         if c.anchor_gain() > 0.0 {
             (true, "a looser bar admits a variant the anchor confirms")
@@ -3346,13 +3395,35 @@ pub fn trial_judge(e: &mut super::Engine, b: &Budget, bar: f32) -> Result<Certif
     let incumbent = e.model.adapters.as_ref().and_then(|a| t.gather(a));
     let fit = t.train(b);
     let (broke, fixed, _, _) = t.paired(incumbent.as_ref(), Some(&fit.dora), Slice::Validation);
-    let (anchor_candidate, anchor_incumbent, read, fresh) =
-        read_anchor(&t, incumbent.as_ref(), Some(&fit.dora));
 
     let standing = bar_in_force();
-    let cross =
-        Cross { standing, proposed: bar, fixed, broke, anchor_candidate, anchor_incumbent };
-    let (honest, why) = judge_verdict(&cross);
+
+    // The anchor is bought, not taken. `judge_precheck` answers the two
+    // questions that are decidable from the bar and the paired counts alone,
+    // and this axis previously spent a read before asking either -- the first
+    // line of `read_anchor` was `spend_test_read()`, unconditionally. With the
+    // candidate inert that outcome was always "admits and refuses what the
+    // standing one did", so three epoch boundaries emptied a lifetime budget
+    // to record three foregone rejections, and every *adapter* certificate
+    // afterwards rendered `(stale)`.
+    //
+    // Where the precheck declines to settle it, the anchor genuinely is the
+    // evidence and the read is charged, which is the arrangement the module
+    // header argues for.
+    let mut cross =
+        Cross { standing, proposed: bar, fixed, broke, anchor_candidate: 0.0, anchor_incumbent: 0.0 };
+    let (honest, why, read, fresh) = match judge_precheck(&cross) {
+        Some((verdict, reason)) => (verdict, reason, test_reads(), false),
+        None => {
+            let (cand, inc, read, fresh) =
+                read_anchor(&t, incumbent.as_ref(), Some(&fit.dora));
+            cross.anchor_candidate = cand;
+            cross.anchor_incumbent = inc;
+            let (honest, why) = judge_verdict(&cross);
+            (honest, why, read, fresh)
+        }
+    };
+    let cross = cross;
     let moves = cross.admits(standing) != cross.admits(bar);
     let n_val = t.slice_size(Slice::Validation);
 
@@ -3414,7 +3485,7 @@ pub fn trial_judge(e: &mut super::Engine, b: &Budget, bar: f32) -> Result<Certif
         epochs: 0,
         capped: false,
         adopted,
-        test_acc: anchor_candidate,
+        test_acc: cross.anchor_candidate,
         test_read: read,
         test_fresh: fresh,
     };
@@ -3565,6 +3636,71 @@ pub fn report_trial(b: &Budget) {
     let _ = LTRED;
 }
 
+/// Drive the criterion axis by hand.
+///
+/// It had no operator path at all: `next_proposal` reaches it only at an epoch
+/// boundary, and the `godel` dispatch had no arm for it. So the one axis that
+/// edits the bar every other judge answers to could never be exercised
+/// deliberately -- which is most of why it went so long being unable to adopt
+/// anything without anybody noticing.
+///
+/// Forced, the way `godel now` is: an operator asking for a trial is the
+/// consent the quiet window stands in for the rest of the time.
+pub fn report_judge(bar: f32, b: &Budget) {
+    use crate::gfx::console::{self, LTGRAY, LTGREEN, LTRED, YELLOW};
+    use crate::kprintln;
+
+    console::set_color(YELLOW);
+    kprintln!("[godel] criterion trial");
+    console::set_color(LTGRAY);
+
+    if !sane_bar(bar) {
+        console::set_color(LTRED);
+        kprintln!("  {} is outside [{}, {}]", bar, JUDGE_MIN, JUDGE_MAX);
+        console::set_color(LTGRAY);
+        return;
+    }
+
+    let standing = bar_in_force();
+    kprintln!("  standing {}, proposed {}", standing, bar);
+    let (used, cap) = (test_reads(), TEST_READS);
+    kprintln!("  test budget {} of {} spent before this trial", used, cap);
+
+    let p = Proposal::judge(bar);
+    let b = &p.budget(b.examples, b.millis);
+    let outcome = super::with_engine(|e| trial_judge(e, b, bar));
+    let c = match outcome {
+        None => {
+            kprintln!("  no engine, or another task holds it");
+            return;
+        }
+        Some(Err(_)) => {
+            kprintln!("  no trial: the trainer refused (hardware, corpus or checkpoint)");
+            return;
+        }
+        Some(Ok(c)) => c,
+    };
+
+    kprintln!("  {} repaired, {} broken of {}", c.fixed, c.broke, c.validation);
+    kprintln!("  chi {}", (c.mcnemar * 100.0) as u32 as f32 / 100.0);
+    kprintln!("  verdict: {}", c.j1_why);
+    let after = test_reads();
+    if after == used {
+        kprintln!("  no test read spent -- settled without the anchor");
+    } else {
+        kprintln!("  test read {} of {} spent on the anchor", after, cap);
+    }
+    if c.adopted {
+        console::set_color(LTGREEN);
+        kprintln!("  ADOPTED -- the bar is now {}", bar);
+    } else {
+        console::set_color(LTRED);
+        kprintln!("  refused -- the bar stays {}", standing);
+    }
+    console::set_color(LTGRAY);
+}
+
+
 /// Boot self-test. Seven claims, none needing a model or a quiet window.
 ///
 /// What is checked here is the machinery that decides whether the machine may
@@ -3663,6 +3799,38 @@ pub fn selftest() -> bool {
         "drift: a looser bar admitting what the anchor rejects is refused",
         judge_verdict(&cross(3.0, 9, 2, -0.01))
             == (false, "drift: a looser bar admits a variant the anchor rejects"),
+    );
+
+    // The precheck, which is what decides whether a lifetime test read is
+    // spent. Both settled cases must be answerable without the anchor, and
+    // the case that genuinely turns on it must decline to settle -- otherwise
+    // the read is either wasted or skipped when it was the evidence.
+    claim(
+        "an insane bar is settled without spending the anchor",
+        judge_precheck(&cross(50.0, 9, 2, 0.04)).is_some(),
+    );
+    claim(
+        "a bar that changes nothing is settled without spending the anchor",
+        judge_precheck(&cross(3.9, 9, 2, 0.04)).is_some(),
+    );
+    claim(
+        "an inert candidate is settled without spending the anchor",
+        judge_precheck(&cross(1.0, 0, 0, 0.0)).is_some(),
+    );
+    claim(
+        "a bar the anchor must arbitrate is not settled early",
+        judge_precheck(&cross(3.0, 9, 2, 0.04)).is_none(),
+    );
+
+    // The proposal the criterion axis actually builds. It carried zero epochs
+    // and rank zero, which trains nothing: the candidate came out identical to
+    // the incumbent, every trial scored `fixed == broke == 0`, and the
+    // precheck above settles that as "changes nothing" -- so adoption was
+    // unreachable for every input the axis could ever be given.
+    let jp = Proposal::judge(3.0);
+    claim(
+        "a criterion proposal carries knobs that actually train",
+        jp.epochs > 0 && jp.rank > 0 && jp.lr > 0.0,
     );
     claim(
         "a looser bar admitting what the anchor confirms is adopted",

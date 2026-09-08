@@ -2828,9 +2828,14 @@ pub fn core_bench_core(
         v.chi = super::godel::mcnemar(v.broke, v.fixed);
         // J1, the same shape the adapter judge uses: a net repair above the
         // floor and beyond the noise.
+        //
+        // The bar is read rather than constant. It was `MCNEMAR_95` here, so
+        // a criterion the judge axis adopted reached `trial`, `trial_deep` and
+        // `trial_config` and was ignored by this one -- which is the failure
+        // `bar_in_force`'s own doc calls a certificate about nothing.
         v.j1 = v.fixed > v.broke
             && v.fixed - v.broke >= super::godel::MIN_FIXED
-            && v.chi >= super::godel::MCNEMAR_95;
+            && v.chi >= super::godel::bar_in_force();
         // J5, cost.
         v.j5 = v.worst_steps <= CORE_STEP_CEILING;
         // J6, independence. A core that never differs from lexical is lexical.
