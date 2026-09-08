@@ -188,7 +188,7 @@ fn find_core(want: &str) -> Option<[u8; 32]> {
 
 const KNOWN_COMMANDS: &[&str] = &[
     "term", "todo", "paint", "write", "mines", "oracle", "enternet", "net", "dhcp", "mem",
-    "uptime", "tasks", "status", "help", "app", "author", "video", "serial", "log", "snap",
+    "mine", "uptime", "tasks", "status", "help", "app", "author", "video", "serial", "log", "snap",
     "update", "gpu", "abstract", "study", "work", "redqueen",
 ];
 
@@ -2090,6 +2090,7 @@ fn execute(line: &str, boot: &BootInfo, acpi: &Option<Acpi>, interp: &mut aiksi:
                 }
             }
         }
+        "mine" => mine_cmd(rest),
         "wlan" | "wifi" => crate::net::wifi::report(),
         "trust" => match rest.trim() {
             "verify" => crate::net::trust::verify_roots(),
@@ -7480,4 +7481,147 @@ fn fat_cmd(rest: &str) {
         }
         other => kprintln!("  not a fat subcommand: {}", other),
     }
+}
+
+/// `mine` -- the pool connection.
+///
+/// A bare verb reports, subverbs act, and an unrecognised subverb says so by
+/// name rather than falling through to the report, which would look like the
+/// command had worked.
+///
+/// `mine on` with no pool set refuses **and names the verb that sets one**. The
+/// alternative is connecting to nothing and reporting "down", which is a state
+/// an operator then has to distinguish from a pool that is genuinely refusing.
+fn mine_cmd(rest: &str) {
+    use crate::mine::client;
+    let mut it = rest.splitn(2, ' ');
+    let sub = it.next().unwrap_or("").trim();
+    let arg = it.next().unwrap_or("").trim();
+
+    match sub {
+        "" => mine_report(),
+        "pool" => {
+            if arg.is_empty() {
+                kprintln!("  usage: mine pool <host>[:port]");
+                return;
+            }
+            // stratum+tls is refused by name rather than connected in the
+            // clear. `tls::connect` is welded to the single-connection API, so
+            // a TLS pool session would tear down whatever the shell or the
+            // updater had open. See mine/client.rs.
+            if arg.starts_with("stratum+tls://") || arg.starts_with("stratums://") {
+                kprintln!("  TLS pools are not supported: this kernel has one TLS session and");
+                kprintln!("  the updater owns it. Use the plain stratum port.");
+                return;
+            }
+            let a = arg.trim_start_matches("stratum+tcp://");
+            let (host, port) = match a.rsplit_once(':') {
+                Some((h, p)) => match p.parse::<u16>() {
+                    Ok(n) => (h, n),
+                    Err(_) => {
+                        kprintln!("  '{}' is not a port", p);
+                        return;
+                    }
+                },
+                None => (a, 3333u16),
+            };
+            let mut g = client::CONFIG.lock_irq();
+            let (user, pass) = match g.as_ref() {
+                Some(c) => (c.user.clone(), c.pass.clone()),
+                None => (String::new(), String::from("x")),
+            };
+            *g = Some(client::Config {
+                host: String::from(host),
+                port,
+                user,
+                pass,
+            });
+            kprintln!("  pool {}:{}", host, port);
+        }
+        "user" => {
+            if arg.is_empty() {
+                kprintln!("  usage: mine user <worker> [password]");
+                return;
+            }
+            let (u, p) = match arg.split_once(' ') {
+                Some((u, p)) => (u.trim(), p.trim()),
+                None => (arg, "x"),
+            };
+            let mut g = client::CONFIG.lock_irq();
+            match g.as_mut() {
+                Some(c) => {
+                    c.user = String::from(u);
+                    c.pass = String::from(p);
+                }
+                None => {
+                    kprintln!("  set a pool first: mine pool <host>[:port]");
+                    return;
+                }
+            }
+            kprintln!("  worker {}", u);
+        }
+        "on" => match client::start() {
+            Ok(()) => kprintln!("  connecting"),
+            Err(e) => kprintln!("  {}", e),
+        },
+        "off" => {
+            client::stop();
+            kprintln!("  stopping");
+        }
+        "log" => {
+            let j = client::journal();
+            if j.is_empty() {
+                kprintln!("  nothing logged yet");
+            }
+            for line in j {
+                kprintln!("  {}", line);
+            }
+        }
+        other => kprintln!("  no such subverb '{}' -- try pool, user, on, off, log", other),
+    }
+}
+
+fn mine_report() {
+    use crate::mine::client;
+    console::set_color(YELLOW);
+    kprintln!("[mine]");
+    console::set_color(LTGRAY);
+    {
+        let g = client::CONFIG.lock_irq();
+        match g.as_ref() {
+            Some(c) => {
+                kprintln!("  pool     {}:{}", c.host, c.port);
+                kprintln!(
+                    "  worker   {}",
+                    if c.user.is_empty() { "(unset)" } else { c.user.as_str() }
+                );
+            }
+            None => kprintln!("  pool     (unset) -- mine pool <host>[:port]"),
+        }
+    }
+    kprintln!("  state    {}", client::phase().name());
+    let (m, s) = client::difficulty();
+    // Printed as the pool sent it rather than as a float, because there are no
+    // floats here and rounding one for display would be a second number.
+    if s == 0 {
+        kprintln!("  share    difficulty {}", m);
+    } else {
+        kprintln!("  share    difficulty {} / 10^{}", m, s);
+    }
+    let g = client::TEMPLATE.lock_irq();
+    match g.as_ref() {
+        Some(t) => {
+            kprintln!("  job      {} (template {})", t.job_id, t.serial);
+            let tgt = t.target.to_be_bytes();
+            kprintln!(
+                "  target   {:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}..",
+                tgt[0], tgt[1], tgt[2], tgt[3], tgt[4], tgt[5], tgt[6], tgt[7]
+            );
+        }
+        None => kprintln!("  job      none"),
+    }
+    // Said plainly, because the whole point of this stage is that it connects
+    // and does not yet mine. A report that omitted it would read as a miner
+    // that is running and finding nothing.
+    kprintln!("  hashing  not implemented yet -- this stage receives work only");
 }
