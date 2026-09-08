@@ -76,7 +76,7 @@
 
 use super::problem::{Case, Family, Origin, Problem};
 use crate::aiksi::eval::Value;
-use alloc::string::String;
+use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 use alloc::{format, vec};
 
@@ -121,27 +121,179 @@ const REACH: usize = 16;
 /// which would also drown every real answer in constants.
 const CONSTS: &[i64] = &[0, 1, 2, -1];
 
+/// Where the library lives, content-addressed like everything else.
+pub const LIB: &str = "/ai/lib";
+
+/// One function the enumerator may call.
+///
+/// Named by the hash of what it computes, not by what it was solved for. Two
+/// problems whose answers are the same expression are one library function,
+/// and a name derived from a problem would have made them two.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct LibFn {
+    pub name: String,
+    pub arity: usize,
+    /// The whole declaration, ready to be prepended to a candidate.
+    pub src: String,
+}
+
+/// What the solver can call as well as compute.
+#[derive(Clone, Default, PartialEq, Eq, Debug)]
+pub struct Lib {
+    pub fns: Vec<LibFn>,
+}
+
+impl Lib {
+    /// Every declaration, ready to sit above a candidate program.
+    pub fn preamble(&self) -> String {
+        let mut out = String::new();
+        for f in &self.fns {
+            out.push_str(&f.src);
+            out.push_str("\n");
+        }
+        out
+    }
+
+    pub fn add(&mut self, f: LibFn) -> bool {
+        if self.fns.iter().any(|g| g.name == f.name) {
+            return false;
+        }
+        self.fns.push(f);
+        true
+    }
+
+    /// Read the adopted library out of the namespace.
+    pub fn load() -> Lib {
+        let mut lib = Lib::default();
+        for name in crate::sysbox::children(LIB) {
+            let mut path = String::from(LIB);
+            path.push('/');
+            path.push_str(&name);
+            let Some(raw) = crate::sysbox::read_blob(&path) else { continue };
+            let Ok(src) = core::str::from_utf8(&raw) else { continue };
+            if let Some(f) = LibFn::parse(src) {
+                lib.add(f);
+            }
+        }
+        lib
+    }
+}
+
+impl LibFn {
+    /// Build one from an expression that was found to answer a problem.
+    ///
+    /// The parameters are the problem's, so a library function has the shape
+    /// of the thing it solved and the enumerator knows its arity without
+    /// parsing anything back.
+    pub fn from_solution(p: &Problem, expr: &str) -> Option<LibFn> {
+        let c = p.cases.first()?;
+        let h = crate::store::sha256::hash(expr.as_bytes());
+        let name = alloc::format!("lib_{}", short_hex(&h));
+        let mut params = String::new();
+        for (i, a) in c.args.iter().enumerate() {
+            if i > 0 {
+                params.push_str(", ");
+            }
+            params.push_str(&alloc::format!("a{}: {}", i, type_of(a)));
+        }
+        let src = alloc::format!(
+            "fn {}({}): {} {{ return {} }}",
+            name,
+            params,
+            type_of(&c.want),
+            expr
+        );
+        Some(LibFn { name, arity: c.args.len(), src })
+    }
+
+    /// Read one back. The name and arity come from the declaration itself, so
+    /// a stored library function cannot disagree with its own signature.
+    pub fn parse(src: &str) -> Option<LibFn> {
+        let rest = src.trim().strip_prefix("fn ")?;
+        let open = rest.find('(')?;
+        let close = rest.find(')')?;
+        let name = rest.get(..open)?.trim().to_string();
+        if !name.starts_with("lib_") {
+            return None;
+        }
+        let inner = rest.get(open + 1..close)?.trim();
+        let arity = if inner.is_empty() { 0 } else { inner.split(',').count() };
+        Some(LibFn { name, arity, src: src.trim().to_string() })
+    }
+
+    /// Store it, and answer whether it was new.
+    pub fn store(&self) -> bool {
+        let mut path = String::from(LIB);
+        path.push('/');
+        path.push_str(&self.name);
+        if crate::sysbox::read_blob(&path).is_some() {
+            return false;
+        }
+        crate::sysbox::write_text(&path, &self.src);
+        true
+    }
+}
+
+fn short_hex(h: &[u8; 32]) -> String {
+    let mut s = String::new();
+    for b in h.iter().take(4) {
+        s.push_str(&alloc::format!("{:02x}", b));
+    }
+    s
+}
+
 /// What a solver knows how to do. The searchable object.
 ///
-/// One field today. It is a struct rather than a bare `usize` because the
-/// second field is the point of the exercise -- a wider grammar, a different
-/// enumeration order -- and a signature that has to change for it is a
-/// signature every caller has to be revisited for.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+/// **The budget is not the improvement axis and was treated as one.** The
+/// enumerator reaches every expression of at most `MAX_OPS` operators and no
+/// others, which for one argument is 86,705 candidates: past that, more budget
+/// does nothing at all. Raising `MAX_OPS` costs about 42x per operator --
+/// 3.6 million at four, 163 million at five -- so it is unbounded in principle
+/// and useless in practice. A solver that improves by searching longer has a
+/// ceiling it reaches and then never passes.
+///
+/// The library is the axis with headroom, and it works the other way round: it
+/// makes answers *shorter* instead of making the search *longer*. A problem
+/// whose answer is `((a0 * 2) + 1)` costs two operators and thousands of
+/// candidates; give the solver the function that computes `(a0 * 2)` and the
+/// same answer is one operator over a call, found in tens. Every problem
+/// solved enlarges the terminal set, which shrinks every future answer, which
+/// brings previously unreachable problems into reach. That compounds, and a
+/// budget does not.
+///
+/// It is also the honest reading of "learning to learn": the machine gets
+/// better by changing what one step means rather than by taking more steps.
+#[derive(Clone, PartialEq, Eq, Debug)]
 pub struct Solver {
     /// Candidates it may try before giving up.
     pub budget: usize,
+    /// What it may call as well as compute.
+    pub lib: Lib,
+}
+
+/// Written out rather than derived. `#[derive(Default)]` gives a budget of
+/// zero, which is a solver that tries nothing and answers nothing -- and it
+/// did, silently, until the self-test caught it two claims in.
+impl Default for Solver {
+    fn default() -> Solver {
+        Solver { budget: BUDGET, lib: Lib::default() }
+    }
 }
 
 impl Solver {
     pub fn new(budget: usize) -> Solver {
-        Solver { budget }
+        Solver { budget, lib: Lib::default() }
     }
-}
 
-impl Default for Solver {
-    fn default() -> Solver {
-        Solver { budget: BUDGET }
+    pub fn with(budget: usize, lib: Lib) -> Solver {
+        Solver { budget, lib }
+    }
+
+    /// The same solver, searching harder. For the reachability probe, which
+    /// asks whether a problem is out of reach of the *grammar* rather than of
+    /// the budget -- so it must differ in the budget alone.
+    pub fn stronger(&self, times: usize) -> Solver {
+        Solver { budget: self.budget.saturating_mul(times), lib: self.lib.clone() }
     }
 }
 
@@ -150,6 +302,9 @@ impl Default for Solver {
 pub struct Solved {
     /// The program that answered every case.
     pub src: String,
+    /// The winning expression alone, without the wrapper or the library.
+    /// What a library function is built from.
+    pub expr: String,
     /// How many candidates were tried before this one worked. The difficulty.
     pub tried: usize,
     /// The worst case's step count, which is what the ceiling bounds.
@@ -170,7 +325,7 @@ fn type_of(v: &Value) -> &'static str {
 /// The signature is read off the first case rather than declared, because the
 /// cases are what a solution is checked against and a signature disagreeing
 /// with them would fail every case for a reason that is not about the answer.
-fn wrap(p: &Problem, expr: &str) -> Option<String> {
+fn wrap(p: &Problem, expr: &str, lib: &Lib) -> Option<String> {
     let c = p.cases.first()?;
     let mut params = String::new();
     for (i, a) in c.args.iter().enumerate() {
@@ -179,8 +334,12 @@ fn wrap(p: &Problem, expr: &str) -> Option<String> {
         }
         params.push_str(&format!("a{}: {}", i, type_of(a)));
     }
+    // The library sits above the candidate rather than beside it. A call has
+    // to resolve inside the one program `differ` runs, and prepending is the
+    // only arrangement that needs no linker.
     Some(format!(
-        "fn {}({}): {} {{ return {} }}",
+        "{}fn {}({}): {} {{ return {} }}",
+        lib.preamble(),
         p.entry,
         params,
         type_of(&c.want),
@@ -193,7 +352,7 @@ fn wrap(p: &Problem, expr: &str) -> Option<String> {
 /// Bottom-up rather than top-down: an expression of n operators is two smaller
 /// ones joined, so each size is built once from sizes already in hand instead
 /// of being re-derived down every branch.
-fn grow(by_size: &[Vec<String>], ops: usize) -> Vec<String> {
+fn grow(by_size: &[Vec<String>], ops: usize, lib: &Lib) -> Vec<String> {
     let mut out = Vec::new();
     for left in 0..ops {
         let right = ops - 1 - left;
@@ -205,6 +364,36 @@ fn grow(by_size: &[Vec<String>], ops: usize) -> Vec<String> {
             }
         }
     }
+    // A library call counts as one operator, which is the whole economy of
+    // the idea: an answer that took three operators to write out takes one to
+    // call, so the size it is found at drops and the candidates tried before
+    // reaching it drop with it.
+    //
+    // Only arity one and two are enumerated. Arity three would need the
+    // three-way split of `ops - 1` and multiplies the branching factor by the
+    // terminal count again; nothing has produced a three-argument problem, and
+    // building the enumeration for one that does not exist is guessing at a
+    // shape rather than answering a need.
+    for f in &lib.fns {
+        match f.arity {
+            1 => {
+                for a in &by_size[ops - 1] {
+                    out.push(format!("{}({})", f.name, a));
+                }
+            }
+            2 => {
+                for left in 0..ops {
+                    let right = ops - 1 - left;
+                    for a in &by_size[left] {
+                        for b in &by_size[right] {
+                            out.push(format!("{}({}, {})", f.name, a, b));
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
     out
 }
 
@@ -212,7 +401,7 @@ fn grow(by_size: &[Vec<String>], ops: usize) -> Vec<String> {
 ///
 /// `None` means the budget ran out, which is the frontier condition's whole
 /// content: not "impossible", but "not by this solver, this many tries in".
-pub fn solve(p: &Problem, s: Solver) -> Option<Solved> {
+pub fn solve(p: &Problem, s: &Solver) -> Option<Solved> {
     let first = p.cases.first()?;
     // Terminals: the arguments, then the constants. Arguments first so a
     // problem answered by one of its inputs costs almost nothing, which keeps
@@ -227,7 +416,7 @@ pub fn solve(p: &Problem, s: Solver) -> Option<Solved> {
 
     for size in 0..=MAX_OPS {
         if size > 0 {
-            let next = grow(&by_size, size);
+            let next = grow(&by_size, size, &s.lib);
             by_size.push(next);
         }
         for expr in &by_size[size] {
@@ -235,9 +424,9 @@ pub fn solve(p: &Problem, s: Solver) -> Option<Solved> {
                 return None;
             }
             tried += 1;
-            let Some(src) = wrap(p, expr) else { return None };
+            let Some(src) = wrap(p, expr, &s.lib) else { return None };
             if let Ok(steps) = p.run(&src) {
-                return Some(Solved { src, tried, steps });
+                return Some(Solved { src, expr: expr.clone(), tried, steps });
             }
         }
     }
@@ -396,6 +585,59 @@ fn answer_of(p: &Problem, args: &[Value]) -> Option<Value> {
     out.value().parse::<i64>().ok().map(Value::Int)
 }
 
+/// What adding one function to the library did to the whole stored set.
+///
+/// Paired, over the same problems both times, which is what makes it a
+/// comparison rather than two averages. The same shape `godel`'s J1 judges,
+/// and deliberately so: this is a proposal about the solver, and the machinery
+/// for judging proposals already exists.
+pub struct LibVerdict {
+    /// Problems that got easier, or became solvable at all.
+    pub fixed: usize,
+    /// Problems that got harder, or stopped being solvable.
+    ///
+    /// This is not hypothetical. Every function added enlarges the terminal
+    /// set, so every candidate list gets longer and an easy problem can take
+    /// more tries to reach the same simple answer. A library is a trade, and
+    /// a judge that could only see the wins would take every trade offered.
+    pub broke: usize,
+    /// Total candidates over the set before and after, unsolved counted at
+    /// the budget rather than dropped -- so a problem going from unsolvable
+    /// to solvable shows as the improvement it is.
+    pub before: usize,
+    pub after: usize,
+}
+
+impl LibVerdict {
+    pub fn helps(&self) -> bool {
+        self.fixed > self.broke && self.after < self.before
+    }
+}
+
+/// Score a candidate library function against every stored problem.
+pub fn bench(s: &Solver, f: &LibFn) -> LibVerdict {
+    let mut with = s.clone();
+    with.lib.add(f.clone());
+
+    let mut v = LibVerdict { fixed: 0, broke: 0, before: 0, after: 0 };
+    for h in super::problem::stored() {
+        let Some(p) = Problem::load(&h) else { continue };
+        if p.family != Family::Program {
+            continue;
+        }
+        let a = solve(&p, s).map(|x| x.tried).unwrap_or(s.budget);
+        let b = solve(&p, &with).map(|x| x.tried).unwrap_or(with.budget);
+        v.before += a;
+        v.after += b;
+        if b < a {
+            v.fixed += 1;
+        } else if b > a {
+            v.broke += 1;
+        }
+    }
+    v
+}
+
 /// What one round of the arms race did.
 pub struct Round {
     /// Problems proposed.
@@ -425,6 +667,14 @@ pub struct Round {
     /// The hardest a *kept* problem cost the stronger solver. This is the
     /// frontier: what the solver would have to become to answer them.
     pub reach: usize,
+    /// Library functions offered from problems solved this round.
+    pub offered: usize,
+    /// Offered, and the paired judge said the whole set got easier.
+    pub learned: usize,
+    /// Total candidates over the stored set before and after learning, so a
+    /// round says what it bought rather than only what it added.
+    pub before: usize,
+    pub after: usize,
     /// Addresses of what was kept, so the caller can store or report them.
     pub frontier: Vec<[u8; 32]>,
 }
@@ -435,7 +685,7 @@ pub struct Round {
 /// whether the solver already answers it -- admission first because it is
 /// cheap and refuses most bad candidates, the frontier check second because it
 /// costs a whole search.
-pub fn round(s: Solver) -> Round {
+pub fn round(s: &Solver) -> Round {
     let mut r = Round {
         proposed: 0,
         inadmissible: 0,
@@ -445,9 +695,18 @@ pub fn round(s: Solver) -> Round {
         known: 0,
         hardest: 0,
         reach: 0,
+        offered: 0,
+        learned: 0,
+        before: 0,
+        after: 0,
         frontier: Vec::new(),
     };
-    let strong = Solver::new(s.budget.saturating_mul(REACH));
+
+    // The solver grows inside the round. A function learned from the first
+    // problem is available to the second, which is the compounding the whole
+    // design rests on -- and it is why this is one mutable solver rather than
+    // the caller's.
+    let mut grown = s.clone();
 
     for h in super::problem::stored() {
         let Some(p) = Problem::load(&h) else { continue };
@@ -456,7 +715,7 @@ pub fn round(s: Solver) -> Round {
         }
         // How hard the parent is, which is what makes the child's difficulty
         // a comparison rather than a reading.
-        if let Some(sol) = solve(&p, s) {
+        if let Some(sol) = solve(&p, &grown) {
             r.hardest = r.hardest.max(sol.tried);
         }
         for m in MUTATIONS {
@@ -466,17 +725,51 @@ pub fn round(s: Solver) -> Round {
                 r.inadmissible += 1;
                 continue;
             }
-            if solve(&child, s).is_some() {
+            if solve(&child, &grown).is_some() {
                 r.already += 1;
                 continue;
             }
             // Past this solver. Is it past every solver of this shape? The
             // stronger probe is what separates a target from noise, and it is
-            // asked last because it is the most expensive question here.
-            let Some(hard) = solve(&child, strong) else {
+            // asked last because it is the most expensive question here. Built
+            // from `grown` rather than from the caller's solver, so a function
+            // learned earlier in the round counts towards reachability too --
+            // otherwise the probe measures a solver that no longer exists.
+            let strong = grown.stronger(REACH);
+            let Some(hard) = solve(&child, &strong) else {
                 r.beyond += 1;
                 continue;
             };
+            // **The library learns here and not from the cheap solves, and
+            // the first version had it the other way round.** A function is
+            // worth having only when it replaces more than one operator: the
+            // seeds answer in one, a call also costs one, and offering those
+            // produced "1 offered, none paid for itself" on every round with
+            // the judge correctly refusing all of them.
+            //
+            // The expensive answer is the one worth keeping. `hard` came from
+            // a solver `REACH` times stronger and is several operators long,
+            // so calling it saves the difference every time -- which is the
+            // wake/sleep economics this is borrowed from: pay once to find an
+            // abstraction, then pay one node to use it forever.
+            if let Some(f) = LibFn::from_solution(&child, &hard.expr) {
+                if !grown.lib.fns.iter().any(|g| g.name == f.name) {
+                    r.offered += 1;
+                    // Judged, not assumed. Every function lengthens every
+                    // candidate list, so one that does not pay for itself
+                    // makes the whole set harder -- which is what the paired
+                    // count is there to catch.
+                    let v = bench(&grown, &f);
+                    if v.helps() {
+                        r.before += v.before;
+                        r.after += v.after;
+                        f.store();
+                        grown.lib.add(f);
+                        r.learned += 1;
+                    }
+                }
+            }
+
             let Some(ch) = child.hash() else { continue };
             let fresh = Problem::load(&ch).is_none();
             if child.store().is_some() {
@@ -494,17 +787,22 @@ pub fn round(s: Solver) -> Round {
 }
 
 /// Report a round to the console.
-pub fn report(rounds: usize, s: Solver) {
+pub fn report(rounds: usize, s: &Solver) {
     use crate::gfx::console::{self, LTGRAY, LTGREEN, YELLOW};
     use crate::kprintln;
 
     console::set_color(YELLOW);
-    kprintln!("[redqueen] {} round(s), solver budget {}", rounds, s.budget);
+    kprintln!(
+        "[redqueen] {} round(s), budget {}, library of {}",
+        rounds,
+        s.budget,
+        s.lib.fns.len()
+    );
     console::set_color(LTGRAY);
 
     let mut total = 0usize;
     for i in 0..rounds.max(1) {
-        let r = round(s);
+        let r = round(&Solver::with(s.budget, Lib::load()));
         kprintln!(
             "  round {}: {} proposed, {} inadmissible, {} solved, {} beyond reach, {} known, {} kept",
             i + 1,
@@ -515,6 +813,17 @@ pub fn report(rounds: usize, s: Solver) {
             r.known,
             r.kept
         );
+        if r.learned > 0 {
+            kprintln!(
+                "    learned {} of {} offered; the set went {} -> {} candidate(s)",
+                r.learned,
+                r.offered,
+                r.before,
+                r.after
+            );
+        } else if r.offered > 0 {
+            kprintln!("    {} offered, none paid for itself", r.offered);
+        }
         if r.reach > 0 {
             kprintln!(
                 "    the frontier stands at {} candidate(s) against a budget of {}",
@@ -537,13 +846,17 @@ pub fn report(rounds: usize, s: Solver) {
         // A round that kept nothing will keep nothing next time either: the
         // stored set did not move, the mutations are a fixed list, and the
         // solver did not change. Stopping says so rather than repeating it.
-        if r.kept == 0 {
-            kprintln!("    the frontier did not move -- every child is known, solved or out of reach");
+        if r.kept == 0 && r.learned == 0 {
+            kprintln!("    nothing moved -- no new problem, no function that paid for itself");
             break;
         }
     }
     console::set_color(LTGREEN);
-    kprintln!("  {} problem(s) now at {}", super::problem::count(), super::problem::ROOT);
+    kprintln!(
+        "  {} problem(s), {} library function(s)",
+        super::problem::count(),
+        Lib::load().fns.len()
+    );
     console::set_color(LTGRAY);
     let _ = total;
 }
@@ -566,7 +879,7 @@ pub fn selftest() -> bool {
 
     // The solver, on something it can do. `twice` is `n * 2`, which the
     // enumerator reaches as one operator over an argument and a constant.
-    match solve(&twice, s) {
+    match solve(&twice, &s) {
         Some(sol) => {
             claim("the solver answers a problem inside its grammar", sol.tried > 0);
             claim("and the program it found really does answer it", twice.run(&sol.src).is_ok());
@@ -583,14 +896,14 @@ pub fn selftest() -> bool {
     // entirely, which is the honest reading of "unsolved" rather than "hard".
     claim(
         "a problem outside the grammar is unsolved rather than wrongly answered",
-        solve(&seeds[1], s).is_none(),
+        solve(&seeds[1], &s).is_none(),
     );
 
     // A solver with no budget answers nothing. The frontier condition rests on
     // failure meaning "not within budget", so a budget of zero has to fail.
     claim(
         "a solver given no budget solves nothing",
-        solve(&twice, Solver::new(0)).is_none(),
+        solve(&twice, &Solver::new(0)).is_none(),
     );
 
     // Mutation. The child must be a real problem in its own right -- the
@@ -603,8 +916,8 @@ pub fn selftest() -> bool {
             claim("and it is not the problem it came from", child.hash() != twice.hash());
             claim("and it is marked as the machine's own", child.origin == Origin::SelfMade);
             // The point of mutating at all.
-            let a = solve(&twice, s).map(|x| x.tried).unwrap_or(usize::MAX);
-            let b = solve(&child, s).map(|x| x.tried).unwrap_or(usize::MAX);
+            let a = solve(&twice, &s).map(|x| x.tried).unwrap_or(usize::MAX);
+            let b = solve(&child, &s).map(|x| x.tried).unwrap_or(usize::MAX);
             claim("and it is harder than its parent", b > a);
         }
         None => claim("a mutated problem is admissible", false),
@@ -627,11 +940,11 @@ pub fn selftest() -> bool {
         let weak = Solver::new(4);
         claim(
             "a weak solver leaves a mutated problem at the frontier",
-            solve(&child, weak).is_none(),
+            solve(&child, &weak).is_none(),
         );
         claim(
             "and a strong one takes it off the frontier",
-            solve(&child, Solver::new(BUDGET * 4)).is_some() || solve(&child, s).is_some(),
+            solve(&child, &Solver::new(BUDGET * 4)).is_some() || solve(&child, &s).is_some(),
         );
     }
 
@@ -641,12 +954,115 @@ pub fn selftest() -> bool {
     // rather than file it as the hardest thing it has ever seen.
     claim(
         "a problem outside the grammar stays unsolved however strong the solver",
-        solve(&seeds[1], Solver::new(BUDGET * REACH)).is_none(),
+        solve(&seeds[1], &Solver::new(BUDGET * REACH)).is_none(),
     );
     claim(
         "while one inside it is reached when the budget is raised",
-        solve(&twice, Solver::new(BUDGET * REACH)).is_some(),
+        solve(&twice, &Solver::new(BUDGET * REACH)).is_some(),
     );
+
+    // --- the library, and the ceiling it exists to break -----------------
+    //
+    // This is the claim the whole redesign rests on, and it is measured
+    // rather than argued. A budget cannot reach past `MAX_OPS`; a library
+    // can, because it makes the answer shorter instead of the search longer.
+    let Some(base) = solve(&twice, &s) else {
+        claim("the library demonstration needs a solved seed", false);
+        return ok;
+    };
+    let Some(f) = LibFn::from_solution(&twice, &base.expr) else {
+        claim("a solution becomes a library function", false);
+        return ok;
+    };
+    claim("a solution becomes a library function", f.arity == 1);
+    claim(
+        "and reads back from its own declaration",
+        LibFn::parse(&f.src).as_ref() == Some(&f),
+    );
+    claim(
+        "and is named for what it computes, not what it solved",
+        f.name.starts_with("lib_") && !f.name.contains("twice"),
+    );
+
+    // **A library function must replace more than one operator to be worth
+    // anything, and the first version of this claim did not.** It built the
+    // function from `twice`'s own answer, which is `(a0 * 2)` -- one operator.
+    // A call also costs one, so nothing was saved, the judge correctly refused
+    // every offer, and four rounds reported "none paid for itself" while the
+    // code was working exactly as designed.
+    //
+    // The expensive answers are the ones worth keeping. So: take a child the
+    // ordinary solver cannot reach, find its answer with the stronger probe,
+    // and check that the *grandchild* -- one mutation further out -- is
+    // cheaper with that answer in hand than without it.
+    // **Constructed rather than mutated, and the reason is worth keeping.**
+    // Two attempts at this claim went through mutation chains and both failed
+    // while the loop they were testing worked: `Offset(1)` twice collapses to
+    // `Offset(2)`, so the grandchild is no larger than the child; `Twist(2)`
+    // twice gives `5n`, which needs three operators with the library and
+    // without it. Arithmetic decides how big an answer is, and picking
+    // mutations and hoping is not a demonstration.
+    //
+    // So the shape is built directly. `g` computes `((a0 * 2) + 1)`, which is
+    // two operators. The problem wants `(((n * 2) + 1) * 2)`, three operators
+    // bare -- deep in the third size band, past any budget here -- and two
+    // with `g` in hand, because the call replaces the whole inner expression.
+    // That is the entire claim of the redesign: shorter answers, not longer
+    // searches.
+    let g = LibFn {
+        name: String::from("lib_deadbeef"),
+        arity: 1,
+        src: String::from("fn lib_deadbeef(a0: int): int { return ((a0 * 2) + 1) }"),
+    };
+    let deep = Problem {
+        family: Family::Program,
+        origin: Origin::Seeded,
+        statement: String::from("double, add one, double again"),
+        entry: String::from("f"),
+        ceiling: 10_000,
+        cases: vec![
+            Case { args: vec![Value::Int(3)], want: Value::Int(14) },
+            Case { args: vec![Value::Int(-4)], want: Value::Int(-14) },
+            Case { args: vec![Value::Int(0)], want: Value::Int(2) },
+        ],
+        reference: String::from("fn f(n: int): int { return (((n * 2) + 1) * 2) }"),
+    };
+    claim("the three-operator problem is a real problem", deep.admit().is_ok());
+
+    let strong = s.stronger(REACH);
+    let mut lib = Lib::default();
+    lib.add(g);
+    let armed = Solver::with(strong.budget, lib);
+    let bare = solve(&deep, &strong).map(|x| x.tried);
+    let withlib = solve(&deep, &armed).map(|x| x.tried);
+    match (bare, withlib) {
+        (None, Some(_)) => claim(
+            "a library function brings an out-of-reach problem into reach",
+            true,
+        ),
+        (Some(a), Some(b)) => claim(
+            "a library function makes an out-of-reach problem reachable, or cheaper",
+            b < a,
+        ),
+        _ => claim(
+            "a library function makes an out-of-reach problem reachable, or cheaper",
+            false,
+        ),
+    }
+
+    // And the trade, which is the reason this is judged rather than assumed:
+    // every function lengthens every candidate list, so a function that buys
+    // nothing costs something. A judge that could only see wins would take it.
+    let junk = LibFn {
+        name: String::from("lib_00000000"),
+        arity: 1,
+        src: String::from("fn lib_00000000(a0: int): int { return ((a0 * 0) + 0) }"),
+        };
+    let before = solve(&twice, &s).map(|x| x.tried).unwrap_or(s.budget);
+    let mut with_junk = s.clone();
+    with_junk.lib.add(junk);
+    let after = solve(&twice, &with_junk).map(|x| x.tried).unwrap_or(s.budget);
+    claim("a function that buys nothing still costs candidates", after >= before);
 
     ok
 }

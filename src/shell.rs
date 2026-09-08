@@ -3001,7 +3001,10 @@ fn execute(line: &str, boot: &BootInfo, acpi: &Option<Acpi>, interp: &mut aiksi:
                     nth += 1;
                 }
             }
-            redqueen::report(rounds, redqueen::Solver::new(budget));
+            // The library is read from the namespace rather than passed,
+            // so a run picks up whatever the machine has already learned.
+            let lib = redqueen::Lib::load();
+            redqueen::report(rounds, &redqueen::Solver::with(budget, lib));
         }
         "godel" => {
             use crate::ai::godel;
