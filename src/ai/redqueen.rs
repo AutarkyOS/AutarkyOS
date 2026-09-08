@@ -585,6 +585,106 @@ fn answer_of(p: &Problem, args: &[Value]) -> Option<Value> {
     out.value().parse::<i64>().ok().map(Value::Int)
 }
 
+/// How many mined structures a round may put in front of the judge.
+///
+/// Capped because `bench` re-solves every stored problem twice, so each offer
+/// costs a full pass over the set. Ranked by `saved` first, so the cap takes
+/// the three the objective already thinks are worth most rather than the three
+/// that happened to be enumerated first.
+const MINE_TOP: usize = 3;
+
+/// Turn a mined structure into something the enumerator can call.
+///
+/// `Candidate::proposal` emits `fn absN(a0, a1) { .. }`, which is a proposal
+/// for a person to read. This needs a *typed* declaration with a
+/// content-addressed name, so the same fragment mined twice is one function
+/// and the enumerator knows its arity without parsing anything back.
+///
+/// The parameters are `int` and not `any`. Everything mined here comes from
+/// expressions the enumerator built or from a problem's reference, and both
+/// are integer arithmetic; declaring `any` would be a wider promise than the
+/// thing can keep.
+fn from_candidate(c: &super::abstraction::Candidate) -> Option<LibFn> {
+    if c.arity == 0 || c.arity > 2 || c.saved <= 0 {
+        return None;
+    }
+    let mut body = c.skeleton.clone();
+    // Highest index first: replacing #1 before #10 would corrupt #10.
+    for i in (0..c.arity).rev() {
+        body = body.replace(&format!("#{}", i), &format!("a{}", i));
+    }
+    if body.contains('#') {
+        return None;
+    }
+    let h = crate::store::sha256::hash(body.as_bytes());
+    let name = format!("lib_{}", short_hex(&h));
+    let mut params = String::new();
+    for i in 0..c.arity {
+        if i > 0 {
+            params.push_str(", ");
+        }
+        params.push_str(&format!("a{}: int", i));
+    }
+    let src = format!("fn {}({}): int {{ return {} }}", name, params, body);
+    Some(LibFn { name, arity: c.arity, src })
+}
+
+/// Mine repeated structure out of what the machine already knows.
+///
+/// **This is the other half of the library and the two learn different
+/// things.** Solving teaches whole answers: an expression that answered one
+/// problem, kept because it will answer the next. Mining teaches shared
+/// *fragments*: a shape that turns up inside several answers and inside the
+/// references of several problems, which nothing solved on its own and which
+/// nobody would think to propose.
+///
+/// `abstraction::analyse` is the whole of it and it already existed. Its
+/// objective is arithmetic rather than taste -- a structure of `size` nodes
+/// occurring `count` times saves `count * (size - 1 - arity) - size` -- so a
+/// fragment whose leaves are all different has an arity as large as its leaf
+/// count, its call site is as big as the thing it replaces, and `saved` goes
+/// negative on its own. Nothing has to decide that six parameters is too many.
+///
+/// What is fed in is the library and the problems' references, and not
+/// `/ai/tools`. That is the whole reason this can be wired at all:
+/// `abstraction.rs` stops short of writing anything because rewriting a
+/// program the operator trusted by hash revokes that trust, which is correct
+/// and needs a story first. Nothing here was ever trusted by an operator --
+/// these are machine-written, content-addressed and judged -- so the story is
+/// not needed and the rewriting never happens.
+pub fn mine(lib: &Lib) -> Vec<LibFn> {
+    let mut programs: Vec<(String, String)> = Vec::new();
+    for f in &lib.fns {
+        programs.push((f.name.clone(), f.src.clone()));
+    }
+    for h in super::problem::stored() {
+        let Some(p) = Problem::load(&h) else { continue };
+        if p.family != Family::Program {
+            continue;
+        }
+        programs.push((p.entry.clone(), p.reference.clone()));
+    }
+    if programs.len() < 2 {
+        return Vec::new();
+    }
+
+    let mut out = Vec::new();
+    for c in super::abstraction::analyse(&programs) {
+        let Some(f) = from_candidate(&c) else { continue };
+        if lib.fns.iter().any(|g| g.name == f.name) {
+            continue;
+        }
+        if out.iter().any(|g: &LibFn| g.name == f.name) {
+            continue;
+        }
+        out.push(f);
+        if out.len() >= MINE_TOP {
+            break;
+        }
+    }
+    out
+}
+
 /// What adding one function to the library did to the whole stored set.
 ///
 /// Paired, over the same problems both times, which is what makes it a
@@ -669,6 +769,8 @@ pub struct Round {
     pub reach: usize,
     /// Library functions offered from problems solved this round.
     pub offered: usize,
+    /// Offered from mining repeated structure rather than from an answer.
+    pub mined: usize,
     /// Offered, and the paired judge said the whole set got easier.
     pub learned: usize,
     /// Total candidates over the stored set before and after learning, so a
@@ -696,6 +798,7 @@ pub fn round(s: &Solver) -> Round {
         hardest: 0,
         reach: 0,
         offered: 0,
+        mined: 0,
         learned: 0,
         before: 0,
         after: 0,
@@ -783,6 +886,32 @@ pub fn round(s: &Solver) -> Round {
             }
         }
     }
+    // --- the sleep phase -------------------------------------------------
+    //
+    // Run once at the end rather than per child, because it reads the whole
+    // library and the whole problem set: mining after every mutation would
+    // re-derive the same fragments from nearly the same input, and pay for a
+    // `bench` each time to be told so.
+    for f in mine(&grown.lib) {
+        if grown.lib.fns.iter().any(|g| g.name == f.name) {
+            continue;
+        }
+        r.mined += 1;
+        r.offered += 1;
+        // The same judge the solved answers face. A mined fragment has an
+        // objective saying it *should* pay, and that objective counts nodes
+        // rather than candidates -- so it is a good proposal and not a
+        // verdict, and the paired count is what decides.
+        let v = bench(&grown, &f);
+        if v.helps() {
+            r.before += v.before;
+            r.after += v.after;
+            f.store();
+            grown.lib.add(f);
+            r.learned += 1;
+        }
+    }
+
     r
 }
 
@@ -815,14 +944,19 @@ pub fn report(rounds: usize, s: &Solver) {
         );
         if r.learned > 0 {
             kprintln!(
-                "    learned {} of {} offered; the set went {} -> {} candidate(s)",
+                "    learned {} of {} offered ({} mined); the set went {} -> {} candidate(s)",
                 r.learned,
                 r.offered,
+                r.mined,
                 r.before,
                 r.after
             );
         } else if r.offered > 0 {
-            kprintln!("    {} offered, none paid for itself", r.offered);
+            kprintln!(
+                "    {} offered ({} mined), none paid for itself",
+                r.offered,
+                r.mined
+            );
         }
         if r.reach > 0 {
             kprintln!(
@@ -1049,6 +1183,53 @@ pub fn selftest() -> bool {
             false,
         ),
     }
+
+    // --- mining, the other half of the library ---------------------------
+    //
+    // Two programs sharing a fragment. `analyse` is pure, so this needs no
+    // namespace and no store: what is checked is that a shared structure is
+    // found, that it becomes something the enumerator can call, and that the
+    // objective's own arithmetic refuses one that would not pay.
+    let shared = alloc::vec![
+        (
+            String::from("one"),
+            String::from("fn one(n: int): int { return (((n * 2) + 1) * 5) }"),
+        ),
+        (
+            String::from("two"),
+            String::from("fn two(n: int): int { return (((n * 2) + 1) - 4) }"),
+        ),
+        (
+            String::from("three"),
+            String::from("fn three(n: int): int { return (((n * 2) + 1) * 9) }"),
+        ),
+    ];
+    let found = super::abstraction::analyse(&shared);
+    claim("repeated structure across programs is found", !found.is_empty());
+    let usable: Vec<LibFn> = found.iter().filter_map(from_candidate).collect();
+    match usable.first() {
+        Some(f) => {
+            claim("and becomes a function the enumerator can call", f.arity <= 2);
+            claim(
+                "named for the shape rather than for where it was found",
+                f.name.starts_with("lib_") && !f.name.contains("abs"),
+            );
+            claim(
+                "and it parses back as the declaration it is",
+                LibFn::parse(&f.src).as_ref() == Some(f),
+            );
+        }
+        None => claim("and becomes a function the enumerator can call", false),
+    }
+
+    // The objective refuses what would not pay, and it does so on arithmetic
+    // rather than on a threshold somebody chose. A fragment whose leaves are
+    // all different has an arity as large as its leaf count, so its call site
+    // is the size of the thing it replaces and `saved` goes negative.
+    claim(
+        "a structure that would not pay for itself is refused by the objective",
+        found.iter().filter(|c| c.saved <= 0).all(|c| from_candidate(c).is_none()),
+    );
 
     // And the trade, which is the reason this is judged rather than assumed:
     // every function lengthens every candidate list, so a function that buys
