@@ -23,15 +23,21 @@
 //! what the budget stops and what a verdict records; two routes that agree on
 //! the answer and disagree on the cost disagree about a number in the ledger.
 //!
-//! **What is not compared is what a program printed**, and that is the same
-//! blind spot `skill.rs` writes down for J3. A program whose whole purpose is
-//! `println` answers nil however it behaved, so two routes could disagree
-//! completely about what reached the console and agree on all three fields
-//! here. Capturing console output would mean giving the console a capture
-//! mode, which is a larger change than this needs; it is recorded so the next
-//! reader knows the gap is known rather than missed. A code generator is
-//! unlikely to fail this way and a builtin dispatch table is exactly how it
-//! would.
+//! **What a program printed is compared too, and for a while it was not.**
+//! The paragraph here used to record that as a known gap: a program whose
+//! whole purpose is `println` answers nil however it behaved, so two routes
+//! could disagree completely about what reached the console and agree on every
+//! field this harness looked at. The stated reason for leaving it was that
+//! capturing would mean giving the console a capture mode -- and the console
+//! had one all along, `begin_capture`/`end_capture`, which `applet` and the
+//! agent loop were already using. It stacks, so it nests inside a caller that
+//! is itself capturing.
+//!
+//! Comparing it is safe on every route rather than only on the interpreted
+//! ones: `jit`'s slice admits no calls at all, so a program the compiled route
+//! accepts cannot print by any path, and both sides are empty by construction.
+//! `skill.rs` writes down the same blind spot for its determinism judge, which
+//! is now closable the same way.
 //!
 //! **The second route today is `prepare`/`adopt` against `run`.** That is a
 //! real pair, not a placeholder -- one registers a program's declarations by
@@ -62,11 +68,18 @@ const BUDGET: u64 = 100_000;
 const ROUNDS: usize = 64;
 
 /// Everything a caller can observe about running a program.
+///
+/// `console` closed the one hole this harness documented against itself: a
+/// program whose whole purpose is `println` answers nil however it behaved, so
+/// two routes could disagree about everything a person would notice and agree
+/// on every field compared. `skill.rs` records the same blind spot for its
+/// determinism judge, and both are fixed by capturing here.
 #[derive(PartialEq, Eq, Clone)]
 pub struct Outcome {
     value: String,
     steps: u64,
     error: Option<String>,
+    console: String,
 }
 
 /// Which of the three differed. Named, because "they disagree" is not a bug
@@ -76,6 +89,7 @@ pub enum Field {
     Value,
     Steps,
     Error,
+    Console,
 }
 
 /// The first field two outcomes differ in, or `None` if they are identical.
@@ -88,6 +102,14 @@ pub fn disagree(a: &Outcome, b: &Outcome) -> Option<Field> {
     }
     if a.value != b.value {
         return Some(Field::Value);
+    }
+    // Before steps, because what a program printed is what a person would
+    // notice and a step count is what only this harness would. Safe to compare
+    // across every route: `jit`'s slice admits no calls at all, so a program
+    // the compiled route accepts cannot print on any route, and both sides are
+    // empty by construction rather than by luck.
+    if a.console != b.console {
+        return Some(Field::Console);
     }
     if a.steps != b.steps {
         return Some(Field::Steps);
@@ -118,11 +140,25 @@ pub enum Entry<'a> {
     /// `f(a, b, ..)` where every argument and the answer is an integer. The
     /// only shape a compiled function can have.
     Ints(&'a str, &'a [i64]),
+    /// `f(a, b, ..)` for any argument types the language has.
+    ///
+    /// The three variants above are shapes this harness happened to need;
+    /// `invoke` underneath was always generic over `&[Value]`, so the enum was
+    /// the whole of the restriction. Interpreted routes only: the compiled one
+    /// declines anything that is not integers, which is `jit`'s slice and not
+    /// a property of this variant.
+    Call(&'a str, &'a [Value]),
 }
 
 impl Outcome {
     fn failed(e: String, steps: u64) -> Outcome {
-        Outcome { value: String::new(), steps, error: Some(e) }
+        Outcome { value: String::new(), steps, error: Some(e), console: String::new() }
+    }
+
+    /// What the program printed while it ran. Empty when it printed nothing,
+    /// which is every program the compiled route can accept.
+    pub fn console(&self) -> &str {
+        &self.console
     }
 }
 
@@ -149,24 +185,38 @@ pub fn observe(src: &str, entry: Entry, route: Route) -> Option<Outcome> {
     }
 
     let mut it = Interp::sandboxed(JAIL).with_step_budget(BUDGET);
+    // Capture spans the whole run, top level included, because a program can
+    // print while it declares and that is behaviour too. The stack form is
+    // what makes this safe to nest inside a caller that is already capturing.
+    crate::gfx::console::begin_capture();
+    let said = || crate::gfx::console::end_capture().unwrap_or_default();
     match route {
         Route::Armed => {
             if let Err(e) = it.run(&prog) {
-                return Some(Outcome::failed(e, it.steps()));
+                let steps = it.steps();
+                let mut o = Outcome::failed(e, steps);
+                o.console = said();
+                return Some(o);
             }
         }
         Route::Prepared => {
             // Declines rather than falls back. A route that quietly armed
             // when it could not prepare would compare `Armed` against
             // `Armed` and report agreement it never tested.
-            let p = Interp::prepare(&prog).ok()?;
+            let Some(p) = Interp::prepare(&prog).ok() else {
+                let _ = said();
+                return None;
+            };
             it.adopt(&p);
         }
         // Handled above, before an interpreter was built at all. Answering
         // `None` rather than asserting, because a route that reached here
         // would be a route with no implementation and the honest reply to
         // that is "this one does not apply".
-        Route::Compiled => return None,
+        Route::Compiled => {
+            let _ = said();
+            return None;
+        }
     }
 
     // A declarative top level evaluates to nil, because `Stmt::Fn` and
@@ -175,22 +225,36 @@ pub fn observe(src: &str, entry: Entry, route: Route) -> Option<Outcome> {
     // where it would show.
     let top = Value::Nil.render();
 
+    // One place that turns an invocation into an outcome, so the console is
+    // taken exactly once however the program was entered.
+    let finish = |it: &Interp, r: Result<Value, String>| -> Option<Outcome> {
+        let steps = it.steps();
+        let console = crate::gfx::console::end_capture().unwrap_or_default();
+        Some(match r {
+            Ok(v) => Outcome { value: v.render(), steps, error: None, console },
+            Err(e) => Outcome { value: String::new(), steps, error: Some(e), console },
+        })
+    };
+
     match entry {
-        Entry::Top => Some(Outcome { value: top, steps: it.steps(), error: None }),
+        Entry::Top => finish(&it, Ok(Value::Nil)).map(|mut o| {
+            o.value = top;
+            o
+        }),
         Entry::Vote(text) => {
             let allowed = Value::List((0..23).map(Value::Int).collect());
             let args = [Value::Str(text.to_string()), allowed];
-            match it.invoke("vote", &args) {
-                Ok(v) => Some(Outcome { value: v.render(), steps: it.steps(), error: None }),
-                Err(e) => Some(Outcome::failed(e, it.steps())),
-            }
+            let r = it.invoke("vote", &args);
+            finish(&it, r)
         }
         Entry::Ints(name, args) => {
             let vals: Vec<Value> = args.iter().map(|i| Value::Int(*i)).collect();
-            match it.invoke(name, &vals) {
-                Ok(v) => Some(Outcome { value: v.render(), steps: it.steps(), error: None }),
-                Err(e) => Some(Outcome::failed(e, it.steps())),
-            }
+            let r = it.invoke(name, &vals);
+            finish(&it, r)
+        }
+        Entry::Call(name, args) => {
+            let r = it.invoke(name, args);
+            finish(&it, r)
         }
     }
 }
@@ -204,6 +268,8 @@ pub fn observe(src: &str, entry: Entry, route: Route) -> Option<Outcome> {
 /// zero" would be wrong in a way only this comparison catches.
 fn compiled(prog: &[super::parse::Stmt], entry: Entry) -> Option<Outcome> {
     use super::jit;
+    // `Call` is interpreted-only: the slice admits no calls, so there is
+    // nothing a compiled route could do with one.
     let Entry::Ints(want, args) = entry else { return None };
     let (name, params, ret, body) = jit::only_fn(prog)?;
     if name != want {
@@ -231,6 +297,7 @@ fn compiled(prog: &[super::parse::Stmt], entry: Entry) -> Option<Outcome> {
             value: Value::Int(r.result).render(),
             steps,
             error: None,
+            console: String::new(),
         },
         jit::ST_NIL => {
             // A function that falls off its end yields nothing, and
@@ -241,7 +308,14 @@ fn compiled(prog: &[super::parse::Stmt], entry: Entry) -> Option<Outcome> {
             if matches!(ret, super::parse::Type::Int) {
                 Outcome::failed(alloc::format!("{} returns int, got nil", name), steps)
             } else {
-                Outcome { value: Value::Nil.render(), steps, error: None }
+                // Compiled code cannot print -- the slice admits no calls --
+                // so an empty console here is a fact rather than a default.
+                Outcome {
+                    value: Value::Nil.render(),
+                    steps,
+                    error: None,
+                    console: String::new(),
+                }
             }
         }
         jit::ST_BUDGET => Outcome::failed(
@@ -533,7 +607,8 @@ pub fn selftest() -> bool {
     }
 
     // The comparator itself, before anything is compared with it.
-    let base = Outcome { value: "1".to_string(), steps: 10, error: None };
+    let base =
+        Outcome { value: "1".to_string(), steps: 10, error: None, console: String::new() };
     claim(&mut ok, disagree(&base, &base.clone()).is_none(), "identical outcomes agree");
     let mut v = base.clone();
     v.value = "2".to_string();
@@ -544,6 +619,40 @@ pub fn selftest() -> bool {
     let mut e = base.clone();
     e.error = Some("boom".to_string());
     claim(&mut ok, disagree(&base, &e) == Some(Field::Error), "a different failure is caught");
+    // The field this harness used to be blind in. Two runs agreeing on value,
+    // cost and error while printing different things were reported identical,
+    // which for a program made of `println` is the whole of its behaviour.
+    let mut c = base.clone();
+    c.console = String::from("said something");
+    claim(
+        &mut ok,
+        disagree(&base, &c) == Some(Field::Console),
+        "a different thing printed is caught",
+    );
+
+    // End to end, on the two things the enum and the field were widened for.
+    // A claim rather than a comment, because a variant nothing constructs and
+    // a field nothing reads are indistinguishable from absent ones.
+    let talks = "fn talk(): int { println(\"spoke\") return 7 }";
+    match observe(talks, Entry::Call("talk", &[]), Route::Armed) {
+        Some(o) => {
+            claim(&mut ok, o.value == "7", "a call by name answers");
+            claim(
+                &mut ok,
+                o.console().contains("spoke"),
+                "and what it printed on the way is captured",
+            );
+        }
+        None => claim(&mut ok, false, "a call by name answers"),
+    }
+    // An argument the older variants could not carry at all: `Ints` takes
+    // integers and `Vote` takes the council's fixed pair.
+    let takes = "fn seen(t: str): int { if (contains(t, \"x\")) { return 1 } return 0 }";
+    let arg = [Value::Str(String::from("axb"))];
+    match observe(takes, Entry::Call("seen", &arg), Route::Armed) {
+        Some(o) => claim(&mut ok, o.value == "1", "a string argument reaches the function"),
+        None => claim(&mut ok, false, "a string argument reaches the function"),
+    }
 
     // And end to end: two programs that agree on the answer and not on the
     // cost must be reported as differing.
