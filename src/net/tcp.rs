@@ -457,6 +457,13 @@ pub fn service() {
 /// Drain the inbox and run the timers. Every blocking operation calls this in
 /// its wait loop, and `service` calls it when the shell is idle.
 pub fn pump() {
+    // One task in the stack at a time. The reap loop below frees `Tcb`s, and
+    // `at()` hands out `&mut Tcb` -- a preemption inside one of those closures
+    // would otherwise let a second task drop what this one is writing through.
+    // Reentrant within a task, because the transitions below reach `poll`.
+    let Some(_guard) = super::StackGuard::take() else {
+        return;
+    };
     // Take the queue before processing so that a `send_ipv4` triggered from
     // inside a transition -- which may poll, which may enqueue -- is writing
     // to an empty inbox rather than the one being iterated.
@@ -1044,6 +1051,27 @@ pub fn recv_to_end(timeout_ms: u64) -> Vec<u8> {
     all
 }
 
+/// Where a close moves the machine to.
+///
+/// Pure, so the transition can be asserted without a peer -- the reason
+/// `update::decide` and `code::locate` are pure. It has to happen at the close
+/// rather than in `queue_pending`, which sends the FIN and leaves the state
+/// where it was: `close_at` did not do it, so a connection sat in Established,
+/// `on_segment`'s FinWait1 arm was unreachable, and every close ran its full
+/// timeout before `abort_at` tore it down regardless. A polite close that was
+/// neither polite nor a close, and from the outside indistinguishable from a
+/// peer that never answered.
+///
+/// Anything else is returned unchanged: closing a connection that is already
+/// closing is not an error and must not move it backwards.
+fn closing_state(s: State) -> State {
+    match s {
+        State::Established => State::FinWait1,
+        State::CloseWait => State::LastAck,
+        other => other,
+    }
+}
+
 /// Close politely: FIN, and wait for the exchange to finish.
 /// Close one connection by handle, with the handshake.
 pub fn close_at(h: Handle, timeout_ms: u64) {
@@ -1053,6 +1081,7 @@ pub fn close_at(h: Handle, timeout_ms: u64) {
     }
     let out = at(h, |t| {
         t.closing = true;
+        t.state = closing_state(t.state);
         let mut out = Outbox::new();
         queue_pending(t, &mut out);
         (t.remote, out)
@@ -1064,23 +1093,19 @@ pub fn close_at(h: Handle, timeout_ms: u64) {
     abort_at(h);
 }
 
+/// Close the current connection.
+///
+/// Delegates rather than repeating the sequence. It used to be a second copy
+/// that had the state transition `close_at` was missing, which is the shape
+/// this kind of duplication always takes: two functions doing one job, and the
+/// one nobody exercised was the broken one. `abort_at(h)` and the old `abort()`
+/// do the same thing when `h` is current, and `!alive(h)` and
+/// `matches!(state(), Closed)` are the same predicate for it.
 pub fn close(timeout_ms: u64) {
-    let Some((remote, out)) = with_tcb(|t| {
-        t.closing = true;
-        if t.state == State::Established {
-            t.state = State::FinWait1;
-        } else if t.state == State::CloseWait {
-            t.state = State::LastAck;
-        }
-        let mut out = Outbox::new();
-        queue_pending(t, &mut out);
-        (t.remote, out)
-    }) else {
+    let Some(h) = (unsafe { *CURRENT.get() }) else {
         return;
     };
-    flush(remote, out);
-    wait_until(timeout_ms, || matches!(state(), State::Closed));
-    abort();
+    close_at(h, timeout_ms);
 }
 
 /// Drop the current connection without ceremony.
@@ -1182,6 +1207,63 @@ pub fn checks() -> Vec<(&'static str, bool)> {
             route([10, 0, 0, 1], [10, 0, 2, 15], &seg(9000 + i as u16, 40000 + i as u16))
                 == Some(i)
         }),
+    ));
+
+    // --- the close transition ---
+    //
+    // Asserted through the pure function rather than by closing a connection,
+    // because a real close sends a FIN and waits for a peer. What broke was
+    // exactly this mapping, and it is the whole of what `close_at` was missing.
+    out.push((
+        "a close moves Established to FinWait1",
+        closing_state(State::Established) == State::FinWait1,
+    ));
+    out.push((
+        "and CloseWait to LastAck",
+        closing_state(State::CloseWait) == State::LastAck,
+    ));
+    out.push((
+        "and leaves a connection already closing where it is",
+        closing_state(State::FinWait1) == State::FinWait1
+            && closing_state(State::LastAck) == State::LastAck
+            && closing_state(State::Closed) == State::Closed,
+    ));
+
+    // --- the stack guard ---
+    //
+    // One task at a time inside `poll` and `pump`, reentrant within that task.
+    // The nesting case is not a nicety: `pump` reaches `poll` through
+    // `send_ipv4` -> `resolve`, so a guard refusing its own holder would turn
+    // ARP resolution inside `pump` into a silent early return.
+    let me = crate::task::current();
+    out.push(("the stack is free before the guard is taken", super::stack_holder().is_none()));
+    {
+        let outer = super::StackGuard::take();
+        out.push(("a free stack hands out a guard", outer.is_some()));
+        out.push(("and records who took it", super::stack_holder() == Some(me)));
+        {
+            let inner = super::StackGuard::take();
+            out.push(("the holder's own nested call is admitted", inner.is_some()));
+        }
+        out.push((
+            "and dropping the inner one releases nothing",
+            super::stack_holder() == Some(me),
+        ));
+    }
+    out.push((
+        "the outermost guard is what releases",
+        super::stack_holder().is_none(),
+    ));
+
+    super::force_stack_holder(Some(me.wrapping_add(1)));
+    out.push((
+        "a stack held by another task is refused",
+        super::StackGuard::take().is_none(),
+    ));
+    super::force_stack_holder(None);
+    out.push((
+        "and is free again once that task leaves",
+        super::StackGuard::take().is_some() && super::stack_holder().is_none(),
     ));
 
     *table() = saved;

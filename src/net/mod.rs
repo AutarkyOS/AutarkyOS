@@ -20,6 +20,42 @@
 //! connection could re-enter its own control block through that path while an
 //! earlier borrow was still live. Queueing breaks the cycle at the one place
 //! it can form.
+//!
+//! ### Why one task at a time drives the stack
+//!
+//! That queueing argument is about re-entering *along one call chain*, and it
+//! is complete for that. It says nothing about two tasks, and both of the
+//! stack's roots hand out `&'static mut` from a `Racy`: `ifaces()` and
+//! `tcp::table()`. `Racy` is not a lock and says so.
+//!
+//! Nothing has hit this because exactly one thing has ever driven TCP -- the
+//! shell's idle loop, or whichever task is parked inside a blocking call. Two
+//! of them is a real failure with two shapes. `poll` advances the driver's
+//! receive ring, so two callers consume descriptors concurrently and `rx_cur`
+//! desynchronises. And `pump` reaps finished connections with `table()[h] =
+//! None`, dropping a `Tcb` and its buffers -- so a preemption inside `at()`'s
+//! closure, with `&mut Tcb` live, lets another task free what the first is
+//! about to write through.
+//!
+//! `StackGuard` is the answer, and it is deliberately **not** a lock: there is
+//! nothing to wait for, and waiting here would be a task spinning on a task it
+//! has preempted. A refused poll is a poll ten milliseconds later, which is
+//! what the idle loop was already doing.
+//!
+//! It records the task rather than a flag, for the reason `ai::with_engine`
+//! gives about its own: `pump` reaches `send_ipv4` -> `resolve` -> `poll`, so
+//! the stack legitimately nests within one call chain, and a guard that
+//! refused its own holder would turn ARP resolution inside `pump` into a
+//! silent early return.
+//!
+//! **That admission is safe only because nothing enters the stack from an
+//! interrupt.** Receive is polled here and always has been -- `tcp`'s header
+//! says so -- and the timer ISR reaches `linux::input::service` and
+//! `task::tick` and nothing in `net`. An interrupt handler that called `poll`
+//! would be admitted as a nested call, because `task::current()` still names
+//! the task it interrupted, and it would re-enter the stack with a `&mut Tcb`
+//! live underneath it. So the day anything here becomes interrupt-driven, this
+//! guard needs to mask interrupts rather than merely record a task.
 
 use crate::gfx::console::{self, LTCYAN, LTGRAY, LTGREEN, LTRED, YELLOW};
 use crate::kprintln;
@@ -27,6 +63,57 @@ use crate::sync::Racy;
 use alloc::boxed::Box;
 use alloc::vec;
 use alloc::vec::Vec;
+use core::sync::atomic::{AtomicUsize, Ordering};
+
+const NOBODY: usize = usize::MAX;
+static IN_STACK: AtomicUsize = AtomicUsize::new(NOBODY);
+
+/// Held for as long as one task is inside `poll` or `pump`.
+///
+/// `take` answers `None` only when a *different* task holds it. The holder's
+/// own nested calls get a guard that releases nothing on drop, so the outermost
+/// one owns the release.
+pub(crate) struct StackGuard {
+    outermost: bool,
+}
+
+impl StackGuard {
+    pub(crate) fn take() -> Option<Self> {
+        let me = crate::task::current();
+        match IN_STACK.compare_exchange(NOBODY, me, Ordering::AcqRel, Ordering::Acquire) {
+            Ok(_) => Some(StackGuard { outermost: true }),
+            // Ours already: `pump` resolving an ARP entry through `poll`.
+            Err(h) if h == me => Some(StackGuard { outermost: false }),
+            Err(_) => None,
+        }
+    }
+}
+
+impl Drop for StackGuard {
+    fn drop(&mut self) {
+        if self.outermost {
+            IN_STACK.store(NOBODY, Ordering::Release);
+        }
+    }
+}
+
+/// Which task is inside the stack, for the selftest. `None` when nobody is.
+pub(crate) fn stack_holder() -> Option<usize> {
+    match IN_STACK.load(Ordering::Acquire) {
+        NOBODY => None,
+        h => Some(h),
+    }
+}
+
+/// Name a foreign holder, for the selftest.
+///
+/// Single-core and cooperatively scheduled, so there is no way to have a second
+/// task ask while this one holds. What can be done is to put somebody else's id
+/// in the record and confirm the refusal, which is the branch that matters --
+/// the same trick `ai::mod`'s claim check uses on `HOLDER`.
+pub(crate) fn force_stack_holder(h: Option<usize>) {
+    IN_STACK.store(h.unwrap_or(NOBODY), Ordering::Release);
+}
 
 pub type Mac = [u8; 6];
 pub type Ipv4 = [u8; 4];
@@ -490,7 +577,14 @@ pub enum Event {
 }
 
 /// Take one frame from whichever interface has one.
+///
+/// Answers `Event::None` when another task is already inside the stack, which
+/// is indistinguishable from "no frame was waiting" to every caller -- they all
+/// poll in a loop. See `StackGuard`.
 pub fn poll() -> Event {
+    let Some(_guard) = StackGuard::take() else {
+        return Event::None;
+    };
     for n in 0..ifaces().len() {
         let frame = {
             let i = &mut ifaces()[n];
