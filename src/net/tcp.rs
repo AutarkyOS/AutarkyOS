@@ -381,8 +381,26 @@ fn flush(remote: Ipv4, out: Outbox) {
     }
 }
 
+/// Borrow one control block, with interrupts masked for the length of it.
+///
+/// `StackGuard` keeps two tasks out of `poll` and `pump`, which is where the
+/// stack is *entered*. It does not cover this, and this is where the `&mut`
+/// actually lives: `recv_at` calls `at` after `wait_until` has returned, so a
+/// timer tick landing inside the closure lets the shell's idle loop run `pump`,
+/// reach its reap loop, and free the very `Tcb` being written through.
+///
+/// Masking rather than locking, for the reason the guard is not a lock either:
+/// the borrow is short and bounded, and a task that spun here would be spinning
+/// on one it has preempted. `without_interrupts` restores rather than enabling,
+/// so nesting inside the heap's `lock_irq` is safe, and `pump` nesting `at`
+/// inside its own masked reap block is safe for the same reason.
+///
+/// **This is sufficient because every task is pinned to core 0.** Interrupts
+/// off stops preemption, and preemption is the only way a second task can start
+/// on one core. `task::unpin` exists and nothing calls it; the day something
+/// does, this has to become a real lock, and so does the guard.
 fn at<R>(h: Handle, f: impl FnOnce(&mut Tcb) -> R) -> Option<R> {
-    table().get_mut(h)?.as_mut().map(f)
+    crate::cpu::without_interrupts(|| table().get_mut(h)?.as_mut().map(f))
 }
 
 /// The current connection, for the single-connection API.
@@ -496,17 +514,24 @@ pub fn pump() {
         if !at(h, |t| t.state == State::Closed).unwrap_or(false) {
             continue;
         }
-        let keep = at(h, |t| core::mem::take(&mut t.recv_buf)).unwrap_or_default();
-        let reset = at(h, |t| t.reset).unwrap_or(false);
-        table()[h] = None;
-        // The last words of the *current* connection are what `recv` and the
-        // shell read after it ends. Another connection closing does not
-        // overwrite them, which it would if this were unconditional.
-        if unsafe { *CURRENT.get() } == Some(h) {
-            unsafe { *CURRENT.get() = None };
-            LAST_RESET.set(reset);
-            LAST_DATA.set(keep);
-        }
+        // Reads and the free are one masked block, not three separate ones.
+        // Between them the slot is a connection somebody else can still borrow,
+        // and `table()[h] = None` drops its buffers -- so a tick landing after
+        // the reads and before the free lets another task take a `&mut` into
+        // memory this loop is one instruction from returning to the allocator.
+        crate::cpu::without_interrupts(|| {
+            let keep = at(h, |t| core::mem::take(&mut t.recv_buf)).unwrap_or_default();
+            let reset = at(h, |t| t.reset).unwrap_or(false);
+            table()[h] = None;
+            // The last words of the *current* connection are what `recv` and the
+            // shell read after it ends. Another connection closing does not
+            // overwrite them, which it would if this were unconditional.
+            if unsafe { *CURRENT.get() } == Some(h) {
+                unsafe { *CURRENT.get() = None };
+                LAST_RESET.set(reset);
+                LAST_DATA.set(keep);
+            }
+        });
     }
 }
 
@@ -1228,6 +1253,28 @@ pub fn checks() -> Vec<(&'static str, bool)> {
             && closing_state(State::LastAck) == State::LastAck
             && closing_state(State::Closed) == State::Closed,
     ));
+
+    // --- the borrow is masked ---
+    //
+    // Asserted by reading RFLAGS from inside the closure, because the property
+    // is not "at() calls without_interrupts" -- that is visible in the source
+    // and could stop being true through an inlining or a refactor without
+    // anybody noticing. What has to hold is that no tick can land while a
+    // `&mut Tcb` is live, and the only witness to that is the flag itself.
+    let read_if = || -> bool {
+        let f: u64;
+        unsafe { core::arch::asm!("pushfq; pop {}", out(reg) f, options(preserves_flags)) };
+        f & (1 << 9) != 0
+    };
+    let before = read_if();
+    table()[0] = Some(mk([93, 184, 216, 34], 80, 50000));
+    let masked = at(0, |_| !read_if()).unwrap_or(false);
+    out.push(("a borrow of a control block runs with interrupts masked", masked));
+    // Restored rather than unconditionally enabled: `pump` nests `at` inside
+    // its own masked reap block, and an `sti` on the way out of the inner one
+    // would unmask in the middle of the outer.
+    out.push(("and puts them back the way it found them", read_if() == before));
+    table()[0] = None;
 
     // --- the stack guard ---
     //
