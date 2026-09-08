@@ -11,7 +11,8 @@ model that lives *inside* the kernel. No user/kernel split, no syscalls, no
 process isolation, one address space. A tool call from the model is a function
 call.
 
-170 files, roughly 108,000 lines. **Three** things in the kernel we did not
+198 files, roughly 132,000 lines, of which 178 files and 118,000 lines were
+written here. **Three** things in the kernel we did not
 write, and the list has grown twice, so it is worth stating precisely rather
 than approximately:
 
@@ -1551,7 +1552,7 @@ An unmodified static binary, fetched from busybox.net and touched by nothing
 here, running at ring 3.
 
     linux run /tmp/busybox uname -a
-    GLaDOS glados 1.3.4 one address space, no processes x86_64 GNU/Linux
+    GLaDOS glados 1.3.5 ring 0, with guests at ring 3 x86_64 GNU/Linux
 
     linux run /tmp/busybox hexdump -C /tmp/lines.txt
     00000000  61 6c 70 68 61 0a 74 68  65 20 71 75 69 63 6b 20  |alpha.the quick |
@@ -1725,18 +1726,24 @@ the restorer. The flag's address is held in `rbx` across the signal on purpose,
 so a `rt_sigreturn` that lost the callee-saved registers reads it from
 somewhere else and fails rather than passing quietly.
 
-**What is still missing, and it is one thing.** `fork`, `execve` and `wait4`,
-which is to say `sh` running anything that is not a builtin. That is not a
-syscall away: `fork` needs two address spaces, and one address space is the
-founding claim of this system rather than a shortcut it took. Nothing else in
-the measured surface is blocked on a decision that large.
+**`fork`, `execve` and `wait4` have landed**, and the two paragraphs that used
+to sit here are worth keeping in summary because of the shape of how they went
+stale. The first said the three calls were "not a syscall away: `fork` needs
+two address spaces, and one address space is the founding claim of this system
+rather than a shortcut it took." The second said that had become half true,
+because `src/mem/space.rs` existed and what remained was *placement*.
 
-**That paragraph is now half true, and which half is the useful part.**
-`src/mem/space.rs` exists: a second address space builds, CR3 moves to it, and
-two spaces map one virtual address to different physical memory. So the
-mechanism is no longer the obstacle and this file should stop saying it is.
-What remains is *placement*, which is a smaller and more specific problem than
-"one address space" made it sound. See the section below.
+Both are now history. `src/mem/space.rs` gives a guest its own page-table root,
+placement is solved by mapping a fixed image rather than placing it, and the
+three calls are in the dispatch table alongside threads, futexes and signals.
+The surface is 93 calls of Linux's roughly 350, counted from the match in
+`glados_syscall_dispatch` rather than remembered:
+
+    sed -n '/fn glados_syscall_dispatch/,/^}/p' src/linux/syscall.rs | grep -oE '^ +SYS_[A-Z0-9_| ]+=>' | grep -oE 'SYS_[A-Z0-9_]+' | sort -u | wc -l
+
+The lesson the pair of them teaches is the one to keep: **a limitation stated
+as a founding claim is still a limitation, and it will be removed by somebody
+who did not read the claim as permanent.**
 
 ### A second address space
 
@@ -1928,10 +1935,10 @@ them would leave the next translation reading the allocator's memory. Nothing
 is installed by then, so it is tidiness rather than a live hazard, and it is
 the same ordering `give_back` exists to get right.
 
-What is left for `fork` is the three calls, plus a `SPACE` that can hold more
-than one guest at a time -- it is a single static today, so nothing can yet
-demonstrate two live guests sharing `0x400000` even though the memory now
-allows it. **`smp::init` passes CR3 to a starting application processor**
+The three calls landed after this was written. What is still true is the
+`SPACE` note: it is a single static, so nothing yet demonstrates two live
+guests sharing `0x400000` at the same instant even though the memory allows it.
+**`smp::init` passes CR3 to a starting application processor**
 (`smp.rs:557`), which is harmless today because APs start at boot before any
 space exists, and would not be if anything ever started one later.
 
@@ -2794,8 +2801,8 @@ GF63 for a correct reason.
 There is no `cargo test`. This is a `no_std` UEFI binary with no host test
 runner, so **verification is the boot selftests plus driving QEMU.**
 
-At boot the system runs **twenty-eight selftest sections**, and `diag` offers
-**forty named suites** on demand, most of them the same checks (the `aiksi` section covers the capability gate by name and never by
+At boot the system runs **twenty-six selftest sections**, and `diag` offers
+**forty-two named suites** on demand, most of them the same checks (the `aiksi` section covers the capability gate by name and never by
 calling -- half that table pokes memory, drives I/O ports or paints over the
 screen, and a suite that called every row to prove it exists would be
 scribbling on the machine to do it), printing `ok` or `FAIL` per line: heap, timer, clock, the namespace's
@@ -2876,7 +2883,7 @@ attention path is wired correctly writes real sentences.
 
 **`diag` on its own lists the suites; `diag all` runs them.** A bare `diag`
 prints a table with `-` beside everything that has not run this boot and a
-tally reading `0 passed, 0 failed, 33 not run`, which is easy to read as a
+tally reading `0 passed, 0 failed, 42 not run`, which is easy to read as a
 clean sweep. It is the opposite of one.
 
 **The list and its verdict table are one number now, and were not.** `RESULTS`
@@ -3472,8 +3479,10 @@ note for what to test at the GF63, since the machine that builds this is a
 different machine from the one that runs it.
 
 **Apps are `Content::App(Box<dyn DeskApp>)`** (`gfx/mod.rs`): a window whose
-client area belongs to a program, being Paintbrush (`paint.rs`), Write
-(`write.rs`) and Minesweeper (`mines.rs`). Six methods (draw, key, press,
+client area belongs to a program. There are ten: Paintbrush (`paint.rs`), Write
+(`write.rs`), Minesweeper (`mines.rs`), ToDo, Ask, Flows, Improve, the Oracle,
+the agent log and the authoring progress window (`agentwin.rs` holds the last
+two). Six methods (draw, key, press,
 right_press, drag, release/wheel); every handler returns whether it consumed
 the event so unclaimed keys fall through to the window manager. `draw_in` takes
 `&self`; layout facts discovered while drawing go in `Cell`s, the Browser's
@@ -3844,20 +3853,51 @@ to long mode through a trampoline at physical 0x8000, and parks it. `smp` in
 the shell reports how many answered; `smp bench` times a 16 MiB matvec on one
 core against all of them.
 
-This began as a **compute fabric rather than general SMP**, and it is moving.
-The extra cores can now allocate and print, because those two structures are
-behind real locks. They still never take an interrupt and still never run a
-task, and the reason is specific: an application processor runs on the
-trampoline's flat descriptor table with no task-state segment, so its code
-selector does not match the one the interrupt table's entries name. Preempting
-a task there needs a per-core GDT and TSS, and `smp.rs` already records why one
-TSS cannot be shared. Running tasks cooperatively without a timer needs
-neither, and is the shorter road if it is wanted. They wait on a generation counter
-with MONITOR/MWAIT, run a range of a matrix, and go back to sleep. Every
-decision and every byte of kernel state stays on the bootstrap processor, so
-`Racy`'s safety argument is untouched -- which is the point. General SMP means
-auditing several hundred `Racy` uses and inventing a lock discipline; this
-needed none of that, and it is where the time goes anyway.
+This began as a **compute fabric rather than general SMP**, and it has moved.
+The extra cores can allocate and print, because those two structures are behind
+real locks.
+
+**They take interrupts and they run tasks now, and this file said otherwise for
+longer than it was true.** It read: "They still never take an interrupt and
+still never run a task, and the reason is specific: an application processor
+runs on the trampoline's flat descriptor table with no task-state segment, so
+its code selector does not match the one the interrupt table's entries name.
+Preempting a task there needs a per-core GDT and TSS." That was an accurate
+description of the obstacle and the obstacle was removed. `smp::init` calls
+`gdt::adopt`, `percpu::adopt`, `idt::load_this_core` and
+`lapic::init_this_core` on every application processor and then starts its
+timer, so each core has its own descriptor table, task-state segment, per-core
+block and idle task.
+
+`diag migrate` is the evidence and it is worth knowing what it actually does:
+it spawns a task, calls `unpin` on it, and waits until the core it has been
+seen on has more than one bit set -- sampled until seen twice rather than once,
+because whether a second core picks the migrant up inside any particular 200 ms
+depends on what else is running, and a single sample can fail spuriously as
+easily as it can pass spuriously.
+
+**What has not happened is the audit, and that is deliberate.** `Task.pin`
+carries the only core allowed to run a task, every task this kernel spawns is
+pinned to core 0, `unpin` exists and nothing outside the selftest calls it.
+Preemption on one core means two tasks never execute at the same instant; on
+two they genuinely overlap, so every `Racy` reachable from two tasks stops
+being a promise and becomes a race. There are 92 of those, the namespace tree
+among them. Unpinning before the audit buys a kernel that passes every test and
+corrupts something later, so migration is opt-in per task and the opt-in *is*
+the audit.
+
+The compute-fabric path is unchanged underneath all of that: helpers wait on a
+generation counter with MONITOR/MWAIT, run a range of a matrix, and go back to
+sleep, with every decision and every byte of kernel state still on the
+bootstrap processor.
+
+**A caution for whoever reads this next.** The README's status table says
+"per-core GDT/TSS/APIC ... tasks that migrate" while its limitations list says
+every task is pinned to core 0. Those look like a contradiction and are not:
+the mechanism works and is deliberately unused. Do not "fix" either one into
+agreeing with the other. This paragraph exists because trusting the stale
+version of this section above would have turned a true statement in the README
+into a false one.
 
 `smp::parallel_split(ctx, func, count, width)` is the whole interface. It
 answers false -- meaning "do it yourself" -- if there are no helpers, if
