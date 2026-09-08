@@ -31,6 +31,23 @@ VERSION = "00000001"
 NBITS = "1a44b9f2"
 NTIME = "4dd7f5c7"
 
+# A real coinbase transaction, split around the extranonce the way a pool
+# splits it. The halves are chosen so coinb1 + extranonce1 + extranonce2 +
+# coinb2 is a transaction that parses exactly to its last byte, because the
+# kernel's expected-value block reads the block subsidy out of the coinbase
+# outputs rather than from a hardcoded constant that would go stale across a
+# halving -- and a coinbase that is not a transaction makes it omit the line.
+#
+# The script length byte accounts for the eight extranonce bytes that land in
+# the middle, which is the one field that has to agree with EXTRANONCE2_SIZE.
+COINB1 = ("0100000001" + "00" * 32 + "ffffffff" + "10" + "03010203")
+COINB2 = "040a0b0cffffffff0200f2052a0100000001514e61bc0000000000026a0000000000"
+# 50.12345678, so a reader can tell it apart from a plain 50 that might have
+# come from somewhere else.
+COINB_VALUE = 5012345678
+EXTRANONCE1 = "08000002"
+EXTRANONCE2_SIZE = 4
+
 
 def send(conn, obj):
     line = json.dumps(obj, separators=(",", ":")) + "\n"
@@ -78,8 +95,8 @@ def serve_one(conn, args):
                 else:
                     result = [
                         [["mining.set_difficulty", "b4b6"], ["mining.notify", "ae6812"]],
-                        "08000002",
-                        4,
+                        EXTRANONCE1,
+                        EXTRANONCE2_SIZE,
                     ]
                 send(conn, {"id": mid, "result": result, "error": None})
                 subscribed = True
@@ -91,7 +108,7 @@ def serve_one(conn, args):
                 # client does not discard notifications while awaiting an id.
                 send(conn, {"id": None, "method": "mining.set_difficulty",
                             "params": [args.difficulty]})
-                params = ["job1", PREV, "01000000", "ffffffff", [],
+                params = ["job1", PREV, COINB1, COINB2, [],
                           VERSION, NBITS, NTIME, True]
                 if args.short_notify:
                     params = params[:8]

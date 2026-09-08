@@ -18,6 +18,7 @@
 //! deliberately not the writer.
 
 pub mod client;
+pub mod ev;
 pub mod hash;
 pub mod header;
 pub mod stratum;
@@ -262,6 +263,90 @@ pub fn checks() -> Vec<(&'static str, bool)> {
     ));
 
     out.extend(stratum_checks());
+    out.extend(ev_checks());
+    out
+}
+
+/// The expected-value arithmetic, and the coinbase parser under it.
+fn ev_checks() -> Vec<(&'static str, bool)> {
+    let mut out = Vec::new();
+
+    // A coinbase transaction, hand-built so every field is known. One input
+    // with the null prevout a coinbase has, two outputs, and a locktime -- 76
+    // bytes exactly, which is the number the parser has to land on.
+    const CB: [u8; 76] = [
+        0x01, 0x00, 0x00, 0x00, // version
+        0x01, // one input
+        0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, // null prevout, 32 bytes
+        0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, //
+        0xff, 0xff, 0xff, 0xff, // prevout index
+        0x04, 0xde, 0xad, 0xbe, 0xef, // script
+        0xff, 0xff, 0xff, 0xff, // sequence
+        0x02, // two outputs
+        0x00, 0xf2, 0x05, 0x2a, 0x01, 0x00, 0x00, 0x00, 0x01, 0x51, // 50 coin
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x02, 0x6a, 0x00, // zero
+        0x00, 0x00, 0x00, 0x00, // locktime
+    ];
+    out.push((
+        "a coinbase's outputs sum to what it pays",
+        ev::coinbase_value(&CB) == Some(5_000_000_000),
+    ));
+    // Landing exactly on the last byte is the whole bargain, and it is what
+    // separates a parse from a plausible number. Both directions.
+    let mut long = alloc::vec::Vec::from(&CB[..]);
+    long.push(0);
+    out.push((
+        "a transaction with a byte left over is refused, not summed",
+        ev::coinbase_value(&long).is_none(),
+    ));
+    out.push((
+        "and so is a truncated one",
+        ev::coinbase_value(&CB[..CB.len() - 1]).is_none()
+            && ev::coinbase_value(&CB[..20]).is_none(),
+    ));
+    // Stratum's coinbase is the non-witness serialisation by construction,
+    // because it is what the merkle root is taken over. A marker here means
+    // this is not the transaction the parser thinks it is.
+    let mut segwit = alloc::vec::Vec::from(&CB[..4]);
+    segwit.push(0x00);
+    segwit.push(0x01);
+    segwit.extend_from_slice(&CB[4..]);
+    out.push((
+        "a segwit marker is refused rather than skipped past",
+        ev::coinbase_value(&segwit).is_none(),
+    ));
+
+    // The two producers of an expected-hash count have to agree. A share at
+    // difficulty 1 costs 2^32 hashes by definition, and the difficulty-1
+    // *target* has to imply the same thing -- it is 0xFFFF * 2^208, so the
+    // exact answer is 2^48 / 0xFFFF, about 0.0015% above 2^32.
+    let d1 = u256::diff1();
+    let from_target = ev::expected_hashes(&d1).unwrap_or(0.0);
+    let from_diff = ev::share_hashes(1, 0);
+    let ratio = from_target / from_diff;
+    out.push((
+        "the difficulty-1 target implies the 2^32 hashes difficulty 1 costs",
+        ratio > 0.999 && ratio < 1.001,
+    ));
+    out.push((
+        "an easier difficulty costs proportionally fewer hashes",
+        (ev::share_hashes(1, 3) * 1000.0 - from_diff).abs() < 1.0,
+    ));
+    out.push((
+        "a zero target is refused rather than dividing by it",
+        ev::expected_hashes(&U256::ZERO).is_none(),
+    ));
+
+    // The unit picker, because a figure in seconds that should be in millennia
+    // is the one this whole block exists to make legible.
+    out.push((
+        "a duration is rendered in a unit that leaves it legible",
+        ev::render_seconds(30.0).1 == "seconds"
+            && ev::render_seconds(120.0).1 == "minutes"
+            && ev::render_seconds(90_000.0).1 == "days"
+            && ev::render_seconds(1.0e12).1 == "millennia",
+    ));
+
     out
 }
 

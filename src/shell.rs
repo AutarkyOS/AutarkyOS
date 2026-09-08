@@ -7568,6 +7568,7 @@ fn mine_cmd(rest: &str) {
             client::stop();
             kprintln!("  stopping");
         }
+        "ev" => mine_ev(),
         "log" => {
             let j = client::journal();
             if j.is_empty() {
@@ -7605,7 +7606,10 @@ fn mine_cmd(rest: &str) {
             client::probe(host, port, worker, 12);
         }
         other => {
-            kprintln!("  no such subverb '{}' -- try pool, user, on, off, log, probe", other)
+            kprintln!(
+                "  no such subverb '{}' -- try pool, user, on, off, ev, log, probe",
+                other
+            )
         }
     }
 }
@@ -7685,4 +7689,110 @@ fn mine_report() {
         "  best     {} leading zero bits (a display figure, never a decision)",
         client::BEST.load(Ordering::Relaxed)
     );
+    // Every run, as promised. Not behind a subverb somebody has to know about.
+    mine_ev();
+}
+
+/// The expected-value block.
+///
+/// `out/release/ROADMAP.md` promised the miner would print "its own terrible
+/// expected value on every run". Every line names where its number came from,
+/// and a line whose input is missing is absent rather than defaulted -- a
+/// guessed subsidy or an assumed difficulty produces a number that is
+/// confidently wrong, which is worse than a gap.
+fn mine_ev() {
+    use crate::mine::{client, ev};
+    use core::sync::atomic::Ordering;
+
+    console::set_color(YELLOW);
+    kprintln!("[mine ev]");
+    console::set_color(LTGRAY);
+
+    let hashes = client::HASHES.load(Ordering::Relaxed);
+    let ms = client::hash_ms();
+    if hashes == 0 || ms == 0 {
+        // Without a rate there is no expected value at all, and every line
+        // below divides by it. Nothing else is printed.
+        kprintln!("  nothing has been hashed, so there is no rate to reason from");
+        return;
+    }
+    let hs = (hashes as f64) * 1000.0 / (ms as f64);
+    kprintln!(
+        "  hashrate     {} H/s                measured, {} hashes in {} ms",
+        hs as u64,
+        hashes,
+        ms
+    );
+    if ms < 5_000 {
+        kprintln!("               short sample -- not a quotable rate");
+    }
+    kprintln!("  sharing      the core with {} task(s)", crate::task::count());
+
+    let (m, sc) = client::difficulty();
+    if m == 0 {
+        kprintln!("  share diff   not set by the pool yet");
+    } else {
+        kprintln!("  share diff   {} / 10^{}                on the wire", m, sc);
+        let per = ev::share_hashes(m, sc);
+        if per > 0.0 {
+            let hr = hs * 3600.0 / per;
+            kprintln!("  shares       {:.3} per hour             derived", hr);
+        }
+    }
+
+    let g = client::TEMPLATE.lock_irq();
+    let Some(t) = g.as_ref() else {
+        kprintln!("  network      no job, so nothing below can be said");
+        return;
+    };
+    kprintln!("  network      nbits {:08x}              on the wire", t.nbits);
+
+    match t.coin_value {
+        Some(v) => kprintln!(
+            "  block pays   {}.{:08}              summed from the coinbase outputs",
+            v / 100_000_000,
+            v % 100_000_000
+        ),
+        // Not a guess and not a constant. The subsidy is not a Stratum field
+        // and a hardcoded one goes stale across a halving.
+        None => {
+            kprintln!(
+                "  block pays   could not read the {}-byte coinbase, starting {:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
+                t.coinbase_len,
+                t.coinbase_head[0], t.coinbase_head[1], t.coinbase_head[2], t.coinbase_head[3],
+                t.coinbase_head[4], t.coinbase_head[5], t.coinbase_head[6], t.coinbase_head[7]
+            )
+        }
+    }
+
+    match crate::mine::u256::U256::from_nbits(t.nbits).and_then(|n| ev::expected_hashes(&n)) {
+        Some(need) => {
+            let secs = need / hs;
+            let (v, unit) = ev::render_seconds(secs);
+            kprintln!("  solo block   {:.1} {}                derived", v, unit);
+            let per_day = need / (hs * 86_400.0);
+            kprintln!("  odds         1 in {:.3e} on any given day", per_day);
+        }
+        None => kprintln!("  solo block   nbits does not give a target this can reason about"),
+    }
+
+    // Power, and only when it is a reading. QEMU models no embedded
+    // controller, so under emulation every battery figure is the firmware's
+    // fallback branch rather than a measurement -- which is why this says
+    // where the number came from rather than printing a watt count bare.
+    match crate::dev::battery::status() {
+        Some(c) if c.on_ac == Some(true) => {
+            kprintln!("  power        not measurable on mains -- no energy counter on this machine")
+        }
+        Some(c) => match c.rate_mw {
+            Some(mw) if mw > 0 => {
+                kprintln!("  power        {} mW total system draw, not this task's share", mw);
+                kprintln!("               a marginal figure needs an idle baseline to subtract");
+            }
+            _ => kprintln!("  power        the battery reports no rate"),
+        },
+        None => kprintln!("  power        no battery, so nothing here can measure energy"),
+    }
+
+    kprintln!("  price        unknown here, so every figure above is coins and not money");
 }

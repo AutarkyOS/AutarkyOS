@@ -86,6 +86,19 @@ pub struct Template {
     pub ntime_be: Vec<u8>,
     pub mid: super::hash::Midstate,
     pub target: super::u256::U256,
+    /// The network's own target, for the expected-value block. On the wire,
+    /// so it moves with the job and is never a constant.
+    pub nbits: u32,
+    /// What the pool is paying itself for this block, summed from the coinbase
+    /// outputs. `None` when the transaction did not parse exactly, in which
+    /// case the report omits every line that depends on it.
+    pub coin_value: Option<u64>,
+    /// How long the assembled coinbase was, and its first bytes. Printed when
+    /// the parse fails, because "could not read it" without saying what was
+    /// read is a diagnostic that sends you to the wrong file -- it cost a run
+    /// working out whether the stub or the assembly was wrong.
+    pub coinbase_len: usize,
+    pub coinbase_head: [u8; 8],
 }
 
 pub static TEMPLATE: Spin<Option<Template>> = Spin::new(None);
@@ -586,6 +599,16 @@ fn rebuild(s: &mut Session) {
         ntime_be,
         mid: super::hash::Midstate::new(&header),
         target,
+        nbits: job.nbits,
+        coin_value: super::ev::coinbase_value(&coinbase),
+        coinbase_len: coinbase.len(),
+        coinbase_head: {
+            let mut h = [0u8; 8];
+            for (i, b) in coinbase.iter().take(8).enumerate() {
+                h[i] = *b;
+            }
+            h
+        },
     });
     // Shares for a template nobody holds any more cannot be submitted: the job
     // id is gone and the extranonce2 has moved. Dropping them here is cheaper
