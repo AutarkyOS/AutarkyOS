@@ -249,6 +249,11 @@ pub const SUITES: &[Suite] = &[
         about: "the Wayland wire format, and which object ids belong to whom",
         run: sky_selftest,
     },
+    Suite {
+        name: "problem",
+        about: "a problem is checkable, and a trivial one is refused",
+        run: crate::ai::problem::selftest,
+    },
 ];
 
 /// The ported picture decoder.
@@ -449,7 +454,7 @@ fn linux_selftest() -> bool {
 /// says it exists to prevent. A `static` cannot be read in a const context, so
 /// the array cannot be measured directly; naming its length is the next best
 /// thing and it is now the only place the number appears.
-const SLOTS: usize = 42;
+const SLOTS: usize = 43;
 
 /// One slot per suite. Indexed by position in `SUITES`, which is a constant,
 /// so the table cannot get out of step with the list.

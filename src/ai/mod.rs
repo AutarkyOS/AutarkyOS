@@ -23,6 +23,7 @@ pub mod voter;
 pub mod harness;
 pub mod model;
 pub mod probe;
+pub mod problem;
 pub mod sample;
 pub mod skill;
 pub mod study;
@@ -1077,6 +1078,15 @@ pub fn init(model_blob: Option<Blob>, tok_blob: Option<Blob>) {
             crate::sysbox::children(vocab::CORPUS).len(),
             vocab::CORPUS
         );
+    }
+
+    // Problems, the other corpus. Seeded the same way and for the same
+    // reason: they live in the namespace, so a snapshot carries them.
+    let (fresh, total) = problem::seed();
+    if fresh > 0 {
+        kprintln!("  {} problem(s) seeded at {}", fresh, problem::ROOT);
+    } else if total > 0 {
+        kprintln!("  {} problem(s) at {}", total, problem::ROOT);
     }
 
     console::set_color(LTGREEN);

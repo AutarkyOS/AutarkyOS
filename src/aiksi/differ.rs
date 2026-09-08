@@ -160,6 +160,26 @@ impl Outcome {
     pub fn console(&self) -> &str {
         &self.console
     }
+
+    /// The answer, rendered. Rendered rather than typed because that is what
+    /// this harness compares, so a caller checking an answer against an
+    /// expected one uses the same notion of sameness the differ does.
+    pub fn value(&self) -> &str {
+        &self.value
+    }
+
+    /// What it cost. The number a budget stops and a verdict records.
+    pub fn steps(&self) -> u64 {
+        self.steps
+    }
+
+    /// Whether it failed. Named `errored` because `failed` is the constructor
+    /// above. The error text itself stays private: it is compared, not
+    /// consumed, and a caller branching on its wording would be a second place
+    /// that has to agree with the interpreter about phrasing.
+    pub fn errored(&self) -> bool {
+        self.error.is_some()
+    }
 }
 
 /// Run one program one way. `None` when the route does not apply to it.
