@@ -4,6 +4,7 @@ pub mod agent;
 pub mod author;
 pub mod adapter;
 pub mod abstraction;
+pub mod acquire;
 pub mod work;
 pub mod aixi;
 pub mod backward;

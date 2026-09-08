@@ -1693,7 +1693,7 @@ const LIB_MAX_BYTES: usize = 16 * 1024;
 /// The bar is read rather than constant, which is the point of the judge axis:
 /// a criterion the loop adopted and the judges ignored would be a certificate
 /// about nothing.
-fn judge_one(n_val: usize, fixed: usize, broke: usize) -> (bool, &'static str) {
+pub(crate) fn judge_one(n_val: usize, fixed: usize, broke: usize) -> (bool, &'static str) {
     // The bar is the one place this ladder varies, and it varies at the top of
     // the loop rather than inside it: `bar_in_force()` is read once here, so a
     // criterion the judge axis adopted reaches every caller. `passes_j1` is
@@ -3517,7 +3517,7 @@ pub const AXIS_NAMES: [&str; 7] = ["adapter", "rule", "skill", "deep", "lib", "c
 const RANKED: usize = 5;
 
 /// Which axis a ledger line came from.
-fn axis_of(line: &str) -> Option<usize> {
+pub(crate) fn axis_of(line: &str) -> Option<usize> {
     let at = line.find(" axis=")? + 6;
     let rest = &line[at..];
     let end = rest.find(' ').unwrap_or(rest.len());

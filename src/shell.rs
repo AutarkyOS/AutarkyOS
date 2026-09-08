@@ -3096,6 +3096,43 @@ fn execute(line: &str, boot: &BootInfo, acpi: &Option<Acpi>, interp: &mut aiksi:
                         None => kprintln!("  usage: godel judge <bar> [examples]"),
                     }
                 }
+                // `godel acquire` -- whether the ledger is long enough to fit
+                // an acquisition function, and whether the fitted one beats
+                // the heuristic it would replace.
+                "acquire" => {
+                    let r = crate::ai::acquire::replay_ledger();
+                    console::set_color(YELLOW);
+                    kprintln!("[godel] acquisition function");
+                    console::set_color(LTGRAY);
+                    kprintln!(
+                        "  {} sample(s) in the ledger, {} needed before a fit",
+                        r.samples,
+                        crate::ai::acquire::MIN_SAMPLES
+                    );
+                    if r.judged == 0 {
+                        kprintln!("  nothing judged yet -- the heuristic stands, and should");
+                    } else {
+                        let (won, why) = r.verdict();
+                        kprintln!(
+                            "  {} judged: fitted closer on {}, heuristic on {}",
+                            r.judged,
+                            r.learned_closer,
+                            r.laplace_closer
+                        );
+                        kprintln!(
+                            "  squared error {} against {}",
+                            (r.learned_err * 100.0) as u32 as f32 / 100.0,
+                            (r.laplace_err * 100.0) as u32 as f32 / 100.0
+                        );
+                        if won {
+                            console::set_color(LTGREEN);
+                            kprintln!("  the fitted estimator is better calibrated -- {}", why);
+                        } else {
+                            kprintln!("  keeping the heuristic -- {}", why);
+                        }
+                        console::set_color(LTGRAY);
+                    }
+                }
                 // `godel drift` -- how far the current criterion has moved from
                 // the one the machine started with, recomputed from the ledger
                 // rather than from a second stream that could fall out of step.
