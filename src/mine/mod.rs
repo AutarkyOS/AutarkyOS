@@ -19,6 +19,7 @@
 
 pub mod hash;
 pub mod header;
+pub mod stratum;
 pub mod u256;
 
 use alloc::vec::Vec;
@@ -205,6 +206,174 @@ pub fn checks() -> Vec<(&'static str, bool)> {
     out.push((
         "submit sends ntime and nonce big-endian, the header's bytes reversed",
         ntime_hex == [0x4d, 0xd7, 0xf5, 0xc7] && nonce_hex == [0x95, 0x46, 0xa1, 0x42],
+    ));
+
+    out.extend(stratum_checks());
+    out
+}
+
+/// The protocol half: framing, classification, and the difficulty trap.
+fn stratum_checks() -> Vec<(&'static str, bool)> {
+    use crate::json::Json;
+    use alloc::vec;
+    use stratum::{classify, decimal, parse_job, subscribe_result, take_line, unhex, Error, Message};
+
+    let mut out = Vec::new();
+
+    // --- framing ---
+    let mut buf: Vec<u8> = b"{\"id\":1}".to_vec();
+    out.push((
+        "a partial line is withheld rather than guessed at",
+        matches!(take_line(&mut buf), Ok(None)),
+    ));
+    buf.extend_from_slice(b"\n{\"id\":2}\n");
+    let first = take_line(&mut buf);
+    out.push((
+        "and completes when the rest of it arrives",
+        matches!(&first, Ok(Some(s)) if s == "{\"id\":1}"),
+    ));
+    out.push((
+        "a second line survives the first being taken",
+        matches!(take_line(&mut buf), Ok(Some(s)) if s == "{\"id\":2}"),
+    ));
+    out.push((
+        "and the buffer is empty afterwards",
+        matches!(take_line(&mut buf), Ok(None)) && buf.is_empty(),
+    ));
+    let mut crlf: Vec<u8> = b"{\"a\":1}\r\n".to_vec();
+    out.push((
+        "a CRLF terminator leaves no carriage return behind",
+        matches!(take_line(&mut crlf), Ok(Some(s)) if s == "{\"a\":1}"),
+    ));
+    let mut huge: Vec<u8> = vec![b'x'; stratum::MAX_LINE + 2];
+    out.push((
+        "a line with no terminator in sight is refused, not buffered forever",
+        take_line(&mut huge) == Err(Error::Oversize),
+    ));
+
+    // --- the difficulty trap, and the contrast that explains it ---
+    //
+    // The first of these two is the bug. `as_i64` splits at the decimal point,
+    // so a pool sending 0.001 hands the kernel a zero, and a target computed
+    // from zero either faults or accepts everything until the worker is banned.
+    // Asserting the wrong answer beside the right one is what stops somebody
+    // "simplifying" `decimal` back into `as_i64`.
+    out.push((
+        "as_i64 really does read 0.001 as zero, which is why decimal exists",
+        matches!(Json::parse("0.001"), Some(j) if j.as_i64() == Some(0)),
+    ));
+    out.push(("difficulty 0.001 reads as 1/10^3", decimal("0.001") == Some((1, 3))));
+    out.push(("difficulty 8192.5 keeps its half", decimal("8192.5") == Some((81925, 1))));
+    out.push(("a whole difficulty has no scale", decimal("8192") == Some((8192, 0))));
+    out.push((
+        "a difficulty too small to represent errs large, never to zero",
+        matches!(decimal("0.0000000001"), Some((m, _)) if m > 0),
+    ));
+    out.push((
+        "and a genuine zero is still zero, for target_for to refuse",
+        decimal("0") == Some((0, 0)),
+    ));
+    out.push((
+        "garbage and negatives are refused",
+        decimal("-1").is_none() && decimal("abc").is_none() && decimal("").is_none(),
+    ));
+
+    // --- hex ---
+    out.push((
+        "hex refuses an odd length and a non-hex byte",
+        unhex("abc").is_none() && unhex("zz").is_none(),
+    ));
+    out.push((
+        "and round-trips what it accepts",
+        unhex("00ff10").as_deref() == Some(&[0x00, 0xff, 0x10][..]),
+    ));
+
+    // --- classification by shape ---
+    let resp = classify("{\"id\":7,\"result\":true,\"error\":null}");
+    out.push((
+        "a message carrying result is a response, with its id",
+        matches!(&resp, Ok(Message::Response { id: 7, ok: true, .. })),
+    ));
+    out.push((
+        "an explicit error is a failed response, not a lost one",
+        matches!(
+            classify("{\"id\":8,\"result\":null,\"error\":[21,\"Job not found\",null]}"),
+            Ok(Message::Response { id: 8, ok: false, .. })
+        ),
+    ));
+    out.push((
+        "a result of false is a rejection even with no error object",
+        matches!(
+            classify("{\"id\":9,\"result\":false,\"error\":null}"),
+            Ok(Message::Response { ok: false, .. })
+        ),
+    ));
+    out.push((
+        "a method with a null id is a notification",
+        matches!(
+            classify("{\"id\":null,\"method\":\"mining.set_difficulty\",\"params\":[0.5]}"),
+            Ok(Message::Notify { .. })
+        ),
+    ));
+
+    // --- subscribe, whose result[0] differs between pools and is never read ---
+    let a = Json::parse(
+        "{\"id\":1,\"result\":[[[\"mining.set_difficulty\",\"b4b6\"],\
+         [\"mining.notify\",\"ae6812\"]],\"08000002\",4],\"error\":null}",
+    );
+    let b = Json::parse("{\"id\":1,\"result\":[\"deadbeef\",\"1a2b3c4d\",8],\"error\":null}");
+    out.push((
+        "a nested subscribe result gives up extranonce1 and its size",
+        matches!(a.as_ref().and_then(subscribe_result), Some((ref e, 4)) if e == &[0x08, 0x00, 0x00, 0x02]),
+    ));
+    out.push((
+        "and so does a flat one, because result[0] is never read",
+        matches!(b.as_ref().and_then(subscribe_result), Some((ref e, 8)) if e == &[0x1a, 0x2b, 0x3c, 0x4d]),
+    ));
+
+    // --- a job, with the real block's own fields ---
+    let notify = alloc::format!(
+        "{{\"id\":null,\"method\":\"mining.notify\",\"params\":[\"job1\",\"{}\",\
+         \"01000000\",\"ffffffff\",[],\"00000001\",\"1a44b9f2\",\"4dd7f5c7\",true]}}",
+        stratum::hex(&BTC_PREV_WIRE)
+    );
+    let job = match classify(&notify) {
+        Ok(Message::Notify { params, .. }) => parse_job(&params),
+        _ => None,
+    };
+    out.push((
+        "a notify parses into a job with the fields in the right order",
+        matches!(&job, Some(j)
+            if j.id == "job1"
+            && j.prev_wire == BTC_PREV_WIRE
+            && j.version == BTC_VERSION
+            && j.nbits == BTC_NBITS
+            && j.ntime == BTC_NTIME
+            && j.clean),
+    ));
+    out.push((
+        "a notify one parameter short is refused rather than defaulted",
+        matches!(
+            classify("{\"id\":null,\"method\":\"mining.notify\",\"params\":[\"j\",\"00\"]}"),
+            Ok(Message::Notify { ref params, .. }) if parse_job(params).is_none()
+        ),
+    ));
+
+    // --- what we send ---
+    let s = stratum::submit(3, "wk", "job1", &[0xaa, 0xbb], &[0x4d, 0xd7, 0xf5, 0xc7], &[0x95, 0x46, 0xa1, 0x42]);
+    out.push((
+        "a submit carries the job, the extranonce and both words as hex",
+        s.contains("\"mining.submit\"")
+            && s.contains("\"job1\"")
+            && s.contains("\"aabb\"")
+            && s.contains("\"4dd7f5c7\"")
+            && s.contains("\"9546a142\"")
+            && s.ends_with('\n'),
+    ));
+    out.push((
+        "and every message we send is one line",
+        stratum::subscribe(1).matches('\n').count() == 1
+            && stratum::authorize(2, "u", "p").matches('\n').count() == 1,
     ));
 
     out
