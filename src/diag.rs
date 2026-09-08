@@ -225,6 +225,11 @@ pub const SUITES: &[Suite] = &[
         run: wifi_selftest,
     },
     Suite {
+        name: "mine",
+        about: "block headers, targets, and the midstate",
+        run: mine_selftest,
+    },
+    Suite {
         name: "sockets",
         about: "the connection table, and which segment belongs to which one",
         run: sockets_selftest,
@@ -357,6 +362,21 @@ fn wifi_selftest() -> bool {
     ok
 }
 
+fn mine_selftest() -> bool {
+    use crate::kprintln;
+    let mut ok = true;
+    let mut n = 0usize;
+    for (what, good) in crate::mine::checks() {
+        n += 1;
+        if !good {
+            kprintln!("    FAIL: {}", what);
+            ok = false;
+        }
+    }
+    kprintln!("    {} claim(s)", n);
+    ok
+}
+
 fn sockets_selftest() -> bool {
     use crate::kprintln;
     let mut ok = true;
@@ -464,7 +484,7 @@ fn linux_selftest() -> bool {
 /// says it exists to prevent. A `static` cannot be read in a const context, so
 /// the array cannot be measured directly; naming its length is the next best
 /// thing and it is now the only place the number appears.
-const SLOTS: usize = 45;
+const SLOTS: usize = 46;
 
 /// One slot per suite. Indexed by position in `SUITES`, which is a constant,
 /// so the table cannot get out of step with the list.

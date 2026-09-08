@@ -33,6 +33,7 @@ mod aiksi;
 mod linux;
 mod log;
 mod mem;
+mod mine;
 mod net;
 mod pkg;
 /// What a program written somewhere else may ask of this machine.
@@ -1370,6 +1371,31 @@ fn selftest(acpi_ref: &Option<acpi::Acpi>) {
         console::set_color(LTRED);
         kprintln!("[selftest] the console cannot be trusted to draw what it was given");
         console::set_color(LTGRAY_IDX);
+    }
+
+    // Cheap, pure, and no network: header assembly, the target arithmetic and
+    // the midstate. Every mistake available in that code is silent -- a header
+    // with two bytes swapped hashes at full speed and is rejected forever --
+    // so it earns a place in the boot sequence rather than only in `diag`.
+    kprintln!("
+[selftest] mining:");
+    {
+        let mut bad = 0usize;
+        let mut n = 0usize;
+        for (what, good) in mine::checks() {
+            n += 1;
+            if !good {
+                bad += 1;
+                console::set_color(LTRED);
+                kprintln!("  FAIL {}", what);
+                console::set_color(LTGRAY_IDX);
+            }
+        }
+        if bad == 0 {
+            console::set_color(LTGREEN);
+            kprintln!("  ok   {} claim(s), block 125552 reassembles and hashes", n);
+            console::set_color(LTGRAY_IDX);
+        }
     }
 
     kprintln!("
