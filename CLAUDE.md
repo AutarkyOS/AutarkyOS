@@ -3552,6 +3552,38 @@ Two gotchas paid for here:
   is not `lapic::timer_hz()` (the calibrated APIC frequency, in the millions).
   Dividing uptime by the latter put every reading at 0s. `mem` and `uptime` use
   `TIMER_HZ`; so must anything converting ticks to seconds.
+
+  **That last sentence was wrong for as long as there have been other cores,
+  and it is the reason this entry is worth reading twice.** `TICKS` is one
+  global counter and `timer_isr` incremented it unconditionally -- while every
+  application processor starts its own periodic timer on the same vector, with
+  the same handler, because `init_this_core` deliberately does not re-register
+  per-core entries. So `ticks()` advanced at **N x TIMER_HZ**, and every
+  duration derived from it was wrong by the core count.
+
+  The expensive one was `tcp::wait_until`, whose deadline is
+  `ticks() + ms * TIMER_HZ / 1000`: **every network timeout in the kernel was
+  short by the core count.** A 15 s TLS deadline was 3.75 s under the tooling's
+  default `-smp 4`, and would be under a second on the GF63's sixteen logical
+  processors -- which is a candidate explanation for fetch and handshake
+  failures on hardware that never reproduced here. `uptime` was wrong the other
+  way, and the model selftest's tokens/sec under-reported by the same factor,
+  since it both sampled a shorter window and divided by too many ticks.
+
+  Measured: a 4-core guest reported **55.58 s of uptime during a 25 s run**,
+  longer than the whole invocation including QEMU startup, against 8.01 s for
+  the same script at `-smp 1`. Only the bootstrap processor increments now.
+
+  Two things about how it hid for so long. The `[selftest] timer` line printed
+  "N ticks in ~0.5 s" where the 0.5 was **a constant in the format string**, so
+  it read identically however fast the counter was really moving; it is timed
+  against the TSC now and fails if the two clocks disagree. And the benchmarks
+  that *are* trustworthy -- `smp bench`, `video bench`, `core bench` and the
+  decode figures -- all use `rdtsc`/`tsc_mhz`, which is exactly why the decode
+  numbers came out consistent across 1, 2 and 4 cores. Had they been
+  tick-based they would have differed fourfold. **Anything measuring a duration
+  should use `rdtsc`; `ticks()` is for wall-clock-ish elapsed time and nothing
+  else.**
 - **`win keys` bypasses the hardware ISR**, so scripted keystrokes do not feed
   the entropy ring. Only real hardware events do. That is correct, since the
   entropy *is* hardware timing, and it means headless tests show "fed by ~1

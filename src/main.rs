@@ -1200,8 +1200,15 @@ fn selftest(acpi_ref: &Option<acpi::Acpi>) {
     console::set_color(LTGREEN);
     kprintln!("\n[selftest] timer:");
     console::set_color(LTGRAY_IDX);
+    // Timed against the TSC rather than labelled. This printed "N ticks in
+    // ~0.5 s" for a long time, where the 0.5 was a constant in the format
+    // string and not a measurement -- so it read identically however fast the
+    // counter was really advancing, and could not see that every core's timer
+    // ISR was incrementing one global `TICKS`. Two clocks that are supposed to
+    // agree do not stay agreeing on their own.
+    let t0 = time::rdtsc();
     let start = dev::lapic::ticks();
-    let want = start + TIMER_HZ as u64 / 2; // half a second
+    let want = start + TIMER_HZ as u64 / 2; // half a second, if ticks are honest
     let mut spins: u64 = 0;
     while dev::lapic::ticks() < want {
         spins += 1;
@@ -1211,12 +1218,34 @@ fn selftest(acpi_ref: &Option<acpi::Acpi>) {
         core::hint::spin_loop();
     }
     let elapsed = dev::lapic::ticks() - start;
-    if elapsed >= TIMER_HZ as u64 / 2 {
-        console::set_color(LTGREEN);
-        kprintln!("  {} ticks in ~0.5 s -- interrupts are firing", elapsed);
+    let mhz = time::tsc_mhz();
+    let real_ms = if mhz > 0 {
+        (time::rdtsc() - t0) / (mhz * 1000)
     } else {
+        0
+    };
+    if elapsed < TIMER_HZ as u64 / 2 {
         console::set_color(LTRED);
         kprintln!("  only {} ticks -- timer is not delivering", elapsed);
+    } else if mhz == 0 {
+        kprintln!("  {} ticks -- firing, but the TSC is uncalibrated", elapsed);
+    } else {
+        // 500 ms expected. Allow a wide band: this is a spin loop on an
+        // emulator and the point is to catch a rate wrong by a whole core
+        // count, not to measure the crystal.
+        let ok = (350..=750).contains(&real_ms);
+        console::set_color(if ok { LTGREEN } else { LTRED });
+        kprintln!(
+            "  {} {} ticks in {} ms of TSC time -- {}",
+            if ok { "ok  " } else { "FAIL" },
+            elapsed,
+            real_ms,
+            if ok {
+                "the two clocks agree"
+            } else {
+                "ticks() disagrees with the TSC; is every core incrementing it?"
+            }
+        );
     }
 
     console::set_color(LTGREEN);
