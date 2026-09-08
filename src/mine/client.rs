@@ -679,3 +679,176 @@ fn mine_task() {
 pub fn next_id() -> u64 {
     NEXT_ID.fetch_add(1, Ordering::Relaxed)
 }
+
+/// Connect, subscribe, listen for a few seconds, print what a real server said,
+/// and disconnect. No hashing, no worker address, no background task.
+///
+/// This exists because the stub cannot produce the two things that matter most:
+/// a **non-empty merkle branch** and a real coinbase. `merkle_root`'s fold has
+/// never run against real data -- the fixture's branch is empty, so the loop
+/// body has literally never executed outside a one-element synthetic case --
+/// and `from_nbits` has never met a live network target. Both are decoded and
+/// printed here so a person can check them against a block explorer.
+///
+/// Runs on the caller's task and blocks, the way `https` does. Bounded, because
+/// `drive.py` sends the next command when it sees a prompt and an unbounded
+/// full-screen command deadlocks it -- the lesson `port bars <ms>` records.
+pub fn probe(host: &str, port: u16, worker: &str, seconds: u64) {
+    use crate::kprintln;
+
+    kprintln!("  resolving {}", host);
+    let ip = match crate::net::dns::lookup(host) {
+        Ok(ip) => ip,
+        Err(e) => {
+            kprintln!("  could not resolve: {:?}", e);
+            return;
+        }
+    };
+    kprintln!("  {}.{}.{}.{}:{}", ip[0], ip[1], ip[2], ip[3], port);
+
+    let h = match tcp::open(ip, port, CONNECT_MS) {
+        Ok(h) => h,
+        Err(e) => {
+            kprintln!("  could not connect: {:?}", e);
+            return;
+        }
+    };
+    let mut s = Session {
+        h,
+        buf: Vec::new(),
+        e1: Vec::new(),
+        e2_size: 4,
+        job: None,
+        e2: 0,
+        pending: Vec::new(),
+    };
+
+    if tcp::send_at(s.h, stratum::subscribe(1).as_bytes(), 5_000).is_err() {
+        kprintln!("  could not send subscribe");
+        tcp::abort_at(s.h);
+        return;
+    }
+    // Authorize as well, because many pools send no work until a worker is
+    // named. A refusal is printed and the probe carries on: the subscribe
+    // result is worth having either way, and what the pool says when it says no
+    // is itself one of the things nothing here has ever seen.
+    if !worker.is_empty() {
+        let _ = tcp::send_at(s.h, stratum::authorize(2, worker, "x").as_bytes(), 5_000);
+    }
+
+    let deadline = now_ms() + seconds * 1000;
+    let mut jobs = 0usize;
+    while now_ms() < deadline {
+        let data = tcp::recv_at(s.h, 500);
+        if data.is_empty() && !tcp::alive(s.h) {
+            kprintln!("  the pool closed the connection");
+            break;
+        }
+        s.buf.extend_from_slice(&data);
+        loop {
+            match stratum::take_line(&mut s.buf) {
+                Ok(Some(line)) => {
+                    match stratum::classify(&line) {
+                        Ok(Message::Response { id, ok, body }) => {
+                            kprintln!("  <- response id {} {}", id, if ok { "ok" } else { "error" });
+                            if id == 1 {
+                                match stratum::subscribe_result(&body) {
+                                    Some((e1, size)) => {
+                                        kprintln!(
+                                            "     extranonce1 {} ({} byte(s)), extranonce2 size {}",
+                                            stratum::hex(&e1),
+                                            e1.len(),
+                                            size
+                                        );
+                                        s.e1 = e1;
+                                        s.e2_size = size;
+                                    }
+                                    None => kprintln!("     could not read the subscribe result"),
+                                }
+                            }
+                            if !ok {
+                                let why = body
+                                    .get("error")
+                                    .and_then(|e| e.idx(1))
+                                    .and_then(|m| m.as_str())
+                                    .unwrap_or("no reason given");
+                                kprintln!("     reason: {}", why);
+                            }
+                        }
+                        Ok(Message::Notify { method, params }) => {
+                            kprintln!("  <- {}", method);
+                            if method == "mining.set_difficulty" {
+                                if let Some(crate::json::Json::Num(t)) = params.idx(0) {
+                                    match stratum::decimal(t) {
+                                        Some((m, sc)) => {
+                                            kprintln!("     difficulty {} / 10^{}", m, sc)
+                                        }
+                                        None => kprintln!("     unreadable difficulty '{}'", t),
+                                    }
+                                }
+                            } else if method == "mining.notify" {
+                                match stratum::parse_job(&params) {
+                                    Some(j) => {
+                                        jobs += 1;
+                                        dump_job(&s, &j);
+                                    }
+                                    None => kprintln!("     could not parse the job"),
+                                }
+                            }
+                        }
+                        Err(_) => kprintln!("  <- unreadable line"),
+                    }
+                }
+                Ok(None) => break,
+                Err(_) => {
+                    kprintln!("  the pool sent a line too long to be a message");
+                    break;
+                }
+            }
+        }
+    }
+    tcp::close_at(s.h, 2_000);
+    kprintln!("  done -- {} job(s) seen", jobs);
+}
+
+/// Print a real job in enough detail to check it against a block explorer.
+fn dump_job(s: &Session, j: &stratum::Job) {
+    use crate::kprintln;
+    kprintln!("     job      {}", j.id);
+    kprintln!("     prevhash {}", stratum::hex(&j.prev_wire));
+    kprintln!(
+        "     coinbase {} + {} byte(s) around a {}-byte extranonce",
+        j.coinb1.len(),
+        j.coinb2.len(),
+        s.e1.len() + s.e2_size
+    );
+    kprintln!(
+        "     version {:08x}  nbits {:08x}  ntime {:08x}  clean {}",
+        j.version,
+        j.nbits,
+        j.ntime,
+        j.clean
+    );
+    match super::u256::U256::from_nbits(j.nbits) {
+        Some(t) => {
+            let b = t.to_be_bytes();
+            kprintln!(
+                "     network target {:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}..",
+                b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]
+            );
+        }
+        None => kprintln!("     nbits {:08x} is not a target this can express", j.nbits),
+    }
+    // The part the stub could not reach. A real branch is several levels deep,
+    // and until now the fold has only ever run over an empty one.
+    kprintln!("     merkle branch {} level(s)", j.branch.len());
+    let mut e2 = alloc::vec![0u8; s.e2_size];
+    if let Some(last) = e2.last_mut() {
+        *last = 1;
+    }
+    let cb = super::header::coinbase(&j.coinb1, &s.e1, &e2, &j.coinb2);
+    let root = super::header::merkle_root(&cb, &j.branch);
+    kprintln!("     coinbase {} byte(s), merkle root {}", cb.len(), stratum::hex(&root));
+    let header = super::header::assemble(j.version, &j.prev_wire, &root, j.ntime, j.nbits, 0);
+    kprintln!("     header   {}", stratum::hex(&header[..16]));
+}

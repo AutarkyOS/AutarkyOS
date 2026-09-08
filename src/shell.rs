@@ -7577,7 +7577,36 @@ fn mine_cmd(rest: &str) {
                 kprintln!("  {}", line);
             }
         }
-        other => kprintln!("  no such subverb '{}' -- try pool, user, on, off, log", other),
+        // Bounded, and that is not a nicety: `drive.py` sends the next command
+        // when it sees a prompt, so an unbounded listen would leave the harness
+        // with commands unsent. The lesson `port bars <ms>` records.
+        "probe" => {
+            if arg.is_empty() {
+                kprintln!("  usage: mine probe <host>[:port] [worker]");
+                kprintln!("  connects, subscribes, prints one job and disconnects. No hashing.");
+                return;
+            }
+            let mut w = arg.splitn(2, ' ');
+            let target = w.next().unwrap_or("").trim();
+            let worker = w.next().unwrap_or("").trim();
+            let (host, port) = match target.rsplit_once(':') {
+                Some((h, p)) => match p.parse::<u16>() {
+                    Ok(n) => (h, n),
+                    Err(_) => {
+                        kprintln!("  '{}' is not a port", p);
+                        return;
+                    }
+                },
+                None => (target, 3333u16),
+            };
+            console::set_color(YELLOW);
+            kprintln!("[mine probe] {}:{}", host, port);
+            console::set_color(LTGRAY);
+            client::probe(host, port, worker, 12);
+        }
+        other => {
+            kprintln!("  no such subverb '{}' -- try pool, user, on, off, log, probe", other)
+        }
     }
 }
 

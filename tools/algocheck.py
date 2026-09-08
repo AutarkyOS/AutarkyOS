@@ -44,6 +44,36 @@ B2S_SEED = (b"GLaDOS blake2s vector "
 B2S_VERIFY_NONCE = 0x12345678
 
 
+# ---- the merkle branch a stratum client folds ---------------------------
+#
+# The kernel carries this branch and this root as a claim. It is here because a
+# generator of expected values must not be the thing that checks them: the root
+# below is hashlib's, and the kernel's `merkle_root` has to arrive at it
+# independently.
+#
+# Eleven leaves, so the tree is four levels deep and one level has an odd node.
+# Bitcoin duplicates the last hash there, and that is the rule a fold gets wrong
+# first -- and gets wrong by producing 32 perfectly plausible bytes.
+MERKLE_COINBASE = bytes(8)
+MERKLE_LEAVES = 11
+
+
+def merkle_branch_ref():
+    """The leftmost leaf's branch, and the root, computed with hashlib."""
+    def d(b):
+        return hashlib.sha256(hashlib.sha256(b).digest()).digest()
+
+    leaves = [d(bytes([i]) * 8) for i in range(MERKLE_LEAVES)]
+    branch, level, idx = [], list(leaves), 0
+    while len(level) > 1:
+        if len(level) % 2:
+            level.append(level[-1])
+        branch.append(level[idx ^ 1])
+        level = [d(level[i] + level[i + 1]) for i in range(0, len(level), 2)]
+        idx //= 2
+    return branch, level[0]
+
+
 def sha256d_expect():
     return hashlib.sha256(hashlib.sha256(BTC_HEADER).digest()).digest().hex()
 
@@ -138,6 +168,22 @@ def selftest():
     claim("the raw digest is the reverse of the displayed id",
           d.hex() == "1dbd981fe6985776b644b173a4d0385ddc1aa2a829688d1e"
                      "0000000000000000")
+    # The merkle fold, which the kernel also performs. Both halves matter: that
+    # the branch reproduces the root, and that its *order* is load-bearing --
+    # a fold that concatenated a set rather than a sequence would pass the
+    # first check on a two-level tree and fail here.
+    branch, root = merkle_branch_ref()
+    r = MERKLE_COINBASE
+    r = hashlib.sha256(hashlib.sha256(r).digest()).digest()
+    for sib in branch:
+        r = hashlib.sha256(hashlib.sha256(r + sib).digest()).digest()
+    claim("the branch folds the coinbase to the root", r == root)
+    claim("the tree is deep enough to have an odd level", len(branch) == 4)
+    rr = hashlib.sha256(hashlib.sha256(MERKLE_COINBASE).digest()).digest()
+    for sib in reversed(branch):
+        rr = hashlib.sha256(hashlib.sha256(rr + sib).digest()).digest()
+    claim("and reversing the branch does not land on the same root", rr != root)
+
     claim("the blake2s block is 64 bytes", len(B2S_SEED) == 64)
 
     # The heavy step, against properties rather than a published vector --
