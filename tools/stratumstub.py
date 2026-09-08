@@ -132,8 +132,19 @@ def main():
         return 2
 
     s = socket.socket()
-    s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    s.bind(("0.0.0.0", args.port))
+    # **No SO_REUSEADDR.** On Windows that flag does not mean "reuse a socket in
+    # TIME_WAIT", it means a second process may bind a port the first is still
+    # listening on, and connections then go to whichever the stack feels like.
+    # Six of these accumulated during one session and the guest kept reaching an
+    # old one with a different difficulty, which read as the kernel ignoring a
+    # set_difficulty it had actually never been sent. Failing to bind is the
+    # correct outcome and it is loud.
+    try:
+        s.bind(("0.0.0.0", args.port))
+    except OSError as e:
+        print("cannot bind :%d -- is another stub still running? (%s)"
+              % (args.port, e), file=sys.stderr)
+        return 2
     s.listen(4)
     print("stratum stub on :%d, difficulty %r" % (args.port, args.difficulty), flush=True)
     while True:

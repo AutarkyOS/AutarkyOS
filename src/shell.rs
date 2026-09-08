@@ -7620,8 +7620,40 @@ fn mine_report() {
         }
         None => kprintln!("  job      none"),
     }
-    // Said plainly, because the whole point of this stage is that it connects
-    // and does not yet mine. A report that omitted it would read as a miner
-    // that is running and finding nothing.
-    kprintln!("  hashing  not implemented yet -- this stage receives work only");
+    drop(g);
+
+    use core::sync::atomic::Ordering;
+    let hashes = client::HASHES.load(Ordering::Relaxed);
+    let ms = client::hash_ms();
+    if hashes == 0 {
+        kprintln!("  hashing  nothing hashed yet");
+    } else {
+        // The rate, the sample it came from, and how many tasks were sharing
+        // the core. CLAUDE.md requires the sample size wherever a figure
+        // appears, and the task count is here because this loop gets a
+        // round-robin share rather than a core: quoting a rate without it
+        // invites comparing it against a flat-out figure this machine never
+        // delivers.
+        let hs = if ms > 0 { hashes * 1000 / ms } else { 0 };
+        kprintln!(
+            "  hashing  {} H/s over {} hashes in {} ms, sharing the core with {} task(s)",
+            hs,
+            hashes,
+            ms,
+            crate::task::count()
+        );
+        if ms < 5_000 {
+            kprintln!("           short sample -- not a quotable rate");
+        }
+    }
+    kprintln!(
+        "  shares   {} found, {} accepted, {} rejected",
+        client::FOUND.load(Ordering::Relaxed),
+        client::ACCEPTED.load(Ordering::Relaxed),
+        client::REJECTED.load(Ordering::Relaxed)
+    );
+    kprintln!(
+        "  best     {} leading zero bits (a display figure, never a decision)",
+        client::BEST.load(Ordering::Relaxed)
+    );
 }

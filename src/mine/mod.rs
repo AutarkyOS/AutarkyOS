@@ -279,6 +279,27 @@ fn stratum_checks() -> Vec<(&'static str, bool)> {
         decimal("-1").is_none() && decimal("abc").is_none() && decimal("").is_none(),
     ));
 
+    // JSON numbers may carry an exponent and a pool that sends one must not be
+    // ignored. This was a real miss: a stub whose difficulty Python serialised
+    // as `1e-05` was refused, the previous difficulty stayed in force, and the
+    // miner hashed against a target the pool had not set with nothing printed.
+    out.push((
+        "1e-05 is the same difficulty as 0.00001",
+        decimal("1e-05") == decimal("0.00001") && decimal("1e-05") == Some((1, 5)),
+    ));
+    out.push((
+        "a positive exponent multiplies out to a whole difficulty",
+        decimal("1.5e3") == Some((1500, 0)) && decimal("2E2") == Some((200, 0)),
+    ));
+    out.push((
+        "an exponent past the scale cap clamps large, never to zero",
+        matches!(decimal("1e-10"), Some((m, s)) if m > 0 && s == stratum::MAX_SCALE),
+    ));
+    out.push((
+        "a malformed exponent is refused rather than half-read",
+        decimal("1e").is_none() && decimal("1e+").is_none() && decimal("1ex").is_none(),
+    ));
+
     // --- hex ---
     out.push((
         "hex refuses an odd length and a non-hex byte",

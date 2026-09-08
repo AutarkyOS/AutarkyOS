@@ -88,11 +88,40 @@ pub fn take_line(buf: &mut Vec<u8>) -> Result<Option<String>, Error> {
 /// The cap is also what makes `target_for`'s multiplication provably safe:
 /// `diff1` has 32 leading zero bits, so multiplying it by `10^8` cannot
 /// overflow 256 bits.
+/// JSON numbers may carry an exponent, and a pool that sends one must not be
+/// silently ignored.
+///
+/// This was found by a stub whose difficulty Python serialised as `1e-05`: the
+/// reader refused it, `handle_notify` kept the previous value, and the miner
+/// went on hashing against a difficulty the pool had not set. Nothing printed.
+/// That is the exact shape of failure this whole function exists to prevent, so
+/// refusing the notation would have been fixing half of it.
+fn split_exponent(t: &str) -> Option<(&str, i32)> {
+    let Some(pos) = t.bytes().position(|b| b == b'e' || b == b'E') else {
+        return Some((t, 0));
+    };
+    let (mant, exp) = t.split_at(pos);
+    let exp = &exp[1..];
+    let (neg, digits) = match exp.as_bytes().first() {
+        Some(b'-') => (true, &exp[1..]),
+        Some(b'+') => (false, &exp[1..]),
+        _ => (false, exp),
+    };
+    if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    // Bounded well outside any difficulty anybody will ever set, so a hostile
+    // exponent cannot make the scale arithmetic below do work.
+    let v: i32 = digits.parse().ok().filter(|&v: &i32| v <= 64)?;
+    Some((mant, if neg { -v } else { v }))
+}
+
 pub fn decimal(text: &str) -> Option<(u64, u32)> {
     let t = text.trim();
     if t.is_empty() || t.starts_with('-') {
         return None;
     }
+    let (t, exp) = split_exponent(t)?;
     let (int_part, frac_part) = match t.split_once('.') {
         Some((a, b)) => (a, b),
         None => (t, ""),
@@ -102,10 +131,21 @@ pub fn decimal(text: &str) -> Option<(u64, u32)> {
     {
         return None;
     }
-    let scale = core::cmp::min(frac_part.len(), MAX_SCALE as usize);
+    // A negative exponent is more fraction; a positive one is less. Applied to
+    // the scale rather than to the mantissa wherever it can be, because the
+    // mantissa is what overflows.
+    let want = frac_part.len() as i64 - exp as i64;
+    let scale_i = want.clamp(0, MAX_SCALE as i64);
+    let scale = scale_i as usize;
+    // How many fraction digits to consume, and how many zeros to append.
+    let take = core::cmp::min(frac_part.len(), (scale_i + exp as i64).max(0) as usize);
+    let pad = ((scale_i + exp as i64) - take as i64).max(0) as usize;
     let mut m: u64 = 0;
-    for b in int_part.bytes().chain(frac_part.bytes().take(scale)) {
+    for b in int_part.bytes().chain(frac_part.bytes().take(take)) {
         m = m.checked_mul(10)?.checked_add((b - b'0') as u64)?;
+    }
+    for _ in 0..pad {
+        m = m.checked_mul(10)?;
     }
     // A difficulty small enough to truncate to nothing is still not zero, and a
     // zero mantissa is a division this cannot do. The smallest representable

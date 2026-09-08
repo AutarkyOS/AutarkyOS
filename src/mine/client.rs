@@ -73,15 +73,56 @@ pub struct Config {
 pub static CONFIG: Spin<Option<Config>> = Spin::new(None);
 
 /// The job in force, already reduced to what a hash loop needs.
+///
+/// Carries the midstate rather than only the header, so the hash loop clones a
+/// forty-byte state per batch instead of re-absorbing sixty-four bytes. And it
+/// carries `extranonce2` and `ntime_be` because the submit has to send the
+/// *same* bytes that were hashed: formatting them a second time at submit is
+/// how a client ends up submitting a share for a header it never built.
 pub struct Template {
     pub serial: u64,
     pub job_id: String,
     pub extranonce2: Vec<u8>,
-    pub header: [u8; 80],
+    pub ntime_be: Vec<u8>,
+    pub mid: super::hash::Midstate,
     pub target: super::u256::U256,
 }
 
 pub static TEMPLATE: Spin<Option<Template>> = Spin::new(None);
+
+/// A share, waiting for the socket task to send it.
+pub struct Share {
+    pub serial: u64,
+    pub job_id: String,
+    pub extranonce2: Vec<u8>,
+    pub ntime_be: Vec<u8>,
+    pub nonce_be: Vec<u8>,
+}
+
+pub static SHARES: Spin<Vec<Share>> = Spin::new(Vec::new());
+
+/// Set by `mine hash on|off`, separately from the connection.
+pub static MINING: AtomicBool = AtomicBool::new(true);
+pub static HASHES: AtomicU64 = AtomicU64::new(0);
+pub static FOUND: AtomicU64 = AtomicU64::new(0);
+pub static ACCEPTED: AtomicU64 = AtomicU64::new(0);
+pub static REJECTED: AtomicU64 = AtomicU64::new(0);
+/// Best leading-zero count this run. A display figure, never a decision.
+pub static BEST: AtomicU32 = AtomicU32::new(0);
+/// When hashing started, for the rate. TSC milliseconds, never `lapic::ticks`.
+static HASH_SINCE: AtomicU64 = AtomicU64::new(0);
+
+/// Nonces per batch. About 1.5 ms of work, so the template check between
+/// batches costs nothing and `mine off` is felt within one.
+const BATCH: u32 = 4096;
+
+pub fn hash_ms() -> u64 {
+    let t0 = HASH_SINCE.load(Ordering::Relaxed);
+    if t0 == 0 {
+        return 0;
+    }
+    now_ms().saturating_sub(t0)
+}
 
 /// Connection and share history, newest last.
 static LOG: Racy<Vec<String>> = Racy::new(Vec::new());
@@ -148,13 +189,21 @@ pub fn start() -> Result<(), &'static str> {
         return Ok(());
     }
     match crate::task::spawn("stratum", stratum_task) {
-        Some(_) => Ok(()),
+        Some(_) => {}
         None => {
             SPAWNED.store(false, Ordering::Release);
             ENABLED.store(false, Ordering::Release);
-            Err("no task slot free")
+            return Err("no task slot free");
         }
     }
+    // The hash loop is a second task and not a branch of the first. The socket
+    // task spends its life blocked in `recv_at`, which is what keeps the TCP
+    // stack alive; hashing inside that loop would stop it doing so for the
+    // length of every batch.
+    if crate::task::spawn("miner", mine_task).is_none() {
+        note("no task slot for the hash loop -- connected, but not mining");
+    }
+    Ok(())
 }
 
 pub fn stop() {
@@ -197,6 +246,8 @@ struct Session {
     job: Option<stratum::Job>,
     /// Counter feeding extranonce2.
     e2: u64,
+    /// Submit ids we are still waiting on.
+    pending: Vec<u64>,
 }
 
 fn stratum_task() {
@@ -268,6 +319,7 @@ fn connect() -> Option<Session> {
         e2_size: 4,
         job: None,
         e2: 0,
+        pending: Vec::new(),
     };
 
     if tcp::send_at(s.h, stratum::subscribe(1).as_bytes(), 5_000).is_err() {
@@ -361,6 +413,9 @@ fn run(s: &mut Session) {
     set_phase(Phase::Live);
     LIVE.store(true, Ordering::Release);
     while ENABLED.load(Ordering::Acquire) {
+        if !drain_shares(s) {
+            return;
+        }
         if !fill(s) {
             return;
         }
@@ -368,7 +423,7 @@ fn run(s: &mut Session) {
             match stratum::take_line(&mut s.buf) {
                 Ok(Some(line)) => match stratum::classify(&line) {
                     Ok(Message::Notify { method, params }) => handle_notify(s, &method, &params),
-                    Ok(Message::Response { .. }) => {}
+                    Ok(Message::Response { id, ok, body }) => on_submit_reply(s, id, ok, &body),
                     Err(_) => {}
                 },
                 Ok(None) => break,
@@ -381,6 +436,71 @@ fn run(s: &mut Session) {
     }
 }
 
+/// Send whatever the hash loop found. `false` if the socket has gone.
+fn drain_shares(s: &mut Session) -> bool {
+    loop {
+        let Some(sh) = SHARES.lock_irq().pop() else {
+            return true;
+        };
+        let user = {
+            let g = CONFIG.lock_irq();
+            match g.as_ref() {
+                Some(c) => c.user.clone(),
+                None => return true,
+            }
+        };
+        let id = next_id();
+        let msg = stratum::submit(
+            id,
+            &user,
+            &sh.job_id,
+            &sh.extranonce2,
+            &sh.ntime_be,
+            &sh.nonce_be,
+        );
+        if tcp::send_at(s.h, msg.as_bytes(), 5_000).is_err() {
+            note("could not send a share; the connection is going");
+            return false;
+        }
+        // Bounded. A pool that never answers must not grow this forever, and
+        // what an unanswered submit means is a half-dead connection rather
+        // than a rejection -- which is why it is not counted as one.
+        if s.pending.len() >= 32 {
+            s.pending.remove(0);
+        }
+        s.pending.push(id);
+    }
+}
+
+/// A reply to one of our submits.
+///
+/// The reason string is printed verbatim and that is the instrument, not
+/// decoration. A pool saying "job not found" is telling you about staleness;
+/// "low difficulty share" is telling you the target arithmetic is wrong; and
+/// "invalid nonce" is telling you the byte order is. Folding those into a
+/// counter throws away the only feedback loop that can tell them apart, and
+/// nothing in this tree has yet seen one from a real server.
+fn on_submit_reply(s: &mut Session, id: u64, ok: bool, body: &crate::json::Json) {
+    let Some(pos) = s.pending.iter().position(|&p| p == id) else {
+        return;
+    };
+    s.pending.remove(pos);
+    if ok {
+        ACCEPTED.fetch_add(1, Ordering::Relaxed);
+        note("share accepted");
+        return;
+    }
+    REJECTED.fetch_add(1, Ordering::Relaxed);
+    let why = body
+        .get("error")
+        .and_then(|e| e.idx(1))
+        .and_then(|m| m.as_str())
+        .unwrap_or("no reason given");
+    let mut line = String::from("share rejected: ");
+    line.push_str(why);
+    note(&line);
+}
+
 fn handle_notify(s: &mut Session, method: &str, params: &crate::json::Json) {
     match method {
         "mining.set_difficulty" => {
@@ -390,10 +510,18 @@ fn handle_notify(s: &mut Session, method: &str, params: &crate::json::Json) {
                 crate::json::Json::Num(t) => t.as_str(),
                 _ => return,
             };
-            if let Some((m, sc)) = stratum::decimal(text) {
-                DIFF_M.store(m, Ordering::Relaxed);
-                DIFF_S.store(sc, Ordering::Relaxed);
-                rebuild(s);
+            match stratum::decimal(text) {
+                Some((m, sc)) => {
+                    DIFF_M.store(m, Ordering::Relaxed);
+                    DIFF_S.store(sc, Ordering::Relaxed);
+                    rebuild(s);
+                }
+                // Never silently. Keeping the previous difficulty leaves the
+                // miner hashing against a target the pool did not set and
+                // submitting nothing, which looks exactly like a miner that is
+                // broken. Found by a stub whose difficulty Python serialised
+                // as `1e-05`.
+                None => note("could not read the difficulty the pool sent"),
             }
         }
         "mining.notify" => {
@@ -449,14 +577,103 @@ fn rebuild(s: &mut Session) {
         job.nbits,
         0,
     );
+    let (ntime_be, _) = super::header::submit_hex(&header);
     let serial = JOB_SERIAL.fetch_add(1, Ordering::AcqRel) + 1;
     *TEMPLATE.lock_irq() = Some(Template {
         serial,
         job_id: job.id.clone(),
         extranonce2: e2,
-        header,
+        ntime_be,
+        mid: super::hash::Midstate::new(&header),
         target,
     });
+    // Shares for a template nobody holds any more cannot be submitted: the job
+    // id is gone and the extranonce2 has moved. Dropping them here is cheaper
+    // than filtering at submit and cannot leave one behind.
+    SHARES.lock_irq().retain(|sh| sh.serial == serial);
+}
+
+/// The hash loop. One task, pinned to core 0 like everything else.
+///
+/// Deliberately the slow version. `smp::parallel_split` is the obvious reach
+/// and it is the wrong instrument: it allows one job system-wide and its only
+/// other callers are the model's forward and backward passes, so a mining batch
+/// in flight makes every projection go serial and vice versa. Worse, it *spins*
+/// on the bootstrap processor, and its `count * width >= 2^19` floor forces
+/// batches large enough that the spin freezes the shell, the clock and this
+/// connection for the whole of one. There is no batch size that is both
+/// accepted and short.
+///
+/// So: one task, taking its round-robin share, which on a machine with seven
+/// runnable tasks is about a seventh of one core. `mine` prints the measured
+/// rate and the task count beside it rather than a flat-out figure, because the
+/// flat-out figure is not one this machine ever delivers.
+fn mine_task() {
+    loop {
+        if !ENABLED.load(Ordering::Acquire) || !MINING.load(Ordering::Acquire) {
+            idle();
+            continue;
+        }
+        // Snapshot under the lock and hash outside it. Holding it across a
+        // batch would block `rebuild` for a millisecond and a half every time.
+        let snap = {
+            let g = TEMPLATE.lock_irq();
+            match g.as_ref() {
+                Some(t) => Some((
+                    t.serial,
+                    t.mid.clone(),
+                    t.target,
+                    t.job_id.clone(),
+                    t.extranonce2.clone(),
+                    t.ntime_be.clone(),
+                )),
+                None => None,
+            }
+        };
+        let Some((serial, mid, target, job_id, e2, ntime_be)) = snap else {
+            idle();
+            continue;
+        };
+        if HASH_SINCE.load(Ordering::Relaxed) == 0 {
+            HASH_SINCE.store(now_ms(), Ordering::Relaxed);
+        }
+
+        // The nonce is derived from the count rather than kept, so a template
+        // change restarts the sweep and two templates never share a nonce
+        // space by accident.
+        let base = (HASHES.load(Ordering::Relaxed) & 0xffff_ffff) as u32;
+        for i in 0..BATCH {
+            let nonce = base.wrapping_add(i);
+            let d = mid.hash_with(nonce);
+            let z = super::hash::leading_zero_bits(&d);
+            if z > BEST.load(Ordering::Relaxed) {
+                BEST.store(z, Ordering::Relaxed);
+            }
+            if super::hash::below_target(&d, &target) {
+                FOUND.fetch_add(1, Ordering::Relaxed);
+                let mut be = [0u8; 4];
+                be.copy_from_slice(&nonce.to_be_bytes());
+                let mut q = SHARES.lock_irq();
+                // Bounded: a misconfigured difficulty of nearly zero would
+                // otherwise queue faster than the socket can drain, and the
+                // heap is the thing that runs out.
+                if q.len() < 64 {
+                    q.push(Share {
+                        serial,
+                        job_id: job_id.clone(),
+                        extranonce2: e2.clone(),
+                        ntime_be: ntime_be.clone(),
+                        nonce_be: be.to_vec(),
+                    });
+                }
+            }
+        }
+        HASHES.fetch_add(BATCH as u64, Ordering::Relaxed);
+        // Cheap, and it is what makes `mine off` and a new job felt promptly.
+        if JOB_SERIAL.load(Ordering::Acquire) != serial {
+            continue;
+        }
+    }
 }
 
 pub fn next_id() -> u64 {
