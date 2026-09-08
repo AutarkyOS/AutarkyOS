@@ -189,7 +189,7 @@ fn find_core(want: &str) -> Option<[u8; 32]> {
 const KNOWN_COMMANDS: &[&str] = &[
     "term", "todo", "paint", "write", "mines", "oracle", "enternet", "net", "dhcp", "mem",
     "uptime", "tasks", "status", "help", "app", "author", "video", "serial", "log", "snap",
-    "update", "gpu", "abstract", "study", "work",
+    "update", "gpu", "abstract", "study", "work", "redqueen",
 ];
 
 /// How many steps an authoring run gets.
@@ -2981,6 +2981,27 @@ fn execute(line: &str, boot: &BootInfo, acpi: &Option<Acpi>, interp: &mut aiksi:
                 }
                 other => kprintln!("  no such action: {}", other),
             }
+        }
+        // `redqueen [rounds] [budget]` -- one turn of the arms race.
+        //
+        // Neither half calls the engine, so this runs on a machine with no
+        // model and holds nothing while it works.
+        "redqueen" => {
+            use crate::ai::redqueen;
+            let mut rounds = 1usize;
+            let mut budget = redqueen::BUDGET;
+            let mut nth = 0usize;
+            for w in rest.split_whitespace() {
+                if let Ok(v) = w.parse::<usize>() {
+                    if nth == 0 {
+                        rounds = v.clamp(1, 64);
+                    } else {
+                        budget = v.clamp(1, 100_000);
+                    }
+                    nth += 1;
+                }
+            }
+            redqueen::report(rounds, redqueen::Solver::new(budget));
         }
         "godel" => {
             use crate::ai::godel;
