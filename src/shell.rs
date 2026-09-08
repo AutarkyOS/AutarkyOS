@@ -3096,6 +3096,50 @@ fn execute(line: &str, boot: &BootInfo, acpi: &Option<Acpi>, interp: &mut aiksi:
                         None => kprintln!("  usage: godel judge <bar> [examples]"),
                     }
                 }
+                // `godel drift` -- how far the current criterion has moved from
+                // the one the machine started with, recomputed from the ledger
+                // rather than from a second stream that could fall out of step.
+                "drift" => {
+                    let d = godel::drift();
+                    let considered = d.agree + d.looser + d.stricter;
+                    console::set_color(YELLOW);
+                    kprintln!("[godel] criterion drift");
+                    console::set_color(LTGRAY);
+                    if considered == 0 {
+                        kprintln!("  no judged variants in the ledger yet");
+                    } else {
+                        kprintln!(
+                            "  founding bar {}, in force now {}",
+                            (d.founding_bar * 100.0) as u32 as f32 / 100.0,
+                            (d.current_bar * 100.0) as u32 as f32 / 100.0
+                        );
+                        kprintln!(
+                            "  {} verdict(s): {} agree, {} looser, {} stricter",
+                            considered,
+                            d.agree,
+                            d.looser,
+                            d.stricter
+                        );
+                        if d.looser > 0 {
+                            console::set_color(LTRED);
+                            kprintln!(
+                                "  {} adopted under the current bar the founding one refused",
+                                d.looser
+                            );
+                            console::set_color(LTGRAY);
+                        } else {
+                            kprintln!("  nothing adopted now that the founding bar would refuse");
+                        }
+                    }
+                    let pt = d.pred_total();
+                    if pt > 0 {
+                        kprintln!(
+                            "  prediction: {} of {} outcomes matched training-set gain",
+                            d.pred_right(),
+                            pt
+                        );
+                    }
+                }
                 // The whole apparatus in one command: a generation trained
                 // against one set of cached features, bred, filed, and the
                 // best of it put in front of the same judge the nightly loop

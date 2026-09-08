@@ -1133,6 +1133,7 @@ fn set_head(h: &[u8; 32]) {
 /// Every judge records its numbers whether it passed or not. A certificate
 /// that only says why something was rejected is a certificate that cannot be
 /// argued with, and the point of writing them down is that they can be.
+#[derive(Clone)]
 pub struct Certificate {
     /// Which axis produced this, as it appears in the ledger.
     ///
@@ -1693,6 +1694,23 @@ const LIB_MAX_BYTES: usize = 16 * 1024;
 /// a criterion the loop adopted and the judges ignored would be a certificate
 /// about nothing.
 fn judge_one(n_val: usize, fixed: usize, broke: usize) -> (bool, &'static str) {
+    // The bar is the one place this ladder varies, and it varies at the top of
+    // the loop rather than inside it: `bar_in_force()` is read once here, so a
+    // criterion the judge axis adopted reaches every caller. `passes_j1` is
+    // the same ladder with the bar as an argument, which is what lets `drift`
+    // re-judge a past line under a *different* bar without a second copy of
+    // "beyond the noise" that could disagree with this one.
+    passes_j1(n_val, fixed, broke, bar_in_force())
+}
+
+/// J1, with the bar named rather than read.
+///
+/// Pure -- no store, no clock -- because `drift` calls it once per ledger line
+/// under two bars, and the founding-vs-current comparison is only re-derivable
+/// if the ladder itself is a function of its inputs. `judge_one` is this with
+/// `bar_in_force()` supplied, so there is exactly one definition of the ladder
+/// and the nightly loop and the drift report cannot part ways about it.
+pub fn passes_j1(n_val: usize, fixed: usize, broke: usize, bar: f32) -> (bool, &'static str) {
     if n_val == 0 {
         // Nothing was held out to judge against. A property of how the trial
         // was asked for rather than of the variant: a subsample too small to
@@ -1703,7 +1721,7 @@ fn judge_one(n_val: usize, fixed: usize, broke: usize) -> (bool, &'static str) {
         (false, "no net repair")
     } else if fixed - broke < MIN_FIXED {
         (false, "net repair below the floor")
-    } else if mcnemar(broke, fixed) < bar_in_force() {
+    } else if mcnemar(broke, fixed) < bar {
         (false, "inside the noise")
     } else {
         (true, "beyond the noise")
@@ -2897,6 +2915,160 @@ pub fn ledger_len() -> usize {
     text.lines().filter(|l| !l.is_empty()).count()
 }
 
+// ---------------------------------------------------------------------------
+// Drift: how far the loop's own judgment has moved from the one it started on.
+// ---------------------------------------------------------------------------
+//
+// **The problem this measures is that nothing here is sacred.** The judge axis
+// can move the bar the other judges answer to, so a loop that improves itself
+// every night can also, over a month, quietly lower the standard it improves
+// against -- and every certificate it writes on the way stays true, because it
+// was true under the bar in force when it was written. A ledger of honest
+// certificates is not proof the loop got better; it can equally be proof the
+// loop got easier to satisfy.
+//
+// The guard is not to freeze the bar. It is to keep two verdicts for every
+// line and watch them separate: the **founding** verdict, under the bar this
+// machine started with (`MCNEMAR_95`), and the **current** verdict, under the
+// bar in force now. Both are recomputed from the counts on the line, so there
+// is no second ledger to fall out of step -- the evidence is written once and
+// the criterion is applied at read time, which is what makes the number
+// re-derivable by anyone from the ledger and the two bars alone.
+//
+// The only judge the bar moves is J1, so a line drifts exactly when its J1
+// flips between the two bars *and* the other three judges passed -- a line
+// rejected for its cost or its structure is rejected under any bar and cannot
+// drift. `looser` is the direction that matters: verdicts the founding
+// criterion refused and the current one adopts. `stricter` is the machine
+// holding itself to more than it began with, which is the safe way to be
+// wrong about your own standard.
+
+/// The integer written right after `key` on a ledger line, if any.
+fn field_usize(line: &str, key: &str) -> Option<usize> {
+    let at = line.find(key)? + key.len();
+    let rest = &line[at..];
+    let end = rest.find(|c: char| !c.is_ascii_digit()).unwrap_or(rest.len());
+    if end == 0 {
+        return None;
+    }
+    rest[..end].parse().ok()
+}
+
+/// Whether the judge tagged `tag` (e.g. `"J2["`) closed with `ok]`.
+fn judge_ok(line: &str, tag: &str) -> bool {
+    let Some(at) = line.find(tag) else { return false };
+    let rest = &line[at..];
+    let Some(close) = rest.find(']') else { return false };
+    rest[..close].trim_end().ends_with("ok")
+}
+
+/// Full adoption of a line under a given bar.
+///
+/// J1 recomputed from the counts at that bar, and the other three read off the
+/// line as they were -- they do not move with the bar, so their recorded
+/// verdicts are their verdicts under any bar.
+fn adopts_at(line: &str, bar: f32) -> bool {
+    let (Some(n), Some(fixed), Some(broke)) = (
+        field_usize(line, " n="),
+        field_usize(line, "fix="),
+        field_usize(line, " broke="),
+    ) else {
+        return false;
+    };
+    passes_j1(n, fixed, broke, bar).0
+        && judge_ok(line, "J2[")
+        && judge_ok(line, "J3[")
+        && judge_ok(line, "J4[")
+}
+
+/// How far the current criterion has drifted from the founding one, and
+/// whether the loop's own win/lose prediction has been worth anything.
+pub struct Drift {
+    /// Lines the two criteria agree on.
+    pub agree: usize,
+    /// Founding rejects, current adopts -- the criterion loosened. The
+    /// direction the whole metric exists to catch.
+    pub looser: usize,
+    /// Founding adopts, current rejects -- the criterion tightened.
+    pub stricter: usize,
+    /// The bar this machine started with, and the one it holds now.
+    pub founding_bar: f32,
+    pub current_bar: f32,
+    /// The prediction cross-tab, over lines that carry an `axis=` field (only
+    /// those have an interpretable `pred=`). `predicted` is whether
+    /// training-set gain said win; the outcome is whether the line adopted.
+    pub pred_win_adopt: usize,
+    pub pred_win_reject: usize,
+    pub pred_lose_adopt: usize,
+    pub pred_lose_reject: usize,
+}
+
+impl Drift {
+    /// Lines where the loop's prediction matched the outcome, over lines where
+    /// it made one. The calibration `pred=` has been recording, unread, since
+    /// the first godel commit.
+    pub fn pred_total(&self) -> usize {
+        self.pred_win_adopt + self.pred_win_reject + self.pred_lose_adopt + self.pred_lose_reject
+    }
+
+    pub fn pred_right(&self) -> usize {
+        self.pred_win_adopt + self.pred_lose_reject
+    }
+}
+
+/// Compute drift from ledger lines and the two bars. Pure, so a saved ledger
+/// re-derives the same numbers and the boot self-test can hand it fixtures.
+pub fn drift_of(lines: &[String], founding: f32, current: f32) -> Drift {
+    let mut d = Drift {
+        agree: 0,
+        looser: 0,
+        stricter: 0,
+        founding_bar: founding,
+        current_bar: current,
+        pred_win_adopt: 0,
+        pred_win_reject: 0,
+        pred_lose_adopt: 0,
+        pred_lose_reject: 0,
+    };
+    for line in lines {
+        // Only lines carrying a variant's counts can be re-judged. A judge-axis
+        // line records a criterion change rather than a variant, so it has no
+        // `fix=`/`broke=` to recompute and is skipped here -- it is the thing
+        // being measured, not a measurement.
+        if field_usize(line, "fix=").is_none() {
+            continue;
+        }
+        let f = adopts_at(line, founding);
+        let c = adopts_at(line, current);
+        match (f, c) {
+            (true, true) | (false, false) => d.agree += 1,
+            (false, true) => d.looser += 1,
+            (true, false) => d.stricter += 1,
+        }
+
+        // The prediction cross-tab, gated on `axis=` for the reason the plan
+        // records: `pred=` predates `axis=`, and the six axes compute the
+        // prediction from six different quantities, so a line with no axis is
+        // uninterpretable and is left out rather than pooled.
+        if axis_of(line).is_some() {
+            let win = line.contains(" pred=win");
+            let adopt = line.contains(" ADOPT");
+            match (win, adopt) {
+                (true, true) => d.pred_win_adopt += 1,
+                (true, false) => d.pred_win_reject += 1,
+                (false, true) => d.pred_lose_adopt += 1,
+                (false, false) => d.pred_lose_reject += 1,
+            }
+        }
+    }
+    d
+}
+
+/// Read the ledger and compute drift against the founding and current bars.
+pub fn drift() -> Drift {
+    drift_of(&ledger_tail(usize::MAX), MCNEMAR_95, bar_in_force())
+}
+
 /// Deep points, walked by markers exactly as `GRID` is.
 ///
 /// Two, and small ones. A deep trial costs two full passes over the corpus
@@ -4035,6 +4207,93 @@ pub fn selftest() -> bool {
     claim(
         "a bar outside the range is refused before anything else is asked",
         !sane_bar(0.0) && !sane_bar(f32::INFINITY) && sane_bar(MCNEMAR_95),
+    );
+
+    // ---- drift: founding vs current criterion, from rendered lines ------
+    //
+    // Rendered rather than hand-typed, so the parser this checks is tied to
+    // the renderer it reads: if the ledger format moves, these break, which is
+    // the point. The counts are chosen so one line drifts and one does not
+    // under each direction, and one is gated out by a failed non-bar judge.
+    let mut base = Certificate {
+        axis: "adapter",
+        parent: None,
+        variant: [0u8; 32],
+        decisions: 180,
+        validation: 180,
+        predicted: true,
+        fixed: 12,
+        broke: 1,
+        mcnemar: mcnemar(1, 12),
+        j1: true,
+        j1_why: "beyond the noise",
+        goals_held: 4,
+        goals_total: 4,
+        j2: true,
+        j3: true,
+        j3_why: "",
+        resident_kib: 24,
+        rank: 8,
+        j4: true,
+        epochs: 20,
+        capped: false,
+        adopted: true,
+        test_acc: 0.6,
+        test_read: 1,
+        test_fresh: true,
+    };
+    // chi 7.69: clears 3.84 and fails 10.0.
+    let strong = render_certificate(&base, 1, 3);
+    // chi 3.12 (7 vs 1): fails 3.84, clears 2.0.
+    base.fixed = 7;
+    base.mcnemar = mcnemar(1, 7);
+    base.j1 = false;
+    base.j1_why = "inside the noise";
+    let weak = render_certificate(&base, 2, 3);
+    // Same thin margin, but J4 failed -- rejected under any bar, so it must
+    // not read as drift when the bar alone would have flipped J1.
+    base.j4 = false;
+    let weak_costly = render_certificate(&base, 3, 3);
+
+    let loosen = drift_of(
+        &[strong.clone(), weak.clone(), weak_costly.clone()],
+        MCNEMAR_95,
+        2.0,
+    );
+    claim(
+        "loosening the bar adopts a line the founding one refused",
+        loosen.looser == 1 && loosen.stricter == 0,
+    );
+    claim(
+        "a line another judge rejected does not read as criterion drift",
+        loosen.agree == 2,
+    );
+
+    let tighten = drift_of(&[strong.clone(), weak.clone()], MCNEMAR_95, 10.0);
+    claim(
+        "tightening the bar refuses a line the founding one adopted",
+        tighten.stricter == 1 && tighten.looser == 0,
+    );
+
+    // The prediction cross-tab, and that a line with no axis is left out.
+    let mut p = base.clone();
+    p.j4 = true;
+    p.predicted = true;
+    p.adopted = true;
+    let win_adopt = render_certificate(&p, 4, 3);
+    p.predicted = false;
+    p.adopted = false;
+    let lose_reject = render_certificate(&p, 5, 3);
+    let cal = drift_of(&[win_adopt, lose_reject], MCNEMAR_95, MCNEMAR_95);
+    claim(
+        "the prediction cross-tab counts hits the loop never read",
+        cal.pred_total() == 2 && cal.pred_right() == 2,
+    );
+    claim(
+        "a line with no axis is left out of the prediction tally",
+        drift_of(&[String::from("1 h3 n=180 fix=12 broke=1 pred=win ADOPT")], MCNEMAR_95, MCNEMAR_95)
+            .pred_total()
+            == 0,
     );
 
     // ---- the archive ----------------------------------------------------
