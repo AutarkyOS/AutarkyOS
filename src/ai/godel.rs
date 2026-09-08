@@ -168,6 +168,17 @@ pub enum ProposalKind {
     /// Change how the council combines its cores. Judged on calibration by
     /// `harness::rule_bench`, because accuracy is not what this axis moves.
     Config(u8),
+    /// Admit a function into the solver's library, by the address of its
+    /// source.
+    ///
+    /// The only axis here that does not touch the model at all. What it moves
+    /// is what the solver can *say* -- a library function is one node where
+    /// the expression it replaces was several, so answers get shorter and
+    /// problems that were out of reach come into reach. Judged by
+    /// `redqueen::bench`, paired over every stored problem, because adding a
+    /// function lengthens every candidate list and one that buys nothing
+    /// costs something.
+    Lib([u8; 32]),
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -282,6 +293,14 @@ impl Proposal {
         }
     }
 
+    /// No training knobs, for the reason `core` and `skill` have none: the
+    /// candidate is a program that already exists and the question is whether
+    /// it is fit to keep. Unlike `judge`, nothing here is trained from the
+    /// budget, so zeroes are correct rather than inert.
+    pub fn lib(h: [u8; 32]) -> Proposal {
+        Proposal { lr: 0.0, rank: 0, alpha: 0.0, epochs: 0, rule: 0, kind: ProposalKind::Lib(h) }
+    }
+
     pub fn config(rule: u8) -> Proposal {
         Proposal { lr: 0.0, rank: 0, alpha: 0.0, epochs: 0, rule, kind: ProposalKind::Config(rule) }
     }
@@ -347,6 +366,11 @@ impl Proposal {
             // make the identity depend on the same fact twice.
             ProposalKind::Config(_) => s.push_str("config 1
 "),
+            ProposalKind::Lib(h) => {
+                s.push_str("lib ");
+                s.push_str(&hex32(&h));
+                s.push('\n');
+            }
         }
         s
     }
@@ -786,6 +810,14 @@ pub struct Variant {
     /// one gives that up. A node that does not say which it is describes the
     /// wrong experiment.
     pub deep: bool,
+    /// Content address of the redqueen library in force, if one has been
+    /// adopted.
+    ///
+    /// Conditional in the rendering for the reason `core` and `deep` are: an
+    /// unconditional line re-addresses every node that already exists, which
+    /// makes `head` name something that no longer reproduces -- the change
+    /// meant to extend re-derivability breaking it instead.
+    pub lib: Option<[u8; 32]>,
     pub born: u32,
 }
 
@@ -958,6 +990,14 @@ impl Variant {
         // Conditional for the same reason `core` is: absent from the rendering
         // when absent from the object, so every node written before this
         // existed still renders to the bytes it was stored as.
+        // Same rule as `core` and `deep`: written only when there is one, so
+        // every node stored before the library existed renders byte for byte
+        // as it was stored.
+        if let Some(l) = self.lib {
+            s.push_str("lib ");
+            s.push_str(&hex32(&l));
+            s.push_str("\n");
+        }
         if self.deep {
             s.push_str("deep 1\n");
         }
@@ -1022,6 +1062,7 @@ impl Variant {
             // read as one that mentions having none.
             core_seen: false,
             deep: false,
+            lib: None,
             born: 0,
         };
         for line in text.lines() {
@@ -1051,6 +1092,7 @@ impl Variant {
                     v.core_seen = true;
                 }
                 "deep" => v.deep = val == "1",
+                "lib" => v.lib = from_hex32(val),
                 "rank" => v.rank = val.parse().unwrap_or(0),
                 "epochs" => v.epochs = val.parse().unwrap_or(0),
                 "rule" => v.rule = val.parse().unwrap_or(0),
@@ -1479,6 +1521,7 @@ fn ensure_head(e: &mut super::Engine) -> Option<[u8; 32]> {
         skills: None,
         corpus: sysbox::hash_of(super::vocab::CORPUS),
         deep,
+        lib: None,
         // What is actually installed, recorded rather than assumed -- the same
         // discipline as `policy` and `corpus`. A variant trained while a
         // machine-written core was voting is not the same object as one
@@ -1542,8 +1585,102 @@ pub fn run(
             p.mark();
             trial_config(e, r).map_err(Refused::Judge)
         }
+        ProposalKind::Lib(h) => {
+            p.mark();
+            // No engine is touched. The library is about what the solver can
+            // say, not about what the model believes, so this is the one axis
+            // that would run on a machine with no checkpoint loaded.
+            trial_lib(&h).map_err(Refused::Judge)
+        }
     }
 }
+
+/// Judge a candidate library function.
+///
+/// Four judges, mapped onto the certificate the other axes already use so a
+/// library adoption reads in the ledger like everything else and `rollback`
+/// walks it like everything else.
+///
+/// - **J1, margin.** `redqueen::bench` is paired over every stored problem:
+///   problems that got easier against problems that got harder. Through
+///   `judge_one`, so this axis answers to the same bar the rest do rather
+///   than to a second definition of "beyond the noise".
+/// - **J2, own goals.** The seeded problems must still be solvable. A
+///   function that made the whole set cheaper by making the simplest things
+///   unreachable is the failure aggregate difficulty would not show, and it
+///   is the same question `trial`'s J2 asks of the curiosity goals.
+/// - **J3, structure.** It parses back as the declaration it claims to be,
+///   and its arity is one the enumerator can actually call.
+/// - **J4, cost.** The library is a preamble on every candidate program, so
+///   it is paid for on every one of thousands of runs. Bounded.
+pub fn trial_lib(h: &[u8; 32]) -> Result<Certificate, &'static str> {
+    use super::redqueen::{self, LibFn, Lib, Solver};
+
+    let Some(f) = redqueen::candidate(h) else {
+        return Err("no such library candidate");
+    };
+    TRIALS.fetch_add(1, Ordering::Relaxed);
+
+    let lib = Lib::load();
+    let s = Solver::with(redqueen::BUDGET, lib.clone());
+    let v = redqueen::bench(&s, &f);
+    let n = super::problem::count();
+
+    let (j1, j1_why) = judge_one(n, v.fixed, v.broke);
+
+    // J2: the seeds, which are the simplest thing the solver is asked to do.
+    let mut with = s.clone();
+    with.lib.add(f.clone());
+    let seeds = super::problem::seeds();
+    let goals_total = seeds.len();
+    let goals_held = seeds
+        .iter()
+        .filter(|p| {
+            redqueen::solve(p, &s).is_none() || redqueen::solve(p, &with).is_some()
+        })
+        .count();
+
+    let j3 = LibFn::parse(&f.src).as_ref() == Some(&f) && f.arity >= 1 && f.arity <= 2;
+    let j4 = with.lib.preamble().len() <= LIB_MAX_BYTES;
+
+    let cert = Certificate {
+        axis: "lib",
+        parent: None,
+        variant: *h,
+        decisions: n,
+        validation: n,
+        predicted: v.after < v.before,
+        fixed: v.fixed,
+        broke: v.broke,
+        mcnemar: mcnemar(v.broke, v.fixed),
+        j1,
+        j1_why,
+        j2: goals_total > 0 && goals_held == goals_total,
+        goals_held,
+        goals_total,
+        j3,
+        j3_why: if j3 { "a callable declaration" } else { "not a callable declaration" },
+        j4,
+        rank: 0,
+        resident_kib: with.lib.preamble().len() / 1024,
+        epochs: 0,
+        capped: false,
+        adopted: false,
+        test_acc: 0.0,
+        test_read: test_reads(),
+        test_fresh: true,
+    };
+    Ok(cert)
+}
+
+/// How much preamble a library may grow to.
+///
+/// Every candidate program carries the whole library above it, and a round
+/// runs thousands of candidates, so this is paid per run and not per
+/// adoption. Sixteen kilobytes is far past anything measured -- three
+/// functions came to about two hundred bytes -- and the point is that the
+/// bound exists rather than where it sits.
+const LIB_MAX_BYTES: usize = 16 * 1024;
 
 /// J1, as one function.
 ///
@@ -1675,6 +1812,7 @@ pub fn storm(e: &mut super::Engine, b: &Budget, points: usize) -> Result<StormRe
             skills: None,
             corpus: sysbox::hash_of(super::vocab::CORPUS),
             deep: false,
+            lib: None,
             core: super::voter::installed().map(|c| c.hash),
             core_seen: true,
             lambda: b.lr,
@@ -1812,6 +1950,7 @@ pub fn trial(
         corpus: sysbox::hash_of(super::vocab::CORPUS),
         // `scatter` builds a classifier-only adapter, always.
         deep: false,
+        lib: None,
         // What is actually installed, recorded rather than assumed -- the same
         // discipline as `policy` and `corpus`. A variant trained while a
         // machine-written core was voting is not the same object as one
@@ -2023,6 +2162,7 @@ pub fn trial_core(e: &mut super::Engine, h: &[u8; 32]) -> Result<Certificate, &'
         // Carried from the incumbent: a core changes no weights, so whatever
         // the parent was, this variant still is.
         deep: parent.and_then(|p| Variant::load(&p)).map(|v| v.deep).unwrap_or(false),
+        lib: None,
         born: crate::dev::rtc::now().map(|d| crate::dev::rtc::unix_seconds(&d)).unwrap_or(0),
     };
     let vhash = variant.hash();
@@ -2273,6 +2413,7 @@ pub fn trial_deep(
         // The whole point of the node: this one moved the attention path, and
         // nothing that reads the lineage may confuse it with one that did not.
         deep: true,
+        lib: None,
         core: super::voter::installed().map(|c| c.hash),
         core_seen: true,
         lambda: b.lr,
@@ -2380,6 +2521,7 @@ pub fn trial_skill(h: &[u8; 32]) -> Result<Certificate, &'static str> {
         skills: Some(*h),
         corpus: sysbox::hash_of(super::vocab::CORPUS),
         deep: carried.as_ref().map(|v| v.deep).unwrap_or(false),
+        lib: None,
         core: super::voter::installed().map(|c| c.hash),
         core_seen: true,
         lambda: 0.0,
@@ -2530,6 +2672,7 @@ pub fn trial_config(e: &mut super::Engine, rule: u8) -> Result<Certificate, &'st
         skills: carried.as_ref().and_then(|x| x.skills),
         corpus: sysbox::hash_of(super::vocab::CORPUS),
         deep: carried.as_ref().map(|x| x.deep).unwrap_or(false),
+        lib: None,
         core: super::voter::installed().map(|c| c.hash),
         core_seen: true,
         lambda: 0.0,
@@ -3077,6 +3220,29 @@ pub fn archive_census() -> (usize, f32) {
     (lit, best)
 }
 
+/// The best-scoring elite in the archive, and the variant that holds it.
+///
+/// **This is the read the archive was missing.** `offer` writes a variant
+/// address into every cell it wins and `cell` parses one back, but nothing
+/// consumed the address -- so `Elite.variant` was written and never read, and
+/// the twelve cells preserved re-derivable elites that nothing re-derived,
+/// which is a high-score table with the winners' names filled in and never
+/// looked at. `godel storm` and `godel archive` reach for this now: a storm
+/// with no live incumbent can descend from the best thing the machine has
+/// found, and the operator can be shown which variant tops the archive rather
+/// than only how many cells are lit.
+pub fn best_elite() -> Option<Elite> {
+    let mut best: Option<Elite> = None;
+    for i in 0..CELLS {
+        if let Some(e) = cell(i) {
+            if best.as_ref().is_none_or(|b| e.score > b.score) {
+                best = Some(e);
+            }
+        }
+    }
+    best
+}
+
 // ---------------------------------------------------------------------------
 // Bayesian surprise: reach for the axis whose verdict is least predictable.
 // ---------------------------------------------------------------------------
@@ -3113,6 +3279,11 @@ fn next_deep() -> Option<Proposal> {
 /// The rule already running is excluded rather than marked: judging it against
 /// itself is a certificate saying nothing changed, which is true and is not
 /// worth a night.
+/// The next library candidate worth judging, if the queue holds one.
+fn next_lib() -> Option<Proposal> {
+    super::redqueen::next_candidate().map(Proposal::lib)
+}
+
 fn next_config() -> Option<Proposal> {
     let now = super::harness::rule_in_force() as u8;
     (0u8..4)
@@ -3151,14 +3322,27 @@ fn next_skill() -> Option<Proposal> {
 /// ledger of integers is a ledger nobody reads. The order is the slot order,
 /// and ties in the surprise ranking break by it, so the ordering is total and
 /// a later run reconstructs the same one rather than a plausible one.
-pub const AXIS_NAMES: [&str; 6] = ["adapter", "rule", "skill", "deep", "core", "judge"];
+// Order is load-bearing: `surprise_order` ranks slots `0..RANKED` and those
+// slots index straight into this array and into `axis_counts`, so the ranked
+// axes must occupy the first `RANKED` positions. `lib` therefore sits at four
+// and the two unranked axes -- `core`, exempt and always last; `judge`, asked
+// only at an epoch boundary -- come after the ranked block. Nothing else
+// depends on position: a ledger line names its axis and `axis_of` finds the
+// index by name, so every consumer derives its indices from this one array.
+pub const AXIS_NAMES: [&str; 7] = ["adapter", "rule", "skill", "deep", "lib", "core", "judge"];
 
 /// How many axes the surprise ranking covers.
 ///
-/// Four, not six. `core` is exempt and stays last regardless of how uncertain
-/// it looks, and `judge` is not ranked at all -- it is reachable only at an
-/// epoch boundary and is asked before the ranking runs.
-const RANKED: usize = 4;
+/// Five, not seven. `core` is exempt and stays last regardless of how
+/// uncertain it looks, and `judge` is not ranked at all -- it is reachable
+/// only at an epoch boundary and is asked before the ranking runs.
+///
+/// `lib` joined the ranking rather than being appended after it, and that is
+/// the point of ranking by surprise: it is a brand new axis, so it has no
+/// verdicts, so `axis_uncertainty` puts it at the coin flip and the loop
+/// reaches for it early. An axis bolted on at the end would have waited for
+/// four others to run out of moves first.
+const RANKED: usize = 5;
 
 /// Which axis a ledger line came from.
 fn axis_of(line: &str) -> Option<usize> {
@@ -3201,7 +3385,7 @@ fn axis_counts() -> [(u32, u32); AXIS_NAMES.len()] {
 /// and the tie rule here is a decision rather than a detail.
 fn surprise_order() -> [usize; RANKED] {
     let counts = axis_counts();
-    let mut order = [0usize, 1, 2, 3];
+    let mut order = [0usize, 1, 2, 3, 4];
     for i in 1..RANKED {
         let mut j = i;
         while j > 0 {
@@ -3281,7 +3465,8 @@ pub fn next_proposal() -> Option<Proposal> {
             0 => frontier(),
             1 => next_config(),
             2 => next_skill(),
-            _ => next_deep(),
+            3 => next_deep(),
+            _ => next_lib(),
         };
         if candidate.is_some() {
             return candidate;
@@ -3308,7 +3493,8 @@ pub fn rotation() -> (bool, [(&'static str, f32, bool); RANKED]) {
             0 => frontier().is_some(),
             1 => next_config().is_some(),
             2 => next_skill().is_some(),
-            _ => next_deep().is_some(),
+            3 => next_deep().is_some(),
+            _ => next_lib().is_some(),
         };
         out[i] = (
             AXIS_NAMES[*slot],
@@ -3441,6 +3627,7 @@ pub fn trial_judge(e: &mut super::Engine, b: &Budget, bar: f32) -> Result<Certif
         skills: carried.as_ref().and_then(|x| x.skills),
         corpus: sysbox::hash_of(super::vocab::CORPUS),
         deep: carried.as_ref().map(|x| x.deep).unwrap_or(false),
+        lib: None,
         core: super::voter::installed().map(|c| c.hash),
         core_seen: true,
         lambda: 0.0,
@@ -3896,6 +4083,7 @@ pub fn selftest() -> bool {
         core: None,
         core_seen: false,
         deep: false,
+        lib: None,
         parent: Some(h),
         adapter: Some(sha256::hash(b"adapter")),
         policy: None,

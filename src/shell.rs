@@ -3141,6 +3141,16 @@ fn execute(line: &str, boot: &BootInfo, acpi: &Option<Acpi>, interp: &mut aiksi:
                                 r.lit,
                                 (r.best * 100.0) as u32
                             );
+                            // The elite's own address, read back from the cell
+                            // that holds it -- the thing the archive stored all
+                            // along and nothing ever asked for.
+                            if let Some(e) = godel::best_elite() {
+                                kprintln!(
+                                    "         top elite {} at {}%",
+                                    godel::short_hex(&e.variant),
+                                    (e.score * 100.0) as u32
+                                );
+                            }
                             kprintln!(
                                 "         tribunal: the best was {} -- {}",
                                 if r.adopted { "accepted" } else { "rejected" },

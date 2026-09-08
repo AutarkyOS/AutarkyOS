@@ -234,6 +234,38 @@ impl LibFn {
     }
 }
 
+/// Where a function waits between being proposed and being judged.
+///
+/// Separate from `LIB`, which holds only what was adopted. Putting candidates
+/// in the same directory would make `Lib::load` pick up everything ever
+/// offered, so the solver would gain every function the judge refused.
+pub const OFFERED: &str = "/ai/libcand";
+
+/// Store a candidate for judging, and answer its address.
+pub fn offer_lib(f: &LibFn) -> [u8; 32] {
+    let h = crate::store::sha256::hash(f.src.as_bytes());
+    let mut path = String::from(OFFERED);
+    path.push('/');
+    for b in &h {
+        path.push_str(&format!("{:02x}", b));
+    }
+    if crate::sysbox::read_blob(&path).is_none() {
+        crate::sysbox::write_text(&path, &f.src);
+    }
+    h
+}
+
+/// Read one back by address.
+pub fn candidate(h: &[u8; 32]) -> Option<LibFn> {
+    let mut path = String::from(OFFERED);
+    path.push('/');
+    for b in h {
+        path.push_str(&format!("{:02x}", b));
+    }
+    let raw = crate::sysbox::read_blob(&path)?;
+    LibFn::parse(core::str::from_utf8(&raw).ok()?)
+}
+
 fn short_hex(h: &[u8; 32]) -> String {
     let mut s = String::new();
     for b in h.iter().take(4) {
@@ -585,6 +617,126 @@ fn answer_of(p: &Problem, args: &[Value]) -> Option<Value> {
     out.value().parse::<i64>().ok().map(Value::Int)
 }
 
+// ---------------------------------------------------------------------------
+// The archive: illuminate the frontier instead of climbing it.
+// ---------------------------------------------------------------------------
+
+/// Where kept problems are filed. A subdirectory of the problem store, which
+/// `problem::stored` skips because it only accepts names of 64 hex digits.
+pub const ARCHIVE: &str = "/ai/problems/archive";
+
+/// Difficulty bands, in candidates the reachability probe needed.
+///
+/// Chosen from measurements rather than from taste: the seeds solve in tens,
+/// the first generation of mutations lands around four to seven thousand, and
+/// anything past that is near the edge of what the probe reaches at all.
+const BANDS: &[usize] = &[100, 2_000, 8_000];
+
+/// One band past the thresholds, crossed with the four families.
+pub const CELLS: usize = (BANDS.len() + 1) * 4;
+
+fn band_of(difficulty: usize) -> usize {
+    let mut b = 0;
+    for t in BANDS {
+        if difficulty < *t {
+            return b;
+        }
+        b += 1;
+    }
+    b
+}
+
+fn family_index(f: Family) -> usize {
+    match f {
+        Family::Program => 0,
+        Family::Machine => 1,
+        Family::Source => 2,
+        Family::Imported => 3,
+    }
+}
+
+pub fn cell_of(f: Family, difficulty: usize) -> usize {
+    family_index(f) * (BANDS.len() + 1) + band_of(difficulty)
+}
+
+/// What a cell holds: the hardest problem of that family in that band.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct Kept {
+    pub problem: [u8; 32],
+    pub difficulty: usize,
+}
+
+fn cell_path(i: usize) -> String {
+    format!("{}/{}", ARCHIVE, i)
+}
+
+/// Read a cell back.
+///
+/// **This is the operation `godel`'s archive does not have, and the whole
+/// argument for content-addressing an elite rests on it.** There, `Elite`
+/// carries a variant address, `offer` writes it, `cell` parses it back, and
+/// both readers drop it on the floor -- so twelve cells of "an elite from
+/// three weeks ago is still reachable" have never had anything reach one. A
+/// cell nothing reads is a high-score table with extra steps.
+pub fn cell(i: usize) -> Option<Kept> {
+    let bytes = crate::sysbox::read_blob(&cell_path(i))?;
+    let text = core::str::from_utf8(&bytes).ok()?;
+    let mut it = text.split_whitespace();
+    let hx = it.next()?;
+    if hx.len() != 64 {
+        return None;
+    }
+    let mut problem = [0u8; 32];
+    for (i, b) in problem.iter_mut().enumerate() {
+        *b = u8::from_str_radix(hx.get(i * 2..i * 2 + 2)?, 16).ok()?;
+    }
+    let difficulty = it.next()?.parse::<usize>().ok()?;
+    Some(Kept { problem, difficulty })
+}
+
+/// File a problem, if it is harder than whatever holds its cell.
+///
+/// Strictly harder, so re-offering the same problem does not rewrite the cell
+/// and a round that discovers nothing new leaves the archive byte-identical --
+/// which is what makes "the archive did not move" a fact rather than a guess.
+pub fn offer(h: &[u8; 32], f: Family, difficulty: usize) -> bool {
+    let i = cell_of(f, difficulty);
+    if let Some(held) = cell(i) {
+        if held.difficulty >= difficulty {
+            return false;
+        }
+    }
+    let mut line = String::new();
+    for b in h {
+        line.push_str(&format!("{:02x}", b));
+    }
+    line.push(' ');
+    line.push_str(&format!("{}", difficulty));
+    line.push_str("\n");
+    crate::sysbox::write_text(&cell_path(i), &line);
+    true
+}
+
+/// Every cell that holds something. The frontier, as objects rather than a
+/// count -- so a round can breed from the hardest of each kind instead of
+/// from whatever happens to be stored.
+pub fn elites() -> Vec<Kept> {
+    let mut out = Vec::new();
+    for i in 0..CELLS {
+        if let Some(k) = cell(i) {
+            out.push(k);
+        }
+    }
+    out
+}
+
+/// How many cells are lit, and the hardest thing in any of them.
+pub fn census() -> (usize, usize) {
+    let e = elites();
+    let hardest = e.iter().map(|k| k.difficulty).max().unwrap_or(0);
+    (e.len(), hardest)
+}
+
 /// How many mined structures a round may put in front of the judge.
 ///
 /// Capped because `bench` re-solves every stored problem twice, so each offer
@@ -771,6 +923,8 @@ pub struct Round {
     pub offered: usize,
     /// Offered from mining repeated structure rather than from an answer.
     pub mined: usize,
+    /// Problems that took a cell off whatever held it.
+    pub filed: usize,
     /// Offered, and the paired judge said the whole set got easier.
     pub learned: usize,
     /// Total candidates over the stored set before and after learning, so a
@@ -799,6 +953,7 @@ pub fn round(s: &Solver) -> Round {
         reach: 0,
         offered: 0,
         mined: 0,
+        filed: 0,
         learned: 0,
         before: 0,
         after: 0,
@@ -811,7 +966,22 @@ pub fn round(s: &Solver) -> Round {
     // the caller's.
     let mut grown = s.clone();
 
-    for h in super::problem::stored() {
+    // **Breed from the archive, not from everything stored.** A round used to
+    // walk `problem::stored()`, which grows every round -- 34 problems after
+    // six -- so each round mutated more than the last and the work per round
+    // climbed without bound while most of it re-derived children already
+    // known. The elites are one problem per (family, difficulty) cell, so the
+    // work is bounded by the number of cells and the diversity is kept on
+    // purpose rather than by accident.
+    //
+    // Falls back to the stored set while the archive is empty, which is only
+    // the first round on a fresh machine.
+    let breeding: Vec<[u8; 32]> = match elites() {
+        e if e.is_empty() => super::problem::stored(),
+        e => e.iter().map(|k| k.problem).collect(),
+    };
+
+    for h in breeding {
         let Some(p) = Problem::load(&h) else { continue };
         if p.family != Family::Program {
             continue;
@@ -862,6 +1032,11 @@ pub fn round(s: &Solver) -> Round {
                     // candidate list, so one that does not pay for itself
                     // makes the whole set harder -- which is what the paired
                     // count is there to catch.
+                    // Queued whether or not this round takes it. The round's
+                    // own judge is the same `bench`, but a round leaves no
+                    // ledger line and nothing to roll back; `godel`'s `lib`
+                    // axis picks these up and records a verdict that survives.
+                    offer_lib(&f);
                     let v = bench(&grown, &f);
                     if v.helps() {
                         r.before += v.before;
@@ -883,6 +1058,12 @@ pub fn round(s: &Solver) -> Round {
                     r.known += 1;
                 }
                 r.reach = r.reach.max(hard.tried);
+                // Filed by what it is and how hard it was, so the hardest of
+                // each kind survives and the rest are still stored but stop
+                // being bred from.
+                if offer(&ch, child.family, hard.tried) {
+                    r.filed += 1;
+                }
             }
         }
     }
@@ -902,6 +1083,7 @@ pub fn round(s: &Solver) -> Round {
         // objective saying it *should* pay, and that objective counts nodes
         // rather than candidates -- so it is a good proposal and not a
         // verdict, and the paired count is what decides.
+        offer_lib(&f);
         let v = bench(&grown, &f);
         if v.helps() {
             r.before += v.before;
@@ -959,10 +1141,18 @@ pub fn report(rounds: usize, s: &Solver) {
             );
         }
         if r.reach > 0 {
+            let (lit, hardest) = census();
             kprintln!(
                 "    the frontier stands at {} candidate(s) against a budget of {}",
                 r.reach,
                 s.budget
+            );
+            kprintln!(
+                "    archive: {} of {} cell(s) lit, {} filed, hardest {}",
+                lit,
+                CELLS,
+                r.filed,
+                hardest
             );
         }
         if r.hardest > 0 {
@@ -993,6 +1183,40 @@ pub fn report(rounds: usize, s: &Solver) {
     );
     console::set_color(LTGRAY);
     let _ = total;
+}
+
+/// The next queued library candidate the adopted library does not hold.
+///
+/// A directory scan in the shape `godel::next_skill` uses, and for the same
+/// reason: the queue is the work list, so what to try tonight is a function
+/// of what is on disk rather than of a counter somebody has to keep in step.
+pub fn next_candidate() -> Option<[u8; 32]> {
+    let held = Lib::load();
+    for name in crate::sysbox::children(OFFERED) {
+        if name.len() != 64 {
+            continue;
+        }
+        let mut h = [0u8; 32];
+        let mut good = true;
+        for (i, b) in h.iter_mut().enumerate() {
+            match name.get(i * 2..i * 2 + 2).and_then(|p| u8::from_str_radix(p, 16).ok()) {
+                Some(v) => *b = v,
+                None => {
+                    good = false;
+                    break;
+                }
+            }
+        }
+        if !good {
+            continue;
+        }
+        let Some(f) = candidate(&h) else { continue };
+        if held.fns.iter().any(|g| g.name == f.name) {
+            continue;
+        }
+        return Some(h);
+    }
+    None
 }
 
 /// Boot self-test. No model, no corpus, no network, no store beyond the
@@ -1229,6 +1453,27 @@ pub fn selftest() -> bool {
     claim(
         "a structure that would not pay for itself is refused by the objective",
         found.iter().filter(|c| c.saved <= 0).all(|c| from_candidate(c).is_none()),
+    );
+
+    // --- the archive ------------------------------------------------------
+    //
+    // The banding is arithmetic and needs no store, so it is checked here;
+    // reading a cell back is checked by the loop itself, which is the only
+    // place a cell is ever written.
+    claim(
+        "difficulty bands are ordered and a harder problem lands no lower",
+        cell_of(Family::Program, 50) <= cell_of(Family::Program, 5_000)
+            && cell_of(Family::Program, 5_000) <= cell_of(Family::Program, 500_000),
+    );
+    claim(
+        "two families never share a cell at the same difficulty",
+        cell_of(Family::Program, 50) != cell_of(Family::Imported, 50),
+    );
+    claim(
+        "every cell a descriptor can name is inside the archive",
+        [0usize, 50, 1_999, 2_000, 7_999, 8_000, usize::MAX]
+            .iter()
+            .all(|d| cell_of(Family::Imported, *d) < CELLS),
     );
 
     // And the trade, which is the reason this is judged rather than assumed:
