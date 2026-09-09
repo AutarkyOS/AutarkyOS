@@ -244,6 +244,7 @@ pub struct Snapshot {
     pub job_id: String,
     pub extranonce2: Vec<u8>,
     pub ntime_be: Vec<u8>,
+    pub echo: super::proto::Echo,
     pub submits: bool,
 }
 
@@ -259,6 +260,7 @@ pub fn snapshot(slot: usize) -> Option<Snapshot> {
         job_id: t.job_id.clone(),
         extranonce2: t.extranonce2.clone(),
         ntime_be: t.ntime_be.clone(),
+        echo: t.echo.clone(),
         submits: c.source == Source::Pool,
     })
 }
@@ -407,6 +409,7 @@ pub fn fixture_template(seed: u8) -> Template {
         coin_value: None,
         coinbase_len: 0,
         coinbase_head: [0u8; 8],
+        echo: alloc::vec::Vec::new(),
     }
 }
 

@@ -62,12 +62,37 @@ static NEXT_ID: AtomicU64 = AtomicU64::new(3);
 static DIFF_M: AtomicU64 = AtomicU64::new(1);
 static DIFF_S: AtomicU32 = AtomicU32::new(0);
 
+/// Which dialect the far end speaks.
+///
+/// A setting rather than something negotiated. A pool that answered `hello`
+/// with a Stratum error and a pool that answered a `subscribe` with nothing
+/// look identical from here -- a silent connection -- so probing for it would
+/// turn a typo in an address into a minute of waiting with no reason given.
+#[derive(Clone, Copy, PartialEq)]
+pub enum Protocol {
+    /// Somebody else's pool, one coin, no algorithm on the wire.
+    StratumV1,
+    /// Ours. Several coins down one connection, each with its algorithm. See
+    /// `design/pool.md` and `mine::proto`.
+    Glados,
+}
+
+impl Protocol {
+    pub fn name(self) -> &'static str {
+        match self {
+            Protocol::StratumV1 => "stratum v1",
+            Protocol::Glados => "glados",
+        }
+    }
+}
+
 /// Where to connect and as whom. Not the connection itself.
 pub struct Config {
     pub host: String,
     pub port: u16,
     pub user: String,
     pub pass: String,
+    pub proto: Protocol,
 }
 
 pub static CONFIG: Spin<Option<Config>> = Spin::new(None);
@@ -105,6 +130,10 @@ pub struct Template {
     /// working out whether the stub or the assembly was wrong.
     pub coinbase_len: usize,
     pub coinbase_head: [u8; 8],
+    /// Whatever the pool wants handed back at submit time, stored without
+    /// being read. Empty under Stratum V1, where `extranonce2` and `ntime_be`
+    /// above are the same idea with the fields named.
+    pub echo: super::proto::Echo,
 }
 
 /// The slot the Stratum connection fills.
@@ -150,6 +179,7 @@ pub struct Share {
     pub extranonce2: Vec<u8>,
     pub ntime_be: Vec<u8>,
     pub nonce_be: Vec<u8>,
+    pub echo: super::proto::Echo,
 }
 
 pub static SHARES: Spin<Vec<Share>> = Spin::new(Vec::new());
@@ -388,6 +418,7 @@ fn sleep_ms(ms: u64) {
 }
 
 struct Session {
+    proto: Protocol,
     h: tcp::Handle,
     buf: Vec<u8>,
     e1: Vec<u8>,
@@ -441,10 +472,10 @@ fn stratum_task() {
 
 /// Resolve, connect, subscribe, authorize. `None` on any refusal.
 fn connect() -> Option<Session> {
-    let (host, port, user, pass) = {
+    let (host, port, user, pass, proto) = {
         let g = CONFIG.lock_irq();
         let c = g.as_ref()?;
-        (c.host.clone(), c.port, c.user.clone(), c.pass.clone())
+        (c.host.clone(), c.port, c.user.clone(), c.pass.clone(), c.proto)
     };
 
     set_phase(Phase::Resolving);
@@ -465,6 +496,7 @@ fn connect() -> Option<Session> {
         }
     };
     let mut s = Session {
+        proto,
         h,
         buf: Vec::new(),
         e1: Vec::new(),
@@ -473,6 +505,10 @@ fn connect() -> Option<Session> {
         e2: 0,
         pending: Vec::new(),
     };
+
+    if proto == Protocol::Glados {
+        return greet(s, &user);
+    }
 
     if tcp::send_at(s.h, stratum::subscribe(1).as_bytes(), 5_000).is_err() {
         tcp::abort_at(s.h);
@@ -506,6 +542,111 @@ fn connect() -> Option<Session> {
     Some(s)
 }
 
+/// The `glados.hello` handshake. One round trip and no subscribe.
+///
+/// There is no extranonce to negotiate, because there is no coinbase for the
+/// miner to put one in: the pool assembles the header. That is the whole
+/// simplification the protocol buys on this side, and it is why this function
+/// is a tenth of the Stratum path above.
+fn greet(mut s: Session, user: &str) -> Option<Session> {
+    let hello = super::proto::encode_hello(1, user, concat!("glados/", env!("CARGO_PKG_VERSION")));
+    if tcp::send_at(s.h, hello.as_bytes(), 5_000).is_err() {
+        tcp::abort_at(s.h);
+        return None;
+    }
+    set_phase(Phase::Subscribed);
+
+    let mut welcomed = false;
+    if !await_id(&mut s, 1, |_, body| {
+        // `classify` hands back the whole message rather than the `result`
+        // field -- `subscribe_result` unwraps it too, and reading past the
+        // wrapper here cost a full end-to-end run: the pool logged the hello
+        // and the answer, and the kernel reported that nothing had answered.
+        let Some(result) = body.get("result") else {
+            return false;
+        };
+        match super::proto::parse_welcome(result) {
+            Some(w) => {
+                // Refused rather than adapted. Two ends disagreeing about the
+                // wire have nothing to say to each other, and a client that
+                // guessed at an older shape would be a second code path that
+                // only ever runs against a pool nobody is running.
+                if w.v != super::proto::VERSION {
+                    return false;
+                }
+                welcomed = true;
+                true
+            }
+            None => false,
+        }
+    }) {
+        note(if welcomed {
+            "the pool speaks a different version of this protocol"
+        } else {
+            "the pool did not answer the greeting"
+        });
+        tcp::abort_at(s.h);
+        return None;
+    }
+    set_phase(Phase::Authorized);
+    note("greeted, and the pool answered");
+    Some(s)
+}
+
+/// A `glados.job`: install it as a coin in the work table.
+///
+/// **The pool's slot number is used directly**, which is what lets one
+/// connection feed several slices at once. It also means a pool job displaces
+/// whatever `mine coin` put in that slot, and that is the right way round: a
+/// fixture exists because there was no real work, and there is now.
+fn handle_glados_job(params: &crate::json::Json) {
+    let Some(j) = super::proto::parse_job(params) else {
+        // A job this build cannot hash is declined and said out loud. Silence
+        // here reads exactly like a pool that has stopped sending.
+        note("a job was refused: unknown algorithm or a malformed field");
+        return;
+    };
+    let slot = j.slot as usize;
+    if slot >= super::work::MAX_COINS {
+        note("the pool offered a slot beyond this build's coin table");
+        return;
+    }
+
+    // `install` keeps the template it finds when the coin has not changed, so
+    // this is a no-op on every job after the first for a slot -- and it resets
+    // the slot's rate when the algorithm does change, which is what stops a
+    // figure spanning two different functions.
+    super::work::install(slot, &j.coin, j.algo, super::work::Source::Pool);
+
+    let serial = bump_serial();
+    let t = Template {
+        serial,
+        job_id: j.job,
+        // Under this protocol these two are the pool's problem: it assembled
+        // the header, so it holds whatever went into it. They stay empty
+        // rather than being filled with something plausible.
+        extranonce2: Vec::new(),
+        ntime_be: Vec::new(),
+        header: j.header,
+        target: j.target,
+        nbits: 0,
+        coin_value: None,
+        coinbase_len: 0,
+        coinbase_head: [0u8; 8],
+        echo: j.echo,
+    };
+    super::work::set_template(slot, t);
+
+    // Shares for the previous job on this slot cannot be submitted: the job id
+    // is gone. Dropped here rather than filtered at submit, and only for this
+    // slot, because another coin's queued shares are still perfectly current.
+    if j.clean {
+        SHARES
+            .lock_irq()
+            .retain(|sh| sh.slot != slot || sh.serial == serial);
+    }
+}
+
 /// Read until the response with `id` arrives, handling notifications on the way.
 ///
 /// The notifications are not a distraction to be skipped: a pool sends
@@ -531,7 +672,17 @@ fn await_id(
                     Ok(Message::Response { id: got, ok, body }) if got == id => {
                         return ok && on_ok(s, &body);
                     }
-                    Ok(Message::Notify { method, params }) => handle_notify(s, &method, &params),
+                    // Dispatched by dialect for the same reason `run` does. A
+                    // pool sends work immediately after the welcome, and a
+                    // handshake that routed those to the Stratum handler would
+                    // drop the first job of every session -- the exact failure
+                    // this function's own doc comment warns about, arriving
+                    // through the other protocol.
+                    Ok(Message::Notify { method, params }) => match s.proto {
+                        Protocol::StratumV1 => handle_notify(s, &method, &params),
+                        Protocol::Glados if method == "glados.job" => handle_glados_job(&params),
+                        Protocol::Glados => {}
+                    },
                     // Somebody else's id, or a line we cannot read. Neither is
                     // fatal: pools send things this client does not implement.
                     Ok(_) => {}
@@ -574,7 +725,14 @@ fn run(s: &mut Session) {
         loop {
             match stratum::take_line(&mut s.buf) {
                 Ok(Some(line)) => match stratum::classify(&line) {
-                    Ok(Message::Notify { method, params }) => handle_notify(s, &method, &params),
+                    // Shape, not order. `classify` sorts a notification from a
+                    // response and both dialects are JSON-RPC, so the only
+                    // thing that differs is which method names mean something.
+                    Ok(Message::Notify { method, params }) => match s.proto {
+                        Protocol::StratumV1 => handle_notify(s, &method, &params),
+                        Protocol::Glados if method == "glados.job" => handle_glados_job(&params),
+                        Protocol::Glados => {}
+                    },
                     Ok(Message::Response { id, ok, body }) => on_submit_reply(s, id, ok, &body),
                     Err(_) => {}
                 },
@@ -599,7 +757,16 @@ fn drain_shares(s: &mut Session) -> bool {
         // second gate, at the only point where bytes actually leave, because
         // the cost of being wrong here is not a bad measurement -- it is the
         // pool refusing this address afterwards.
-        if sh.slot != POOL_SLOT {
+        //
+        // Asked of the *slot* rather than compared against `POOL_SLOT`, which
+        // was right only while one connection meant one coin. Under the glados
+        // protocol every slot the pool filled has an upstream and a fixture
+        // beside them still must not be sent.
+        let submits = super::work::coin(sh.slot)
+            .as_ref()
+            .map(|c| c.source == super::work::Source::Pool)
+            .unwrap_or(false);
+        if !submits {
             continue;
         }
         let user = {
@@ -610,14 +777,35 @@ fn drain_shares(s: &mut Session) -> bool {
             }
         };
         let id = next_id();
-        let msg = stratum::submit(
-            id,
-            &user,
-            &sh.job_id,
-            &sh.extranonce2,
-            &sh.ntime_be,
-            &sh.nonce_be,
-        );
+        let msg = match s.proto {
+            Protocol::StratumV1 => stratum::submit(
+                id,
+                &user,
+                &sh.job_id,
+                &sh.extranonce2,
+                &sh.ntime_be,
+                &sh.nonce_be,
+            ),
+            Protocol::Glados => {
+                // Big-endian on the wire either way, and taken from the same
+                // bytes the miner hashed rather than reformatted here -- the
+                // reason `submit_hex` exists at all.
+                let nonce = u32::from_be_bytes([
+                    sh.nonce_be[0],
+                    sh.nonce_be[1],
+                    sh.nonce_be[2],
+                    sh.nonce_be[3],
+                ]);
+                super::proto::encode_submit(
+                    id,
+                    &super::proto::Share {
+                        job: sh.job_id.clone(),
+                        nonce,
+                        echo: sh.echo.clone(),
+                    },
+                )
+            }
+        };
         if tcp::send_at(s.h, msg.as_bytes(), 5_000).is_err() {
             note("could not send a share; the connection is going");
             return false;
@@ -756,6 +944,10 @@ fn rebuild(s: &mut Session) {
             }
             h
         },
+        // Stratum V1 names its round-trip fields, so there is nothing opaque
+        // to carry. Empty rather than a copy of the named ones, which would be
+        // two places holding one fact.
+        echo: Vec::new(),
     };
     // The slot has to exist before the job goes in, and creating it here rather
     // than at `mine on` is deliberate: an operator who never ran `mine coin`
@@ -916,6 +1108,7 @@ fn mine_task() {
                         extranonce2: w.extranonce2.clone(),
                         ntime_be: w.ntime_be.clone(),
                         nonce_be: nonce.to_be_bytes().to_vec(),
+                        echo: w.echo.clone(),
                     });
                 }
             }
@@ -1093,6 +1286,11 @@ pub fn probe(host: &str, port: u16, worker: &str, seconds: u64) {
         }
     };
     let mut s = Session {
+        // Stratum, always. This command exists to read what a *real* pool
+        // sends -- a non-empty merkle branch and a live network target, which
+        // our own pool by construction never produces -- so pointing it at the
+        // glados dialect would defeat its whole purpose.
+        proto: Protocol::StratumV1,
         h,
         buf: Vec::new(),
         e1: Vec::new(),

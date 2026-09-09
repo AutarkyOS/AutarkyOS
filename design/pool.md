@@ -1,10 +1,9 @@
 # The pool, and the one protocol it speaks downstream
 
-Status: the pool listens, serves two coins on two algorithms down one
-connection, and validates the shares that come back by recomputing them. No
-coin has been mined against a real chain and nothing has crossed a real
-network. What is settled here is the protocol, why it has the shape it has,
-and what it costs.
+Status: **the kernel mines three coins on three algorithms against this pool
+over one connection, and every share is recomputed and accepted.** What has
+not happened is a real chain behind any of it: the pool builds its own headers,
+so a share that beat a network target would still be worth nothing.
 
 `design/mining.md` is the other half and should be read first: it covers what
 the kernel does with the work this pool hands it.
@@ -227,6 +226,48 @@ coins down one connection while validating both under one algorithm passes a
 single-coin check perfectly, and that is precisely the bug this protocol exists
 to make impossible.
 
+## And the kernel actually does it
+
+`mine pool <host>:<port> glados` picks the dialect; the word is trailing rather
+than a scheme, because a scheme would have to be invented while
+`stratum+tcp://` is one people already paste from a pool's own page. Measured,
+QEMU against the pool running on the host:
+
+```
+glados> mine coins
+  slot  label       slices  source   rate            algorithm
+  0     btc-ish     1       pool     248884 H/s      sha256d
+        5 share(s) found
+  1     verge-ish   1       pool     5506646 H/s     blake2s (RFC 7693)
+        140 share(s) found
+  2     zeny-ish    1       pool     342 H/s         yespower 1.0 N=2048 r=8
+        6 share(s) found
+```
+
+```
+[ledger] gl4d0s.rig1  btc-ish     5 accepted, 0 stale, 0 bad, 0 dup
+[ledger] gl4d0s.rig1  verge-ish 166 accepted, 0 stale, 0 bad, 0 dup
+[ledger] gl4d0s.rig1  zeny-ish    9 accepted, 0 stale, 0 bad, 0 dup
+```
+
+181 shares, every one recomputed at the other end and agreed with, across three
+algorithms. **The three coins came from one TCP connection and one socket
+task**, which is the thing four Stratum connections could not have done inside
+`MAX_TASKS`.
+
+**One bug, and it cost the first end-to-end run.** `stratum::classify` hands
+back the whole message rather than the `result` field -- `subscribe_result`
+unwraps it too, and the greeting did not. The pool logged the hello and logged
+its answer; the kernel reported that nothing had answered. Two logs that both
+look correct and disagree about whether a message arrived is the shape to
+remember.
+
+**`mine ev` had to learn to say less.** A glados job carries no nbits and no
+coinbase, so the block printed `nbits 00000000` and a failed parse of a
+zero-byte coinbase: three lines that read as three things being broken. It
+names the absence now, which is `src/linux/proc.rs`'s rule -- a field this
+machine does not know means the answer does not exist.
+
 ## What does not
 
 - **The upstream.** Every coin's `Source` is `Local`, which means the pool
@@ -235,9 +276,6 @@ to make impossible.
   enum with no code behind it, so the report says "local" rather than implying
   otherwise. Filling it in is `stratum.rs` -- already shared -- driven by a
   host socket.
-- **The kernel speaking this protocol.** `src/mine/client.rs` still speaks
-  Stratum V1 to one pool, so `mine coin` fills every slot but the pool's with a
-  fixture. The codec is in the kernel and compiles; nothing calls it yet.
 - Accounting beyond a per-worker tally: no VarDiff, no PPLNS, no persistence.
   The ledger prints to stdout every minute and is lost on restart.
 - Worker identity, which is `supabase/functions/link` already and needs joining

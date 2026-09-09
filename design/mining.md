@@ -236,13 +236,17 @@ ones, submitting it would send the pool a share for a header it never issued,
 which is how a worker gets banned. The miner declines to queue it and
 `drain_shares` declines to send it.
 
-**What this is not yet.** Every slot but the pool's is fed by a *fixture* job,
-because there is one Stratum connection and no protocol that can carry several
-coins down it. That is not a stopgap to be replaced by four connections -- four
-socket tasks do not fit in `MAX_TASKS` beside four slices -- it is the shape
-that waits for the pool in the table at the top of this file to exist and speak
-one protocol with a coin field in it. The kernel half of "mine many coins at
-once" is done; the half that makes the coins real is Part B.
+**And the fixtures are no longer the only filling.** This section used to end
+by saying every slot but the pool's was fed by a fixture, because there was one
+Stratum connection and no protocol that could carry several coins down it. That
+protocol exists now: `src/mine/proto.rs`, `mine pool <host> glados`, and
+`design/pool.md` for the argument. Measured, three coins on three algorithms
+from one connection, 181 shares all accepted.
+
+What is still true is that no chain sits behind any of it. The pool assembles
+its own headers, so a share beating a network target would be worth nothing.
+`mine coin` and its fixtures also stay, and are still the only way to measure a
+coin without a pool at all -- which is what the L3 question on the GF63 needs.
 
 ## BLAKE2s, and why a third algorithm was worth the day
 

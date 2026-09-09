@@ -7615,7 +7615,9 @@ fn mine_cmd(rest: &str) {
         "" => mine_report(),
         "pool" => {
             if arg.is_empty() {
-                kprintln!("  usage: mine pool <host>[:port]");
+                kprintln!("  usage: mine pool <host>[:port] [glados]");
+                kprintln!("  the trailing word picks the dialect. Without it this speaks");
+                kprintln!("  Stratum V1, which is what somebody else's pool speaks.");
                 return;
             }
             // stratum+tls is refused by name rather than connected in the
@@ -7627,7 +7629,15 @@ fn mine_cmd(rest: &str) {
                 kprintln!("  the updater owns it. Use the plain stratum port.");
                 return;
             }
-            let a = arg.trim_start_matches("stratum+tcp://");
+            // The dialect is a trailing word rather than a scheme, because a
+            // scheme would have to be invented and `stratum+tcp://` is one
+            // people already paste in from a pool's own page.
+            let (a, proto) = match arg.rsplit_once(' ') {
+                Some((rest, "glados")) => (rest.trim(), client::Protocol::Glados),
+                Some((rest, "stratum")) => (rest.trim(), client::Protocol::StratumV1),
+                _ => (arg, client::Protocol::StratumV1),
+            };
+            let a = a.trim_start_matches("stratum+tcp://");
             let (host, port) = match a.rsplit_once(':') {
                 Some((h, p)) => match p.parse::<u16>() {
                     Ok(n) => (h, n),
@@ -7648,8 +7658,9 @@ fn mine_cmd(rest: &str) {
                 port,
                 user,
                 pass,
+                proto,
             });
-            kprintln!("  pool {}:{}", host, port);
+            kprintln!("  pool {}:{}  speaking {}", host, port, proto.name());
         }
         "user" => {
             if arg.is_empty() {
@@ -8028,6 +8039,18 @@ fn mine_ev() {
         kprintln!("  network      no job, so nothing below can be said");
         return;
     };
+    // A glados job is an assembled header, an algorithm and a target, and
+    // carries no nbits and no coinbase -- the pool holds the chain and the
+    // miner never sees one. Saying so is `src/linux/proc.rs`'s rule applied
+    // here: a field this machine does not know means the answer does not
+    // exist. Printing `nbits 00000000` and a failed parse of a zero-byte
+    // coinbase, which is what this did, reads as three things being broken.
+    if t.nbits == 0 && t.coinbase_len == 0 {
+        kprintln!("  network      not carried by this protocol -- the pool holds the chain");
+        kprintln!("  block pays   likewise, so no expected value follows from it");
+        virtual_caveat();
+        return;
+    }
     kprintln!("  network      nbits {:08x}              on the wire", t.nbits);
 
     match t.coin_value {
