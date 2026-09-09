@@ -208,6 +208,66 @@ copy, and a vendored copy is precisely the drift the arrangement exists to
 prevent. The site repository holds published data and HTML and needs none of
 the Rust.
 
+### How big a host, measured
+
+`glados-pool --bench` answers it, and the answer is "almost anything", for a
+reason worth stating plainly because it is the opposite of the intuition mining
+usually carries:
+
+> **A miner grinds several million nonces to find one share. The pool hashes
+> exactly once to agree.** So the pool's load scales with the share *rate*,
+> which the operator sets by choosing the target, and not with anybody's
+> hashrate. A room full of fast miners costs this server no more than the same
+> room of slow ones.
+
+Best of nine, on the development machine:
+
+| algorithm | per share | working set | shares/s on one core |
+|---|---|---|---|
+| sha256d | 0.74 us | 0 | 1,347,708 |
+| blake2s | 0.20 us | 0 | 5,025,125 |
+| yespower 2 MiB | 1.91 ms | 2,146 KiB | 524 |
+| yespower 8 MiB | 7.49 ms | 8,296 KiB | 133 |
+
+And the process itself: **370 KB of binary, 3.49 MB resident** with four coins
+configured and five threads.
+
+The transient peak is one working set on top of that, not one per miner, and
+that falls out of something accidental rather than designed: `Pool` sits behind
+a `Mutex` and validation happens while it is held, so shares are checked one at
+a time. Worth knowing before anybody "fixes" that for throughput -- a parallel
+validator would make peak memory `threads * 8 MiB`, which is the one way this
+program could become large.
+
+**So 32 MB of RAM and one core is comfortable, and the CPU number is the
+generous one.** yespower here is the *reference* implementation, deliberately
+unoptimised so the vectors have something plain to check; an optimised
+validator is roughly eight times faster, and the pool has no reason to want one.
+
+Sized against real miners: a GF63 slice does about 387 H/s of yespower, so at a
+12-bit share target (4,096 hashes) it submits one share every ten seconds or so.
+That is 0.1 shares a second, and one core absorbs **thirteen hundred** of those
+even at the 8 MiB setting.
+
+**The knob that could hurt is the share target, and it is the operator's.** Set
+it too low and a single miner submits constantly; one core saturates at 133
+yespower-8 MiB validations a second, so anything above about one share per
+second per miner means the target is wrong rather than the server small.
+
+Network and disk are noise: a job is a few hundred bytes per coin per thirty
+seconds, a share is under two hundred, and the ledger is a few kilobytes.
+
+**Do not build on the small machine.** Cross-compile and copy one file:
+
+```bash
+cargo build --release --target x86_64-unknown-linux-musl
+```
+
+musl rather than gnu so the result is statically linked -- no glibc version to
+match against whatever the host is running, no runtime dependencies, and the
+whole daemon is a single artefact to copy. A weak box should not be asked to
+hold a Rust toolchain.
+
 ### The record goes as files, not as an endpoint
 
 `--ledger PATH` writes the share log as canonical JSON. A static site whose

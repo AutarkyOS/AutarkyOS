@@ -3,6 +3,7 @@
 //! ```text
 //! glados-pool [--listen ADDR] [--ledger PATH] [COIN ...]
 //! glados-pool --selftest
+//! glados-pool --bench
 //! ```
 //!
 //! A coin is one token, `label:algo:bits`, because an algorithm is parameters
@@ -86,6 +87,10 @@ fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     if args.iter().any(|a| a == "--selftest") {
         std::process::exit(if selftest() { 0 } else { 1 });
+    }
+    if args.iter().any(|a| a == "--bench") {
+        bench();
+        return;
     }
 
     let mut listen = String::from("0.0.0.0:3334");
@@ -174,6 +179,73 @@ fn main() {
         eprintln!("[pool] {listen}: {e}");
         std::process::exit(1);
     }
+}
+
+/// What one share costs to check, which is what sizing a host comes down to.
+///
+/// **The pool's work is per share and the miner's is per hash**, and the two
+/// differ by the difficulty: a miner grinds several million nonces to find one
+/// share and the pool hashes exactly once to agree. So the load here does not
+/// scale with anybody's hashrate, only with how often shares arrive -- which is
+/// a number the operator sets, by choosing the share target.
+///
+/// Best of nine, like `video bench` and `core bench`, and for the reason those
+/// record: a single sample on a shared machine measures the host's scheduler.
+fn bench() {
+    use glados_pool::mine::algo::{Algo, Hasher};
+    use std::time::Instant;
+
+    let algos = [
+        ("sha256d", Algo::Sha256d),
+        ("blake2s", Algo::Blake2s),
+        (
+            "yespower 2 MiB",
+            Algo::Yespower { v10: true, n: 2048, r: 8, pers: None },
+        ),
+        (
+            "yespower 8 MiB",
+            Algo::Yespower { v10: true, n: 2048, r: 32, pers: None },
+        ),
+    ];
+    let header: [u8; 80] = core::array::from_fn(|i| (i as u32 * 3) as u8);
+
+    println!("what one share costs to validate, best of nine");
+    println!();
+    println!("  algorithm        per share   working set   shares/s on one core");
+    for (name, algo) in algos.iter() {
+        let Some(h) = Hasher::new(algo, &header) else {
+            continue;
+        };
+        let foot = h.footprint();
+        drop(h);
+
+        let mut best = u128::MAX;
+        for _ in 0..9 {
+            // A fresh `Hasher` every time, because that is what validating a
+            // share actually does: the pool holds no per-miner scratch, so the
+            // allocation is part of the cost rather than something amortised
+            // away by a benchmark that reuses one.
+            let t = Instant::now();
+            let reps = if foot > 0 { 20 } else { 2000 };
+            for n in 0..reps {
+                let mut hh = Hasher::new(algo, &header).unwrap();
+                core::hint::black_box(hh.hash(&header, n));
+            }
+            let per = t.elapsed().as_nanos() / reps as u128;
+            best = best.min(per);
+        }
+        let per_s = if best > 0 { 1_000_000_000 / best } else { 0 };
+        println!(
+            "  {name:<15}  {:>7} us   {:>7} KiB   {:>10}",
+            best as f64 / 1000.0,
+            foot / 1024,
+            per_s
+        );
+    }
+    println!();
+    println!("A miner grinds millions of nonces per share; the pool hashes once.");
+    println!("So this scales with the share *rate*, which the operator sets by");
+    println!("choosing the target -- not with anybody's hashrate.");
 }
 
 /// The whole path, in one process, with no kernel and no network beyond
