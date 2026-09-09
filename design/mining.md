@@ -366,8 +366,46 @@ the coin to point the machine at, and this document said it was.
 **The two algorithms with live markets are the two the GPU already has.**
 BLAKE2s is one of Verge's five, at six million dollars a day, and kHeavyHash is
 Kaspa at fourteen. Both are written in `cuda/`; BLAKE2s is also in ring 0.
-kHeavyHash is measured in `design/xpu.md` and wired to nothing, which makes it
-the single highest-value item left in this document.
+
+**And that paragraph made the same mistake in the other direction, one section
+after correcting it.** It went on to call kHeavyHash "the single highest-value
+item left in this document" on the strength of that fourteen million a day.
+Liquidity says a coin can be sold. It says nothing about whether this machine
+can win a share of one, and those are two axes. Measured the next day, off
+`api.kaspa.org`:
+
+    network difficulty    1.678e16
+    network hashrate      3.36e17 H/s   (336 PH/s)
+    this RTX 3050         3.83e8 H/s    upper bound -- see below
+    share                 1.14e-9,  one part in 878 million
+
+The card's figure is `design/xpu.md`'s best kHeavyHash path, and it is an
+*upper* bound rather than a rate: that number is the heavy step alone, and the
+full algorithm wraps it in two cSHAKE256 passes that are not implemented. The
+real one is lower and the conclusion does not depend on how much.
+
+Put in money, because a ratio that small stops meaning anything: for this
+device to earn **ten cents a day** on Kaspa, the network would have to issue
+$88M of new coin daily, which is 8.7% of Kaspa's entire market capitalisation
+every day. It is not close, and no amount of tuning a CUDA kernel moves a
+number by nine orders of magnitude. Kaspa has had dedicated ASICs since 2023
+and that is what 336 PH/s is.
+
+The derivation is worth keeping because it also settled a fact about the chain:
+`difficulty x 2 / 0.1 s` reproduces the API's own hashrate to within 0.15%,
+which confirms Kaspa is running at ten blocks a second rather than one.
+
+**Verge's BLAKE2s is the open question and it is open for a boring reason.**
+Four Verge explorer endpoints answered 404 or did not resolve, so the
+per-algorithm difficulty is not quoted here. That is not a gap needing a
+scraper: `nbits` off a live `mining.notify` *is* the network target, `mine
+probe` was built to read exactly that, and most Stratum pools hand out work to
+anybody who authorises with a payout address. So the instrument exists and what
+it needs is a connection rather than code.
+
+Until it is measured, this document ranks nothing. What the price survey
+established is which coins can be **sold**, and that is one of the two
+questions.
 
 **The finding took a field that has to be asked for.** CoinGecko answers
 BitZeny with `0.00023968` and no error; `last_updated_at` is what says the
@@ -482,11 +520,14 @@ afterwards.
 5. **The pool**, which is independent of all of the above and could start in
    parallel: proxy first, device-agnostic, `xmrig` on somebody's Pi as its
    first client. **Built** -- see `design/pool.md`.
-6. **kHeavyHash**, which the price survey moved from "nice to have" to the top
-   of the list: it is the only unimplemented algorithm in the table attached to
-   a fourteen-million-dollar-a-day market, it is already written and measured in
-   `cuda/`, and `tools/algocheck.py` already carries its oracle. What is missing
-   is the CPU port and the wire-up, not the hash.
+6. ~~**kHeavyHash**, which the price survey moved to the top of the list.~~
+   **Withdrawn the day after it was written.** Kaspa is 336 PH/s of ASIC and
+   this card would hold one part in 878 million of it -- see the correction
+   under Candidates. The hash is written and measured either way, so nothing is
+   lost by not wiring it up.
+7. **Measure Verge's BLAKE2s difficulty with `mine probe`**, which is the only
+   number that can rank anything and the only one still missing. It needs a
+   Stratum connection and a payout address, not code.
 
 Items 1 to 4 are kernel work and item 5 is not, so they do not block each
 other. The pool can exist and take miners before GLaDOS is a useful client at
