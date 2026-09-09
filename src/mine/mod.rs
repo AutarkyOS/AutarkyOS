@@ -23,6 +23,7 @@ pub mod hash;
 pub mod header;
 pub mod stratum;
 pub mod u256;
+pub mod yespower;
 
 use alloc::vec::Vec;
 
@@ -264,6 +265,111 @@ pub fn checks() -> Vec<(&'static str, bool)> {
 
     out.extend(stratum_checks());
     out.extend(ev_checks());
+    out.extend(yespower_checks());
+    out
+}
+
+/// yespower against vectors this kernel did not compute.
+///
+/// The input is `src[i] = i * 3` over 80 bytes, which is what upstream's
+/// `tests.c` hashes and is conveniently a header's length. Every digest below
+/// comes from `tools/yespower.py`, which is checked against upstream's own
+/// published TESTS-OK before it is trusted to produce anything -- so the chain
+/// is upstream's vectors, then the Python, then this.
+///
+/// The small parameter sets are here rather than the large ones because the
+/// implementation is the *reference* one, deliberately unoptimised, and a boot
+/// selftest that takes seconds is one people stop reading. `diag mine` is where
+/// a slower set belongs when there is one.
+fn yespower_checks() -> Vec<(&'static str, bool)> {
+    use yespower::{Version, Yespower};
+    let mut out = Vec::new();
+
+    let src: alloc::vec::Vec<u8> = (0..80u32).map(|i| (i * 3) as u8).collect();
+
+    const V10_1024_8: [u8; 32] = [
+        0xc9, 0x8f, 0x31, 0x9e, 0xa7, 0xdf, 0x5e, 0x7f, 0xd0, 0xd8, 0xac, 0xa4, 0xac, 0x14, 0xf7,
+        0x69, 0x2a, 0x40, 0xf4, 0x88, 0x63, 0x15, 0xe2, 0x42, 0x09, 0x28, 0x5a, 0x42, 0x94, 0x91,
+        0x23, 0xfd,
+    ];
+    const V05_1024_8: [u8; 32] = [
+        0x62, 0xa5, 0x42, 0x28, 0x38, 0x76, 0x1e, 0x78, 0xb5, 0xbe, 0x2c, 0xa8, 0x47, 0xde, 0xc9,
+        0x20, 0xf9, 0x17, 0x2a, 0x90, 0xeb, 0x29, 0x7c, 0x64, 0x97, 0x3e, 0x95, 0xf3, 0xd5, 0x00,
+        0xce, 0x0e,
+    ];
+    // This one is upstream's own TESTS-OK line verbatim rather than something
+    // the Python produced, so it closes the loop on the whole chain.
+    const V10_1024_32: [u8; 32] = [
+        0x50, 0x1b, 0x79, 0x2d, 0xb4, 0x2e, 0x38, 0x8f, 0x6e, 0x7d, 0x45, 0x3c, 0x95, 0xd0, 0x3a,
+        0x12, 0xa3, 0x60, 0x16, 0xa5, 0x15, 0x4a, 0x68, 0x83, 0x90, 0xdd, 0xc6, 0x09, 0xa4, 0x0c,
+        0x67, 0x99,
+    ];
+
+    match Yespower::new(Version::V1_0, 1024, 8) {
+        Some(mut y) => {
+            out.push((
+                "yespower 1.0 at N=1024 r=8 matches the oracle",
+                y.hash(&src, None) == V10_1024_8,
+            ));
+            // Same instance, twice. The S-boxes rotate and `w` advances during
+            // a hash, so an instance that failed to reset them would answer
+            // correctly once and differently ever after -- which is the worst
+            // shape available here, since a miner reuses one instance for
+            // millions of nonces and only the first would be right.
+            out.push((
+                "and again on the same instance, so the state resets",
+                y.hash(&src, None) == V10_1024_8,
+            ));
+            let mut other = src.clone();
+            other[0] ^= 1;
+            out.push((
+                "a one-bit change in the input changes the digest",
+                y.hash(&other, None) != V10_1024_8,
+            ));
+        }
+        None => out.push(("yespower 1.0 at N=1024 r=8 could be constructed", false)),
+    }
+
+    // The two versions are not variants of one function, they are different
+    // proof-of-work schemes that live on different coins. Same input, same
+    // parameters, different answer.
+    match Yespower::new(Version::V0_5, 1024, 8) {
+        Some(mut y) => out.push((
+            "yespower 0.5 answers differently, and matches its own vector",
+            y.hash(&src, None) == V05_1024_8 && V05_1024_8 != V10_1024_8,
+        )),
+        None => out.push(("yespower 0.5 at N=1024 r=8 could be constructed", false)),
+    }
+
+    match Yespower::new(Version::V1_0, 1024, 32) {
+        Some(mut y) => {
+            out.push((
+                "and at r=32 it matches upstream's own published vector",
+                y.hash(&src, None) == V10_1024_32,
+            ));
+            // 128 * r * N for V, plus the S-boxes and three 128r scratches.
+            out.push((
+                "the working set is the size the parameters imply",
+                y.footprint() >= 128 * 32 * 1024 && y.footprint() < 128 * 32 * 1024 * 2,
+            ));
+        }
+        None => out.push(("yespower 1.0 at N=1024 r=32 could be constructed", false)),
+    }
+
+    // Refused rather than clamped. Every one of these bounds is part of what a
+    // coin's network agreed on, so a clamped parameter hashes a different
+    // function perfectly correctly and every share is rejected.
+    out.push((
+        "a non-power-of-two N is refused",
+        Yespower::new(Version::V1_0, 1500, 8).is_none(),
+    ));
+    out.push((
+        "and an N or r outside the scheme's range",
+        Yespower::new(Version::V1_0, 512, 8).is_none()
+            && Yespower::new(Version::V1_0, 1024, 7).is_none()
+            && Yespower::new(Version::V1_0, 1024, 33).is_none(),
+    ));
+
     out
 }
 
