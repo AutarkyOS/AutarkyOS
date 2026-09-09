@@ -1,0 +1,44 @@
+# This file exists to escape the kernel's target, and for nothing else.
+#
+# `../.cargo/config.toml` sets `build.target = "x86_64-unknown-uefi"`, and
+# cargo walks up from the working directory, so a bare `cargo build` in here
+# would try to build a server as a UEFI application. Cargo has no way to
+# *unset* an inherited key, so the only way out is to name one, and the closest
+# config wins.
+#
+# The triple named is this development machine's, which is the one place a
+# `cargo test` is ever actually typed. Anywhere the pool is really deployed --
+# CI, a server -- passes `--target` explicitly and overrides this line:
+#
+#     cargo build --release --target x86_64-unknown-linux-gnu
+#
+[build]
+target = "x86_64-pc-windows-msvc"
+
+# Cleared, not inherited. The parent sets `+sse,+sse2,-soft-float` for the UEFI
+# target; on a hard-float host the first two are baseline and the third is a
+# switch with nothing to disable, so rustc warns on every single build that
+# `soft-float` cannot be disabled this way. The flags change no code generated
+# here and the warning is about a target this crate does not use, so the honest
+# thing is to stop asking for them rather than to read past it.
+rustflags = []
+
+# Cross-compiling to Linux from this Windows machine, which is how the daemon
+# is actually built: there is no `cc` here, and cargo's default linker for a
+# Linux target is `cc`.
+#
+# `rust-lld` ships with the toolchain and can link a fully static musl binary
+# with no C toolchain anywhere, which is the whole reason musl is the target
+# rather than gnu. It is written down here rather than exported by hand,
+# because a hand-set environment variable is how a build silently leaves the
+# *previous* binary in place -- which happened once during this work and looks
+# exactly like a change that did nothing. The same class of failure `drive.py`
+# records about preferring the release artefact.
+[target.x86_64-unknown-linux-musl]
+linker = "rust-lld"
+
+# Present for the day the host is an ARM box. Untested -- nothing has been
+# built for it -- and listed so the setting is one line rather than a
+# rediscovery.
+[target.aarch64-unknown-linux-musl]
+linker = "rust-lld"

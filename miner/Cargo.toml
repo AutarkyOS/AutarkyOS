@@ -1,0 +1,23 @@
+[package]
+name = "glados-miner"
+version = "0.1.0"
+edition = "2021"
+description = "Mines into a GLaDOS pool, on a GPU or on this host's cores"
+
+[workspace]
+
+# The one dependency, and it is this repository. `glados-pool` is where the
+# kernel's mining core is already made available to host programs -- twelve of
+# `src/`'s own files reached by `#[path]`, including `proto.rs` -- so the miner
+# reuses that rather than opening a second seam onto the same files. Two
+# `#[path]` trees over one source directory is two places to keep a list
+# current, and the list is the thing that goes stale.
+[dependencies]
+glados-pool = { path = "../pool" }
+
+[[bin]]
+name = "glados-miner"
+path = "src/main.rs"
+
+[profile.release]
+opt-level = 3
