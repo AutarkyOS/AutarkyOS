@@ -1,10 +1,10 @@
 # Mining many coins at once, and which ones
 
-Status: research only. No coin below has been mined, no algorithm below is
-implemented except SHA-256d, and every live figure in the last section is
-absent on purpose rather than guessed at. What is settled here is the shape of
-the problem, the licence gate, and which algorithm family the arithmetic points
-at.
+Status: yespower is implemented in ring 0 and measured; see "Measured" below.
+No coin has been mined. Every *network* figure is still absent on purpose
+rather than guessed at, for the reason the last section gives. What is settled
+here is the shape of the problem, the licence gate, and which algorithm family
+the arithmetic points at.
 
 ## The idea
 
@@ -90,6 +90,54 @@ Roughly 1,000 H/s per core at 2 MiB and 200 at 8 MiB, on hardware a decade
 older than the GF63. Those are four-thread figures on a four-core part, so they
 already include some contention.
 
+## Measured, in ring 0
+
+`mine bench <ms>` hashes flat out with no pool and no network. QEMU under WHPX,
+`-smp 4`, best of one, five-second samples:
+
+| algorithm | H/s | working set |
+|---|---|---|
+| sha256d | 88,297 | 0 |
+| yespower 1.0, N=2048 r=8 | **125** | 2,146 KiB |
+| yespower 0.5, N=2048 r=8 | 97 | 2,058 KiB |
+| yespower 1.0, N=2048 r=32 | 33 | 8,296 KiB |
+
+Two internal consistency checks fall out and both hold. **r=32 is 3.8x slower
+than r=8**, where upstream's own figures give 4.8x -- the same shape, since `r`
+scales the blockmix work linearly. And **0.5 is slower than 1.0 at identical
+parameters**, which it must be: 0.5 runs salsa20/8 with PWXrounds=6 where 1.0
+runs salsa20/2 with PWXrounds=3, so 1.0 is simply less work per hash. A build
+where those two came out the other way round would have the versions swapped
+somewhere.
+
+The working set is what `128 * N * r` predicts plus the S-boxes, so
+`Hasher::footprint` is telling the truth and the slice budget can be trusted to
+it.
+
+**Against upstream, we are about 8x slow**, and that is expected rather than
+alarming: upstream's ~1000 H/s per core is `yespower-opt.c` on bare metal, and
+this is `yespower-ref.c` under an emulator. The reference is what the vectors
+are checked against; speed is a later change with them still passing.
+
+### The number that matters is not the bench one
+
+The same algorithm, measured **inside the mining loop** rather than flat out:
+
+    mine bench   125 H/s   over 632 hashes in 5039 ms, 5 tasks
+    mine (loop)   40 H/s   over 240 hashes in 5955 ms, 7 tasks
+
+**Three times less, on the same machine and the same algorithm.** The bench
+runs on the shell task while everything else is blocked; the miner is one
+runnable task among seven and gets a round-robin share of one core.
+
+Both numbers are honest and they answer different questions. The bench says
+what the algorithm costs, which is what a comparison against upstream or
+against another algorithm needs. The loop says what a slice actually delivers,
+which is what the supervisor's accounting and every expected-value figure must
+use. **Quoting the bench number in an EV calculation would overstate earnings
+by 3x**, and `mine ev` therefore reads the loop's counter and prints the task
+count beside it.
+
 ## The licence gate
 
 This decides where implementations may come from, and it is a gate rather than
@@ -161,14 +209,16 @@ Which fixes the order.
 
 ## Sequencing
 
-1. **yespower in ring 0.** Cheapest, and it unlocks six coins at once. BSD
-   upstream, `tools/algocheck.py` gains it as an oracle before the kernel does,
-   the way every algorithm here has been checked.
-2. **Score those six with `mine probe` and `mine ev`.** Real targets, real
+1. ~~**yespower in ring 0.**~~ **Done.** `tools/yespower.py` came first and
+   carries upstream's own thirteen TESTS-OK vectors; `src/mine/yespower.rs`
+   matches three of them, one verbatim. Wired to the loop and measured above.
+2. **Score the six coins with `mine probe` and `mine ev`.** Real targets, real
    coinbase values, real hashrate. This is the calibration set for everything
    after, and the first honest answer to whether the premise holds.
 3. **Measure the concurrency curve.** Jobs against total hashrate, to find
-   where L3 bends. Replaces the arithmetic above with a number.
+   where L3 bends. Replaces the arithmetic above with a number, and it is now
+   the largest unmeasured claim in this document. Needs the supervisor, since
+   nothing today can run two jobs at once.
 4. **The supervisor**, allocating slices against that measured budget rather
    than against core count.
 5. **The pool**, which is independent of all of the above and could start in

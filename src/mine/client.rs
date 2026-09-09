@@ -84,7 +84,13 @@ pub struct Template {
     pub job_id: String,
     pub extranonce2: Vec<u8>,
     pub ntime_be: Vec<u8>,
-    pub mid: super::hash::Midstate,
+    /// The assembled header with a zero nonce. The miner substitutes into it.
+    ///
+    /// Not a midstate any more: that is a SHA-256d-only optimisation, since it
+    /// rests on the first 64 bytes being absorbable once, and yespower puts all
+    /// eighty through every nonce. The midstate is rebuilt on the miner's side
+    /// for the algorithms that can use one.
+    pub header: [u8; 80],
     pub target: super::u256::U256,
     /// The network's own target, for the expected-value block. On the wire,
     /// so it moves with the job and is never a constant.
@@ -102,6 +108,18 @@ pub struct Template {
 }
 
 pub static TEMPLATE: Spin<Option<Template>> = Spin::new(None);
+
+/// Which proof-of-work to compute.
+///
+/// A setting rather than something the pool says, because Stratum V1 has no
+/// field for it -- the pool and the miner are simply assumed to agree, which is
+/// true when a pool serves one coin and is the whole reason our own pool wants
+/// a protocol that says so out loud. See `design/mining.md`.
+pub static ALGO: Spin<Option<super::algo::Algo>> = Spin::new(None);
+
+pub fn algo_in_force() -> super::algo::Algo {
+    ALGO.lock_irq().clone().unwrap_or(super::algo::Algo::Sha256d)
+}
 
 /// A share, waiting for the socket task to send it.
 pub struct Share {
@@ -597,7 +615,7 @@ fn rebuild(s: &mut Session) {
         job_id: job.id.clone(),
         extranonce2: e2,
         ntime_be,
-        mid: super::hash::Midstate::new(&header),
+        header,
         target,
         nbits: job.nbits,
         coin_value: super::ev::coinbase_value(&coinbase),
@@ -632,31 +650,64 @@ fn rebuild(s: &mut Session) {
 /// rate and the task count beside it rather than a flat-out figure, because the
 /// flat-out figure is not one this machine ever delivers.
 fn mine_task() {
+    // The hasher lives here rather than in the template, because it owns a
+    // working set that must not be shared with the socket task. Rebuilt only
+    // when the algorithm changes; a new job only retargets it.
+    let mut held: Option<(super::algo::Algo, super::algo::Hasher)> = None;
+    let mut held_serial = 0u64;
+
     loop {
         if !ENABLED.load(Ordering::Acquire) || !MINING.load(Ordering::Acquire) {
             idle();
             continue;
         }
         // Snapshot under the lock and hash outside it. Holding it across a
-        // batch would block `rebuild` for a millisecond and a half every time.
+        // batch would block `rebuild` for the length of one every time.
         let snap = {
             let g = TEMPLATE.lock_irq();
-            match g.as_ref() {
-                Some(t) => Some((
+            g.as_ref().map(|t| {
+                (
                     t.serial,
-                    t.mid.clone(),
+                    t.header,
                     t.target,
                     t.job_id.clone(),
                     t.extranonce2.clone(),
                     t.ntime_be.clone(),
-                )),
-                None => None,
-            }
+                )
+            })
         };
-        let Some((serial, mid, target, job_id, e2, ntime_be)) = snap else {
+        let Some((serial, header, target, job_id, e2, ntime_be)) = snap else {
             idle();
             continue;
         };
+        let algo = algo_in_force();
+
+        if held.as_ref().map(|(a, _)| a != &algo).unwrap_or(true) {
+            match super::algo::Hasher::new(&algo, &header) {
+                Some(h) => {
+                    note("hasher built");
+                    held = Some((algo.clone(), h));
+                    held_serial = serial;
+                }
+                None => {
+                    // Parameters the algorithm refuses, or a working set that
+                    // will not fit. Said once rather than spun on.
+                    note("the algorithm refused its parameters; not mining");
+                    MINING.store(false, Ordering::Release);
+                    continue;
+                }
+            }
+        } else if serial != held_serial {
+            if let Some((_, h)) = held.as_mut() {
+                h.retarget(&header);
+            }
+            held_serial = serial;
+        }
+        let Some((_, hasher)) = held.as_mut() else {
+            idle();
+            continue;
+        };
+
         if HASH_SINCE.load(Ordering::Relaxed) == 0 {
             HASH_SINCE.store(now_ms(), Ordering::Relaxed);
         }
@@ -664,18 +715,17 @@ fn mine_task() {
         // The nonce is derived from the count rather than kept, so a template
         // change restarts the sweep and two templates never share a nonce
         // space by accident.
+        let batch = algo.batch();
         let base = (HASHES.load(Ordering::Relaxed) & 0xffff_ffff) as u32;
-        for i in 0..BATCH {
+        for i in 0..batch {
             let nonce = base.wrapping_add(i);
-            let d = mid.hash_with(nonce);
+            let d = hasher.hash(&header, nonce);
             let z = super::hash::leading_zero_bits(&d);
             if z > BEST.load(Ordering::Relaxed) {
                 BEST.store(z, Ordering::Relaxed);
             }
             if super::hash::below_target(&d, &target) {
                 FOUND.fetch_add(1, Ordering::Relaxed);
-                let mut be = [0u8; 4];
-                be.copy_from_slice(&nonce.to_be_bytes());
                 let mut q = SHARES.lock_irq();
                 // Bounded: a misconfigured difficulty of nearly zero would
                 // otherwise queue faster than the socket can drain, and the
@@ -686,17 +736,44 @@ fn mine_task() {
                         job_id: job_id.clone(),
                         extranonce2: e2.clone(),
                         ntime_be: ntime_be.clone(),
-                        nonce_be: be.to_vec(),
+                        nonce_be: nonce.to_be_bytes().to_vec(),
                     });
                 }
             }
         }
-        HASHES.fetch_add(BATCH as u64, Ordering::Relaxed);
-        // Cheap, and it is what makes `mine off` and a new job felt promptly.
-        if JOB_SERIAL.load(Ordering::Acquire) != serial {
-            continue;
-        }
+        HASHES.fetch_add(batch as u64, Ordering::Relaxed);
     }
+}
+
+/// Hash as fast as this machine can for `ms`, with no pool and no network.
+///
+/// Bounded, and that is not a nicety: `drive.py` sends the next command when it
+/// sees a prompt, so an unbounded measurement leaves the harness with commands
+/// unsent -- the lesson `port bars <ms>` records. Runs on the caller's task.
+///
+/// The header is a fixture rather than a real job, because the rate does not
+/// depend on which bytes go in and requiring a pool to measure a hash rate
+/// would make the number impossible to take before the pool exists.
+pub fn bench(algo: &super::algo::Algo, ms: u64) -> Option<(u64, u64, usize)> {
+    let header: [u8; 80] = core::array::from_fn(|i| (i as u32 * 3) as u8);
+    let mut h = super::algo::Hasher::new(algo, &header)?;
+    let foot = h.footprint();
+    let t0 = now_ms();
+    let deadline = t0 + ms;
+    let mut n = 0u64;
+    let mut nonce = 0u32;
+    // In chunks, so the clock is read once per chunk rather than once per hash
+    // -- at sha256d speed the read would otherwise be a measurable part of what
+    // is being measured.
+    let chunk = algo.batch();
+    while now_ms() < deadline {
+        for _ in 0..chunk {
+            core::hint::black_box(h.hash(&header, nonce));
+            nonce = nonce.wrapping_add(1);
+        }
+        n += chunk as u64;
+    }
+    Some((n, now_ms().saturating_sub(t0), foot))
 }
 
 pub fn next_id() -> u64 {

@@ -17,6 +17,7 @@
 //! `hashlib`, which is the bargain `tokenizer.py --verify` makes: the reader is
 //! deliberately not the writer.
 
+pub mod algo;
 pub mod client;
 pub mod ev;
 pub mod hash;

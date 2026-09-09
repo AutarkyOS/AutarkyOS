@@ -7568,6 +7568,82 @@ fn mine_cmd(rest: &str) {
             client::stop();
             kprintln!("  stopping");
         }
+        "algo" => {
+            use crate::mine::algo::Algo;
+            if arg.is_empty() {
+                kprintln!("  {}", client::algo_in_force().detail());
+                kprintln!("  usage: mine algo sha256d");
+                kprintln!("         mine algo yespower <10|05> <N> <r> [personalisation]");
+                return;
+            }
+            let mut w = arg.split_whitespace();
+            let a = match w.next().unwrap_or("") {
+                "sha256d" => Some(Algo::Sha256d),
+                "yespower" => {
+                    // Explicit parameters and no per-coin preset table. A
+                    // preset is a number this tree would be asserting about
+                    // somebody else's network without having read their
+                    // source, and a wrong one hashes a different function
+                    // perfectly correctly and has every share rejected.
+                    let v = w.next().unwrap_or("");
+                    let n = w.next().and_then(|x| x.parse::<u32>().ok());
+                    let r = w.next().and_then(|x| x.parse::<u32>().ok());
+                    let pers = w.next().map(|p| p.as_bytes().to_vec());
+                    match (v, n, r) {
+                        ("10", Some(n), Some(r)) => Some(Algo::Yespower { v10: true, n, r, pers }),
+                        ("05", Some(n), Some(r)) => Some(Algo::Yespower { v10: false, n, r, pers }),
+                        _ => {
+                            kprintln!("  usage: mine algo yespower <10|05> <N> <r> [pers]");
+                            return;
+                        }
+                    }
+                }
+                other => {
+                    kprintln!("  no such algorithm '{}' -- try sha256d or yespower", other);
+                    return;
+                }
+            };
+            let Some(a) = a else { return };
+            // Built once here so bad parameters are refused at the prompt
+            // rather than by the miner task, where the only place to say so
+            // is a journal nobody is looking at.
+            let probe: [u8; 80] = core::array::from_fn(|i| (i as u32 * 3) as u8);
+            if crate::mine::algo::Hasher::new(&a, &probe).is_none() {
+                kprintln!("  those parameters are refused by the algorithm");
+                return;
+            }
+            kprintln!("  {}", a.detail());
+            *client::ALGO.lock_irq() = Some(a);
+        }
+        "bench" => {
+            let ms: u64 = arg.parse().unwrap_or(3000);
+            if ms < 500 {
+                kprintln!("  under half a second measures the clock, not the machine");
+                return;
+            }
+            let a = client::algo_in_force();
+            console::set_color(YELLOW);
+            kprintln!("[mine bench] {}", a.detail());
+            console::set_color(LTGRAY);
+            match client::bench(&a, ms) {
+                Some((n, took, foot)) if took > 0 => {
+                    kprintln!(
+                        "  {} H/s over {} hashes in {} ms, sharing the core with {} task(s)",
+                        n * 1000 / took,
+                        n,
+                        took,
+                        crate::task::count()
+                    );
+                    if foot > 0 {
+                        kprintln!("  {} KiB of working set", foot / 1024);
+                    }
+                    if took < 5_000 {
+                        kprintln!("  short sample -- not a quotable rate");
+                    }
+                }
+                _ => kprintln!("  could not build a hasher for those parameters"),
+            }
+        }
         "ev" => mine_ev(),
         "log" => {
             let j = client::journal();
@@ -7607,7 +7683,7 @@ fn mine_cmd(rest: &str) {
         }
         other => {
             kprintln!(
-                "  no such subverb '{}' -- try pool, user, on, off, ev, log, probe",
+                "  no such subverb '{}' -- try pool, user, algo, on, off, bench, ev, log, probe",
                 other
             )
         }
