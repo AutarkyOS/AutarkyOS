@@ -60,6 +60,47 @@ pub const VERSION: u64 = 1;
 /// is a problem the moment anything hashes or signs one.
 pub type Echo = Vec<(String, String)>;
 
+/// What a pool sends so a miner can check what it is mining for.
+///
+/// A miner handed a finished header cannot see which address the block would
+/// pay: the coinbase is inside a merkle root, and a root is a hash. This is the
+/// answer, and `proves` below is the whole of the check.
+///
+/// **The extranonce arrives already spliced.** Stratum splits it into a
+/// per-connection half and a per-job half because the miner has to vary the
+/// second; here the pool varies it and the miner only ever rebuilds, so where
+/// the boundary falls is not information the miner can use. One field is one
+/// fewer thing to get wrong.
+pub struct Proof {
+    pub coinb1: Vec<u8>,
+    pub extranonce: Vec<u8>,
+    pub coinb2: Vec<u8>,
+    pub branch: Vec<[u8; 32]>,
+}
+
+/// Does this proof produce the header it came with.
+///
+/// Only the merkle root is checked, and that is sufficient rather than
+/// partial: the root is the single field a coinbase reaches, and everything
+/// else in the header -- version, previous hash, time, bits -- belongs to the
+/// chain rather than to the pool's payout. A root that matches proves the
+/// coinbase the miner was *shown* is the coinbase that was *committed to*, and
+/// a pool cannot show one coinbase and mine another without breaking it.
+///
+/// What it does not prove is that the chain wants this header at all. A pool
+/// free-running its own template passes this check perfectly, which is why
+/// `Source` is reported beside every coin.
+pub fn proves(p: &Proof, header: &[u8; 80]) -> bool {
+    let coinbase = super::header::coinbase(&p.coinb1, &p.extranonce, &[], &p.coinb2);
+    let root = super::header::merkle_root(&coinbase, &p.branch);
+    root[..] == header[36..68]
+}
+
+/// The coinbase a proof describes, for reading its outputs.
+pub fn coinbase_of(p: &Proof) -> Vec<u8> {
+    super::header::coinbase(&p.coinb1, &p.extranonce, &[], &p.coinb2)
+}
+
 pub struct Job {
     /// Which of the pool's coins this belongs to. The pool's numbering, not
     /// the miner's: the miner puts it in whichever local slot it likes, and a
@@ -75,6 +116,10 @@ pub struct Job {
     /// Abandon work on this slot's previous job. Per slot and never global:
     /// one coin's chain moving on says nothing about another's.
     pub clean: bool,
+    /// Present when the pool is willing to show its working. Optional because
+    /// a pool with no chain behind a coin has no meaningful coinbase to show,
+    /// and sending a fabricated one would be worse than sending none.
+    pub proof: Option<Proof>,
 }
 
 pub struct Share {
@@ -186,6 +231,22 @@ pub fn encode_job(j: &Job) -> String {
     push_echo(&mut s, &j.echo);
     s.push_str(",\"clean\":");
     s.push_str(if j.clean { "true" } else { "false" });
+    if let Some(p) = &j.proof {
+        s.push_str(",\"proof\":{\"coinb1\":");
+        write_str(&mut s, &hex(&p.coinb1));
+        s.push_str(",\"extranonce\":");
+        write_str(&mut s, &hex(&p.extranonce));
+        s.push_str(",\"coinb2\":");
+        write_str(&mut s, &hex(&p.coinb2));
+        s.push_str(",\"branch\":[");
+        for (i, b) in p.branch.iter().enumerate() {
+            if i > 0 {
+                s.push(',');
+            }
+            write_str(&mut s, &hex(b));
+        }
+        s.push_str("]}");
+    }
     s.push_str("}}\n");
     s
 }
@@ -257,6 +318,40 @@ fn take_echo(j: Option<&Json>) -> Echo {
     out
 }
 
+fn take_proof(j: Option<&Json>) -> Option<Proof> {
+    let j = j?;
+    let hexfield = |k: &str| -> Option<Vec<u8>> { unhex(j.get(k)?.as_str()?) };
+    let mut branch: Vec<[u8; 32]> = Vec::new();
+    match j.get("branch") {
+        Some(Json::Arr(items)) => {
+            for it in items.iter() {
+                let b = unhex(it.as_str()?)?;
+                // Exactly 32, and refused rather than padded. A short sibling
+                // zero-extended folds to a root that is arithmetically fine and
+                // describes nothing, which would turn a proof into a check that
+                // always fails for a reason nobody could find.
+                if b.len() != 32 {
+                    return None;
+                }
+                let mut w = [0u8; 32];
+                w.copy_from_slice(&b);
+                branch.push(w);
+            }
+        }
+        // An absent branch is a one-transaction block, which is legal and is
+        // what a freshly-started chain looks like. `None` would be a missing
+        // field; an empty list is a real answer.
+        None => {}
+        _ => return None,
+    }
+    Some(Proof {
+        coinb1: hexfield("coinb1")?,
+        extranonce: hexfield("extranonce")?,
+        coinb2: hexfield("coinb2")?,
+        branch,
+    })
+}
+
 fn take_algo(j: &Json) -> Option<Algo> {
     match j.get("name")?.as_str()? {
         "sha256d" => Some(Algo::Sha256d),
@@ -325,6 +420,11 @@ pub fn parse_job(params: &Json) -> Option<Job> {
         // stale template wastes a slice, and dropping a live one loses shares
         // nobody can tell were ever found.
         clean: params.get("clean").and_then(|x| x.as_bool()).unwrap_or(false),
+        // A proof that will not parse is dropped rather than failing the job.
+        // The job is still perfectly minable; what is lost is the ability to
+        // check it, and `client` says so out loud rather than refusing work
+        // over a field that is optional by design.
+        proof: take_proof(params.get("proof")),
     })
 }
 

@@ -134,6 +134,12 @@ pub struct Template {
     /// being read. Empty under Stratum V1, where `extranonce2` and `ntime_be`
     /// above are the same idea with the fields named.
     pub echo: super::proto::Echo,
+    /// Whether this job arrived with a proof that checked out.
+    ///
+    /// False covers two different things and the report says which: a pool that
+    /// sent no proof, and Stratum V1, where the miner assembled the header
+    /// itself and there was never anything to take on trust.
+    pub verified: bool,
 }
 
 /// The slot the Stratum connection fills.
@@ -612,6 +618,37 @@ fn handle_glados_job(params: &crate::json::Json) {
         return;
     }
 
+    // **What the pool is paid, checked rather than taken on trust.**
+    //
+    // A job is a finished header, so the coinbase is inside a merkle root and
+    // a root is a hash: there is nothing to read. When the pool sends its
+    // working, rebuilding it and requiring the same root is a complete check --
+    // a matching root proves the coinbase shown is the coinbase committed to,
+    // and a pool cannot show one and mine another without breaking it.
+    //
+    // Once per job against several billion hashes, so it costs nothing.
+    let mut verified = false;
+    let mut value = None;
+    let mut cb_len = 0usize;
+    let mut cb_head = [0u8; 8];
+    if let Some(p) = &j.proof {
+        if !super::proto::proves(p, &j.header) {
+            // Refused, and this is the one refusal in the file that is about
+            // honesty rather than capability. The job would hash perfectly
+            // well; what fails is the pool's account of what it pays. Mining
+            // it anyway would make the check decorative.
+            note("a job's proof does not match its header -- refused");
+            return;
+        }
+        verified = true;
+        let cb = super::proto::coinbase_of(p);
+        value = super::ev::coinbase_value(&cb);
+        cb_len = cb.len();
+        for (i, b) in cb.iter().take(8).enumerate() {
+            cb_head[i] = *b;
+        }
+    }
+
     // `install` keeps the template it finds when the coin has not changed, so
     // this is a no-op on every job after the first for a slot -- and it resets
     // the slot's rate when the algorithm does change, which is what stops a
@@ -630,10 +667,11 @@ fn handle_glados_job(params: &crate::json::Json) {
         header: j.header,
         target: j.target,
         nbits: 0,
-        coin_value: None,
-        coinbase_len: 0,
-        coinbase_head: [0u8; 8],
+        coin_value: value,
+        coinbase_len: cb_len,
+        coinbase_head: cb_head,
         echo: j.echo,
+        verified,
     };
     super::work::set_template(slot, t);
 
@@ -948,6 +986,9 @@ fn rebuild(s: &mut Session) {
         // to carry. Empty rather than a copy of the named ones, which would be
         // two places holding one fact.
         echo: Vec::new(),
+        // Nothing to verify, because nothing was taken on trust: under Stratum
+        // the miner built this header out of the coinbase halves itself.
+        verified: true,
     };
     // The slot has to exist before the job goes in, and creating it here rather
     // than at `mine on` is deliberate: an operator who never ran `mine coin`

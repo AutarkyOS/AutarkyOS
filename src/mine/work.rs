@@ -245,6 +245,7 @@ pub struct Snapshot {
     pub extranonce2: Vec<u8>,
     pub ntime_be: Vec<u8>,
     pub echo: super::proto::Echo,
+    pub verified: bool,
     pub submits: bool,
 }
 
@@ -261,6 +262,7 @@ pub fn snapshot(slot: usize) -> Option<Snapshot> {
         extranonce2: t.extranonce2.clone(),
         ntime_be: t.ntime_be.clone(),
         echo: t.echo.clone(),
+        verified: t.verified,
         submits: c.source == Source::Pool,
     })
 }
@@ -410,6 +412,9 @@ pub fn fixture_template(seed: u8) -> Template {
         coinbase_len: 0,
         coinbase_head: [0u8; 8],
         echo: alloc::vec::Vec::new(),
+        // A fixture is this machine's own invention and says so. Claiming a
+        // verified job here would put "checked" beside a header nobody issued.
+        verified: false,
     }
 }
 

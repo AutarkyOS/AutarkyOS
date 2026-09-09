@@ -244,6 +244,7 @@ impl Pool {
         self.next_job += 1;
         let job = format!("{id:08x}");
 
+        let mut proof = None;
         let (header, up) = match &work {
             Some(w) => {
                 // The extranonce2 is what makes two jobs from one `notify` into
@@ -264,6 +265,26 @@ impl Pool {
 
                 let coinbase = header::coinbase(&w.coinb1, &w.extranonce1, &e2, &w.coinb2);
                 let root = header::merkle_root(&coinbase, &w.branch);
+                // The miner is shown the working. `extranonce1 || extranonce2`
+                // goes as one field because the split is Stratum's answer to a
+                // problem the miner does not have here: the pool varies the
+                // second half, so where the boundary falls is nothing a miner
+                // can use.
+                let mut spliced = w.extranonce1.clone();
+                spliced.extend_from_slice(&e2);
+                if LIE.load(core::sync::atomic::Ordering::Relaxed) {
+                    // One byte. The point is that a miner must refuse a proof
+                    // that is *almost* right, not only one that is obviously
+                    // malformed -- a check that only caught garbage would pass
+                    // on every interesting lie.
+                    spliced[0] ^= 0x01;
+                }
+                proof = Some(proto::Proof {
+                    coinb1: w.coinb1.clone(),
+                    extranonce: spliced,
+                    coinb2: w.coinb2.clone(),
+                    branch: w.branch.clone(),
+                });
                 let h = header::assemble(w.version, &w.prev_wire, &root, w.ntime, w.nbits, 0);
                 let (ntime_be, _) = header::submit_hex(&h);
                 (
@@ -320,6 +341,11 @@ impl Pool {
             target,
             echo: Vec::new(),
             clean: true,
+            // Absent for a local coin, deliberately. There is no chain behind
+            // one, so its "coinbase" would be a fabrication -- and a proof that
+            // verifies against an invented header is worse than none, because
+            // it looks like evidence.
+            proof,
         })
     }
 
@@ -600,6 +626,17 @@ impl Pool {
     }
 }
 
+/// Set by `--bad-proof`. Off unless an operator deliberately asked for it.
+///
+/// A global rather than a field on `Pool`, because it is a testing switch and
+/// not a property of a coin: threading it through every constructor would put a
+/// "tell lies" argument in the signature of ordinary code.
+static LIE: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+pub fn lie_about_proofs() {
+    LIE.store(true, core::sync::atomic::Ordering::Relaxed);
+}
+
 /// A target easy enough that a laptop finds shares in seconds.
 ///
 /// `leading` is how many leading zero *bits* a digest must have. Expressed in
@@ -838,6 +875,61 @@ mod tests {
         assert_eq!(a.header[..36], b.header[..36]);
         assert_ne!(a.header[36..68], b.header[36..68]);
         assert_eq!(a.header[68..], b.header[68..]);
+    }
+
+    /// A job carries its own working, and the working checks out.
+    ///
+    /// This is the pool verifying itself with the *miner's* function --
+    /// `proto::proves` is the same code the kernel runs -- so a header assembly
+    /// that drifted from the proof beside it would fail here rather than in a
+    /// miner's log a week later.
+    #[test]
+    fn an_upstream_job_proves_its_own_header() {
+        let mut p = upstream_pool();
+        p.set_work(0, some_work());
+        let job = p.make_job(0, 8).unwrap();
+        let proof = job.proof.expect("an upstream job carried no proof");
+        assert!(
+            proto::proves(&proof, &job.header),
+            "the pool's own proof does not produce the header it sent"
+        );
+
+        // A coinbase changed by one byte must not. Otherwise the check passes
+        // on anything and is worse than absent, because it looks like evidence.
+        let bent = proto::Proof {
+            coinb1: proof.coinb1.clone(),
+            extranonce: proof.extranonce.clone(),
+            coinb2: {
+                let mut c = proof.coinb2.clone();
+                c.push(0x00);
+                c
+            },
+            branch: proof.branch.clone(),
+        };
+        assert!(!proto::proves(&bent, &job.header));
+
+        // And so must a branch in the wrong order, which is the mistake that
+        // produces thirty-two perfectly plausible bytes.
+        if proof.branch.len() >= 2 {
+            let mut rev = proof.branch.clone();
+            rev.reverse();
+            let flipped = proto::Proof {
+                coinb1: proof.coinb1.clone(),
+                extranonce: proof.extranonce.clone(),
+                coinb2: proof.coinb2.clone(),
+                branch: rev,
+            };
+            assert!(!proto::proves(&flipped, &job.header));
+        }
+    }
+
+    /// A local coin sends no proof, because it has no chain to prove anything
+    /// about. A proof that verified against an invented header would be worse
+    /// than none: it would look like evidence.
+    #[test]
+    fn a_local_coin_offers_no_proof() {
+        let mut p = a_pool();
+        assert!(p.make_job(0, 8).unwrap().proof.is_none());
     }
 
     /// A share is forwarded only when it beats *upstream's* target, not ours.

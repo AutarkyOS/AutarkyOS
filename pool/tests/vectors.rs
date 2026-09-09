@@ -217,6 +217,7 @@ fn a_job(algo: Algo) -> proto::Job {
             (String::from("ntime"), String::from("4dd7f5c7")),
         ],
         clean: true,
+        proof: None,
     }
 }
 
@@ -259,6 +260,43 @@ fn the_algorithm_is_carried_and_not_assumed() {
     let mut ha = Hasher::new(&a.algo, &a.header).unwrap();
     let mut hb = Hasher::new(&b.algo, &b.header).unwrap();
     assert_ne!(ha.hash(&a.header, 7), hb.hash(&b.header, 7));
+}
+
+/// A proof survives the wire, and still proves the header afterwards.
+///
+/// The round-trip alone is not the claim -- fields could survive encoding and
+/// still describe nothing. What matters is that  still answers yes on
+/// the far side, since that is the only thing a miner actually does with it.
+#[test]
+fn a_proof_survives_the_round_trip_and_still_proves() {
+    let c1 = unhex("0100000001").unwrap();
+    let e = unhex("deadbeef00000001").unwrap();
+    let c2 = unhex("ffffffff0100f2052a01000000434104").unwrap();
+    let branch = [
+        h32("aa00000000000000000000000000000000000000000000000000000000000001"),
+        h32("bb00000000000000000000000000000000000000000000000000000000000002"),
+    ];
+    let coinbase = header::coinbase(&c1, &e, &[], &c2);
+    let root = header::merkle_root(&coinbase, &branch);
+    let prev = h32("81cd02ab7e569e8bcd9317e2fe99f2de44d49ab2b8851ba4a308000000000000");
+    let hdr = header::assemble(1, &prev, &root, 0x4dd7_f5c7, 0x1a44_b9f2, 0);
+
+    let mut j = a_job(Algo::Sha256d);
+    j.header = hdr;
+    j.proof = Some(proto::Proof {
+        coinb1: c1,
+        extranonce: e,
+        coinb2: c2,
+        branch: branch.to_vec(),
+    });
+    assert!(proto::proves(j.proof.as_ref().unwrap(), &j.header));
+
+    let back = roundtrip_job(&j);
+    let p = back.proof.expect("the proof did not survive the wire");
+    assert!(
+        proto::proves(&p, &back.header),
+        "the proof arrived but no longer proves the header"
+    );
 }
 
 #[test]

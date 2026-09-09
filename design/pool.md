@@ -71,8 +71,27 @@ path -- a job is verified once and then hashed several billion times -- so the
 verification costs approximately nothing and is the difference between a pool
 that asks for trust and one that offers evidence.
 
-Not built yet. The fields are in the protocol from the first version because
-adding them later means every deployed miner is one that never checked.
+**Built.** `proto::proves` is the check and lives beside the codec so both ends
+run one function. Measured, kernel in QEMU against a pool with a real upstream
+and a three-level branch:
+
+    0  chain  1 slice  pool  254139 H/s  sha256d
+       checked: the coinbase it committed to pays 50.12345678
+
+That figure is the upstream's own coinbase value to the satoshi, so the kernel
+rebuilt the coinbase, folded the branch, matched the header's root and summed
+the outputs in ring 0.
+
+**And the refusal is watched rather than assumed.** `glados-pool --bad-proof`
+flips one byte of the extranonce before sending -- one byte, because a check
+that only caught obvious garbage would pass on every interesting lie. Against
+that pool the kernel installs no coin at all and says `a job's proof does not
+match its header -- refused`. That a pool can lie on purpose is the
+arrangement `diag paging` has when it faults deliberately.
+
+A *local* coin sends no proof and there is a claim that it does not: with no
+chain behind it the coinbase would be a fabrication, and a proof verifying
+against an invented header is worse than none because it looks like evidence.
 
 ## JSON lines, for one reason
 

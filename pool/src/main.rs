@@ -141,6 +141,7 @@ fn main() {
     }
 
     let mut listen = String::from("0.0.0.0:3334");
+    let mut lie = false;
     let mut ledger: Option<String> = None;
     let mut coins: Vec<Coin> = Vec::new();
     let mut it = args.iter();
@@ -153,6 +154,13 @@ fn main() {
                     std::process::exit(2);
                 }
             },
+            // Sends a proof that does not match the header it accompanies.
+            //
+            // A pool that can lie on purpose is how the miner's refusal gets
+            // watched rather than assumed -- the same reason `diag paging`
+            // faults deliberately and `fault code` jumps into a bad address.
+            // A check nobody has seen refuse is a check written in a comment.
+            "--bad-proof" => lie = true,
             "--ledger" => match it.next() {
                 Some(v) => ledger = Some(v.clone()),
                 None => {
@@ -164,6 +172,7 @@ fn main() {
                 println!("glados-pool [--listen ADDR] [--ledger PATH] [COIN ...]");
                 println!();
                 println!("  COIN is label:algo:bits[@host:port,user[,pass]]");
+                println!("  --bad-proof deliberately corrupts every proof, to watch a miner refuse");
                 println!("  without @, the pool builds its own headers and there is no chain");
                 println!("            --selftest");
                 println!();
@@ -212,6 +221,10 @@ fn main() {
     // One client thread per coin that has an upstream, started before the
     // listener so a miner connecting immediately is more likely to find work
     // already in hand rather than a coin that answers no job.
+    if lie {
+        eprintln!("[pool] --bad-proof: every proof will be deliberately wrong");
+        glados_pool::pool::lie_about_proofs();
+    }
     glados_pool::upstream::start_all(Arc::clone(&pool));
     let reporter = Arc::clone(&pool);
     // The share log is the whole product of a non-custodial pool: Layer 1

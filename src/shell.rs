@@ -7545,16 +7545,22 @@ fn mine_coins() {
     console::set_color(YELLOW);
     kprintln!("  slot  label       slices  source   rate            algorithm");
     console::set_color(LTGRAY);
+    let mut any_unverified = false;
     for i in 0..MAX_COINS {
         let g = work::coin(i);
         let Some(c) = g.as_ref() else { continue };
-        let (label, detail, src, job) = (
+        let (label, detail, src, job, verified, value) = (
             c.label.clone(),
             c.algo.detail(),
             c.source.name(),
             c.template.is_some(),
+            c.template.as_ref().map(|t| t.verified).unwrap_or(false),
+            c.template.as_ref().and_then(|t| t.coin_value),
         );
         drop(g);
+        if job && !verified {
+            any_unverified = true;
+        }
         let on = work::slices_on(i);
         let (h, ms, found) = work::rate(i);
         let rate = if !job {
@@ -7579,12 +7585,31 @@ fn mine_coins() {
         if found > 0 {
             kprintln!("        {} share(s) found", found);
         }
+        // Only for a job that came with working. Saying "unverified" on every
+        // row would make the word noise; saying it on the rows that are is what
+        // makes it mean something.
+        if job && verified {
+            match value {
+                Some(v) => kprintln!(
+                    "        checked: the coinbase it committed to pays {}.{:08}",
+                    v / 100_000_000,
+                    v % 100_000_000
+                ),
+                None => kprintln!("        checked: the header matches the coinbase shown"),
+            }
+        }
     }
     kprintln!(
         "  {} slice(s) over {} coin(s); a starred rate is a sample under five seconds",
         crate::mine::client::slices(),
         work::occupied()
     );
+    if any_unverified {
+        // Stated rather than left blank, because "no line" and "checked" are
+        // easy to read as the same thing at a glance.
+        kprintln!("  note     a coin above sent no proof of what it pays. That is what a");
+        kprintln!("           fixture looks like, and also what an unwilling pool looks like.");
+    }
     virtual_caveat();
 }
 
