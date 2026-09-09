@@ -351,6 +351,54 @@ prints. The catch is circular and worth stating: a pool will not hand out work
 a miner cannot do, so the algorithm has to exist before the coin can be scored.
 Which fixes the order.
 
+## Splitting one device across a field, which is mechanism and not policy
+
+A card at half a gigahash is not one coin's worth of hashrate. The question is
+how to divide it, and the answer has two halves that must not be one function:
+**how** a device is shared out, and **what** each coin is worth. This is the
+first half. Nothing here decides the second.
+
+`miner/src/main.rs::choose` is the whole of it -- least-virtual-time over the
+slots that have work this device can do, weight per slot, ties by slot number.
+Three things in that are decisions.
+
+**The unit is time and not hashes.** A yespower hash is roughly a thousand
+times the work of a sha256d hash, so a scheduler counting hashes hands the
+machine to the slow algorithm: it looks permanently behind however long it has
+run. Seconds are the only quantity that means the same thing on both, and it is
+the same objection this document's own measurement section makes about a
+"total hashrate" across algorithms -- adding those two numbers and calling the
+sum a speed. The per-slot report keeps them apart for that reason.
+
+**The batch is measured rather than chosen, per algorithm.** `SLICE` is 250 ms
+and the loop asks each backend for however many nonces that buys, learned from
+the last scan. That matters because the two ends are four orders of magnitude
+apart: the same constant has to mean 128M nonces on the GPU and about eighty on
+one core of yespower. An algorithm the device has not timed gets a 4096-nonce
+probe, small in absolute terms so the probe is never the thing that blocks, and
+two scans take it to a full slice. The GPU figure it converges on is 128M,
+which is what `design/xpu.md`'s batch benchmark chose independently.
+
+**Weights are the entire policy interface, and they are all 1 today.** The
+scheduler cannot ask what a coin is worth, because nothing in this tree yet
+knows: `mine ev` reads `nbits` off the wire and a coinbase value out of the
+block, and there is still no price. When there is, a weight is where it goes,
+and this file's rule about invented figures is why that number is not being
+guessed at now. Measured, on the RTX 3050 against a two-coin pool:
+
+    weights   btc (sha256d)      verge (blake2s)
+    1 : 1     49% of the device  47%
+    2 : 1     64%                32%
+    3 : 1     73%                24%
+
+**And the socket is charged to the device too.** The loop reads the pool once
+per scan, so the read timeout is time the card is not hashing: fifty
+milliseconds against a 250 ms slice measured as exactly that, two coins summing
+to 73% of the wall clock with nothing accounting for the rest. Two milliseconds
+now, with a separate 50 ms park for the case a long timeout was really there
+for -- a miner with every slot refused, which should sleep rather than spin. 97%
+afterwards.
+
 ## Sequencing
 
 1. ~~**yespower in ring 0.**~~ **Done.** `tools/yespower.py` came first and
@@ -366,6 +414,9 @@ Which fixes the order.
 4. **The supervisor**, allocating slices against that measured budget rather
    than against core count. Slices exist and are unpinned; what does not exist
    is anything that gives them *different coins*, which is the whole idea.
+   **The host miner has this now** -- `choose`, above -- and the kernel does
+   not. The mechanism transfers directly; what does not is the batch, since a
+   kernel slice is preempted at 100 Hz rather than blocking in a scan.
 5. **The pool**, which is independent of all of the above and could start in
    parallel: proxy first, device-agnostic, `xmrig` on somebody's Pi as its
    first client.

@@ -69,6 +69,13 @@ const MAX_BAD: u32 = 32;
 /// caps one connection at 150 ms of validation per second -- fifteen percent of
 /// a core even if every message is garbage.
 const MAX_SUBMITS_PER_SEC: u32 = 20;
+/// A `glados.work` costs one job build rather than a validation, so the bound
+/// is about the job ring rather than about the CPU: `KEEP_JOBS` is 64, and a
+/// connection allowed to ask freely would evict every job every other miner is
+/// working. Four a second is well above what any real device needs -- an RTX
+/// 3050 on sha256d spends a nonce space every eight and a half seconds, so a
+/// card sixty times faster than that one is still inside this.
+const MAX_WORK_PER_SEC: u32 = 4;
 /// A ceiling on threads as much as on miners, and deliberately below the
 /// `TasksMax=512` in the systemd unit so the daemon refuses before the service
 /// manager kills it. A refusal is a log line; being killed is an outage.
@@ -138,6 +145,7 @@ fn handle(mut stream: TcpStream, pool: Arc<Mutex<Pool>>, peer: &str) -> std::io:
     let mut greeted = false;
     let mut bad: u32 = 0;
     let mut submits_this_second: u32 = 0;
+    let mut works_this_second: u32 = 0;
     let mut window = Instant::now();
     // One retargeter per coin, not one per connection. A single machine works
     // several coins on different algorithms and its rate on them differs by
@@ -253,6 +261,7 @@ fn handle(mut stream: TcpStream, pool: Arc<Mutex<Pool>>, peer: &str) -> std::io:
                     if window.elapsed() >= Duration::from_secs(1) {
                         window = Instant::now();
                         submits_this_second = 0;
+                        works_this_second = 0;
                     }
                     submits_this_second += 1;
                     if submits_this_second > MAX_SUBMITS_PER_SEC {
@@ -320,6 +329,58 @@ fn handle(mut stream: TcpStream, pool: Arc<Mutex<Pool>>, peer: &str) -> std::io:
                             println!("[pool] {worker} dropped after {bad} bad shares");
                             return Ok(());
                         }
+                    }
+                }
+                "glados.work" => {
+                    // **A job is a finite search and a fast device finishes
+                    // it.** The nonce is four bytes at a fixed offset, so a job
+                    // carries 2^32 hashes and nothing more; at half a gigahash
+                    // a second that is eight and a half seconds against a
+                    // thirty-second re-issue. Before this existed the miner
+                    // wrapped and rescanned the same space, and the pool saw 35
+                    // duplicates against 23 accepted shares, every repeated
+                    // nonce arriving exactly six times. The duplicate counter
+                    // was reporting a real defect and nobody had read it as
+                    // one.
+                    //
+                    // One slot, not all of them. `make_job` advances the
+                    // extranonce2 for an upstream coin and the job counter for
+                    // a local one, so the answer is a genuinely different
+                    // search either way -- and re-issuing every slot on every
+                    // request is the exact shape of the churn bug the abuse
+                    // test found.
+                    if !greeted {
+                        return Ok(());
+                    }
+                    if window.elapsed() >= Duration::from_secs(1) {
+                        window = Instant::now();
+                        submits_this_second = 0;
+                        works_this_second = 0;
+                    }
+                    works_this_second += 1;
+                    if works_this_second > MAX_WORK_PER_SEC {
+                        continue;
+                    }
+                    let Some(slot) = params.and_then(proto::parse_work) else {
+                        continue;
+                    };
+                    let job = {
+                        let mut p = pool.lock().unwrap();
+                        if slot as usize >= p.slots() as usize {
+                            None
+                        } else {
+                            let bits = vd
+                                .get(slot as usize)
+                                .map(|v| v.bits())
+                                .unwrap_or_else(|| p.start_bits(slot as usize));
+                            p.make_job(slot, bits)
+                        }
+                    };
+                    // Silence when there is nothing to give. An upstream coin
+                    // with no template yet yields no job, and inventing one
+                    // would put a miner on a search that can never pay.
+                    if let Some(j) = job {
+                        stream.write_all(proto::encode_job(&j).as_bytes())?;
                     }
                 }
                 // Unknown methods are ignored rather than refused. A miner

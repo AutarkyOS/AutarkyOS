@@ -279,6 +279,32 @@ pub fn encode_welcome(id: u64, w: &Welcome) -> String {
     s
 }
 
+/// A miner saying it has spent a slot's nonce space and wants a fresh job.
+///
+/// **A job is a finite search and a fast device finishes it.** The header is
+/// assembled by the pool with a zero nonce, so the whole of the work a job
+/// carries is the 2^32 values at offset 76 -- which at half a gigahash a
+/// second is eight and a half seconds. The pool re-issues on a thirty-second
+/// idle timeout, so without this a device four times too fast for its work
+/// simply rescans the space it has already searched and submits the same
+/// nonces again. Measured on the RTX 3050 before this existed: 23 accepted
+/// shares against 35 duplicates, every repeated nonce found exactly six times.
+///
+/// It names one slot rather than asking for everything, because the reason to
+/// ask is always about one coin, and re-issuing all of them would churn the
+/// pool's job ring for no one's benefit -- which is the shape of a bug this
+/// pool has already had once.
+pub fn encode_work(id: u64, slot: u32) -> String {
+    let mut s = String::new();
+    s.push_str("{\"id\":");
+    push_u64(&mut s, id);
+    s.push_str(",\"method\":\"glados.work\",\"params\":{\"slot\":");
+    push_u64(&mut s, slot as u64);
+    s.push_str("}}
+");
+    s
+}
+
 pub fn encode_submit(id: u64, sh: &Share) -> String {
     let mut s = String::new();
     s.push_str("{\"id\":");
@@ -426,6 +452,15 @@ pub fn parse_job(params: &Json) -> Option<Job> {
         // over a field that is optional by design.
         proof: take_proof(params.get("proof")),
     })
+}
+
+/// The slot a `glados.work` asks about.
+pub fn parse_work(params: &Json) -> Option<u32> {
+    let n = params.get("slot")?.as_i64()?;
+    if !(0..=u32::MAX as i64).contains(&n) {
+        return None;
+    }
+    Some(n as u32)
 }
 
 pub fn parse_share(params: &Json) -> Option<Share> {

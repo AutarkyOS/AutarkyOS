@@ -332,6 +332,30 @@ fn the_handshake_survives_the_round_trip() {
 }
 
 #[test]
+fn a_request_for_work_names_one_slot_and_survives_the_round_trip() {
+    let line = proto::encode_work(7, 2);
+    let v = glados_pool::json::Json::parse(line.trim_end()).unwrap();
+    assert_eq!(v.get("id").unwrap().as_i64(), Some(7));
+    assert_eq!(v.get("method").unwrap().as_str(), Some("glados.work"));
+    assert_eq!(proto::parse_work(v.get("params").unwrap()), Some(2));
+
+    // Slot zero is a real slot and must not read as absent -- the first coin
+    // in the table is the one a single-algorithm device is most likely to be
+    // working, so a falsy zero would break exactly the case this exists for.
+    let line = proto::encode_work(8, 0);
+    let v = glados_pool::json::Json::parse(line.trim_end()).unwrap();
+    assert_eq!(proto::parse_work(v.get("params").unwrap()), Some(0));
+
+    // No slot at all, and a slot outside the range a `u32` can hold, are
+    // refused rather than defaulted. Defaulting to zero would send a fast
+    // device the wrong coin's work and report nothing.
+    let v = glados_pool::json::Json::parse("{\"nothing\":1}").unwrap();
+    assert_eq!(proto::parse_work(&v), None);
+    let v = glados_pool::json::Json::parse("{\"slot\":-1}").unwrap();
+    assert_eq!(proto::parse_work(&v), None);
+}
+
+#[test]
 fn a_malformed_job_is_refused_rather_than_padded() {
     let good = proto::encode_job(&a_job(Algo::Sha256d));
     let v = glados_pool::json::Json::parse(good.trim_end()).unwrap();

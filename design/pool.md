@@ -107,7 +107,7 @@ saved are a rounding error against a job that arrives every thirty seconds.
 
 ## The methods
 
-Three, and a job notification.
+Four, and a job notification.
 
 ```
 -> {"id":1,"method":"glados.hello","params":{"v":1,"worker":"...","agent":"glados/1.3.5"}}
@@ -126,9 +126,12 @@ Three, and a job notification.
      "job":"a3f1", "nonce":"1f8c04b2", "echo":{...}
    }}
 <- {"id":7,"result":{"ok":true,"diff":0.001},"error":null}
+
+-> {"id":9,"method":"glados.work","params":{"slot":1}}
+<- a glados.job for that slot, or silence
 ```
 
-Four decisions in that, each with an alternative that is worse.
+Five decisions in that, each with an alternative that is worse.
 
 **`slot` is the pool's, not the miner's.** The pool says which of its coins a
 job belongs to and the miner puts it where it likes; the kernel's own slot
@@ -142,6 +145,33 @@ different parameters, so a name-only field is a job that hashes a different
 function perfectly correctly and has every share rejected. This is the same
 refusal `Algo` already makes about a per-coin preset table, moved onto the
 wire.
+
+**`glados.work` exists because a job is a finite search.** The nonce is four
+bytes at a fixed offset, so a job carries 2^32 hashes and not one more --
+eight and a half seconds on an RTX 3050, against a pool that re-issues on a
+thirty-second idle timeout. Without a way to say so, a device four times too
+fast for its work does not stop: it wraps and rescans the space it has already
+searched, and resubmits every share it finds there. Measured on the card before
+this existed, over one three-coin run: **23 accepted shares against 35
+duplicates**, with every repeated nonce arriving exactly six times.
+
+The `duplicate` verdict had been counting that correctly the whole time and
+nobody had read it as a defect. It looked like a retry, which is what the
+counter is mostly for, and the abuse limiter deliberately does not count it as
+abuse for exactly that reason -- so the one number that knew was also the one
+number designed not to complain.
+
+It names **one slot** rather than asking for everything. The reason to ask is
+always about one coin, `make_job` advances the extranonce2 for an upstream coin
+and the job counter for a local one so the answer is a genuinely different
+search either way, and re-issuing every slot on every message is the precise
+shape of the churn bug the abuse test found once already. It is bounded at four
+a second per connection, which is about the job ring rather than about the CPU:
+`KEEP_JOBS` is 64, and a connection allowed to ask freely would evict the jobs
+every other miner is working.
+
+Silence is a legal answer. An upstream coin with no template yet yields no job,
+and inventing one would put a miner on a search that can never pay.
 
 **`echo` is opaque and is returned verbatim.** Whatever the upstream dialect
 needs back at submit time -- an extranonce2, an ntime, a Monero job blob id --
