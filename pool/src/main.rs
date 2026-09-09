@@ -73,6 +73,11 @@ fn parse_coin(spec: &str) -> Result<Coin, String> {
     let label = it.next().unwrap_or("").trim();
     let algo_s = it.next().unwrap_or("");
     let bits_s = it.next().unwrap_or("");
+    // A fourth field, optional, naming the traded asset. Positional and last
+    // so every configuration written before it still parses -- and defaulting
+    // to the label, so a pool whose coins are named as `prices.py` names them
+    // needs nothing at all.
+    let asset = it.next().unwrap_or(label).trim().to_string();
     if label.is_empty() || algo_s.is_empty() || bits_s.is_empty() {
         return Err(format!("'{spec}' is not label:algo:bits"));
     }
@@ -116,6 +121,7 @@ fn parse_coin(spec: &str) -> Result<Coin, String> {
 
     Ok(Coin {
         label: String::from(label),
+        asset,
         algo,
         share_bits: bits,
         share_target: target_with_leading_zeros(bits),
@@ -143,6 +149,7 @@ fn main() {
     let mut listen = String::from("0.0.0.0:3334");
     let mut lie = false;
     let mut ledger: Option<String> = None;
+    let mut prices: Option<String> = None;
     let mut coins: Vec<Coin> = Vec::new();
     let mut it = args.iter();
     while let Some(a) = it.next() {
@@ -168,10 +175,19 @@ fn main() {
                     std::process::exit(2);
                 }
             },
+            "--prices" => match it.next() {
+                Some(v) => prices = Some(v.clone()),
+                None => {
+                    eprintln!("--prices wants a path");
+                    std::process::exit(2);
+                }
+            },
             "-h" | "--help" => {
                 println!("glados-pool [--listen ADDR] [--ledger PATH] [COIN ...]");
                 println!();
-                println!("  COIN is label:algo:bits[@host:port,user[,pass]]");
+                println!("  COIN is label:algo:bits[:asset][@host:port,user[,pass]]");
+                println!("  --prices PATH reads what tools/prices.py wrote and says");
+                println!("            whether each coin can be sold at all");
                 println!("  --bad-proof deliberately corrupts every proof, to watch a miner refuse");
                 println!("  without @, the pool builds its own headers and there is no chain");
                 println!("            --selftest");
@@ -193,6 +209,49 @@ fn main() {
         // a configured pool.
         eprintln!("[pool] no coins given, serving one sha256d coin at 20 bits");
         coins.push(parse_coin("local:sha256d:20").unwrap());
+    }
+
+    // **Said before the listener opens, because the point is to be read before
+    // the machine is pointed at something.** `design/mining.md` spent a
+    // document ranking yespower first and one run of `tools/prices.py`
+    // answered it: every coin on that list was last traded between four months
+    // and seven years ago. A line at startup is that finding arriving in time.
+    //
+    // It never refuses to start. A pool serving a coin nobody trades is a
+    // decision an operator is allowed to make -- a testnet, a chain they
+    // believe in, a coin whose market has not opened yet -- and a daemon that
+    // would not run without a fresh price file would be one more thing to go
+    // wrong at three in the morning on somebody else's server.
+    let market = match &prices {
+        None => None,
+        Some(path) => match std::fs::read_to_string(path) {
+            Ok(text) => match glados_pool::market::parse(&text) {
+                Ok(m) => Some(m),
+                Err(e) => {
+                    eprintln!("[pool] {path} could not be read ({e}); no coin will be priced");
+                    None
+                }
+            },
+            Err(e) => {
+                eprintln!("[pool] {path}: {e}; no coin will be priced");
+                None
+            }
+        },
+    };
+    if let Some(m) = &market {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let age = m.age_hours(now);
+        // The age of the *file*, which is a different thing from the age of a
+        // price in it. A file fetched a week ago holds prices that were fresh
+        // when it was written and says so on every row, so both have to be
+        // shown or a reader cannot tell which is stale.
+        println!("[pool] prices from {} ({:.1} h old)", prices.as_deref().unwrap_or(""), age);
+    }
+    for c in &coins {
+        println!("[pool] {}", glados_pool::market::verdict(market.as_ref(), &c.label, &c.asset));
     }
 
     let pool = Arc::new(Mutex::new(Pool::new(coins)));

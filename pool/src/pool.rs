@@ -19,6 +19,13 @@ use crate::mine::u256::U256;
 /// A coin this pool serves.
 pub struct Coin {
     pub label: String,
+    /// Which traded asset this coin is, as `tools/prices.py` names it.
+    ///
+    /// Separate from `label` because a label is the operator's shorthand --
+    /// `btc`, `xvg`, `zeny` -- and a price file has to be keyed by something
+    /// two independent sources agree on. Defaulting it to the label is what
+    /// makes it optional; naming it is what makes `btc` findable.
+    pub asset: String,
     pub algo: Algo,
     /// Where a *new* miner starts, in leading zero bits. Only a starting
     /// point: `server.rs` moves each connection from here, per coin, so this
@@ -699,6 +706,7 @@ mod tests {
     fn a_pool() -> Pool {
         Pool::new(vec![Coin {
             label: String::from("test"),
+            asset: String::from("test"),
             algo: Algo::Sha256d,
             // Eight bits, so a share turns up within a few hundred nonces.
             share_bits: 8,
@@ -762,6 +770,7 @@ mod tests {
         let mut p = Pool::new(vec![
             Coin {
                 label: String::from("a"),
+            asset: String::from("a"),
                 algo: Algo::Sha256d,
                 share_bits: 8,
                 share_target: target_with_leading_zeros(8),
@@ -772,6 +781,7 @@ mod tests {
             },
             Coin {
                 label: String::from("b"),
+            asset: String::from("b"),
                 algo: Algo::Blake2s,
                 share_bits: 8,
                 share_target: target_with_leading_zeros(8),
@@ -865,6 +875,7 @@ mod tests {
     fn upstream_pool() -> Pool {
         Pool::new(vec![Coin {
             label: String::from("chain"),
+            asset: String::from("chain"),
             algo: Algo::Sha256d,
             share_bits: 8,
             share_target: target_with_leading_zeros(8),
@@ -1147,6 +1158,7 @@ mod tests {
 
         let mut fresh = Pool::new(vec![Coin {
             label: String::from("test"),
+            asset: String::from("test"),
             algo: Algo::Sha256d,
             share_bits: 8,
             share_target: target_with_leading_zeros(8),

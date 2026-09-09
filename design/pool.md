@@ -618,6 +618,49 @@ be a fourth implementation of the one algorithm this tree is most careful
 about, and `tools/yespower.py` already exists and is checked against upstream's
 own vectors. A job it cannot compute is skipped and said out loud.
 
+## Whether the coin can be sold at all, said before the listener opens
+
+    glados-pool --prices out/prices.json btc:sha256d:24:bitcoin xvg:blake2s:24:verge
+
+    [pool] prices from out/prices.json (0.1 h old)
+    [pool] btc: $78141.29 at $30017587394 of 24h volume
+    [pool] xvg: $0.00264568 at $6058540 of 24h volume (the sources are 2.5% apart; the lower is quoted)
+    [pool] zeny: cannot be quoted -- last priced 1493 days ago
+    [pool] nope: 'nope' is not in the price file, so nothing here knows what it is worth
+
+`tools/prices.py` writes the file from two independent sources and `market.rs`
+reads it. **Two parsers over one format**, the bargain `tokenizer.py --verify`
+makes: the writer is Python and `json.dumps`, the reader is this tree's own
+`Json`, and both ends assert the same invariant -- an unusable coin carries its
+reason, a usable one is not also refused. A property one end checks is a
+property the other can drift away from.
+
+The coin spec gained a fourth positional field, the traded asset, defaulting to
+the label. A label is the operator's shorthand and a price file has to be keyed
+by something two sources agree on, so `btc` is findable as `bitcoin` without
+anybody having to rename their coins.
+
+**It never refuses to start.** Serving a coin nobody trades is a decision an
+operator is allowed to make -- a testnet, a chain they believe in, a market
+that has not opened -- and a daemon that would not run without a fresh price
+file is one more thing to go wrong at three in the morning on somebody else's
+machine. What it will not do is stay quiet about it.
+
+`as_i64` is the wrong reader for a price for exactly the reason
+`stratum::decimal` exists one file over: it splits at the `.` and answers the
+integer part, so every coin in the table except Bitcoin and Monero reads as
+zero. A price of zero is not an error, it is a coin the pool ranks last
+forever. `market.rs` takes the `Json::Num` token text, and a claim says so.
+
+**There is no expected value here yet, and the second reason is the
+interesting one.** The arithmetic is `price x reward / (2^256 / network
+target)`; the pool holds the network target from a live `nbits` and the reward
+from `ev::coinbase_value`, so it is a few lines. What it does not hold is how
+many base units make a coin -- a coinbase output is in the chain's own unit and
+that constant is not on the wire. Writing 1e8 because Bitcoin uses it is the
+invented figure `ev.rs` refuses in its own header. Both blockers lift together:
+when there is a live upstream there is also a chain to read it from.
+
 ## What does not
 - **A real pool.** Everything above ran against a stub on loopback. No upstream
   on the internet has been asked for work, which needs an account and an
@@ -635,3 +678,7 @@ own vectors. A job it cannot compute is skipped and said out loud.
 - Publishing any of it, which is the whole of B4 and the only thing standing in
   for trust.
 - Any of it having met a real network.
+- **An expected value per coin**, and therefore weights a miner could derive
+  rather than be given. `miner/src/main.rs` shares one device across coins by
+  weight and every weight is 1, which is honest and is not a policy. See above
+  for the two things missing.
