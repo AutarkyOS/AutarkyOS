@@ -187,6 +187,28 @@ fn main() {
     }
 
     let pool = Arc::new(Mutex::new(Pool::new(coins)));
+
+    // Read the log back before anything can add to it. A pool that began at
+    // zero after every restart would lose a miner's whole record to a reboot
+    // or a crash-restart, and on a machine that is not ours both of those are
+    // ordinary rather than exceptional.
+    if let Some(path) = &ledger {
+        match std::fs::read_to_string(path) {
+            Ok(text) => match pool.lock().unwrap().load_ledger(&text) {
+                Ok(n) => println!("[pool] resumed {n} row(s) from {path}"),
+                // Loud, and it carries on with an empty tally rather than
+                // refusing to start. A pool that will not run because its
+                // history is unreadable helps nobody; one that starts quietly
+                // and silently forgets is what has to be avoided.
+                Err(e) => eprintln!("[pool] {path} could not be read ({e}); starting from zero"),
+            },
+            // Absent is the ordinary first run and is not an error.
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                println!("[pool] no ledger at {path} yet; starting from zero")
+            }
+            Err(e) => eprintln!("[pool] {path}: {e}; starting from zero"),
+        }
+    }
     // One client thread per coin that has an upstream, started before the
     // listener so a miner connecting immediately is more likely to find work
     // already in hand rather than a coin that answers no job.

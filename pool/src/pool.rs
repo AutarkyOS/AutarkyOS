@@ -164,7 +164,7 @@ impl Verdict {
 }
 
 /// One worker's record against one coin.
-#[derive(Default, Clone)]
+#[derive(Default, Clone, Debug, PartialEq)]
 pub struct Tally {
     pub accepted: u64,
     pub stale: u64,
@@ -446,6 +446,74 @@ impl Pool {
 
     pub fn slots(&self) -> u32 {
         self.coins.len() as u32
+    }
+
+    /// Read a ledger back, so a restart does not begin at zero.
+    ///
+    /// Only the *tallies* are restored. The coins come from the command line,
+    /// which is authoritative: a file that disagreed about which algorithm a
+    /// label means would otherwise silently change what the pool serves, and
+    /// the operator would be reading their own config to find out why.
+    ///
+    /// Parsed with `crate::json`, which is the kernel's parser reading this
+    /// program's own output -- one parser at both ends, for the reason the
+    /// protocol gives.
+    ///
+    /// **What the digest can and cannot catch.** It is over the rows, so a
+    /// truncated or corrupted file is refused rather than half-loaded. It is
+    /// not a signature and proves nothing about *who* wrote the file: anybody
+    /// who can edit it can recompute the digest. That is acceptable because
+    /// this is the operator's own record on the operator's own disk, and it is
+    /// written down because a digest is easy to mistake for more than it is.
+    pub fn load_ledger(&mut self, text: &str) -> Result<usize, String> {
+        let doc = crate::json::Json::parse(text.trim()).ok_or("not JSON")?;
+        let rows = match doc.get("shares") {
+            Some(crate::json::Json::Arr(items)) => items,
+            _ => return Err(String::from("no shares array")),
+        };
+
+        let mut restored: Vec<((String, String), Tally)> = Vec::new();
+        let mut canon = String::new();
+        for r in rows.iter() {
+            let worker = r.get("worker").and_then(|x| x.as_str()).ok_or("row has no worker")?;
+            let coin = r.get("coin").and_then(|x| x.as_str()).ok_or("row has no coin")?;
+            let n = |k: &str| -> Result<u64, String> {
+                match r.get(k).and_then(|x| x.as_i64()) {
+                    // Negative is refused rather than clamped. A count below
+                    // zero is a file that has been edited or corrupted, and
+                    // saturating it to zero would load the damage silently.
+                    Some(v) if v >= 0 => Ok(v as u64),
+                    Some(v) => Err(format!("{k} is {v}")),
+                    None => Err(format!("row has no {k}")),
+                }
+            };
+            let t = Tally {
+                accepted: n("accepted")?,
+                stale: n("stale")?,
+                bad: n("bad")?,
+                duplicate: n("duplicate")?,
+            };
+            canon.push_str(&format!(
+                "{worker}\t{coin}\t{}\t{}\t{}\t{}\n",
+                t.accepted, t.stale, t.bad, t.duplicate
+            ));
+            restored.push(((String::from(worker), String::from(coin)), t));
+        }
+
+        // The rows are canonicalised the same way `ledger_json` does, so this
+        // check is against the writer rather than against a second idea of what
+        // the document says.
+        let want = doc.get("digest").and_then(|x| x.as_str()).unwrap_or("");
+        let got = crate::mine::stratum::hex(&crate::store::sha256::hash(canon.as_bytes()));
+        if want != got {
+            return Err(format!("digest {want} does not match the rows ({got})"));
+        }
+
+        let n = restored.len();
+        for (k, v) in restored {
+            self.tallies.insert(k, v);
+        }
+        Ok(n)
     }
 
     /// The share log as a publishable document.
@@ -821,6 +889,95 @@ mod tests {
         // Draining is draining: a share is only worth anything on the
         // connection whose extranonce1 it was found under.
         assert!(p.take_forwards().is_empty());
+    }
+
+    /// A restart must not lose a miner's record.
+    ///
+    /// The write and the read are the same canonicalisation, so this is a
+    /// check that they agree rather than a check that a file exists -- and a
+    /// disagreement is exactly what a digest over the rows is for.
+    #[test]
+    fn a_ledger_survives_being_written_and_read_back() {
+        let mut p = a_pool();
+        let job = p.make_job(0, 8).unwrap();
+        let mut h = Hasher::new(&job.algo, &job.header).unwrap();
+        let n = (0..200_000u32)
+            .find(|n| below_target(&h.hash(&job.header, *n), &job.target))
+            .expect("no share found");
+        p.submit(
+            "w1",
+            &proto::Share {
+                job: job.job.clone(),
+                nonce: n,
+                echo: vec![],
+            },
+        );
+        // A refusal too, so the row carries more than one non-zero field and a
+        // reader that restored only `accepted` would be caught.
+        p.submit(
+            "w1",
+            &proto::Share {
+                job: String::from("ffffffff"),
+                nonce: n,
+                echo: vec![],
+            },
+        );
+        let doc = p.ledger_json(1, 1_000);
+
+        let mut fresh = Pool::new(vec![Coin {
+            label: String::from("test"),
+            algo: Algo::Sha256d,
+            share_bits: 8,
+            share_target: target_with_leading_zeros(8),
+            network_target: None,
+            source: Source::Local,
+            work: None,
+            e2: 0,
+        }]);
+        let rows = fresh.load_ledger(&doc).expect("a ledger we just wrote was refused");
+        assert!(rows > 0);
+        assert_eq!(fresh.ledger(), p.ledger(), "the record changed on the way back");
+    }
+
+    /// A damaged ledger is refused whole rather than loaded in part.
+    ///
+    /// Half a record is worse than none: the counts would be wrong in a way
+    /// nothing downstream could detect, where an empty tally is at least
+    /// obviously empty and is announced.
+    #[test]
+    fn a_tampered_ledger_is_refused() {
+        let mut p = a_pool();
+        let job = p.make_job(0, 8).unwrap();
+        let mut h = Hasher::new(&job.algo, &job.header).unwrap();
+        let n = (0..200_000u32)
+            .find(|n| below_target(&h.hash(&job.header, *n), &job.target))
+            .expect("no share found");
+        p.submit(
+            "w1",
+            &proto::Share {
+                job: job.job,
+                nonce: n,
+                echo: vec![],
+            },
+        );
+        let doc = p.ledger_json(1, 1_000);
+
+        // Somebody gives themselves credit without recomputing the digest,
+        // which is the whole shape this check catches.
+        let doctored = doc.replace("\"accepted\": 1", "\"accepted\": 9999");
+        assert_ne!(doctored, doc, "the test did not actually change anything");
+
+        let mut fresh = a_pool();
+        let err = fresh
+            .load_ledger(&doctored)
+            .expect_err("an edited ledger was accepted");
+        assert!(err.contains("digest"), "refused for the wrong reason: {err}");
+        // And nothing was loaded from it.
+        assert!(fresh.ledger().is_empty());
+
+        // Truncation is the accidental version of the same thing.
+        let cut = &doc[..doc.len() / 2];
+        assert!(fresh.load_ledger(cut).is_err());
     }
 
     /// Two jobs must not be the same search. A fixed header would make every

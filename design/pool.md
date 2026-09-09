@@ -504,13 +504,76 @@ seconds and returned early on an elapsed zero -- but eight shares inside one
 second is the most extreme flood there is, so the fastest miners, the entire
 reason the file exists, were the one case that never retargeted.
 
+## A restart no longer starts from zero
+
+`--ledger` reads the file back before anything can add to it, which matters
+because on a machine that is not ours a reboot and a crash-restart are both
+ordinary rather than exceptional -- and `run-pool.sh` restarts on exit by
+design.
+
+Only the tallies come back. The coins come from the command line, which is
+authoritative: a file that disagreed about which algorithm a label means would
+silently change what the pool serves, and the operator would be reading their
+own config to find out why.
+
+Measured: four accepted shares, restart, `resumed 1 row(s)`, two more mined,
+seven in the file. And a doctored one:
+
+```
+[pool] bad.json could not be read (digest ec322564... does not match the rows
+       (956602d2...)); starting from zero
+```
+
+Loud, and it carries on with an empty tally rather than refusing to start. A
+pool that will not run because its history is unreadable helps nobody; one that
+starts quietly and silently forgets is what has to be avoided.
+
+**What the digest can and cannot catch.** It is over the rows, so a truncated
+or corrupted file is refused whole rather than half-loaded -- half a record is
+worse than none, since the counts would be wrong in a way nothing downstream
+could detect. It is **not a signature** and proves nothing about who wrote the
+file: anybody who can edit it can recompute it. That is acceptable because this
+is the operator's own record on the operator's own disk, and it is written down
+because a digest is easy to mistake for more than it is.
+
+## Driving it without a kernel
+
+`tools/poolclient.py` speaks the protocol and mines sha256d or blake2s with
+`hashlib`. Booting the kernel under QEMU to check a change in the pool costs
+three minutes; this costs a second, and the kernel run stays the thing that
+settles anything about the kernel.
+
+It is also a **third implementation** of the protocol, which matters more than
+the convenience: `src/mine/proto.rs` is shared by the kernel and the pool, so
+without something written separately the encoder and the decoder are the same
+code agreeing with itself.
+
+It earned that immediately. Every share it found was refused, and the pool was
+right: `below_target` reads a digest **little-endian** -- a block hash is a
+256-bit integer stored least-significant byte first, which is why a Bitcoin
+block id is displayed reversed -- and the client compared big-endian. Not close
+to right; it accepts and rejects an unrelated set of shares.
+
+**And that led to a test in this repository that passed for the wrong reason.**
+`a_target_comparison_is_a_real_comparison` built its digests big-endian too, so
+"equal to the target" was a number vastly below it and "one over" vastly above:
+three passing assertions, none of which touched the boundary they were named
+for. A comparison that only ever sees values orders of magnitude apart passes
+with almost any implementation, including the leading-zero count it exists to
+rule out. It is now genuinely at the boundary, plus a pair that are each other
+reversed -- 1 and 2^248 -- which no order-ignoring comparison can answer the
+same way.
+
+yespower is deliberately absent from the client. A Python transliteration would
+be a fourth implementation of the one algorithm this tree is most careful
+about, and `tools/yespower.py` already exists and is checked against upstream's
+own vectors. A job it cannot compute is skipped and said out loud.
+
 ## What does not
 - **A real pool.** Everything above ran against a stub on loopback. No upstream
   on the internet has been asked for work, which needs an account and an
   address rather than any more code.
-- Accounting beyond a per-worker tally: no PPLNS, no persistence.
-  `--ledger` writes the log every minute but nothing reads it back at start, so
-  a restart begins from zero.
+- PPLNS, and any notion of a payout window. The tally is cumulative.
 - TLS, and therefore any safety on an untrusted network. See above.
 - The site repository, the DNS record, and the host. None of them exist yet.
 - Worker identity, which is `supabase/functions/link` already and needs joining

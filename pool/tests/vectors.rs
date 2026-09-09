@@ -142,20 +142,54 @@ fn yespower_matches_every_upstream_vector() {
     }
 }
 
+/// A digest whose *value* is the number this hex spells.
+///
+/// `below_target` reads a digest little-endian, because a block hash is a
+/// 256-bit integer stored least-significant byte first -- which is why a
+/// Bitcoin block id is displayed reversed. So a digest meant to equal a
+/// big-endian target is that target's bytes reversed.
+fn digest_worth(be_hex: &str) -> [u8; 32] {
+    let mut d = h32(be_hex);
+    d.reverse();
+    d
+}
+
 #[test]
-fn a_target_comparison_is_not_a_leading_zero_count() {
-    // The failure `below_target` exists to avoid: a target that is not a power
-    // of two cannot be expressed as a count of leading zeros, so an
-    // implementation counting them accepts and rejects the wrong shares.
+fn a_target_comparison_is_a_real_comparison() {
+    // This test asserted the right three outcomes for the wrong reason first.
+    // It built its digests big-endian, so "equal to the target" was in fact a
+    // number vastly below it and "one over" was vastly above -- three passing
+    // assertions, none of which touched the boundary they were named for. A
+    // comparison that only ever sees values orders of magnitude apart would
+    // pass with almost any implementation, including the leading-zero count
+    // this is here to rule out.
     let t = u256::U256::from_be_bytes(&h32(
         "00000000ffff0000000000000000000000000000000000000000000000000000",
     ));
-    let equal = h32("00000000ffff0000000000000000000000000000000000000000000000000000");
-    let under = h32("00000000fffe0000000000000000000000000000000000000000000000000000");
-    let over = h32("00000000ffff0000000000000000000000000000000000000000000000000001");
-    assert!(hash::below_target(&equal, &t), "equal to target must pass");
-    assert!(hash::below_target(&under, &t));
-    assert!(!hash::below_target(&over, &t));
+    let equal = digest_worth("00000000ffff0000000000000000000000000000000000000000000000000000");
+    let under = digest_worth("00000000fffe0000000000000000000000000000000000000000000000000000");
+    let over = digest_worth("00000000ffff0000000000000000000000000000000000000000000000000001");
+
+    assert!(hash::below_target(&equal, &t), "equal to the target must pass");
+    assert!(hash::below_target(&under, &t), "one below must pass");
+    assert!(!hash::below_target(&over, &t), "one above must not");
+
+    // And byte order is load-bearing rather than incidental. These two arrays
+    // are each other reversed, and as little-endian integers they are 1 and
+    // 2^248 -- so a comparison that ignored order would have to give them the
+    // same answer, and no correct one can.
+    let one = {
+        let mut d = [0u8; 32];
+        d[0] = 1;
+        d
+    };
+    let vast = {
+        let mut d = [0u8; 32];
+        d[31] = 1;
+        d
+    };
+    assert!(hash::below_target(&one, &t), "a digest worth 1 must pass");
+    assert!(!hash::below_target(&vast, &t), "a digest worth 2^248 must not");
 }
 
 // ------------------------------------------------------------ the protocol

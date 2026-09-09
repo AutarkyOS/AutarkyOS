@@ -282,9 +282,10 @@ rewrite a job. The kernel has one TLS session and the updater owns it, so this
 is a real limitation rather than a setting -- see `design/pool.md`. Until it is
 fixed, a miner on an untrusted network is trusting the network.
 
-**No persistence across restarts.** `--ledger` writes the share log every
-minute and nothing reads it back at start, so `systemctl restart` begins the
-tally at zero. Back the file up before restarting if the numbers matter.
+**The ledger survives a restart, but only if you pass `--ledger`.** Without it
+the tally is in memory and a restart begins at zero. With it the file is read
+back at start, and a truncated or edited one is refused whole and announced
+rather than half-loaded.
 
 **No chain behind any coin.** Every `Source` is `Local`: the pool builds its own
 headers, so shares are real proof of work against a target nobody else
