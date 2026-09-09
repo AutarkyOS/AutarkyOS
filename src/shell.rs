@@ -7492,6 +7492,118 @@ fn fat_cmd(rest: &str) {
 /// `mine on` with no pool set refuses **and names the verb that sets one**. The
 /// alternative is connecting to nothing and reporting "down", which is a state
 /// an operator then has to distinguish from a pool that is genuinely refusing.
+/// The algorithm spelling, shared by `mine algo` and `mine coin`.
+///
+/// One parser rather than two, because the second copy is the one that gets a
+/// new algorithm added to it a release late -- and a slot whose parameters were
+/// parsed differently from the pool slot's hashes a different function
+/// perfectly correctly, which is the failure `Algo` refuses to clamp its way
+/// into.
+fn parse_algo<'a>(w: &mut impl Iterator<Item = &'a str>) -> Option<crate::mine::algo::Algo> {
+    use crate::mine::algo::Algo;
+    match w.next().unwrap_or("") {
+        "sha256d" => Some(Algo::Sha256d),
+        "yespower" => {
+            // Explicit parameters and no per-coin preset table. A preset is a
+            // number this tree would be asserting about somebody else's network
+            // without having read their source, and a wrong one hashes a
+            // different function perfectly correctly and has every share
+            // rejected.
+            let v = w.next().unwrap_or("");
+            let n = w.next().and_then(|x| x.parse::<u32>().ok());
+            let r = w.next().and_then(|x| x.parse::<u32>().ok());
+            let pers = w.next().map(|p| p.as_bytes().to_vec());
+            match (v, n, r) {
+                ("10", Some(n), Some(r)) => Some(Algo::Yespower { v10: true, n, r, pers }),
+                ("05", Some(n), Some(r)) => Some(Algo::Yespower { v10: false, n, r, pers }),
+                _ => {
+                    kprintln!("  usage: yespower <10|05> <N> <r> [pers]");
+                    None
+                }
+            }
+        }
+        other => {
+            kprintln!("  no such algorithm '{}' -- try sha256d or yespower", other);
+            None
+        }
+    }
+}
+
+/// The coin table: one row per slot, with its own rate.
+///
+/// A rate per coin and never a total. Two slices on different algorithms differ
+/// by three orders of magnitude in hashes per second, so a sum across them is
+/// dominated by whichever is cheap and describes neither -- the reason
+/// `mine::work` keeps a counter per slot at all.
+fn mine_coins() {
+    use crate::mine::work::{self, MAX_COINS};
+    if work::occupied() == 0 {
+        kprintln!("  no coins. `mine coin <n> <label> <algo...>`, or `mine on` for the pool's");
+        return;
+    }
+    console::set_color(YELLOW);
+    kprintln!("  slot  label       slices  source   rate            algorithm");
+    console::set_color(LTGRAY);
+    for i in 0..MAX_COINS {
+        let g = work::coin(i);
+        let Some(c) = g.as_ref() else { continue };
+        let (label, detail, src, job) = (
+            c.label.clone(),
+            c.algo.detail(),
+            c.source.name(),
+            c.template.is_some(),
+        );
+        drop(g);
+        let on = work::slices_on(i);
+        let (h, ms, found) = work::rate(i);
+        let rate = if !job {
+            String::from("no job yet")
+        } else if on == 0 {
+            String::from("no slice on it")
+        } else if h == 0 || ms == 0 {
+            String::from("nothing yet")
+        } else {
+            let mut r = String::new();
+            push_num(&mut r, h * 1000 / ms);
+            r.push_str(" H/s");
+            if ms < 5_000 {
+                r.push('*');
+            }
+            r
+        };
+        kprintln!(
+            "  {:<4}  {:<10}  {:<6}  {:<7}  {:<14}  {}",
+            i, crate::gfx::theme::head_chars(&label, 10), on, src, rate, detail
+        );
+        if found > 0 {
+            kprintln!("        {} share(s) found", found);
+        }
+    }
+    kprintln!(
+        "  {} slice(s) over {} coin(s); a starred rate is a sample under five seconds",
+        crate::mine::client::slices(),
+        work::occupied()
+    );
+    virtual_caveat();
+}
+
+fn push_num(s: &mut String, mut v: u64) {
+    if v == 0 {
+        s.push('0');
+        return;
+    }
+    let mut b = [0u8; 20];
+    let mut i = b.len();
+    while v > 0 {
+        i -= 1;
+        b[i] = b'0' + (v % 10) as u8;
+        v /= 10;
+    }
+    for &c in &b[i..] {
+        s.push(c as char);
+    }
+}
+
 fn mine_cmd(rest: &str) {
     use crate::mine::client;
     let mut it = rest.splitn(2, ' ');
@@ -7569,7 +7681,6 @@ fn mine_cmd(rest: &str) {
             kprintln!("  stopping");
         }
         "algo" => {
-            use crate::mine::algo::Algo;
             if arg.is_empty() {
                 kprintln!("  {}", client::algo_in_force().detail());
                 kprintln!("  usage: mine algo sha256d");
@@ -7577,33 +7688,8 @@ fn mine_cmd(rest: &str) {
                 return;
             }
             let mut w = arg.split_whitespace();
-            let a = match w.next().unwrap_or("") {
-                "sha256d" => Some(Algo::Sha256d),
-                "yespower" => {
-                    // Explicit parameters and no per-coin preset table. A
-                    // preset is a number this tree would be asserting about
-                    // somebody else's network without having read their
-                    // source, and a wrong one hashes a different function
-                    // perfectly correctly and has every share rejected.
-                    let v = w.next().unwrap_or("");
-                    let n = w.next().and_then(|x| x.parse::<u32>().ok());
-                    let r = w.next().and_then(|x| x.parse::<u32>().ok());
-                    let pers = w.next().map(|p| p.as_bytes().to_vec());
-                    match (v, n, r) {
-                        ("10", Some(n), Some(r)) => Some(Algo::Yespower { v10: true, n, r, pers }),
-                        ("05", Some(n), Some(r)) => Some(Algo::Yespower { v10: false, n, r, pers }),
-                        _ => {
-                            kprintln!("  usage: mine algo yespower <10|05> <N> <r> [pers]");
-                            return;
-                        }
-                    }
-                }
-                other => {
-                    kprintln!("  no such algorithm '{}' -- try sha256d or yespower", other);
-                    return;
-                }
-            };
-            let Some(a) = a else { return };
+            let Some(a) = parse_algo(&mut w) else { return };
+
             // Built once here so bad parameters are refused at the prompt
             // rather than by the miner task, where the only place to say so
             // is a journal nobody is looking at.
@@ -7613,7 +7699,9 @@ fn mine_cmd(rest: &str) {
                 return;
             }
             kprintln!("  {}", a.detail());
-            *client::ALGO.lock_irq() = Some(a);
+            // The pool slot's, not a global. `mine coin <n> ...` is how the
+            // other slots get theirs, which is the whole point of the table.
+            client::set_pool_algo(a);
         }
         "bench" => {
             let ms: u64 = arg.parse().unwrap_or(3000);
@@ -7644,6 +7732,57 @@ fn mine_cmd(rest: &str) {
                 }
                 _ => kprintln!("  could not build a hasher for those parameters"),
             }
+        }
+        "coins" => mine_coins(),
+        "coin" => {
+            use crate::mine::work::{self, Source, MAX_COINS};
+            let mut w = arg.split_whitespace();
+            let Some(n) = w.next().and_then(|x| x.parse::<usize>().ok()) else {
+                kprintln!("  usage: mine coin <0..{}> <label> <algo...>", MAX_COINS - 1);
+                kprintln!("         mine coin <n> off");
+                kprintln!("  the algorithm spelling is `mine algo`'s: sha256d, or");
+                kprintln!("  yespower <10|05> <N> <r> [pers]");
+                return;
+            };
+            if n >= MAX_COINS {
+                kprintln!("  slots are 0 to {}", MAX_COINS - 1);
+                return;
+            }
+            let label = w.next().unwrap_or("");
+            if label.is_empty() || label == "off" {
+                if work::clear(n) && label == "off" {
+                    kprintln!("  slot {} cleared", n);
+                } else {
+                    kprintln!("  usage: mine coin {} <label> <algo...>", n);
+                }
+                return;
+            }
+            let Some(a) = parse_algo(&mut w) else { return };
+            let probe: [u8; 80] = core::array::from_fn(|i| (i as u32 * 3) as u8);
+            if crate::mine::algo::Hasher::new(&a, &probe).is_none() {
+                kprintln!("  those parameters are refused by the algorithm");
+                return;
+            }
+            // Slot 0 is the connection's, and installing over it as a fixture
+            // would leave the socket task writing jobs into a slot whose shares
+            // are dropped -- a miner that looks perfectly healthy and submits
+            // nothing. Named rather than silently corrected.
+            let src = if n == crate::mine::client::POOL_SLOT {
+                kprintln!("  slot {} is the pool's: this coin takes the connection's work", n);
+                Source::Pool
+            } else {
+                Source::Fixture
+            };
+            work::install(n, label, a.clone(), src);
+            if src == Source::Fixture {
+                // Without a job the slice assigned here would idle, and an idle
+                // slice reads from `mine coins` exactly like a slow one. There
+                // is no second pool connection to fill it from, so the honest
+                // filling is a fixture, and the row says so.
+                work::set_template(n, work::fixture_template(n as u8));
+            }
+            kprintln!("  slot {}  {}  {}  ({})", n, label, a.detail(), src.name());
+            mine_coins();
         }
         "slices" => {
             use crate::mine::client::MAX_SLICES;
@@ -7685,7 +7824,8 @@ fn mine_cmd(rest: &str) {
             kprintln!("[mine sweep] {}", a.detail());
             console::set_color(LTGRAY);
             kprintln!("  no pool: a fixture job, and a target nothing will meet");
-            let saved = client::sweep_begin();
+            kprintln!("  the coin table is set aside for the sweep and put back after");
+            let saved = client::sweep_begin(a.clone());
             let mut first = 0u64;
             for n in 1..=max {
                 let (have, hashes, took) = client::sweep_point(n, ms);
@@ -7783,8 +7923,8 @@ fn mine_report() {
     } else {
         kprintln!("  share    difficulty {} / 10^{}", m, s);
     }
-    let g = client::TEMPLATE.lock_irq();
-    match g.as_ref() {
+    let g = crate::mine::work::coin(client::POOL_SLOT);
+    match g.as_ref().and_then(|c| c.template.as_ref()) {
         Some(t) => {
             kprintln!("  job      {} (template {})", t.job_id, t.serial);
             let tgt = t.target.to_be_bytes();
@@ -7882,8 +8022,8 @@ fn mine_ev() {
         }
     }
 
-    let g = client::TEMPLATE.lock_irq();
-    let Some(t) = g.as_ref() else {
+    let g = crate::mine::work::coin(client::POOL_SLOT);
+    let Some(t) = g.as_ref().and_then(|c| c.template.as_ref()) else {
         kprintln!("  network      no job, so nothing below can be said");
         return;
     };

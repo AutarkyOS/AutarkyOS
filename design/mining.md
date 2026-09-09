@@ -170,6 +170,62 @@ anything printing a hash rate asks `dev::power::virtualised()` and appends a
 note when a hypervisor is present, because a figure that does not say what it
 is worth gets quoted as though it were hardware.
 
+## Many coins at once, which is now a thing the kernel does
+
+`src/mine/work.rs` is the table: four slots, each with its own label, its own
+algorithm and its own job, and a supervisor saying which slice works which slot.
+`mine coin <n> <label> <algo...>` installs one, `mine coin <n> off` removes it,
+`mine coins` prints the table.
+
+Measured under QEMU with three slices over two coins, which is the whole claim
+of this section in one command:
+
+    slot  label       slices  source   rate            algorithm
+    1     zeny        2       fixture  676 H/s         yespower 1.0 N=2048 r=8
+    2     bitcoin     1       fixture  238759 H/s      sha256d
+
+Two different proof-of-work functions, on two different cores, at the same
+instant. Clearing the second put all three slices back on the first and it read
+968 H/s, against 676 on two -- so the supervisor's re-spread is visible in the
+figures rather than only in the table.
+
+**The aggregate hashrate had to be abandoned, and that is the interesting
+part.** One `HASHES` counter was a fair summary while every slice computed the
+same function. Sum those two rows and the answer is 239,435 "H/s", which is
+238,759 with rounding: the yespower work -- the work that is actually scarce and
+actually worth something -- disappears entirely into a number dominated by the
+cheap algorithm. So there is a counter per slot and the report prints a row per
+coin with no total anywhere. `client::HASHES` survives only as the *sweep's*
+counter, where one coin is in the table by construction.
+
+**A slot's figures are forgotten whenever what produced them changes** -- the
+algorithm, or its share of the slices. That was found rather than designed:
+clearing a coin took slot 1 from two slices to three and it reported 792 H/s,
+which is neither the two-slice rate nor the three-slice one and looks perfectly
+plausible as either.
+
+**Assignment is sticky, and that is a memory decision rather than a policy.** A
+slice keeps its hasher across batches because `Yespower` owns up to 8 MiB of
+working set and a batch at that setting is eight hashes; rotating a slice
+between coins per batch would throw that allocation away and take it again
+several times a second, spending more time in the allocator than in the
+algorithm. So a slice stays on a coin until the table changes.
+
+**A share carries its slot and is checked twice.** Only slot 0 has a connection
+behind it. A fixture slot exists to be measured and its target is one nothing
+meets -- but the day one does, through a mistyped difficulty or a target of all
+ones, submitting it would send the pool a share for a header it never issued,
+which is how a worker gets banned. The miner declines to queue it and
+`drain_shares` declines to send it.
+
+**What this is not yet.** Every slot but the pool's is fed by a *fixture* job,
+because there is one Stratum connection and no protocol that can carry several
+coins down it. That is not a stopgap to be replaced by four connections -- four
+socket tasks do not fit in `MAX_TASKS` beside four slices -- it is the shape
+that waits for the pool in the table at the top of this file to exist and speak
+one protocol with a coin field in it. The kernel half of "mine many coins at
+once" is done; the half that makes the coins real is Part B.
+
 ## The licence gate
 
 This decides where implementations may come from, and it is a gate rather than

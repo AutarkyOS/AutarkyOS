@@ -107,7 +107,12 @@ pub struct Template {
     pub coinbase_head: [u8; 8],
 }
 
-pub static TEMPLATE: Spin<Option<Template>> = Spin::new(None);
+/// The slot the Stratum connection fills.
+///
+/// Fixed at zero rather than allocated. There is one connection, and a slot
+/// number that moved would mean a share queued before a reconnection could be
+/// submitted against a different coin's job after it.
+pub const POOL_SLOT: usize = 0;
 
 /// Which proof-of-work to compute.
 ///
@@ -115,14 +120,31 @@ pub static TEMPLATE: Spin<Option<Template>> = Spin::new(None);
 /// field for it -- the pool and the miner are simply assumed to agree, which is
 /// true when a pool serves one coin and is the whole reason our own pool wants
 /// a protocol that says so out loud. See `design/mining.md`.
-pub static ALGO: Spin<Option<super::algo::Algo>> = Spin::new(None);
-
+///
+/// It lives on the *slot* now rather than being one global, because the whole
+/// point of the work table is that two slices may be computing different
+/// functions at the same instant.
 pub fn algo_in_force() -> super::algo::Algo {
-    ALGO.lock_irq().clone().unwrap_or(super::algo::Algo::Sha256d)
+    super::work::algo(POOL_SLOT).unwrap_or(super::algo::Algo::Sha256d)
+}
+
+/// Set the pool slot's algorithm, creating the slot if the operator has not.
+pub fn set_pool_algo(a: super::algo::Algo) {
+    let label = super::work::label(POOL_SLOT).unwrap_or_else(|| {
+        CONFIG
+            .lock_irq()
+            .as_ref()
+            .map(|c| c.host.clone())
+            .unwrap_or_else(|| String::from("pool"))
+    });
+    super::work::install(POOL_SLOT, &label, a, super::work::Source::Pool);
 }
 
 /// A share, waiting for the socket task to send it.
 pub struct Share {
+    /// Which coin it belongs to. Checked before submitting, because only the
+    /// pool slot has an upstream that issued the header it was found against.
+    pub slot: usize,
     pub serial: u64,
     pub job_id: String,
     pub extranonce2: Vec<u8>,
@@ -154,8 +176,6 @@ pub const MAX_SLICES: usize = 4;
 
 /// How many slices are wanted. Slices above this park.
 static SLICES: AtomicU32 = AtomicU32::new(1);
-/// Lets the slices run with no pool, for `mine sweep`.
-static SWEEPING: AtomicBool = AtomicBool::new(false);
 /// How many have actually been spawned. Only ever rises, because a task that
 /// returns is not reclaimed -- so slices are spawned lazily and then reused
 /// rather than spawned per `mine on`.
@@ -202,6 +222,11 @@ pub fn set_slices(n: u32) -> u32 {
     }
     let have = SPAWNED_SLICES.load(Ordering::Relaxed).min(n);
     SLICES.store(have, Ordering::Relaxed);
+    // The supervisor runs here rather than in the hash loop, because assignment
+    // is sticky by design -- see `work`'s header. Changing the slice count
+    // without re-spreading would leave a newly wanted slice pointing at nothing
+    // and reading, from the report, exactly like a slice that could not spawn.
+    super::work::assign();
     have
 }
 
@@ -220,7 +245,7 @@ pub fn hash_ms() -> u64 {
 /// from the shell, so the day a slice stops being pinned to core 0 this is two
 /// cores in one `Vec`. It was the only thing the miner touched that was not
 /// already an atomic or a real lock; everything else it reads or writes is
-/// `TEMPLATE`, `SHARES`, `ALGO` or a counter.
+/// the work table, `SHARES` or a counter.
 ///
 /// `lock_irq` rather than `lock`, for the reason the heap and console take it:
 /// this is reachable from a path that can be preempted while holding it.
@@ -309,6 +334,22 @@ pub fn stop() {
     ENABLED.store(false, Ordering::Release);
 }
 
+/// What a slice with nothing to do does.
+///
+/// `hlt` and not the spin `idle()` uses, and the difference only started
+/// mattering when slices were unpinned. A parked task on core 0 spinning is a
+/// task the scheduler hands its quantum to and takes it back from -- annoying
+/// and bounded. A parked task on a core of its own spinning is that whole core
+/// held at full power computing nothing, for as long as the table is empty,
+/// which on this laptop is a fan that never stops after a `mine coin ... off`.
+///
+/// Safe because a task runs with interrupts enabled and the timer fires at
+/// 100 Hz, so the longest this can sleep is one tick. The socket task keeps
+/// `idle()`, since its spin is what drives the TCP stack.
+fn park() {
+    unsafe { core::arch::asm!("hlt", options(nomem, nostack)) };
+}
+
 /// A short spin, for the parked case. Not `yield_now`: see the module header.
 fn idle() {
     for _ in 0..2000 {
@@ -321,12 +362,22 @@ fn idle() {
 /// **Never `lapic::ticks()`.** That counter is the timer-interrupt count and
 /// only the bootstrap processor advances it now, but the whole class of bug is
 /// worth staying away from in code whose entire output is a rate.
-fn now_ms() -> u64 {
+pub fn now_ms() -> u64 {
     let mhz = crate::time::tsc_mhz();
     if mhz == 0 {
         return 0;
     }
     crate::time::rdtsc() / (mhz * 1000)
+}
+
+/// The next template serial.
+///
+/// One counter across every slot, not one per slot. A slice compares the serial
+/// it snapshotted against the one it holds to decide whether to retarget, and
+/// with per-slot counters a slice moved from one coin to another would see two
+/// unrelated sequences and could read a *lower* number as no change at all.
+pub fn bump_serial() -> u64 {
+    JOB_SERIAL.fetch_add(1, Ordering::AcqRel) + 1
 }
 
 fn sleep_ms(ms: u64) {
@@ -357,7 +408,7 @@ fn stratum_task() {
                 set_phase(Phase::Off);
                 LIVE.store(false, Ordering::Release);
                 JOB_SERIAL.fetch_add(1, Ordering::AcqRel);
-                *TEMPLATE.lock_irq() = None;
+                super::work::drop_template(POOL_SLOT);
                 note("disconnected on request");
             }
             idle();
@@ -379,7 +430,9 @@ fn stratum_task() {
         // next one: `extranonce1` is per-connection, so the work is not merely
         // stale, it is unsubmittable.
         JOB_SERIAL.fetch_add(1, Ordering::AcqRel);
-        *TEMPLATE.lock_irq() = None;
+        // Only the pool slot's job. A fixture slot's is still perfectly good --
+        // it never depended on this connection's extranonce.
+        super::work::drop_template(POOL_SLOT);
         if ENABLED.load(Ordering::Acquire) {
             set_phase(Phase::Connecting);
         }
@@ -541,6 +594,14 @@ fn drain_shares(s: &mut Session) -> bool {
         let Some(sh) = SHARES.lock_irq().pop() else {
             return true;
         };
+        // Belt and braces against the one thing that gets a worker banned. The
+        // miner already declines to queue a fixture slot's share; this is the
+        // second gate, at the only point where bytes actually leave, because
+        // the cost of being wrong here is not a bad measurement -- it is the
+        // pool refusing this address afterwards.
+        if sh.slot != POOL_SLOT {
+            continue;
+        }
         let user = {
             let g = CONFIG.lock_irq();
             match g.as_ref() {
@@ -677,8 +738,8 @@ fn rebuild(s: &mut Session) {
         0,
     );
     let (ntime_be, _) = super::header::submit_hex(&header);
-    let serial = JOB_SERIAL.fetch_add(1, Ordering::AcqRel) + 1;
-    *TEMPLATE.lock_irq() = Some(Template {
+    let serial = bump_serial();
+    let t = Template {
         serial,
         job_id: job.id.clone(),
         extranonce2: e2,
@@ -695,14 +756,32 @@ fn rebuild(s: &mut Session) {
             }
             h
         },
-    });
+    };
+    // The slot has to exist before the job goes in, and creating it here rather
+    // than at `mine on` is deliberate: an operator who never ran `mine coin`
+    // still gets one, named after the host, the moment the pool sends work.
+    // `install` keeps the template it finds when nothing about the coin
+    // changed, so this is a no-op on every job after the first.
+    if super::work::algo(POOL_SLOT).is_none() {
+        set_pool_algo(super::algo::Algo::Sha256d);
+    }
+    super::work::set_template(POOL_SLOT, t);
+
     // Shares for a template nobody holds any more cannot be submitted: the job
     // id is gone and the extranonce2 has moved. Dropping them here is cheaper
     // than filtering at submit and cannot leave one behind.
-    SHARES.lock_irq().retain(|sh| sh.serial == serial);
+    //
+    // **Scoped to the pool slot**, which it did not have to be while there was
+    // one template. A bare `serial ==` filter now discards every other coin's
+    // queued share every time this pool sends a job -- shares for work that is
+    // still perfectly current, thrown away by a rebuild they have nothing to
+    // do with.
+    SHARES
+        .lock_irq()
+        .retain(|sh| sh.slot != POOL_SLOT || sh.serial == serial);
 }
 
-/// The hash loop. One task, pinned to core 0 like everything else.
+/// The hash loop. One task per slice, unpinned, each on one coin.
 ///
 /// Deliberately the slow version. `smp::parallel_split` is the obvious reach
 /// and it is the wrong instrument: it allows one job system-wide and its only
@@ -727,63 +806,72 @@ fn mine_task() {
     // several slices there is one per slice, which is the memory the budget in
     // `design/mining.md` is really spending.
     let mut held: Option<(super::algo::Algo, super::algo::Hasher)> = None;
+    let mut held_slot: Option<usize> = None;
     let mut held_serial = 0u64;
 
     loop {
         // A slice above the wanted count parks rather than exiting, because a
         // task that returns is never reclaimed and `mine slices` would then be
         // a one-way door.
-        if !(ENABLED.load(Ordering::Acquire) || SWEEPING.load(Ordering::Acquire))
-            || !MINING.load(Ordering::Acquire)
-            || slice >= SLICES.load(Ordering::Relaxed)
-        {
-            idle();
+        //
+        // **The work table is the switch, not `ENABLED`.** That gate was a fact
+        // about the *connection*, which is the right question only while there
+        // is one coin and it comes from a pool: a fixture coin installed for
+        // measurement is real work with no connection behind it, and a slice
+        // that waited for `mine on` would never touch it. What actually decides
+        // is whether the supervisor gave this slice a slot and whether that
+        // slot has a job -- both of which go away on their own when the
+        // connection does, because `stratum_task` drops the pool slot's job.
+        if !MINING.load(Ordering::Acquire) || slice >= SLICES.load(Ordering::Relaxed) {
+            park();
             continue;
         }
-        // Snapshot under the lock and hash outside it. Holding it across a
-        // batch would block `rebuild` for the length of one every time.
-        let snap = {
-            let g = TEMPLATE.lock_irq();
-            g.as_ref().map(|t| {
-                (
-                    t.serial,
-                    t.header,
-                    t.target,
-                    t.job_id.clone(),
-                    t.extranonce2.clone(),
-                    t.ntime_be.clone(),
-                )
-            })
-        };
-        let Some((serial, header, target, job_id, e2, ntime_be)) = snap else {
-            idle();
+        // Which coin this slice is on. The supervisor decides, and it decides
+        // when the table changes rather than here -- see `work::assign`.
+        let Some(slot) = super::work::slot_for(slice) else {
+            park();
             continue;
         };
-        let algo = algo_in_force();
+        // Snapshot under the lock and hash outside it. Holding it across a
+        // batch would block a job update for the length of one every time.
+        let Some(w) = super::work::snapshot(slot) else {
+            park();
+            continue;
+        };
 
-        if held.as_ref().map(|(a, _)| a != &algo).unwrap_or(true) {
-            match super::algo::Hasher::new(&algo, &header) {
+        // Rebuilt when the algorithm changes *or* when the slice moves to a
+        // different coin. The second condition is the new one and it is not
+        // optional: two coins can share an algorithm and still be different
+        // chains, and a hasher carrying the wrong slot's midstate hashes a
+        // header that never existed while looking perfectly healthy -- the
+        // failure `Hasher::hash` already warns about, arriving by a new route.
+        if held_slot != Some(slot) || held.as_ref().map(|(a, _)| a != &w.algo).unwrap_or(true) {
+            match super::algo::Hasher::new(&w.algo, &w.header) {
                 Some(h) => {
-                    note("hasher built");
-                    held = Some((algo.clone(), h));
-                    held_serial = serial;
+                    held = Some((w.algo.clone(), h));
+                    held_slot = Some(slot);
+                    held_serial = w.serial;
                 }
                 None => {
                     // Parameters the algorithm refuses, or a working set that
-                    // will not fit. Said once rather than spun on.
-                    note("the algorithm refused its parameters; not mining");
-                    MINING.store(false, Ordering::Release);
+                    // will not fit. The *coin* is stood down rather than all
+                    // mining: one bad slot must not stop the other three, which
+                    // is what `MINING.store(false)` used to do here.
+                    note("a coin's parameters are refused by its algorithm; dropping it");
+                    super::work::clear(slot);
+                    held = None;
+                    held_slot = None;
                     continue;
                 }
             }
-        } else if serial != held_serial {
+        } else if w.serial != held_serial {
             if let Some((_, h)) = held.as_mut() {
-                h.retarget(&header);
+                h.retarget(&w.header);
             }
-            held_serial = serial;
+            held_serial = w.serial;
         }
         let Some((_, hasher)) = held.as_mut() else {
-            idle();
+            park();
             continue;
         };
 
@@ -792,38 +880,47 @@ fn mine_task() {
         }
 
         // Each slice owns a disjoint quarter of the nonce space, so two slices
-        // never hash the same header twice -- which would burn a core to find a
-        // share somebody else already found and would make the concurrency
-        // curve read as scaling when it is duplicating.
-        let batch = algo.batch();
+        // on the same coin never hash the same header twice -- which would burn
+        // a core to find a share somebody else already found and would make the
+        // concurrency curve read as scaling when it is duplicating.
+        let batch = w.algo.batch();
         let stride = (u32::MAX / MAX_SLICES as u32).wrapping_add(1);
         let base = slice
             .wrapping_mul(stride)
             .wrapping_add((HASHES.load(Ordering::Relaxed) & 0xffff_ffff) as u32);
         for i in 0..batch {
             let nonce = base.wrapping_add(i);
-            let d = hasher.hash(&header, nonce);
+            let d = hasher.hash(&w.header, nonce);
             let z = super::hash::leading_zero_bits(&d);
             if z > BEST.load(Ordering::Relaxed) {
                 BEST.store(z, Ordering::Relaxed);
             }
-            if super::hash::below_target(&d, &target) {
+            if super::hash::below_target(&d, &w.target) {
                 FOUND.fetch_add(1, Ordering::Relaxed);
+                super::work::found(slot);
+                // A fixture slot has no upstream that issued this header, so
+                // its share is counted and dropped. Submitting it would send
+                // the pool work for a job it never sent, which is a ban.
+                if !w.submits {
+                    continue;
+                }
                 let mut q = SHARES.lock_irq();
                 // Bounded: a misconfigured difficulty of nearly zero would
                 // otherwise queue faster than the socket can drain, and the
                 // heap is the thing that runs out.
                 if q.len() < 64 {
                     q.push(Share {
-                        serial,
-                        job_id: job_id.clone(),
-                        extranonce2: e2.clone(),
-                        ntime_be: ntime_be.clone(),
+                        slot,
+                        serial: w.serial,
+                        job_id: w.job_id.clone(),
+                        extranonce2: w.extranonce2.clone(),
+                        ntime_be: w.ntime_be.clone(),
                         nonce_be: nonce.to_be_bytes().to_vec(),
                     });
                 }
             }
         }
+        super::work::count(slot, batch as u64);
         HASHES.fetch_add(batch as u64, Ordering::Relaxed);
     }
 }
@@ -871,33 +968,26 @@ fn rest_ms(ms: u64) {
     }
 }
 
-/// Put a fixture job in place so the slices have something to hash.
+/// What the sweep displaced, so it can be put back.
 ///
-/// A sweep with no pool, deliberately. The concurrency curve is a fact about
-/// this machine's caches and not about anybody's network, and requiring a live
-/// pool to measure it would mean the one measurement that has to be taken on
-/// the GF63 could only be taken with the GF63 online.
-fn install_fixture_template() {
-    let header: [u8; 80] = core::array::from_fn(|i| (i as u32 * 3) as u8);
-    // A target nothing will meet, so the sweep measures hashing and never
-    // spends time building and queueing shares.
-    let target = super::u256::U256::ZERO;
-    let serial = JOB_SERIAL.fetch_add(1, Ordering::AcqRel) + 1;
-    *TEMPLATE.lock_irq() = Some(Template {
-        serial,
-        job_id: String::from("sweep"),
-        extranonce2: alloc::vec![0u8; 4],
-        ntime_be: alloc::vec![0u8; 4],
-        header,
-        target,
-        nbits: 0x1d00_ffff,
-        coin_value: None,
-        coinbase_len: 0,
-        coinbase_head: [0u8; 8],
-    });
+/// The *templates* are not saved. A live pool re-sends a job within seconds, so
+/// the cost of dropping one is a few seconds of idle at worst -- against
+/// carrying a second way to construct a `Template` here, which is exactly the
+/// duplicate-writer arrangement `v4.py` and `tokenizer.py --verify` exist to
+/// avoid. What is saved is the table's *shape*, which nothing else can restore.
+pub struct SweepState {
+    mining: bool,
+    slices: u32,
+    table: alloc::vec::Vec<Option<(String, super::algo::Algo, super::work::Source)>>,
 }
 
 /// One point of the concurrency curve: `n` slices for `ms`, aggregate H/s.
+///
+/// The aggregate is meaningful here and nowhere else: `sweep_begin` puts one
+/// coin in the table, so every slice is computing the same function and the
+/// objection `work`'s header makes about summing across algorithms does not
+/// apply. That is the reason the sweep clears the table rather than measuring
+/// whatever happens to be in it.
 pub fn sweep_point(n: u32, ms: u64) -> (u32, u64, u64) {
     let have = set_slices(n);
     HASHES.store(0, Ordering::Relaxed);
@@ -908,23 +998,60 @@ pub fn sweep_point(n: u32, ms: u64) -> (u32, u64, u64) {
     (have, HASHES.load(Ordering::Relaxed), took)
 }
 
-/// Run the whole curve. Restores what it disturbed.
-pub fn sweep_begin() -> (bool, u32) {
-    let was_mining = MINING.load(Ordering::Relaxed);
-    let had = SLICES.load(Ordering::Relaxed);
-    install_fixture_template();
+/// Clear the table down to one fixture coin and start the curve.
+///
+/// A sweep with no pool, deliberately. The concurrency curve is a fact about
+/// this machine's caches and not about anybody's network, and requiring a live
+/// pool to measure it would mean the one measurement that has to be taken on
+/// the GF63 could only be taken with the GF63 online.
+pub fn sweep_begin(algo: super::algo::Algo) -> SweepState {
+    let mut table = alloc::vec::Vec::new();
+    for i in 0..super::work::MAX_COINS {
+        table.push(
+            super::work::coin(i)
+                .as_ref()
+                .map(|c| (c.label.clone(), c.algo.clone(), c.source)),
+        );
+    }
+    let state = SweepState {
+        mining: MINING.load(Ordering::Relaxed),
+        slices: SLICES.load(Ordering::Relaxed),
+        table,
+    };
+    for i in 0..super::work::MAX_COINS {
+        super::work::clear(i);
+    }
+    super::work::install(0, "sweep", algo, super::work::Source::Fixture);
+    super::work::set_template(0, super::work::fixture_template(0));
     MINING.store(true, Ordering::Release);
-    SWEEPING.store(true, Ordering::Release);
-    (was_mining, had)
+    state
 }
 
-pub fn sweep_end(state: (bool, u32)) {
-    SWEEPING.store(false, Ordering::Release);
-    MINING.store(state.0, Ordering::Release);
-    SLICES.store(state.1, Ordering::Relaxed);
-    // The fixture job is not a real one and must not outlive the sweep, or the
+pub fn sweep_end(state: SweepState) {
+    MINING.store(state.mining, Ordering::Release);
+    // The fixture coin is not a real one and must not outlive the sweep, or the
     // next `mine` would report a job the pool never sent.
-    *TEMPLATE.lock_irq() = None;
+    for i in 0..super::work::MAX_COINS {
+        super::work::clear(i);
+    }
+    for (i, c) in state.table.into_iter().enumerate() {
+        if let Some((l, a, src)) = c {
+            super::work::install(i, &l, a, src);
+            // A pool slot gets its job back from the pool within seconds, which
+            // is the whole reason templates are not saved. A **fixture** slot
+            // has nobody to send it one, so not rebuilding it here leaves the
+            // coin in the table reading "no job yet" for the rest of the boot
+            // -- a sweep quietly killing every coin the operator installed to
+            // measure. Regenerating is exactly right rather than a workaround:
+            // a fixture template is generated and not received, so this is the
+            // same bytes the slot had.
+            if src == super::work::Source::Fixture {
+                super::work::set_template(i, super::work::fixture_template(i as u8));
+            }
+        }
+    }
+    SLICES.store(state.slices, Ordering::Relaxed);
+    super::work::assign();
     JOB_SERIAL.fetch_add(1, Ordering::AcqRel);
 }
 

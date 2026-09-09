@@ -3908,15 +3908,26 @@ because whether a second core picks the migrant up inside any particular 200 ms
 depends on what else is running, and a single sample can fail spuriously as
 easily as it can pass spuriously.
 
-**What has not happened is the audit, and that is deliberate.** `Task.pin`
-carries the only core allowed to run a task, every task this kernel spawns is
-pinned to core 0, `unpin` exists and nothing outside the selftest calls it.
-Preemption on one core means two tasks never execute at the same instant; on
-two they genuinely overlap, so every `Racy` reachable from two tasks stops
-being a promise and becomes a race. There are 92 of those, the namespace tree
-among them. Unpinning before the audit buys a kernel that passes every test and
-corrupts something later, so migration is opt-in per task and the opt-in *is*
-the audit.
+**The audit is per task, and there is exactly one task that has passed it.**
+`Task.pin` carries the only core allowed to run a task. Preemption on one core
+means two tasks never execute at the same instant; on two they genuinely
+overlap, so every `Racy` reachable from two tasks stops being a promise and
+becomes a race. There are 92 of those, the namespace tree among them. Unpinning
+before the audit buys a kernel that passes every test and corrupts something
+later, so migration is opt-in per task and the opt-in *is* the audit.
+
+This said "nothing outside the selftest calls `unpin`" until the mining slices
+did. `mine::client::set_slices` is the first real caller, and what the claim
+cost is worth knowing, because it is the price of every future one: the
+miner's shared surface was audited to a single object -- its journal, which was
+a `Racy<Vec<String>>` and is a `Spin<Vec<String>>` -- and everything else a
+slice touches is an atomic, a `Spin`, or its own stack. `mine::work`'s table is
+one `Spin` per slot for the same reason. The other 91 `Racy`s are untouched and
+every other task is still pinned to core 0.
+
+The evidence that it works is arithmetic rather than a passing test: four
+slices summed to 256% of one slice's hash rate, and tasks sharing a core sum to
+100% however many there are. `tasks` shows them being resumed independently.
 
 The compute-fabric path is unchanged underneath all of that: helpers wait on a
 generation counter with MONITOR/MWAIT, run a range of a matrix, and go back to
@@ -3925,11 +3936,12 @@ bootstrap processor.
 
 **A caution for whoever reads this next.** The README's status table says
 "per-core GDT/TSS/APIC ... tasks that migrate" while its limitations list says
-every task is pinned to core 0. Those look like a contradiction and are not:
-the mechanism works and is deliberately unused. Do not "fix" either one into
-agreeing with the other. This paragraph exists because trusting the stale
-version of this section above would have turned a true statement in the README
-into a false one.
+every task is pinned to core 0. Those looked like a contradiction and were not:
+the mechanism worked and was deliberately unused. The limitations line is now
+genuinely stale rather than deliberately conservative -- the mining slices
+migrate -- and the honest edit is "every task but the mining slices", not
+deleting the line. Do not resolve it the other way by unpinning something else
+to make the README true; the pinning is the audit.
 
 `smp::parallel_split(ctx, func, count, width)` is the whole interface. It
 answers false -- meaning "do it yourself" -- if there are no helpers, if

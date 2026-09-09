@@ -262,6 +262,13 @@ pub const STEPS: &[Step] = &[
         fail: "flat from 2 onwards -> the slices are not migrating; check                'tasks' shows several 'mine slice' rows all being resumed, and                that none logged 'could not be unpinned'. Linear all the way to                4 -> the wall is further out than predicted, which is a better                answer than the prediction and should go in the doc.",
     },
     Step {
+        title: "Mining: two coins, two algorithms, one machine",
+        place: Place::Glados,
+        cmd: "mine slices 4   then   mine coin 1 zeny yespower 10 2048 8                  then   mine coin 2 btc sha256d   then   mine coins",
+        expect: "two rows with wildly different rates and the slices split                  between them. Under QEMU with three slices this read 676 H/s                  of yespower beside 238,759 H/s of sha256d, which is the                  demonstration that a combined figure would be meaningless.                  On sixteen logical processors the interesting question is                  whether the yespower row holds its rate while the sha256d                  row runs -- they share L3, and only one of them cares.",
+        fail: "a row saying 'no slice on it' -> the supervisor gave every                slice to the other coin; check 'mine slices' against the number                of coins. A yespower rate that collapses when the second coin                starts -> that is the L3 contention this whole design is about,                and it is a finding rather than a fault. Write down both rates.",
+    },
+    Step {
         title: "Mining: a real pool's job",
         place: Place::Glados,
         cmd: "mine probe <host>:<port> <worker>",

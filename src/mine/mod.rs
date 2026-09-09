@@ -24,6 +24,7 @@ pub mod hash;
 pub mod header;
 pub mod stratum;
 pub mod u256;
+pub mod work;
 pub mod yespower;
 
 use alloc::vec::Vec;
@@ -641,6 +642,8 @@ fn stratum_checks() -> Vec<(&'static str, bool)> {
         stratum::subscribe(1).matches('\n').count() == 1
             && stratum::authorize(2, "u", "p").matches('\n').count() == 1,
     ));
+
+    out.extend(work::checks());
 
     out
 }
