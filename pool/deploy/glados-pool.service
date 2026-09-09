@@ -1,0 +1,90 @@
+[Unit]
+# The pool daemon, as a systemd service.
+#
+# Written to be a polite guest before it is a fast one. This runs on a machine
+# somebody lent us, so every limit below is set to a measured figure with
+# headroom rather than left open -- a mining pool that took a friend's server
+# down would be a worse outcome than one that refused a share.
+Description=GLaDOS multi-coin mining pool
+Documentation=https://github.com/IlumCI/GLaDOS/blob/main/design/pool.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=glados-pool
+Group=glados-pool
+
+# The share target is the knob that decides load: the pool hashes once per
+# share, so what costs CPU is how often shares arrive and not how fast anybody
+# mines. See `glados-pool --bench` and design/pool.md. Twelve bits suits a
+# laptop on yespower; sha256d and blake2s are thousands of times cheaper to
+# check and can afford a much harder target.
+ExecStart=/usr/local/bin/glados-pool \
+    --listen 0.0.0.0:3334 \
+    --ledger /var/lib/glados-pool/ledger.json \
+    bitzeny:yespower-10-2048-8:12 \
+    testnet:sha256d:24
+
+Restart=always
+RestartSec=5s
+
+# --- limits, all against measured numbers ---
+#
+# Measured: 3.49 MB resident with four coins, plus at most one algorithm
+# working set live at a time -- 8,296 KiB at the largest yespower setting.
+# `Pool` is behind a mutex and validation happens while it is held, so shares
+# are checked one at a time and the peak is one working set rather than one per
+# miner. Call it 12 MB in the worst case; 64 M is five times that.
+#
+# If this ever OOMs, the thing to look at first is whether somebody made
+# validation parallel, because that is the one change that turns peak memory
+# into `threads * 8 MiB`.
+MemoryMax=64M
+MemoryHigh=48M
+
+# Half a core. Measured, one whole core absorbs 133 yespower-8MiB validations a
+# second and a laptop-class miner submits about 0.1 -- so half a core is still
+# several hundred miners, and leaving the other half to the machine's owner
+# costs nothing anybody will notice.
+CPUQuota=50%
+
+# A thread per connection, so this is the connection ceiling in disguise. Raise
+# it and MemoryMax together if the pool ever has that many miners.
+TasksMax=512
+
+# --- hardening ---
+#
+# The daemon needs a listening socket above 1024, one directory to write, and
+# nothing else at all. Everything below is that stated as policy.
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictNamespaces=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged @resources
+
+# The one writable path. The ledger is the whole product of a non-custodial
+# pool, so it needs somewhere to live that survives a restart -- even though
+# nothing reads it back yet.
+StateDirectory=glados-pool
+ReadWritePaths=/var/lib/glados-pool
+
+# Port 3334 is above 1024, so no capability is needed to bind it. Stated
+# because the obvious instinct is to give this CAP_NET_BIND_SERVICE and it
+# genuinely does not want it.
+CapabilityBoundingSet=
+AmbientCapabilities=
+
+[Install]
+WantedBy=multi-user.target
