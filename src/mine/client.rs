@@ -143,9 +143,67 @@ pub static BEST: AtomicU32 = AtomicU32::new(0);
 /// When hashing started, for the rate. TSC milliseconds, never `lapic::ticks`.
 static HASH_SINCE: AtomicU64 = AtomicU64::new(0);
 
-/// Nonces per batch. About 1.5 ms of work, so the template check between
-/// batches costs nothing and `mine off` is felt within one.
-const BATCH: u32 = 4096;
+/// How many mining slices may ever exist.
+///
+/// Bounded by task slots rather than by cores: `MAX_TASKS` is 24, every
+/// application processor takes one through `adopt_idle`, and slots are never
+/// reclaimed -- so on the GF63's sixteen logical processors roughly four are
+/// free once the resident tasks have theirs. Asking for more than this would
+/// spawn until the machine could not spawn anything else, ever.
+pub const MAX_SLICES: usize = 4;
+
+/// How many slices are wanted. Slices above this park.
+static SLICES: AtomicU32 = AtomicU32::new(1);
+/// Lets the slices run with no pool, for `mine sweep`.
+static SWEEPING: AtomicBool = AtomicBool::new(false);
+/// How many have actually been spawned. Only ever rises, because a task that
+/// returns is not reclaimed -- so slices are spawned lazily and then reused
+/// rather than spawned per `mine on`.
+static SPAWNED_SLICES: AtomicU32 = AtomicU32::new(0);
+/// Claimed once by each slice task at entry, since `task::spawn` takes a bare
+/// `fn()` and there is nowhere to pass an index.
+static NEXT_SLICE: AtomicU32 = AtomicU32::new(0);
+
+pub fn slices() -> u32 {
+    SLICES.load(Ordering::Relaxed)
+}
+
+pub fn spawned_slices() -> u32 {
+    SPAWNED_SLICES.load(Ordering::Relaxed)
+}
+
+/// Ask for `n` concurrent slices, spawning any that do not exist yet.
+///
+/// Answers how many are actually available, which can be fewer than asked when
+/// the task table is full -- and saying so is the point, since the alternative
+/// is a sweep that reports a flat curve because half its slices were never
+/// created.
+pub fn set_slices(n: u32) -> u32 {
+    let n = n.clamp(1, MAX_SLICES as u32);
+    while SPAWNED_SLICES.load(Ordering::Relaxed) < n {
+        match crate::task::spawn("mine slice", mine_task) {
+            Some(i) => {
+                SPAWNED_SLICES.fetch_add(1, Ordering::Relaxed);
+                // **This kernel's first `unpin` caller outside the selftest.**
+                // The claim it makes is the audit above: everything this task
+                // touches is an atomic, a `Spin`, or its own stack. Without it
+                // every slice shares core 0 and the concurrency curve would be
+                // measuring round-robin overhead rather than cache contention,
+                // which is the one thing it exists to find.
+                if !crate::task::unpin(i) {
+                    note("a slice could not be unpinned; it stays on core 0");
+                }
+            }
+            None => {
+                note("no task slot for another slice");
+                break;
+            }
+        }
+    }
+    let have = SPAWNED_SLICES.load(Ordering::Relaxed).min(n);
+    SLICES.store(have, Ordering::Relaxed);
+    have
+}
 
 pub fn hash_ms() -> u64 {
     let t0 = HASH_SINCE.load(Ordering::Relaxed);
@@ -156,10 +214,20 @@ pub fn hash_ms() -> u64 {
 }
 
 /// Connection and share history, newest last.
-static LOG: Racy<Vec<String>> = Racy::new(Vec::new());
+///
+/// **A `Spin` and not a `Racy`, and that conversion is the whole of the unpin
+/// audit.** `note` is called from the socket task, from every mining slice, and
+/// from the shell, so the day a slice stops being pinned to core 0 this is two
+/// cores in one `Vec`. It was the only thing the miner touched that was not
+/// already an atomic or a real lock; everything else it reads or writes is
+/// `TEMPLATE`, `SHARES`, `ALGO` or a counter.
+///
+/// `lock_irq` rather than `lock`, for the reason the heap and console take it:
+/// this is reachable from a path that can be preempted while holding it.
+static LOG: Spin<Vec<String>> = Spin::new(Vec::new());
 
 pub fn note(s: &str) {
-    let v = unsafe { &mut *LOG.get() };
+    let mut v = LOG.lock_irq();
     if v.len() == JOURNAL {
         v.remove(0);
     }
@@ -167,7 +235,7 @@ pub fn note(s: &str) {
 }
 
 pub fn journal() -> Vec<String> {
-    unsafe { &*LOG.get() }.clone()
+    LOG.lock_irq().clone()
 }
 
 pub fn difficulty() -> (u64, u32) {
@@ -227,12 +295,12 @@ pub fn start() -> Result<(), &'static str> {
             return Err("no task slot free");
         }
     }
-    // The hash loop is a second task and not a branch of the first. The socket
+    // The hash loop is separate tasks and not a branch of the first. The socket
     // task spends its life blocked in `recv_at`, which is what keeps the TCP
     // stack alive; hashing inside that loop would stop it doing so for the
     // length of every batch.
-    if crate::task::spawn("miner", mine_task).is_none() {
-        note("no task slot for the hash loop -- connected, but not mining");
+    if set_slices(slices()) == 0 {
+        note("no task slot for a hash loop -- connected, but not mining");
     }
     Ok(())
 }
@@ -650,14 +718,25 @@ fn rebuild(s: &mut Session) {
 /// rate and the task count beside it rather than a flat-out figure, because the
 /// flat-out figure is not one this machine ever delivers.
 fn mine_task() {
+    // Claimed once, because `task::spawn` takes a bare `fn()` and there is
+    // nowhere to pass an index.
+    let slice = NEXT_SLICE.fetch_add(1, Ordering::Relaxed);
+
     // The hasher lives here rather than in the template, because it owns a
-    // working set that must not be shared with the socket task. Rebuilt only
-    // when the algorithm changes; a new job only retargets it.
+    // working set that must not be shared with the socket task -- and with
+    // several slices there is one per slice, which is the memory the budget in
+    // `design/mining.md` is really spending.
     let mut held: Option<(super::algo::Algo, super::algo::Hasher)> = None;
     let mut held_serial = 0u64;
 
     loop {
-        if !ENABLED.load(Ordering::Acquire) || !MINING.load(Ordering::Acquire) {
+        // A slice above the wanted count parks rather than exiting, because a
+        // task that returns is never reclaimed and `mine slices` would then be
+        // a one-way door.
+        if !(ENABLED.load(Ordering::Acquire) || SWEEPING.load(Ordering::Acquire))
+            || !MINING.load(Ordering::Acquire)
+            || slice >= SLICES.load(Ordering::Relaxed)
+        {
             idle();
             continue;
         }
@@ -712,11 +791,15 @@ fn mine_task() {
             HASH_SINCE.store(now_ms(), Ordering::Relaxed);
         }
 
-        // The nonce is derived from the count rather than kept, so a template
-        // change restarts the sweep and two templates never share a nonce
-        // space by accident.
+        // Each slice owns a disjoint quarter of the nonce space, so two slices
+        // never hash the same header twice -- which would burn a core to find a
+        // share somebody else already found and would make the concurrency
+        // curve read as scaling when it is duplicating.
         let batch = algo.batch();
-        let base = (HASHES.load(Ordering::Relaxed) & 0xffff_ffff) as u32;
+        let stride = (u32::MAX / MAX_SLICES as u32).wrapping_add(1);
+        let base = slice
+            .wrapping_mul(stride)
+            .wrapping_add((HASHES.load(Ordering::Relaxed) & 0xffff_ffff) as u32);
         for i in 0..batch {
             let nonce = base.wrapping_add(i);
             let d = hasher.hash(&header, nonce);
@@ -774,6 +857,75 @@ pub fn bench(algo: &super::algo::Algo, ms: u64) -> Option<(u64, u64, usize)> {
         n += chunk as u64;
     }
     Some((n, now_ms().saturating_sub(t0), foot))
+}
+
+/// Wait, on `hlt` rather than a spin.
+///
+/// The sweep must not compete with what it is measuring: a shell task spinning
+/// through the measurement is one more runnable task on the core, and the whole
+/// question being asked is how several runnable tasks interact.
+fn rest_ms(ms: u64) {
+    let deadline = now_ms() + ms;
+    while now_ms() < deadline {
+        unsafe { core::arch::asm!("hlt", options(nomem, nostack)) };
+    }
+}
+
+/// Put a fixture job in place so the slices have something to hash.
+///
+/// A sweep with no pool, deliberately. The concurrency curve is a fact about
+/// this machine's caches and not about anybody's network, and requiring a live
+/// pool to measure it would mean the one measurement that has to be taken on
+/// the GF63 could only be taken with the GF63 online.
+fn install_fixture_template() {
+    let header: [u8; 80] = core::array::from_fn(|i| (i as u32 * 3) as u8);
+    // A target nothing will meet, so the sweep measures hashing and never
+    // spends time building and queueing shares.
+    let target = super::u256::U256::ZERO;
+    let serial = JOB_SERIAL.fetch_add(1, Ordering::AcqRel) + 1;
+    *TEMPLATE.lock_irq() = Some(Template {
+        serial,
+        job_id: String::from("sweep"),
+        extranonce2: alloc::vec![0u8; 4],
+        ntime_be: alloc::vec![0u8; 4],
+        header,
+        target,
+        nbits: 0x1d00_ffff,
+        coin_value: None,
+        coinbase_len: 0,
+        coinbase_head: [0u8; 8],
+    });
+}
+
+/// One point of the concurrency curve: `n` slices for `ms`, aggregate H/s.
+pub fn sweep_point(n: u32, ms: u64) -> (u32, u64, u64) {
+    let have = set_slices(n);
+    HASHES.store(0, Ordering::Relaxed);
+    HASH_SINCE.store(0, Ordering::Relaxed);
+    let t0 = now_ms();
+    rest_ms(ms);
+    let took = now_ms().saturating_sub(t0);
+    (have, HASHES.load(Ordering::Relaxed), took)
+}
+
+/// Run the whole curve. Restores what it disturbed.
+pub fn sweep_begin() -> (bool, u32) {
+    let was_mining = MINING.load(Ordering::Relaxed);
+    let had = SLICES.load(Ordering::Relaxed);
+    install_fixture_template();
+    MINING.store(true, Ordering::Release);
+    SWEEPING.store(true, Ordering::Release);
+    (was_mining, had)
+}
+
+pub fn sweep_end(state: (bool, u32)) {
+    SWEEPING.store(false, Ordering::Release);
+    MINING.store(state.0, Ordering::Release);
+    SLICES.store(state.1, Ordering::Relaxed);
+    // The fixture job is not a real one and must not outlive the sweep, or the
+    // next `mine` would report a job the pool never sent.
+    *TEMPLATE.lock_irq() = None;
+    JOB_SERIAL.fetch_add(1, Ordering::AcqRel);
 }
 
 pub fn next_id() -> u64 {

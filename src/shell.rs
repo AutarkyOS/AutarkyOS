@@ -7640,9 +7640,75 @@ fn mine_cmd(rest: &str) {
                     if took < 5_000 {
                         kprintln!("  short sample -- not a quotable rate");
                     }
+                    virtual_caveat();
                 }
                 _ => kprintln!("  could not build a hasher for those parameters"),
             }
+        }
+        "slices" => {
+            use crate::mine::client::MAX_SLICES;
+            if arg.is_empty() {
+                kprintln!(
+                    "  {} slice(s) wanted, {} spawned, {} is the ceiling",
+                    client::slices(),
+                    client::spawned_slices(),
+                    MAX_SLICES
+                );
+                return;
+            }
+            match arg.parse::<u32>() {
+                Ok(n) => {
+                    let have = client::set_slices(n);
+                    kprintln!("  {} slice(s)", have);
+                    if have < n {
+                        // Said rather than swallowed: a sweep whose slices were
+                        // never created reports a flat curve and looks like a
+                        // finding.
+                        kprintln!("  asked for {}, and the task table would not give more", n);
+                    }
+                }
+                Err(_) => kprintln!("  usage: mine slices <1..{}>", MAX_SLICES),
+            }
+        }
+        "sweep" => {
+            use crate::mine::client::MAX_SLICES;
+            let mut w = arg.split_whitespace();
+            let max: u32 = w.next().and_then(|x| x.parse().ok()).unwrap_or(MAX_SLICES as u32);
+            let ms: u64 = w.next().and_then(|x| x.parse().ok()).unwrap_or(5000);
+            let max = max.clamp(1, MAX_SLICES as u32);
+            if ms < 2000 {
+                kprintln!("  under two seconds a slice barely starts; not a measurement");
+                return;
+            }
+            let a = client::algo_in_force();
+            console::set_color(YELLOW);
+            kprintln!("[mine sweep] {}", a.detail());
+            console::set_color(LTGRAY);
+            kprintln!("  no pool: a fixture job, and a target nothing will meet");
+            let saved = client::sweep_begin();
+            let mut first = 0u64;
+            for n in 1..=max {
+                let (have, hashes, took) = client::sweep_point(n, ms);
+                let hs = if took > 0 { hashes * 1000 / took } else { 0 };
+                if n == 1 {
+                    first = hs;
+                }
+                // The ratio against one slice is the whole point. Linear means
+                // the slices are not fighting; anything less is where they are.
+                let scale = if first > 0 { hs * 100 / first } else { 0 };
+                kprintln!(
+                    "  {} slice(s)  {} H/s  ({}% of one)  over {} hashes in {} ms",
+                    have, hs, scale, hashes, took
+                );
+                if have < n {
+                    kprintln!("    only {} could be spawned; the rest of the curve is not real", have);
+                    break;
+                }
+            }
+            client::sweep_end(saved);
+            virtual_caveat();
+            kprintln!("  the number this is for is L3 contention, which an emulator does not");
+            kprintln!("  model faithfully. Run it on the GF63 before believing the shape.");
         }
         "ev" => mine_ev(),
         "log" => {
@@ -7683,7 +7749,7 @@ fn mine_cmd(rest: &str) {
         }
         other => {
             kprintln!(
-                "  no such subverb '{}' -- try pool, user, algo, on, off, bench, ev, log, probe",
+                "  no such subverb '{}' -- try pool, user, algo, slices, on, off, bench, sweep, ev, log, probe",
                 other
             )
         }
@@ -7871,4 +7937,21 @@ fn mine_ev() {
     }
 
     kprintln!("  price        unknown here, so every figure above is coins and not money");
+    virtual_caveat();
+}
+
+/// Say what a rate measured under emulation is worth.
+///
+/// The machine says it rather than a person remembering it. Every figure this
+/// tree has ever taken under QEMU is about the host's scheduler and the host's
+/// caches as much as about the guest -- `smp bench` records one core reading
+/// 4570 MB/s alone and 3526 MB/s with seven cores *merely idling* beside it --
+/// and a rate printed without that gets quoted as though it were hardware.
+fn virtual_caveat() {
+    if crate::dev::power::virtualised() {
+        console::set_color(YELLOW);
+        kprintln!("  note     a hypervisor is present, so this is a figure about the host");
+        kprintln!("           as much as about this machine. The real one comes off the GF63.");
+        console::set_color(LTGRAY);
+    }
 }

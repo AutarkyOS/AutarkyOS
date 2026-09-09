@@ -76,6 +76,21 @@ fn caps() -> u32 {
     HAVE.load(Ordering::Relaxed)
 }
 
+/// Whether a hypervisor said it is here.
+///
+/// Public because it is not only an MSR question. Anything that prints a
+/// *rate* has the same problem this module has with registers: under emulation
+/// the number is about the host's scheduler and the host's caches as much as
+/// about this machine, and a figure that does not say so gets quoted as though
+/// it were hardware. `mine bench` asks.
+///
+/// Advisory, like the bit itself. A hypervisor that hides the bit is lying and
+/// nothing here can catch it, which is the same limit `probe` already accepts.
+pub fn virtualised() -> bool {
+    probe();
+    caps() & CAP_VIRTUAL != 0
+}
+
 /// Whether MSR access is permitted right now.
 fn allowed(bit: u32) -> bool {
     let c = caps();

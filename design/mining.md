@@ -61,10 +61,25 @@ The GF63's i5-12450H has roughly 12 MB of L3. At the 2 MiB setting that is
 **about four to six concurrent jobs** before they steal from each other; at
 8 MiB, one or two.
 
-**That figure is arithmetic and not a measurement.** It is the first thing to
-check once one algorithm runs: sweep concurrent job count against total
-hashrate and find where the curve bends. Until then it is a prediction, and
-this tree's own record on predictions of this kind is poor.
+**That figure is arithmetic and not a measurement**, and `mine sweep` is the
+command that would settle it. Under QEMU it cannot:
+
+    [mine sweep] yespower 1.0 N=2048 r=8
+      1 slice(s)  387 H/s  (100% of one)
+      2 slice(s)  704 H/s  (181%)
+      3 slice(s)  992 H/s  (256%)
+      4 slice(s)  993 H/s  (256%)
+
+The curve bends hard at three and goes perfectly flat after it -- and that is
+**core count rather than cache**. The guest has four vCPUs and core 0 is
+carrying the shell and the clock, so three is all there ever was. An emulator
+with four cores cannot find a wall that only appears when jobs outnumber the
+cache, so this measurement belongs on the GF63 and is in the hardware runbook
+(`todo`) accordingly.
+
+What the sweep *does* settle here is that the slices genuinely run in parallel:
+2.56x on three of them is impossible for tasks sharing one core, which would
+sum to 1x however many there were.
 
 ## yespower, measured upstream
 
@@ -137,6 +152,23 @@ which is what the supervisor's accounting and every expected-value figure must
 use. **Quoting the bench number in an EV calculation would overstate earnings
 by 3x**, and `mine ev` therefore reads the loop's counter and prints the task
 count beside it.
+
+### And a pinned slice is not an unpinned one
+
+Those two figures were taken with the miner pinned to core 0 like every other
+task this kernel has ever spawned. A slice on a core of its own reads **387
+H/s** -- three times the bench and nearly ten times the pinned loop.
+
+Two things changed at once there and it would be dishonest to credit one: the
+slice was unpinned *and* the sweep rests the shell on `hlt` rather than letting
+it poll. So the honest statement is that a slice with a core to itself and
+nothing competing does about 387 H/s under emulation, and how that splits
+between the two causes has not been measured.
+
+**Every rate in this section is a QEMU rate.** The kernel says so itself now:
+anything printing a hash rate asks `dev::power::virtualised()` and appends a
+note when a hypervisor is present, because a figure that does not say what it
+is worth gets quoted as though it were hardware.
 
 ## The licence gate
 
@@ -215,12 +247,13 @@ Which fixes the order.
 2. **Score the six coins with `mine probe` and `mine ev`.** Real targets, real
    coinbase values, real hashrate. This is the calibration set for everything
    after, and the first honest answer to whether the premise holds.
-3. **Measure the concurrency curve.** Jobs against total hashrate, to find
-   where L3 bends. Replaces the arithmetic above with a number, and it is now
-   the largest unmeasured claim in this document. Needs the supervisor, since
-   nothing today can run two jobs at once.
+3. ~~**Measure the concurrency curve.**~~ **`mine sweep` exists and runs.**
+   The measurement itself is a GF63 job and is in the hardware runbook, because
+   a four-vCPU guest plateaus on cores before it can reach cache. Still the
+   largest unmeasured claim in this document.
 4. **The supervisor**, allocating slices against that measured budget rather
-   than against core count.
+   than against core count. Slices exist and are unpinned; what does not exist
+   is anything that gives them *different coins*, which is the whole idea.
 5. **The pool**, which is independent of all of the above and could start in
    parallel: proxy first, device-agnostic, `xmrig` on somebody's Pi as its
    first client.
