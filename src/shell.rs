@@ -7503,6 +7503,7 @@ fn parse_algo<'a>(w: &mut impl Iterator<Item = &'a str>) -> Option<crate::mine::
     use crate::mine::algo::Algo;
     match w.next().unwrap_or("") {
         "sha256d" => Some(Algo::Sha256d),
+        "blake2s" => Some(Algo::Blake2s),
         "yespower" => {
             // Explicit parameters and no per-coin preset table. A preset is a
             // number this tree would be asserting about somebody else's network
@@ -7523,7 +7524,7 @@ fn parse_algo<'a>(w: &mut impl Iterator<Item = &'a str>) -> Option<crate::mine::
             }
         }
         other => {
-            kprintln!("  no such algorithm '{}' -- try sha256d or yespower", other);
+            kprintln!("  no such algorithm '{}' -- try sha256d, blake2s or yespower", other);
             None
         }
     }
@@ -7683,7 +7684,7 @@ fn mine_cmd(rest: &str) {
         "algo" => {
             if arg.is_empty() {
                 kprintln!("  {}", client::algo_in_force().detail());
-                kprintln!("  usage: mine algo sha256d");
+                kprintln!("  usage: mine algo sha256d | blake2s");
                 kprintln!("         mine algo yespower <10|05> <N> <r> [personalisation]");
                 return;
             }

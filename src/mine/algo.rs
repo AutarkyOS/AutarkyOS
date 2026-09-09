@@ -27,13 +27,21 @@
 use alloc::string::String;
 use alloc::vec::Vec;
 
+use super::blake2s;
 use super::hash;
 use super::yespower::{Version, Yespower};
 
 #[derive(Clone, PartialEq)]
 pub enum Algo {
-    /// Bitcoin's own. The only one with a usable midstate, because it is the
-    /// only one whose first 64 header bytes can be absorbed once.
+    /// Bitcoin's own.
+    ///
+    /// This said "the only one with a usable midstate, because it is the only
+    /// one whose first 64 header bytes can be absorbed once". The reasoning
+    /// was right and the conclusion was about SHA-256 rather than about
+    /// midstates -- BLAKE2s is also a 64-byte block function over the same
+    /// header and gets one too. What actually distinguishes yespower is that
+    /// it puts all eighty bytes through PBKDF2 before the expensive part
+    /// begins, so there is no prefix to absorb.
     Sha256d,
     /// The scheme BitZeny, Yenten, Koto, WAVI, Veco and PRiVCY use.
     ///
@@ -48,6 +56,14 @@ pub enum Algo {
         r: u32,
         pers: Option<Vec<u8>>,
     },
+    /// RFC 7693 BLAKE2s-256 over the header. Verge's `blake2s` chain and
+    /// others.
+    ///
+    /// No parameters, and that is the algorithm rather than a simplification:
+    /// a chain using keyed or salted BLAKE2s would be a different `Algo`
+    /// variant, not this one with a field bolted on, because a key is part of
+    /// the parameter block and changes the initial state.
+    Blake2s,
 }
 
 impl Algo {
@@ -56,6 +72,7 @@ impl Algo {
             Algo::Sha256d => "sha256d",
             Algo::Yespower { v10: true, .. } => "yespower-1.0",
             Algo::Yespower { v10: false, .. } => "yespower-0.5",
+            Algo::Blake2s => "blake2s",
         }
     }
 
@@ -66,6 +83,11 @@ impl Algo {
     pub fn batch(&self) -> u32 {
         match self {
             Algo::Sha256d => 4096,
+            // Two compressions per nonce against SHA-256d's four, so it runs
+            // ahead of sha256d rather than behind it. The same batch is
+            // therefore a shorter hold on the quantum, which is the direction
+            // that is safe to be wrong in.
+            Algo::Blake2s => 4096,
             // Measured rather than guessed: see `mine bench`. Small because one
             // yespower hash is three orders of magnitude more work than one
             // sha256d, by design.
@@ -77,6 +99,7 @@ impl Algo {
     pub fn detail(&self) -> String {
         match self {
             Algo::Sha256d => String::from("sha256d"),
+            Algo::Blake2s => String::from("blake2s (RFC 7693)"),
             Algo::Yespower { v10, n, r, pers } => {
                 let mut s = String::from(if *v10 { "yespower 1.0 N=" } else { "yespower 0.5 N=" });
                 push_u32(&mut s, *n);
@@ -114,6 +137,7 @@ fn push_u32(s: &mut String, mut v: u32) {
 /// A prepared hasher, holding whatever working set its algorithm needs.
 pub enum Hasher {
     Sha256d(hash::Midstate),
+    Blake2s(blake2s::Midstate),
     Yespower(Yespower, Option<Vec<u8>>),
 }
 
@@ -123,6 +147,7 @@ impl Hasher {
     pub fn new(algo: &Algo, header: &[u8; 80]) -> Option<Hasher> {
         match algo {
             Algo::Sha256d => Some(Hasher::Sha256d(hash::Midstate::new(header))),
+            Algo::Blake2s => Some(Hasher::Blake2s(blake2s::Midstate::new(header))),
             Algo::Yespower { v10, n, r, pers } => {
                 let v = if *v10 { Version::V1_0 } else { Version::V0_5 };
                 Some(Hasher::Yespower(Yespower::new(v, *n, *r)?, pers.clone()))
@@ -135,6 +160,7 @@ impl Hasher {
     pub fn footprint(&self) -> usize {
         match self {
             Hasher::Sha256d(_) => 0,
+            Hasher::Blake2s(_) => 0,
             Hasher::Yespower(y, _) => y.footprint(),
         }
     }
@@ -149,6 +175,7 @@ impl Hasher {
     pub fn retarget(&mut self, header: &[u8; 80]) {
         match self {
             Hasher::Sha256d(mid) => *mid = hash::Midstate::new(header),
+            Hasher::Blake2s(mid) => *mid = blake2s::Midstate::new(header),
             Hasher::Yespower(..) => {}
         }
     }
@@ -164,6 +191,7 @@ impl Hasher {
             // midstate built from a *different* header would hash a block that
             // never existed while looking perfectly healthy.
             Hasher::Sha256d(mid) => mid.hash_with(nonce),
+            Hasher::Blake2s(mid) => mid.hash_with(nonce),
             Hasher::Yespower(y, pers) => {
                 let mut h = *header;
                 h[76..80].copy_from_slice(&nonce.to_le_bytes());

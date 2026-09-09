@@ -185,7 +185,25 @@ of this section in one command:
     2     bitcoin     1       fixture  238759 H/s      sha256d
 
 Two different proof-of-work functions, on two different cores, at the same
-instant. Clearing the second put all three slices back on the first and it read
+instant. Three, with BLAKE2s added:
+
+    slot  label       slices  source   rate            algorithm
+    0     pool        0       pool     no job yet      blake2s (RFC 7693)
+    1     zeny        1       fixture  351 H/s         yespower 1.0 N=2048 r=8
+    2     verge       1       fixture  5756621 H/s     blake2s (RFC 7693)
+    3     bitcoin     1       fixture  246235 H/s      sha256d
+
+Slot 0 has no job and correctly gets no slice. That was a bug first: `assign`
+spread slices over slots that *existed* rather than slots that were *workable*,
+so a jobless slot took two of three slices and they parked. Workability is
+having a job, and `set_template` and `drop_template` re-run the supervisor.
+
+**The yespower row moved when the others started, and that is the whole L3
+question showing up.** It read 390 H/s alone and 351 with a BLAKE2s slice and a
+sha256d slice beside it -- 10% off for two neighbours that are not memory-bound
+in anything like the same way. Under emulation that number means little; on the
+GF63, with sixteen logical processors and a 12 MB L3, it is the measurement
+`design/mining.md` has been pointing at from the start. Clearing the second put all three slices back on the first and it read
 968 H/s, against 676 on two -- so the supervisor's re-spread is visible in the
 figures rather than only in the table.
 
@@ -226,6 +244,40 @@ that waits for the pool in the table at the top of this file to exist and speak
 one protocol with a coin field in it. The kernel half of "mine many coins at
 once" is done; the half that makes the coins real is Part B.
 
+## BLAKE2s, and why a third algorithm was worth the day
+
+Not for the coins. It is that `algo.rs`'s claim -- one `Algo`, one `Hasher`,
+and the header assembly, merkle fold, target comparison and Stratum client
+shared unchanged -- cannot be established by two algorithms, because with two
+there is no telling a seam from a coincidence. Nothing above `Hasher` moved.
+
+It is written from RFC 7693 rather than ported, which was available here and
+was not for yespower: BLAKE2s has a published specification with its own test
+vectors, so a from-scratch implementation can be settled against something that
+is not somebody's source file. The licence gate below never comes up.
+
+**And it falsified a comment.** `algo.rs` said SHA-256d was "the only one with
+a usable midstate, because it is the only one whose first 64 header bytes can
+be absorbed once." The reasoning was right and the conclusion was about SHA-256
+rather than about midstates: BLAKE2s is also a 64-byte block function over the
+same 80-byte header with the nonce at offset 76, so block 0 is constant across
+nonces and is compressed once. What actually makes yespower different is that
+it puts all eighty bytes through PBKDF2 before the expensive part begins, so
+there is no prefix to absorb.
+
+Measured: **2,219,757 H/s** benched, **5.7 million** in a slice with a core to
+itself -- the same bench-versus-slice gap every other algorithm here shows, and
+for the same reason.
+
+Five claims, against digests this kernel did not compute, and two of them are
+about the failure that produces a hash function looking entirely healthy. The
+counter in section 3.2 is the *message length* and not the block index, so a
+short final block that is zero-padded without moving the counter makes `"a"`
+and `"a "` collide; and a message of exactly one block must keep that block
+for the `last` flag rather than compressing it as an interior one. Both are
+asserted, in the kernel and in `tools/algocheck.py`, which holds the same
+digests so they live in two places that have to agree.
+
 ## The licence gate
 
 This decides where implementations may come from, and it is a gate rather than
@@ -258,7 +310,7 @@ saying where it came from.
 | algorithm | coins | cost | notes |
 |---|---|---|---|
 | SHA-256d | many | **done** | in ring 0, pinned by block 125552 |
-| BLAKE2s | several | **~done** | written in `exp/xpu`, `algocheck.py` oracles it |
+| BLAKE2s | several | **done** | in ring 0, from RFC 7693, with a midstate |
 | kHeavyHash | Kaspa family | **~done** | written in `exp/xpu`, oracle exists |
 | **yespower / yescrypt** | **BitZeny, Yenten, Koto, WAVI, Veco, PRiVCY** | **low** | BSD upstream, scrypt-derived, 1-16 MiB |
 | VerusHash | Verus | low-moderate | Haraka512 over AES-NI |

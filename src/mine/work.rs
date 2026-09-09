@@ -202,13 +202,22 @@ pub fn set_template(slot: usize, t: Template) -> bool {
         return false;
     };
     let mut g = cell.lock_irq();
-    match g.as_mut() {
+    let ok = match g.as_mut() {
         Some(c) => {
             c.template = Some(t);
             true
         }
         None => false,
+    };
+    drop(g);
+    if ok {
+        // A slot only becomes workable when it has a job, so the supervisor has
+        // to hear about it. Cheap in steady state: `assign` resets nothing
+        // unless a slot's share of the slices actually moved, and a job
+        // replacing a job moves nothing.
+        assign();
     }
+    ok
 }
 
 pub fn drop_template(slot: usize) {
@@ -217,6 +226,9 @@ pub fn drop_template(slot: usize) {
             c.template = None;
         }
     }
+    // The slot stops being workable, so its slices go to coins that are. A
+    // disconnected pool must not hold a quarter of the machine idle.
+    assign();
 }
 
 /// Everything the hash loop needs, taken under the lock in one go.
@@ -264,10 +276,16 @@ pub fn snapshot(slot: usize) -> Option<Snapshot> {
 pub fn assign() {
     let before: [u32; MAX_COINS] = core::array::from_fn(|i| slices_on(i));
 
+    // Only slots that can actually be worked. A coin with no job yet is a real
+    // coin and shows in the report as one, but a slice given to it parks --
+    // measured: `mine algo blake2s` with no pool created slot 0, `assign` gave
+    // it two of three slices on the strength of it existing, and those two did
+    // nothing at all while a coin with work sat on one. Workability is having a
+    // job, so this is re-run when a job arrives and when one goes.
     let mut slots = [0usize; MAX_COINS];
     let mut n = 0;
     for (i, cell) in COINS.iter().enumerate() {
-        if cell.lock_irq().is_some() {
+        if cell.lock_irq().as_ref().map(|c| c.template.is_some()).unwrap_or(false) {
             slots[n] = i;
             n += 1;
         }
@@ -420,6 +438,12 @@ pub fn checks() -> Vec<(&'static str, bool)> {
 
     let want = super::client::slices();
     install(0, "a", Algo::Sha256d, Source::Fixture);
+    // A coin with no job is a coin in the report and not a coin to work.
+    out.push((
+        "a coin with no job gets no slice",
+        (0..MAX_SLICES as u32).all(|s| slot_for(s).is_none()),
+    ));
+    set_template(0, fixture_template(0));
     // Every slice on the only coin there is. The alternative -- one slice on it
     // and the rest idle -- is what a naive one-to-one mapping gives, and it
     // would leave a single-coin machine three quarters idle without saying so.
@@ -429,10 +453,19 @@ pub fn checks() -> Vec<(&'static str, bool)> {
     ));
 
     install(1, "b", Algo::Sha256d, Source::Fixture);
+    set_template(1, fixture_template(1));
     out.push((
         "two coins alternate across slices",
         slot_for(0) == Some(0) && (want < 2 || slot_for(1) == Some(1)),
     ));
+
+    // Losing the job is not losing the coin, and the slices must move anyway.
+    drop_template(1);
+    out.push((
+        "a coin that loses its job loses its slices",
+        (0..MAX_SLICES as u32).all(|s| slot_for(s) != Some(1)),
+    ));
+    set_template(1, fixture_template(1));
 
     // The one that matters. A slice told to work a slot that was emptied hashes
     // against whatever lands there next, which produces perfectly valid shares
@@ -463,6 +496,7 @@ pub fn checks() -> Vec<(&'static str, bool)> {
     install(3, "d", Algo::Sha256d, Source::Pool);
     out.push(("a coin with no job yields no snapshot", snapshot(3).is_none()));
 
+    set_template(3, fixture_template(3));
     count(3, 1000);
     install(3, "e", Algo::Yespower { v10: true, n: 2048, r: 8, pers: None }, Source::Pool);
     out.push(("changing the algorithm forgets the rate", rate(3).0 == 0));
@@ -481,9 +515,11 @@ pub fn checks() -> Vec<(&'static str, bool)> {
     clear(2);
     clear(3);
     install(0, "a", Algo::Sha256d, Source::Fixture);
+    set_template(0, fixture_template(0));
     count(0, 5000);
     let moved = want > 1;
     install(1, "b", Algo::Sha256d, Source::Fixture);
+    set_template(1, fixture_template(1));
     out.push((
         "re-spreading the slices forgets the rates it changed",
         !moved || rate(0).0 == 0,

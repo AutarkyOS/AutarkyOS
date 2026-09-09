@@ -18,6 +18,7 @@
 //! deliberately not the writer.
 
 pub mod algo;
+pub mod blake2s;
 pub mod client;
 pub mod ev;
 pub mod hash;
@@ -77,6 +78,22 @@ fn le_digest(be: &[u8; 32]) -> [u8; 32] {
         d[i] = be[31 - i];
     }
     d
+}
+
+/// Parse a 64-character hex digest into bytes.
+///
+/// Only reachable from `checks`, and it refuses nothing: a malformed literal
+/// here would be a typo in a claim rather than input from anywhere, and the
+/// claim it belongs to fails, which is the report that is wanted.
+fn hex32(s: &str) -> [u8; 32] {
+    let b = s.as_bytes();
+    let mut out = [0u8; 32];
+    for i in 0..32 {
+        let hi = (b[i * 2] as char).to_digit(16).unwrap_or(0) as u8;
+        let lo = (b[i * 2 + 1] as char).to_digit(16).unwrap_or(0) as u8;
+        out[i] = (hi << 4) | lo;
+    }
+    out
 }
 
 pub fn checks() -> Vec<(&'static str, bool)> {
@@ -641,6 +658,67 @@ fn stratum_checks() -> Vec<(&'static str, bool)> {
         "and every message we send is one line",
         stratum::subscribe(1).matches('\n').count() == 1
             && stratum::authorize(2, "u", "p").matches('\n').count() == 1,
+    ));
+
+    // --- BLAKE2s, against RFC 7693's own vectors and hashlib's ---
+    //
+    // Three messages spanning the three shapes the padding can take: empty
+    // (one all-zero final block with t=0), short (one partial block), and 80
+    // bytes (a full interior block plus a partial final one, which is the
+    // only shape mining ever uses and the only one that exercises `last`
+    // being false on a compression).
+    out.push((
+        "blake2s of the empty string matches RFC 7693",
+        blake2s::hash(&[]) == hex32("69217a3079908094e11121d042354a7c1f55b6482ca1a51e1b250dfd1ed0eef9"),
+    ));
+    out.push((
+        "blake2s(\"abc\") matches RFC 7693",
+        blake2s::hash(b"abc") == hex32("508c5e8c327c14e2e1a72ba34eeb452f37458b209ed63a294d999b4c86675982"),
+    ));
+    let b2_hdr = hex32("753d9b626a850d23b32a05e6d531fbe985af7a300b21505d3b080611e9940aeb");
+    out.push((
+        "and an 80-byte header matches what hashlib computes for it",
+        blake2s::hash(&BTC_HEADER) == b2_hdr,
+    ));
+
+    // The midstate, which is the whole reason this algorithm is cheap, and the
+    // claim that `algo.rs` was wrong about it only having one for SHA-256d.
+    let b2mid = blake2s::Midstate::new(&BTC_HEADER);
+    out.push((
+        "a blake2s midstate reproduces the whole-header hash",
+        b2mid.hash_with(BTC_NONCE) == b2_hdr,
+    ));
+    // And moves with the nonce. A midstate that ignored its argument would
+    // pass the line above and mine one nonce forever.
+    out.push((
+        "and a different nonce gives the digest hashlib gives for it",
+        b2mid.hash_with(0x1234_5678)
+            == hex32("d81f08a0b2790da2d71ddea1ea3f6a76688eb996b148aa7d4463f177506e4411"),
+    ));
+    // The counter is the message length and not the block index. Padding a
+    // short final block without moving `t` makes two messages of different
+    // lengths collide, which is the single misreading of section 3.2 that
+    // produces a hash function that looks perfectly healthy.
+    out.push((
+        "blake2s tells a message from the same message zero-padded",
+        blake2s::hash(b"a") != blake2s::hash(b"a "),
+    ));
+    // 64 bytes exactly: the loop must keep its last full block for the `last`
+    // flag rather than compressing it as an interior one and then compressing
+    // an all-zero final block.
+    out.push((
+        "a message of exactly one block is not compressed twice",
+        blake2s::hash(&[0u8; 64]) != blake2s::hash(&[0u8; 128]),
+    ));
+
+    // The seam `algo.rs` claims: a third algorithm and nothing above `Hasher`
+    // moved. Checked by driving it through the same `Hasher` the miner uses
+    // rather than by calling `blake2s::hash`, since the point is the interface.
+    out.push((
+        "the Hasher seam takes a third algorithm unchanged",
+        algo::Hasher::new(&algo::Algo::Blake2s, &BTC_HEADER)
+            .map(|mut h| h.hash(&BTC_HEADER, BTC_NONCE) == b2_hdr)
+            .unwrap_or(false),
     ));
 
     out.extend(work::checks());
