@@ -29,6 +29,7 @@ on:
       - 'tools/poolclient.py'
       - 'tools/prooftest.py'
       - 'tools/algocheck.py'
+      - 'tools/prices.py'
       - '.github/workflows/pool.yml'
   pull_request:
   workflow_dispatch:
@@ -100,6 +101,15 @@ jobs:
       # -- and a third holder of a published constant is a third checker.
       - name: The host-side vectors agree
         run: python3 tools/algocheck.py --selftest
+
+      # The price file's reader against its writer, and deliberately offline.
+      # What this checks is the shape the pool parses and the rule it applies --
+      # that an unusable coin is present and carries its reason, and that a
+      # caveat is not a refusal. A step that fetched real prices would fail on
+      # a rate limit rather than on a defect, and would be checking somebody
+      # else's uptime.
+      - name: The price file round-trips and keeps its refusals
+        run: python3 tools/prices.py --selftest
 
       # A real Stratum server, a real merkle branch, and a pool that has to
       # produce headers the server will accept. `--verify` rebuilds every

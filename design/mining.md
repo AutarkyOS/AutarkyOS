@@ -329,16 +329,75 @@ implement, smallest working set so the most jobs fit, licence-clean at source,
 CPU-only by construction rather than merely ASIC-unfriendly, and attached to
 the smallest networks in the table. Nothing else scores well on all five.
 
+**That paragraph is wrong, and the axis it is wrong about is the fifth one.**
+"Attached to the smallest networks" was listed as an advantage, because a small
+network means blocks a small miner can actually find. It is the same fact as
+"nobody trades this", and the second reading is the one that decides whether
+mining it is worth anything. Measured, `tools/prices.py`, two independent
+sources:
+
+    coin       algo        usd            24h vol usd    age
+    bitcoin    sha256d     78141          30,017,587,394 1.1 h
+    verge      blake2s     0.00264568     6,058,540      1.1 h
+    kaspa      kheavyhash  0.03637        14,205,519     1.1 h
+    digibyte   sha256d     0.0046092      2,447,078      1.0 h
+    monero     --          510.17         145,506,516    1.0 h
+    bitzeny    yespower    0.00023968     0              1493 d
+    koto       yespower    0.00003222     2              1328 d
+    yenten     yespower    0.00303093     36             440 d
+    veco       yespower    --             0              134 d
+    privcy     yespower    0.00002741     0              122 d
+    wavi       yespower    0.00001598     0              2450 d
+
+**Every yespower coin in the table above has no live market.** The most recent
+of the six was last priced four hundred and forty days ago at thirty-six
+dollars of daily volume; the oldest was priced in 2019. CoinPaprika does not
+list BitZeny, Koto or Yenten at all, which is what a delisting looks like from
+the outside, and Veco's two quotes are a factor of 4.6 apart because the two
+sources are describing two different assets that share a ticker.
+
+So the cheapest algorithm to implement is attached to coins that cannot be
+sold, and yespower in ring 0 -- which is done, correct, and checked against
+thirteen upstream vectors -- buys a share of nothing. That is not wasted work:
+it is the first algorithm here that is CPU-only by construction, and the
+measurement apparatus around it is what every later one inherits. But it is not
+the coin to point the machine at, and this document said it was.
+
+**The two algorithms with live markets are the two the GPU already has.**
+BLAKE2s is one of Verge's five, at six million dollars a day, and kHeavyHash is
+Kaspa at fourteen. Both are written in `cuda/`; BLAKE2s is also in ring 0.
+kHeavyHash is measured in `design/xpu.md` and wired to nothing, which makes it
+the single highest-value item left in this document.
+
+**The finding took a field that has to be asked for.** CoinGecko answers
+BitZeny with `0.00023968` and no error; `last_updated_at` is what says the
+number is from August 2022, and it is opt-in. A fetcher that did not request it
+would have written four-year-old prices into the pool and every expected value
+after that would have been confidently wrong, with nothing anywhere reporting
+it. `prices.py` requests it, prints it beside every figure, and writes a stale
+coin into the file **marked** rather than omitting it -- an absent coin reads as
+one nobody asked about.
+
 Three algorithms are already most of the way there. Porting a hash kernel from
 the CUDA in `exp/xpu` to CPU Rust is far cheaper than writing one, and
 `tools/algocheck.py` transfers unchanged as the oracle.
 
 ## What is deliberately absent, and how to get it
 
-**No network hashrates, no prices, no coins-per-day.** miningpoolstats, poolbay
-and bitinfocharts all render those in JavaScript and none of them yielded a
-figure. Inventing them would be worse than the gap, and they would be stale
-within days regardless.
+**~~No network hashrates, no prices, no coins-per-day.~~ Prices are solved.**
+The original note read: "miningpoolstats, poolbay and bitinfocharts all render
+those in JavaScript and none of them yielded a figure." That was true of those
+*sites* and it was never checked against the market -- CoinGecko and
+CoinPaprika both answer plain JSON, with no key and no account, and
+`tools/prices.py` reads both. The gap was a fact about three web pages that had
+been recorded as a fact about the world, which is the same shape as this file's
+own note about "too slow to test here" being an untested assumption about the
+emulator.
+
+Network *hashrate* is still not fetched and does not need to be: `nbits` off a
+live `mining.notify` is the network target, which is the quantity the
+arithmetic actually wants, and a hashrate is only that divided by a block time
+somebody else assumed.
 
 **The kernel already reads the real number off the wire.** `mine probe` pulls
 `nbits` out of a live `mining.notify`, and `nbits` *is* the network target;
@@ -404,9 +463,12 @@ afterwards.
 1. ~~**yespower in ring 0.**~~ **Done.** `tools/yespower.py` came first and
    carries upstream's own thirteen TESTS-OK vectors; `src/mine/yespower.rs`
    matches three of them, one verbatim. Wired to the loop and measured above.
-2. **Score the six coins with `mine probe` and `mine ev`.** Real targets, real
-   coinbase values, real hashrate. This is the calibration set for everything
-   after, and the first honest answer to whether the premise holds.
+2. ~~**Score the six coins with `mine probe` and `mine ev`.**~~ **Answered, and
+   the answer is no.** The six are the yespower coins and none of them has a
+   live price, so there is no expected value to compute -- see the correction
+   under Candidates. `tools/prices.py` is the measurement. The calibration set
+   is Verge and Kaspa instead, and scoring those needs a pool account and a
+   payout address rather than more code.
 3. ~~**Measure the concurrency curve.**~~ **`mine sweep` exists and runs.**
    The measurement itself is a GF63 job and is in the hardware runbook, because
    a four-vCPU guest plateaus on cores before it can reach cache. Still the
@@ -419,7 +481,12 @@ afterwards.
    kernel slice is preempted at 100 Hz rather than blocking in a scan.
 5. **The pool**, which is independent of all of the above and could start in
    parallel: proxy first, device-agnostic, `xmrig` on somebody's Pi as its
-   first client.
+   first client. **Built** -- see `design/pool.md`.
+6. **kHeavyHash**, which the price survey moved from "nice to have" to the top
+   of the list: it is the only unimplemented algorithm in the table attached to
+   a fourteen-million-dollar-a-day market, it is already written and measured in
+   `cuda/`, and `tools/algocheck.py` already carries its oracle. What is missing
+   is the CPU port and the wire-up, not the hash.
 
 Items 1 to 4 are kernel work and item 5 is not, so they do not block each
 other. The pool can exist and take miners before GLaDOS is a useful client at
