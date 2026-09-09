@@ -32,6 +32,7 @@ use crate::json::Json;
 use crate::mine::proto;
 use crate::mine::stratum::take_line;
 use crate::pool::{Pool, Verdict};
+use crate::vardiff::VarDiff;
 
 /// How often a connection is given fresh work.
 ///
@@ -138,6 +139,12 @@ fn handle(mut stream: TcpStream, pool: Arc<Mutex<Pool>>, peer: &str) -> std::io:
     let mut bad: u32 = 0;
     let mut submits_this_second: u32 = 0;
     let mut window = Instant::now();
+    // One retargeter per coin, not one per connection. A single machine works
+    // several coins on different algorithms and its rate on them differs by
+    // three orders of magnitude -- 248,884 H/s of sha256d beside 342 H/s of
+    // yespower, measured on the kernel in one run -- so a shared difficulty
+    // would be wrong for at least one of them by a factor of a thousand.
+    let mut vd: Vec<VarDiff> = Vec::new();
 
     loop {
         let n = match stream.read(&mut chunk) {
@@ -162,7 +169,15 @@ fn handle(mut stream: TcpStream, pool: Arc<Mutex<Pool>>, peer: &str) -> std::io:
                     || e.kind() == std::io::ErrorKind::TimedOut =>
             {
                 if greeted {
-                    issue_all(&mut stream, &pool)?;
+                    // The idle path is what finds a miner set *too hard*. It
+                    // will never reach a share window, so without a clock the
+                    // pool would wait forever to discover it asked too much.
+                    for (slot, v) in vd.iter_mut().enumerate() {
+                        if let Some(b) = v.on_idle() {
+                            println!("[pool] {worker} slot {slot} eased to {b} bits");
+                        }
+                    }
+                    issue_all(&mut stream, &pool, &vd)?;
                 }
                 continue;
             }
@@ -208,6 +223,10 @@ fn handle(mut stream: TcpStream, pool: Arc<Mutex<Pool>>, peer: &str) -> std::io:
                     worker = h.worker.clone();
                     println!("[pool] {peer} hello  worker={} agent={}", h.worker, h.agent);
                     let slots = pool.lock().unwrap().slots();
+                    vd = {
+                        let p = pool.lock().unwrap();
+                        (0..slots as usize).map(|i| VarDiff::new(p.start_bits(i))).collect()
+                    };
                     let w = proto::Welcome {
                         v: proto::VERSION,
                         slots,
@@ -215,7 +234,7 @@ fn handle(mut stream: TcpStream, pool: Arc<Mutex<Pool>>, peer: &str) -> std::io:
                     };
                     stream.write_all(proto::encode_welcome(id, &w).as_bytes())?;
                     greeted = true;
-                    issue_all(&mut stream, &pool)?;
+                    issue_all(&mut stream, &pool, &vd)?;
                 }
                 "glados.submit" => {
                     // Before the greeting there is no worker to attribute a
@@ -265,6 +284,29 @@ fn handle(mut stream: TcpStream, pool: Arc<Mutex<Pool>>, peer: &str) -> std::io:
                     );
                     stream.write_all(msg.as_bytes())?;
 
+                    // Retarget on accepted shares only. A stale share is work
+                    // against a job that aged out and says nothing about the
+                    // rate now, and counting rejected ones would let a miner
+                    // talk its own difficulty upward by sending noise.
+                    if verdict == Verdict::Accepted {
+                        let slot = {
+                            let p = pool.lock().unwrap();
+                            p.slot_of_job(&sh.job)
+                        };
+                        if let Some(slot) = slot {
+                            if let Some(v) = vd.get_mut(slot) {
+                                if let Some(b) = v.on_share() {
+                                    println!("[pool] {worker} slot {slot} retargeted to {b} bits");
+                                    // Sent straight away rather than at the next
+                                    // job period: a miner that just proved it is
+                                    // fast should not spend another thirty
+                                    // seconds flooding at the old difficulty.
+                                    issue_all(&mut stream, &pool, &vd)?;
+                                }
+                            }
+                        }
+                    }
+
                     // Only `Bad` counts. `Stale` is a job that aged out and is
                     // nobody's fault, and `Duplicate` is a retry -- treating
                     // either as abuse would disconnect honest miners on a slow
@@ -290,10 +332,26 @@ fn handle(mut stream: TcpStream, pool: Arc<Mutex<Pool>>, peer: &str) -> std::io:
     }
 }
 
-fn issue_all(stream: &mut TcpStream, pool: &Arc<Mutex<Pool>>) -> std::io::Result<()> {
+fn issue_all(
+    stream: &mut TcpStream,
+    pool: &Arc<Mutex<Pool>>,
+    vd: &[VarDiff],
+) -> std::io::Result<()> {
     let jobs: Vec<proto::Job> = {
         let mut p = pool.lock().unwrap();
-        (0..p.slots()).filter_map(|s| p.make_job(s)).collect()
+        (0..p.slots())
+            .filter_map(|s| {
+                // A connection that has not greeted yet has no retargeters, so
+                // fall back to the coin's configured start rather than
+                // refusing: the alternative is a miner that greets and is told
+                // nothing until the first timeout.
+                let bits = vd
+                    .get(s as usize)
+                    .map(|v| v.bits())
+                    .unwrap_or_else(|| p.start_bits(s as usize));
+                p.make_job(s, bits)
+            })
+            .collect()
     };
     for j in jobs {
         stream.write_all(proto::encode_job(&j).as_bytes())?;

@@ -98,3 +98,4 @@ pub mod mine {
 pub mod pool;
 pub mod server;
 pub mod upstream;
+pub mod vardiff;

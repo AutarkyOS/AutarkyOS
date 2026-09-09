@@ -20,9 +20,12 @@ use crate::mine::u256::U256;
 pub struct Coin {
     pub label: String,
     pub algo: Algo,
-    /// What a miner's share must beat. Not the network's target: a share is
-    /// proof of work done, and asking for network difficulty from a laptop
-    /// means one share a geological age.
+    /// Where a *new* miner starts, in leading zero bits. Only a starting
+    /// point: `server.rs` moves each connection from here, per coin, so this
+    /// is the operator's guess rather than a setting anybody has to get right.
+    pub share_bits: u32,
+    /// The same thing as a target, kept so a coin with no connection on it
+    /// still reports something meaningful.
     pub share_target: U256,
     /// The network's own target, when a chain is behind this coin. `None` for
     /// a coin with no upstream, which is every coin today -- and it is `None`
@@ -214,11 +217,18 @@ impl Pool {
     /// The header is assembled here and the miner never sees a coinbase, which
     /// is the whole shape of the protocol and its whole trust cost. See
     /// `design/pool.md`.
-    pub fn make_job(&mut self, slot: u32) -> Option<proto::Job> {
+    /// Build the next job for a coin, at the difficulty this caller wants.
+    ///
+    /// **The difficulty is an argument and not a property of the coin**, which
+    /// is what makes per-connection retargeting possible at all: every call
+    /// takes a fresh job id, so two miners on one coin simply hold two
+    /// `Issued` records with two targets and nothing has to be shared between
+    /// them.
+    pub fn make_job(&mut self, slot: u32, bits: u32) -> Option<proto::Job> {
         let coin = self.coins.get(slot as usize)?;
         let label = coin.label.clone();
         let algo = coin.algo.clone();
-        let target = coin.share_target;
+        let target = target_with_leading_zeros(bits);
         let work = coin.work.clone();
         let upstream = matches!(coin.source, Source::Upstream { .. });
 
@@ -320,6 +330,24 @@ impl Pool {
         };
         coin.work = Some(w);
         true
+    }
+
+    /// Which coin an issued job belongs to.
+    ///
+    /// Asked of the pool rather than tracked a second time in the connection,
+    /// because the pool is already the one thing that knows -- and two records
+    /// of which job is which coin is the arrangement that eventually
+    /// disagrees.
+    pub fn slot_of_job(&self, job: &str) -> Option<usize> {
+        self.issued
+            .iter()
+            .find(|(id, _)| id == job)
+            .map(|(_, j)| j.slot as usize)
+    }
+
+    /// Where a new connection should start on this coin.
+    pub fn start_bits(&self, slot: usize) -> u32 {
+        self.coins.get(slot).map(|c| c.share_bits).unwrap_or(20)
     }
 
     /// Whether a coin has upstream work in hand.
@@ -531,6 +559,7 @@ mod tests {
             label: String::from("test"),
             algo: Algo::Sha256d,
             // Eight bits, so a share turns up within a few hundred nonces.
+            share_bits: 8,
             share_target: target_with_leading_zeros(8),
             network_target: None,
             source: Source::Local,
@@ -544,7 +573,7 @@ mod tests {
     #[test]
     fn a_real_share_is_accepted_and_a_forged_one_is_not() {
         let mut p = a_pool();
-        let job = p.make_job(0).unwrap();
+        let job = p.make_job(0, 8).unwrap();
         let mut h = Hasher::new(&job.algo, &job.header).unwrap();
 
         let mut good = None;
@@ -592,6 +621,7 @@ mod tests {
             Coin {
                 label: String::from("a"),
                 algo: Algo::Sha256d,
+                share_bits: 8,
                 share_target: target_with_leading_zeros(8),
                 network_target: None,
                 source: Source::Local,
@@ -601,6 +631,7 @@ mod tests {
             Coin {
                 label: String::from("b"),
                 algo: Algo::Blake2s,
+                share_bits: 8,
                 share_target: target_with_leading_zeros(8),
                 network_target: None,
                 source: Source::Local,
@@ -608,7 +639,7 @@ mod tests {
                 e2: 0,
             },
         ]);
-        let ja = p.make_job(0).unwrap();
+        let ja = p.make_job(0, 8).unwrap();
         let mut ha = Hasher::new(&ja.algo, &ja.header).unwrap();
         let n = (0..200_000u32)
             .find(|n| below_target(&ha.hash(&ja.header, *n), &ja.target))
@@ -616,7 +647,7 @@ mod tests {
 
         // Under blake2s the same header and nonce give a different digest, so
         // this nonce is almost certainly not a solution there.
-        let jb = p.make_job(1).unwrap();
+        let jb = p.make_job(1, 8).unwrap();
         let mut hb = Hasher::new(&jb.algo, &jb.header).unwrap();
         assert_ne!(ha.hash(&ja.header, n), hb.hash(&jb.header, n));
 
@@ -646,7 +677,7 @@ mod tests {
     #[test]
     fn the_ledger_digest_depends_on_the_record_and_not_the_run() {
         let mut p = a_pool();
-        let job = p.make_job(0).unwrap();
+        let job = p.make_job(0, 8).unwrap();
         let mut h = Hasher::new(&job.algo, &job.header).unwrap();
         let n = (0..200_000u32)
             .find(|n| below_target(&h.hash(&job.header, *n), &job.target))
@@ -662,7 +693,7 @@ mod tests {
 
         // And a record that genuinely changed must change it, or the digest is
         // decoration rather than evidence.
-        let job2 = p.make_job(0).unwrap();
+        let job2 = p.make_job(0, 8).unwrap();
         let mut h2 = Hasher::new(&job2.algo, &job2.header).unwrap();
         let n2 = (0..200_000u32)
             .find(|n| below_target(&h2.hash(&job2.header, *n), &job2.target))
@@ -693,6 +724,7 @@ mod tests {
         Pool::new(vec![Coin {
             label: String::from("chain"),
             algo: Algo::Sha256d,
+            share_bits: 8,
             share_target: target_with_leading_zeros(8),
             network_target: None,
             source: Source::Upstream {
@@ -713,11 +745,11 @@ mod tests {
     #[test]
     fn an_upstream_coin_with_no_work_yields_no_job() {
         let mut p = upstream_pool();
-        assert!(p.make_job(0).is_none());
+        assert!(p.make_job(0, 8).is_none());
         assert!(!p.has_work(0));
         p.set_work(0, some_work());
         assert!(p.has_work(0));
-        assert!(p.make_job(0).is_some());
+        assert!(p.make_job(0, 8).is_some());
     }
 
     /// Two jobs from one `mining.notify` must be two different searches.
@@ -729,8 +761,8 @@ mod tests {
     fn two_jobs_from_one_notify_use_different_extranonces() {
         let mut p = upstream_pool();
         p.set_work(0, some_work());
-        let a = p.make_job(0).unwrap();
-        let b = p.make_job(0).unwrap();
+        let a = p.make_job(0, 8).unwrap();
+        let b = p.make_job(0, 8).unwrap();
         assert_ne!(a.header, b.header, "same header means the same search");
         // And the difference is in the merkle root, since that is the only part
         // of the header an extranonce reaches. Everything else is upstream's,
@@ -755,7 +787,7 @@ mod tests {
                 ..some_work()
             },
         );
-        let job = p.make_job(0).unwrap();
+        let job = p.make_job(0, 8).unwrap();
         let mut h = Hasher::new(&job.algo, &job.header).unwrap();
 
         let mut accepted = 0;
@@ -796,8 +828,8 @@ mod tests {
     #[test]
     fn two_jobs_are_two_different_searches() {
         let mut p = a_pool();
-        let a = p.make_job(0).unwrap();
-        let b = p.make_job(0).unwrap();
+        let a = p.make_job(0, 8).unwrap();
+        let b = p.make_job(0, 8).unwrap();
         assert_ne!(a.job, b.job);
         assert_ne!(a.header, b.header);
     }

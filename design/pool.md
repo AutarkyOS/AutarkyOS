@@ -477,11 +477,38 @@ live pool. Three levels closes it here, repeatably, offline.
 Also newly exercised end to end: extranonce2 generation and its round-trip
 through a submit, and the fractional-difficulty path.
 
+## A difficulty per miner per coin
+
+A fixed share target is wrong for everybody the moment the miners are not
+identical, and Pis and phones beside a laptop is the stated point. `vardiff.rs`
+moves each connection, **per coin**, which an ordinary pool does not need: one
+pool serving one coin needs one difficulty per connection, while here a single
+machine works several algorithms and its rate across them differs by three
+orders of magnitude.
+
+Measured, both coins started at 14 bits on purpose so any divergence is the
+retargeter and nothing else, one connection, one kernel:
+
+    slot 0  fast  sha256d                 158289 H/s   14 -> 17 -> 20 -> 21
+    slot 1  slow  yespower 1.0 N=2048 r=8     180 H/s   14 -> 12
+
+Opposite directions from one starting point, driven only by measured rate.
+
+Everything is leading zero bits, so a step is exactly a halving and the
+arithmetic is integer throughout. A difficulty as a float is what
+`stratum::decimal` exists to survive on the way in; there is no reason to
+introduce one on the way out.
+
+**The test found the bug that mattered most.** The window was measured in whole
+seconds and returned early on an elapsed zero -- but eight shares inside one
+second is the most extreme flood there is, so the fastest miners, the entire
+reason the file exists, were the one case that never retargeted.
+
 ## What does not
 - **A real pool.** Everything above ran against a stub on loopback. No upstream
   on the internet has been asked for work, which needs an account and an
   address rather than any more code.
-- Accounting beyond a per-worker tally: no VarDiff, no PPLNS, no persistence.
+- Accounting beyond a per-worker tally: no PPLNS, no persistence.
   `--ledger` writes the log every minute but nothing reads it back at start, so
   a restart begins from zero.
 - TLS, and therefore any safety on an untrusted network. See above.

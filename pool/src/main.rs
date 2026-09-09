@@ -117,6 +117,7 @@ fn parse_coin(spec: &str) -> Result<Coin, String> {
     Ok(Coin {
         label: String::from(label),
         algo,
+        share_bits: bits,
         share_target: target_with_leading_zeros(bits),
         // Filled from upstream's `set_difficulty` when there is an upstream,
         // and `None` otherwise -- rather than a plausible constant, because an
