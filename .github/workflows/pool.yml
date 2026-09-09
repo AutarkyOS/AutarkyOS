@@ -30,6 +30,7 @@ on:
       - 'tools/prooftest.py'
       - 'tools/algocheck.py'
       - 'tools/prices.py'
+      - 'tools/payrate.py'
       - '.github/workflows/pool.yml'
   pull_request:
   workflow_dispatch:
@@ -110,6 +111,13 @@ jobs:
       # else's uptime.
       - name: The price file round-trips and keeps its refusals
         run: python3 tools/prices.py --selftest
+
+      # Only the arithmetic half. The other three claims check a derived unit
+      # convention against a live pool and Bitcoin's issuance, which is the
+      # check that matters and is also somebody else's uptime -- run by hand,
+      # not here.
+      - name: The payout arithmetic holds
+        run: python3 tools/payrate.py --selftest --offline
 
       # A real Stratum server, a real merkle branch, and a pool that has to
       # produce headers the server will accept. `--verify` rebuilds every

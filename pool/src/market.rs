@@ -23,6 +23,18 @@
 //! its own header. When there is a live upstream there is also a chain to read
 //! it from, so the two blockers lift together.
 //!
+//! **And a third route makes both moot for the ranking question.** A multi-coin
+//! auto-exchange pool publishes `estimate_current` per algorithm -- what a unit
+//! of hashrate earned in a day, in BTC, after it sold what it mined. Price,
+//! difficulty, reward and the decimals constant are all already inside that,
+//! because somebody else did the selling and is quoting the proceeds.
+//! `tools/payrate.py` reads it, and it is what actually settled which half of
+//! this laptop is worth pointing at a pool.
+//!
+//! That answers "what should this machine mine". It does not answer "what is a
+//! share on *our* pool worth", which is the question this file is eventually
+//! for and which still wants the arithmetic above.
+//!
 //! ### The refusal is the product
 //!
 //! Naming a coin the price file cannot quote is the whole of what this is for.

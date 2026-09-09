@@ -407,6 +407,68 @@ Until it is measured, this document ranks nothing. What the price survey
 established is which coins can be **sold**, and that is one of the two
 questions.
 
+## Both of those rankings asked the wrong question, and one number answers it
+
+Three corrections now sit above this line and they are all the same shape.
+Yespower was chosen for implementation cost. It was then refused for coin
+liquidity. kHeavyHash was chosen for market size and refused for network
+hashrate. Every one of those is a proxy, and the thing being proxied is
+**revenue per unit of this machine's hardware**.
+
+A multi-coin auto-exchange pool publishes exactly that. yiimp's `/api/status`
+carries `estimate_current` per algorithm: what a unit of hashrate earned in a
+day, in BTC, *after the pool sold whatever it mined*. Price, network
+difficulty, block reward and the per-chain decimals constant are all already
+inside it, because the pool did the selling and is quoting the proceeds.
+
+That dissolves the blocker `pool/src/market.rs` records against computing an
+expected value -- "how many base units make a coin is not on the wire" -- by
+not needing the constant. And it dissolves the liquidity objection above:
+**on an auto-exchange pool the coin's own market is the pool's problem, not
+the miner's.** It pays in BTC whatever it mined. A dead coin is a risk zpool
+carries, and its `actual_last24h` is what it managed to realise.
+
+`tools/payrate.py` asks. Measured against zpool, with BTC at $78,141:
+
+    algo        ours H/s      USD/day       what it is
+    sha256      6.3e8         $0.000031     RTX 3050, through the pool
+    blake2s     1.28e9        --            zpool does not serve it
+    heavyhash   3.83e8        --            served, pays nothing, no miners
+    yespower    342           $0.013645     one kernel slice, ring 0
+    yespower    1368          $0.054581     four kernel slices
+
+**The kernel's CPU on yespower out-earns the RTX 3050 on sha256d by about
+eighteen hundred times.** That is the ranking, and it is the opposite of what
+the last two sections concluded. The reason is not subtle once the right
+question is asked: sha256d is ASIC territory and a laptop GPU is a rounding
+error in it, while yespower is CPU-only *by construction*, so a laptop core is
+a real participant in a small field. The original document said exactly that
+under "CPU-only by construction rather than merely ASIC-unfriendly", and it was
+the axis that mattered all along.
+
+**Verge is unreachable for a different reason than being unprofitable.** Every
+Verge-specific BLAKE2s pool named in every guide -- `xvg.blake2s.com`,
+`xvg.antminepool.com`, `cryptocartel.one`, `pool.verge-blockchain.com` -- fails
+to resolve, and zpool does not carry blake2s among its seventy-five
+algorithms. The coin has a live market and the algorithm has no pool. So the
+GPU's second algorithm currently has nowhere to go, which is a fact about
+infrastructure rather than about arithmetic and could change next month.
+
+**The unit convention is derived and therefore checked.** zpool documents none
+of it; `estimate_current` being BTC per `mbtc_mh_factor` MH/s per day was read
+off the data, and a wrong reading moves every figure by three orders of
+magnitude while still printing plausible pennies. `payrate.py --selftest`
+checks it against a quantity nobody in the exchange controls: zpool's SHA-256
+farm is a known fraction of Bitcoin's hashrate and Bitcoin's issuance is
+published, so the pool's share of one must be its share of the other. Measured
+ratio: **1.02**.
+
+**And the conclusion has not moved once.** Five cents a day against an assumed
+thirty-six cents of electricity is seven times underwater. Three rankings have
+been overturned and the original objection at the top of this document is
+untouched by all of them. What changed is which part of the machine is least
+bad at it, and the answer is the part with no GPU in it.
+
 **The finding took a field that has to be asked for.** CoinGecko answers
 BitZeny with `0.00023968` and no error; `last_updated_at` is what says the
 number is from August 2022, and it is opt-in. A fetcher that did not request it
@@ -525,9 +587,15 @@ afterwards.
    this card would hold one part in 878 million of it -- see the correction
    under Candidates. The hash is written and measured either way, so nothing is
    lost by not wiring it up.
-7. **Measure Verge's BLAKE2s difficulty with `mine probe`**, which is the only
-   number that can rank anything and the only one still missing. It needs a
-   Stratum connection and a payout address, not code.
+7. ~~**Measure Verge's BLAKE2s difficulty with `mine probe`.**~~ **Overtaken.**
+   `tools/payrate.py` answers the ranking question directly off a pool's own
+   published payout rate, and no BLAKE2s pool is reachable to probe anyway. The
+   difficulty is still the right number for a coin we mine *directly*; it is
+   not needed to decide what to point the machine at.
+8. **Point the kernel at zpool's yespower port and take a real share.** This
+   is the only step left that has never been done: everything green in this
+   tree is green against our own stub. It needs the address in hand and
+   nothing else.
 
 Items 1 to 4 are kernel work and item 5 is not, so they do not block each
 other. The pool can exist and take miners before GLaDOS is a useful client at
