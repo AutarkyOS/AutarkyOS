@@ -109,6 +109,57 @@ Prints what one share costs to validate here, which is the number that decides
 whether the share targets in the unit are sane. Compare against `design/pool.md`;
 a much slower machine wants harder targets, not a bigger box.
 
+## If it is a home server, read this before the port section
+
+A machine in somebody's house is not a small VPS. Four things change, and the
+last one is a decision rather than a detail.
+
+**It probably has no reachable address.** A residential connection has a
+dynamic IPv4 at best and is behind carrier-grade NAT at worst, and under CGNAT
+no port forward exists to make -- the address on the router is not the address
+the world sees. `curl -s ifconfig.me` on the server against the WAN address in
+the router's own status page settles it: if they differ, forwarding cannot
+work and a tunnel is the only route in.
+
+**A forwarded port is a hole in his house, not in a rented box.** Everything
+behind that NAT is his: other machines, whatever is on the LAN, his own
+traffic. A VPS that gets compromised is a VPS. This is not that, and it is his
+risk rather than ours to accept on his behalf.
+
+**A DNS record pointing at his home publishes where he lives**, to street
+level, to anybody who resolves `stratum.aperture.institute`. That is a fact
+about him that a mining pool has no business making public, and it does not
+become reversible by deleting the record later.
+
+**His ISP may forbid it.** Running a public server on a residential line is
+against the terms of most of them, and mining-adjacent traffic is the kind
+that gets noticed.
+
+### What to do instead, for now
+
+**Do not expose it to the internet yet**, and the reason is not caution -- it
+is that doing so buys nothing. Every coin's `Source` is `Local`: the pool
+builds its own headers, so there is no chain, no block, and nothing for a
+stranger to mine that is worth anything to them or to us. Opening a port on a
+friend's house to serve work with no value is all cost.
+
+What the server is genuinely useful for today is being the always-on end of a
+*private* link:
+
+- **Same LAN.** If the GLaDOS machine and the server are in one house, this is
+  finished: `mine pool <lan-ip>:3334 glados` and nothing is exposed at all.
+- **Different houses**, which is the likely case. Put both machines on a
+  WireGuard or Tailscale network and point the miner at the private address.
+  The kernel has its own TCP stack and no WireGuard, so **the tunnel cannot
+  run inside GLaDOS** -- it has to be the router, or the host if GLaDOS is in
+  QEMU, and the kernel just sees an ordinary address it can reach.
+
+Revisit hosting when there is something to mine. By then the two things that
+make exposure defensible will exist or will not: an upstream behind at least
+one coin, and TLS. Until both are true, a public endpoint is a liability with
+no matching asset -- and if it still seems worth it then, a five-dollar VPS
+fronting the home box keeps his address and his LAN out of it entirely.
+
 ## The port
 
 3334, TCP, inbound. Above 1024, so the daemon binds it without any capability.

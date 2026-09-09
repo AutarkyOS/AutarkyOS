@@ -248,6 +248,104 @@ fn bench() {
     println!("choosing the target -- not with anybody's hashrate.");
 }
 
+/// A stranger cannot spend this machine's CPU without limit.
+///
+/// Checked rather than asserted, because a limit nobody has watched fire is a
+/// limit written in a comment -- the objection `diag paging` makes about page
+/// rights, which faults on purpose for exactly this reason.
+///
+/// The garbage is a *valid* submit for a *real* job with a nonce that does not
+/// meet the target, which is the expensive case: the pool has to compute the
+/// hash to find out, so every one of these costs it a full validation. A
+/// malformed message would be rejected by the parser for free and would prove
+/// nothing.
+fn abuse_check(addr: std::net::SocketAddr) -> bool {
+    use glados_pool::json::Json;
+    use glados_pool::mine::proto;
+    use glados_pool::mine::stratum::take_line;
+    use std::io::{Read, Write};
+
+    let Ok(mut sock) = std::net::TcpStream::connect(addr) else {
+        println!("FAIL  could not open a second connection");
+        return false;
+    };
+    sock.set_read_timeout(Some(std::time::Duration::from_secs(15)))
+        .unwrap();
+    if sock
+        .write_all(proto::encode_hello(1, "abuse.rig", "abuse-check").as_bytes())
+        .is_err()
+    {
+        println!("FAIL  could not greet on the second connection");
+        return false;
+    }
+
+    let mut buf: Vec<u8> = Vec::new();
+    let mut chunk = [0u8; 4096];
+    let mut job: Option<proto::Job> = None;
+    for _ in 0..40 {
+        let Ok(n) = sock.read(&mut chunk) else { break };
+        if n == 0 {
+            break;
+        }
+        buf.extend_from_slice(&chunk[..n]);
+        while let Ok(Some(line)) = take_line(&mut buf) {
+            let Some(v) = Json::parse(line.trim()) else { continue };
+            if v.get("method").and_then(|m| m.as_str()) == Some("glados.job") {
+                if let Some(j) = v.get("params").and_then(proto::parse_job) {
+                    job = Some(j);
+                }
+            }
+        }
+        if job.is_some() {
+            break;
+        }
+    }
+    let Some(j) = job else {
+        println!("FAIL  the second connection was never given a job");
+        return false;
+    };
+
+    // Nonce zero against a twelve-bit target is a solution about one time in
+    // four thousand, so a few dozen of these are bad shares with near
+    // certainty -- and the one-in-4096 case is an *accepted* share, which
+    // simply does not count toward the limit and costs an extra round.
+    for i in 0..200u32 {
+        let sh = proto::Share { job: j.job.clone(), nonce: i, echo: vec![] };
+        if sock
+            .write_all(proto::encode_submit(2, &sh).as_bytes())
+            .is_err()
+        {
+            println!("ok    a stranger sending garbage was cut off after {i} shares");
+            return true;
+        }
+        // Under the per-second cap, so the drop that ends this is the bad-share
+        // limit rather than the rate limit. Testing both at once would leave it
+        // unclear which one fired.
+        std::thread::sleep(std::time::Duration::from_millis(80));
+
+        // A closed connection shows as a read of zero as readily as a failed
+        // write, and which one appears depends on timing rather than on
+        // behaviour.
+        let mut probe = [0u8; 1024];
+        match sock.read(&mut probe) {
+            Ok(0) => {
+                println!("ok    a stranger sending garbage was cut off after {i} shares");
+                return true;
+            }
+            Ok(_) => {}
+            Err(e)
+                if e.kind() == std::io::ErrorKind::WouldBlock
+                    || e.kind() == std::io::ErrorKind::TimedOut => {}
+            Err(_) => {
+                println!("ok    a stranger sending garbage was cut off after {i} shares");
+                return true;
+            }
+        }
+    }
+    println!("FAIL  200 bad shares and the connection is still open");
+    false
+}
+
 /// The whole path, in one process, with no kernel and no network beyond
 /// loopback: listen, greet, take a job, mine it, submit, be believed.
 ///
@@ -362,7 +460,10 @@ fn selftest() -> bool {
                             "ok    greeted, mined {want} coins ({}), and every share was accepted",
                             algos.join(" + ")
                         );
-                        return true;
+                        // The second half. A pool that accepts good shares and
+                        // never refuses a stranger is half checked, and on a
+                        // machine somebody lent us it is the wrong half.
+                        return abuse_check(addr);
                     }
                 }
             }
