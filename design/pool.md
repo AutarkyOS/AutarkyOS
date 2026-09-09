@@ -593,7 +593,7 @@ own vectors. A job it cannot compute is skipped and said out loud.
   on the internet has been asked for work, which needs an account and an
   address rather than any more code.
 - PPLNS, and any notion of a payout window. The tally is cumulative, and it
-  records **work** rather than share count --  per accepted share --
+  records **work** rather than share count -- `2^bits` per accepted share --
   because VarDiff made counting shares unfair. Measured over one 400,000-nonce
   sweep: 394 shares at 10 bits against 5 at 16, with the credited work within
   1.2x. A share count would have paid the first miner seventy-nine times as
