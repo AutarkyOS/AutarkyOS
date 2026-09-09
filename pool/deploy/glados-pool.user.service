@@ -1,0 +1,68 @@
+[Unit]
+# The same daemon, for a machine where you are not root.
+#
+# Install to ~/.config/systemd/user/ and run with `systemctl --user`. The
+# daemon genuinely does not need privilege: it binds a port above 1024, writes
+# one directory, and reads nothing it did not create. Being unable to sudo
+# costs enforcement, not function.
+#
+# **Run `loginctl enable-linger $USER` or this dies when you log out.** A user
+# service without lingering is stopped with the session, which presents as a
+# pool that works perfectly while you are watching it and is gone in the
+# morning. It is the single thing most likely to go wrong here.
+Description=GLaDOS multi-coin mining pool (user)
+Documentation=https://github.com/IlumCI/GLaDOS/blob/main/design/pool.md
+After=network-online.target
+
+[Service]
+Type=simple
+
+ExecStart=%h/.local/bin/glados-pool \
+    --listen 0.0.0.0:3334 \
+    --ledger %S/glados-pool/ledger.json \
+    bitzeny:yespower-10-2048-8:12 \
+    testnet:sha256d:24
+
+Restart=always
+RestartSec=5s
+
+StateDirectory=glados-pool
+
+# --- limits, and what is different about them here ---
+#
+# The figures are the system unit's and the reasoning is identical: 3.49 MB
+# resident plus at most one 8,296 KiB working set live at a time, because
+# validation happens under a mutex and is therefore serialised.
+#
+# **Whether these are enforced is not up to this file.** A user manager only
+# applies MemoryMax and CPUQuota when the controllers are delegated to it, and
+# on many distributions CPU is not delegated by default. Check rather than
+# assume:
+#
+#     cat /sys/fs/cgroup/user.slice/user-$(id -u).slice/cgroup.controllers
+#
+# If `memory` and `cpu` are absent, these lines are documentation. The daemon
+# still behaves -- the numbers above are what it actually uses, not what it is
+# being held to -- but nothing is stopping a bug, so watch it for a day.
+MemoryMax=64M
+MemoryHigh=48M
+CPUQuota=50%
+TasksMax=512
+
+# --- hardening that a user manager will honour ---
+#
+# The system unit's list is deliberately not copied wholesale. Several of those
+# directives need privilege the user manager does not have, and systemd's
+# behaviour on an unavailable one is to fail the unit rather than skip it, so a
+# copied list is a service that will not start. These are the ones that work
+# unprivileged.
+NoNewPrivileges=true
+PrivateTmp=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+SystemCallArchitectures=native
+
+[Install]
+WantedBy=default.target

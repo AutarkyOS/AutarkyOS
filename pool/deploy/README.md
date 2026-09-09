@@ -28,6 +28,35 @@ file target/x86_64-unknown-linux-musl/release/glados-pool
 # ELF 64-bit LSB pie executable, x86-64, static-pie linked, ...
 ```
 
+## First, find out what you are deploying onto
+
+All read-only, and `sudo -n` cannot hang on a password prompt:
+
+```bash
+uname -m; uname -r
+grep PRETTY /etc/os-release
+systemctl --version 2>/dev/null | head -1
+sudo -n true 2>/dev/null && echo "sudo: yes" || echo "sudo: no (or wants a password)"
+loginctl show-user "$USER" -p Linger 2>/dev/null
+nproc; free -m | head -2
+ss -ltn 2>/dev/null | grep ':3334' || echo "port 3334: free"
+cat /sys/fs/cgroup/user.slice/user-$(id -u).slice/cgroup.controllers 2>/dev/null
+```
+
+What each answer changes:
+
+- **`uname -m`** picks the build target and nothing else. `x86_64` or `aarch64`.
+- **sudo** picks which unit file. With it, `glados-pool.service`; without,
+  `glados-pool.user.service` and the caveats in its header.
+- **`Linger=no`** with no sudo is the trap: a user service stops when you log
+  out, so the pool works while you watch it and is gone by morning.
+  `loginctl enable-linger $USER` fixes it, and needs sudo on some systems.
+- **`cgroup.controllers`** says whether the resource limits in a *user* unit
+  are enforced or merely written down. If `memory` and `cpu` are absent they
+  are documentation.
+- **port 3334 in use** means pick another and change it in three places: the
+  unit, the firewall, and `mine pool`.
+
 ## Install
 
 ```bash
@@ -42,6 +71,22 @@ systemctl status glados-pool
 
 Edit the `ExecStart` line first: the coins and their share targets are the only
 thing in the unit that is a decision rather than a measurement.
+
+### Without root
+
+```bash
+mkdir -p ~/.local/bin ~/.config/systemd/user
+install -m 0755 glados-pool ~/.local/bin/glados-pool
+install -m 0644 glados-pool.user.service ~/.config/systemd/user/glados-pool.service
+systemctl --user daemon-reload
+systemctl --user enable --now glados-pool
+loginctl enable-linger "$USER"    # or it stops when you log out
+systemctl --user status glados-pool
+```
+
+The daemon needs no privilege: a port above 1024, one directory to write, and
+nothing else. What is lost is *enforcement* of the limits, not function -- see
+the header of `glados-pool.user.service`, and check `cgroup.controllers` above.
 
 ## Check it before opening any port
 
