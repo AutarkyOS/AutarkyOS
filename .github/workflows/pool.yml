@@ -1,0 +1,197 @@
+name: pool
+
+# What the shared-source arrangement promised, actually enforced.
+#
+# `pool/` includes twelve of the kernel's own files by `#[path]`, and the whole
+# argument for that (design/pool.md) is: **a divergence is a build failure in
+# the same commit, rather than a share rejected next week for a reason nobody
+# can find.** Nothing was running that check. This does.
+#
+# It is also the first automated test this repository has ever had of anything
+# in `src/mine/`. The kernel is a `no_std` UEFI binary with no host test runner,
+# so its checks are the boot selftests and driving QEMU -- neither of which a CI
+# job can do. The hash core is not kernel code in any useful sense, though: it
+# touches no hardware and allocates from a heap, so on the host it is ordinary
+# Rust, and the vectors that cost a boot cost about a second here.
+
+on:
+  push:
+    paths:
+      # Both halves, because a change to either breaks the pair. Editing
+      # `src/mine/yespower.rs` is a change to the pool whether or not anybody
+      # thought of it that way, which is exactly the point.
+      - 'pool/**'
+      - 'src/mine/**'
+      - 'src/json.rs'
+      - 'src/store/sha256.rs'
+      - 'src/crypto/hkdf.rs'
+      - 'tools/stratumstub.py'
+      - 'tools/poolclient.py'
+      - 'tools/prooftest.py'
+      - 'tools/algocheck.py'
+      - '.github/workflows/pool.yml'
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # Not actions-rs/toolchain, for the reason rust-clippy.yml records at
+      # length: `override: true` sits above rust-toolchain.toml in rustup's
+      # precedence and silently hands you a different compiler.
+      - name: Install the pinned toolchain
+        run: |
+          rustup show active-toolchain || rustup toolchain install
+          rustup target add x86_64-unknown-linux-musl
+          rustc --version --verbose
+
+      # Thirty-two, and the thirteen upstream yespower vectors are why this is
+      # worth running on every push rather than at release: their failure would
+      # be the least visible anywhere else.
+      - name: Test
+        working-directory: pool
+        run: cargo test --locked
+
+      # musl, so the artefact is statically linked: no glibc version to match
+      # against whatever a host runs, no shared objects, one file. `--target` is
+      # explicit and overrides `pool/.cargo/config.toml`, which names the
+      # development machine's triple because it has to name something.
+      - name: Build the daemon
+        working-directory: pool
+        run: cargo build --release --locked --target x86_64-unknown-linux-musl
+
+      # "Statically linked" is a claim, so it is checked rather than asserted. A
+      # `PT_INTERP` would mean the artefact needs a loader on the target after
+      # all, which is the one property the whole musl choice exists for.
+      - name: It needs no loader
+        working-directory: pool
+        run: |
+          BIN=target/x86_64-unknown-linux-musl/release/glados-pool
+          file "$BIN"
+          if readelf -l "$BIN" | grep -q INTERP; then
+            echo "::error::the binary carries a PT_INTERP and is not static"
+            exit 1
+          fi
+          sha256sum "$BIN"
+
+      # End to end in one process: stand up a listener, greet it, take two jobs
+      # on two different algorithms, mine them, submit, and require the pool to
+      # have independently recomputed both hashes. Then drive a stranger at it
+      # and require the connection to be dropped.
+      #
+      # The *musl* binary and not a host build, so what is exercised is the
+      # artefact that would be copied to a server.
+      - name: Selftest the artefact
+        working-directory: pool
+        run: ./target/x86_64-unknown-linux-musl/release/glados-pool --selftest
+
+      - name: What one share costs here
+        working-directory: pool
+        run: ./target/x86_64-unknown-linux-musl/release/glados-pool --bench
+
+      # The oracle that checks the oracle. `algocheck.py` holds the same
+      # published vectors the Rust does -- a block anybody can look up, RFC 7693
+      # -- and a third holder of a published constant is a third checker.
+      - name: The host-side vectors agree
+        run: python3 tools/algocheck.py --selftest
+
+      # A real Stratum server, a real merkle branch, and a pool that has to
+      # produce headers the server will accept. `--verify` rebuilds every
+      # submitted header in Python and checks its hash, so this is the kernel's
+      # header assembly against an implementation sharing no code with it -- and
+      # the only place the merkle fold meets a non-empty branch outside a unit
+      # test.
+      - name: A pool against a real upstream
+        working-directory: pool
+        run: |
+          set -e
+          BIN=./target/x86_64-unknown-linux-musl/release/glados-pool
+          # **The two difficulties are chosen so shares actually get forwarded**,
+          # and that is not a detail. Rehearsed first with upstream at 0.0005
+          # (a ~21-bit target) against a 12-bit local one: the client stopped
+          # after about 131,000 hashes and nothing ever qualified, so the
+          # handshake check passed and "no share was refused" passed
+          # *vacuously*. A step that reports success without exercising the
+          # thing is the failure `smp.rs` records about its own one-shot canary.
+          #
+          # 4e-06 puts upstream at about 14 bits against a local 12, so roughly
+          # one share in four qualifies -- and measured, 17 of 20 did, with 3
+          # beating the local target and not upstream's. That gap is the proxy
+          # property, and a run where every share forwarded would not show it.
+          python3 ../tools/stratumstub.py --port 3420 --difficulty 0.000004 \
+            --branch 3 --verify --forever > /tmp/stub.log 2>&1 &
+          sleep 2
+          $BIN --listen 127.0.0.1:3421 \
+            'chain:sha256d:12@127.0.0.1:3420,ciwallet.rig,x' > /tmp/pool.log 2>&1 &
+          sleep 4
+          python3 ../tools/poolclient.py --port 3421 --worker ci.rig \
+            --shares 20 --seconds 120 --quiet
+          sleep 3
+          echo "--- pool ---"; cat /tmp/pool.log
+          echo "--- upstream ---"; grep -E "share verified|share REFUSED" /tmp/stub.log || true
+
+          # `if` rather than `grep && { ... }`. Whether a false AND-OR list is
+          # fatal under `set -e` differs between shells, and here a *passing*
+          # grep is the failure case -- so getting it wrong would either mask a
+          # refused share or fail the job for finding none. `run-pool.sh`
+          # records the same trap, found by running it.
+          if ! grep -q "subscribed and authorized" /tmp/pool.log; then
+            echo "::error::the pool never completed its upstream handshake"
+            exit 1
+          fi
+          if grep -q "share REFUSED" /tmp/stub.log; then
+            echo "::error::the upstream refused a share this pool forwarded"
+            exit 1
+          fi
+          # The assertion that stops this being vacuous. Without it the two
+          # checks above pass on a run where nothing was ever forwarded.
+          VERIFIED=$(grep -c "share verified" /tmp/stub.log || true)
+          echo "upstream verified $VERIFIED share(s)"
+          if [ "${VERIFIED:-0}" -lt 1 ]; then
+            echo "::error::no share reached the upstream, so nothing here was tested"
+            exit 1
+          fi
+          echo "ok"
+
+      # A miner must be able to check what a pool pays, and must refuse one that
+      # misrepresents it. Both directions, because a check that can only pass is
+      # not a check -- the arrangement `diag paging` has when it faults on
+      # purpose. `--bad-proof` corrupts the extranonce by a single byte, since a
+      # check that only caught obvious garbage would pass on every lie worth
+      # telling.
+      #
+      # The kernel does this in ring 0; CI cannot boot QEMU, so `prooftest.py`
+      # stands in -- and it is the same rebuild a miner would run before
+      # pointing hardware at a stranger's pool.
+      - name: An honest pool proves what it pays, and a liar cannot
+        working-directory: pool
+        run: |
+          set -e
+          BIN=./target/x86_64-unknown-linux-musl/release/glados-pool
+          # A stub each, because the stub serves one connection at a time and
+          # the second pool would otherwise sit queued behind the first.
+          python3 ../tools/stratumstub.py --port 3423 --difficulty 0.0005 \
+            --branch 3 --forever > /tmp/stub-honest.log 2>&1 &
+          python3 ../tools/stratumstub.py --port 3424 --difficulty 0.0005 \
+            --branch 3 --forever > /tmp/stub-liar.log 2>&1 &
+          sleep 2
+          $BIN --listen 127.0.0.1:3425 \
+            'chain:sha256d:14@127.0.0.1:3423,ciwallet.rig,x' > /tmp/honest.log 2>&1 &
+          $BIN --listen 127.0.0.1:3426 --bad-proof \
+            'chain:sha256d:14@127.0.0.1:3424,ciwallet.rig,x' > /tmp/liar.log 2>&1 &
+          sleep 5
+          python3 ../tools/prooftest.py --port 3425
+          python3 ../tools/prooftest.py --port 3426 --expect-fail
+          # And the liar must genuinely fail an ordinary audit, or `--expect-fail`
+          # is passing for some reason other than the one it names.
+          if python3 ../tools/prooftest.py --port 3426; then
+            echo "::error::a pool built to lie passed an honest audit"
+            exit 1
+          fi
+          echo "ok"
