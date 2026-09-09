@@ -102,6 +102,13 @@ pub struct Issued {
     pub header: [u8; 80],
     pub target: U256,
     pub echo: proto::Echo,
+    /// The difficulty this job went out at, in leading zero bits.
+    ///
+    /// Kept on the job rather than read off the coin, because with per
+    /// -connection retargeting the coin no longer has one: two miners hold two
+    /// jobs on the same coin at two difficulties, and crediting either from the
+    /// coin's own figure would pay one of them for the other's work.
+    pub bits: u32,
     /// Everything a `mining.submit` needs, kept from when the header was built.
     ///
     /// Stored rather than recomputed, for the reason `client::Template` gives
@@ -164,8 +171,22 @@ impl Verdict {
 }
 
 /// One worker's record against one coin.
+///
+/// **`work` is the number that decides a payout, and `accepted` is not.** That
+/// was true the moment difficulty stopped being fixed: a miner retargeted to 12
+/// bits produces 256 times as many shares as one at 20 for the same effort, so
+/// paying by share count would pay the slow device several hundred times per
+/// unit of work what the fast one gets. The count stays because it is what an
+/// operator reads to see whether a miner is alive.
 #[derive(Default, Clone, Debug, PartialEq)]
 pub struct Tally {
+    /// Expected hashes behind the accepted shares: `2^bits` each, summed.
+    ///
+    /// Saturating rather than wrapping. At the 40-bit ceiling it takes about
+    /// sixteen million shares to reach `u64::MAX`, which at one every ten
+    /// seconds is five years -- but a wrap would silently reset somebody's
+    /// entire record, and a clamp at least stops rising visibly.
+    pub work: u64,
     pub accepted: u64,
     pub stale: u64,
     pub bad: u64,
@@ -191,6 +212,10 @@ pub struct Pool {
     forwards: Vec<Forward>,
     next_job: u64,
 }
+
+/// Bumped when a change makes an older document unreadable rather than merely
+/// different. Recording `work` did exactly that.
+const LEDGER_VERSION: u32 = 2;
 
 /// How many issued jobs to remember. Sixty-four is four coins' worth of a
 /// couple of minutes at a thirty-second job cadence, which is comfortably
@@ -325,6 +350,7 @@ impl Pool {
                 header,
                 target,
                 echo: Vec::new(),
+                bits,
                 up,
             },
         ));
@@ -447,7 +473,10 @@ impl Pool {
             }
         }
 
-        self.tally(worker, &job.coin).accepted += 1;
+        let credit = if job.bits >= 64 { u64::MAX } else { 1u64 << job.bits };
+        let t = self.tally(worker, &job.coin);
+        t.accepted += 1;
+        t.work = t.work.saturating_add(credit);
         Verdict::Accepted
     }
 
@@ -493,6 +522,16 @@ impl Pool {
     /// written down because a digest is easy to mistake for more than it is.
     pub fn load_ledger(&mut self, text: &str) -> Result<usize, String> {
         let doc = crate::json::Json::parse(text.trim()).ok_or("not JSON")?;
+        // Absent means version 1, which is what the pool wrote before it
+        // recorded work. Refused rather than half-read: those rows have no
+        // `work` field, so loading them would credit every past share as zero
+        // effort and quietly rewrite the record the file exists to preserve.
+        let v = doc.get("v").and_then(|x| x.as_i64()).unwrap_or(1);
+        if v != LEDGER_VERSION as i64 {
+            return Err(format!(
+                "written by an older pool (format {v}, this one writes {LEDGER_VERSION})"
+            ));
+        }
         let rows = match doc.get("shares") {
             Some(crate::json::Json::Arr(items)) => items,
             _ => return Err(String::from("no shares array")),
@@ -514,14 +553,15 @@ impl Pool {
                 }
             };
             let t = Tally {
+                work: n("work")?,
                 accepted: n("accepted")?,
                 stale: n("stale")?,
                 bad: n("bad")?,
                 duplicate: n("duplicate")?,
             };
             canon.push_str(&format!(
-                "{worker}\t{coin}\t{}\t{}\t{}\t{}\n",
-                t.accepted, t.stale, t.bad, t.duplicate
+                "{worker}\t{coin}\t{}\t{}\t{}\t{}\t{}\n",
+                t.work, t.accepted, t.stale, t.bad, t.duplicate
             ));
             restored.push(((String::from(worker), String::from(coin)), t));
         }
@@ -574,44 +614,43 @@ impl Pool {
             // the digest must not depend on how a JSON writer spaces or
             // escapes. Two encoders that agree about a document can still
             // disagree about its bytes.
+            //
+            // `work` leads, because it is the field a payout comes from.
             canon.push_str(&format!(
-                "{w}	{c}	{}	{}	{}	{}
-",
-                t.accepted, t.stale, t.bad, t.duplicate
+                "{w}\t{c}\t{}\t{}\t{}\t{}\t{}\n",
+                t.work, t.accepted, t.stale, t.bad, t.duplicate
             ));
         }
         let digest = crate::store::sha256::hash(canon.as_bytes());
 
-        let mut s = String::from("{
-");
-        s.push_str(&format!("  \"epoch\": {epoch},
-"));
-        s.push_str(&format!("  \"generated_at\": {generated_at},
-"));
+        let mut s = String::from("{\n");
+        // The format's own version, so a document written by an older pool is
+        // refused by name rather than as a digest mismatch. Those are different
+        // problems -- one is a format change and one is a damaged file -- and a
+        // single confusing error for both is how somebody concludes their
+        // ledger was corrupted when it was merely old.
+        s.push_str(&format!("  \"v\": {LEDGER_VERSION},\n"));
+        s.push_str(&format!("  \"epoch\": {epoch},\n"));
+        s.push_str(&format!("  \"generated_at\": {generated_at},\n"));
         s.push_str(&format!(
-            "  \"digest\": \"{}\",
-",
+            "  \"digest\": \"{}\",\n",
             crate::mine::stratum::hex(&digest)
         ));
-        s.push_str("  \"coins\": [
-");
+        s.push_str("  \"coins\": [\n");
         for (i, c) in self.coins.iter().enumerate() {
             s.push_str(&format!(
-                "    {{\"slot\": {i}, \"label\": \"{}\", \"algo\": \"{}\", \"source\": \"{}\"}}{}
-",
+                "    {{\"slot\": {i}, \"label\": \"{}\", \"algo\": \"{}\", \"source\": \"{}\"}}{}\n",
                 c.label,
                 c.algo.detail(),
                 c.source.name(),
                 if i + 1 == self.coins.len() { "" } else { "," }
             ));
         }
-        s.push_str("  ],
-  \"shares\": [
-");
+        s.push_str("  ],\n  \"shares\": [\n");
         for (i, (w, c, t)) in rows.iter().enumerate() {
             s.push_str(&format!(
-                "    {{\"worker\": \"{w}\", \"coin\": \"{c}\", \"accepted\": {}, \"stale\": {}, \"bad\": {}, \"duplicate\": {}}}{}
-",
+                "    {{\"worker\": \"{w}\", \"coin\": \"{c}\", \"work\": {}, \"accepted\": {}, \"stale\": {}, \"bad\": {}, \"duplicate\": {}}}{}\n",
+                t.work,
                 t.accepted,
                 t.stale,
                 t.bad,
@@ -619,9 +658,7 @@ impl Pool {
                 if i + 1 == rows.len() { "" } else { "," }
             ));
         }
-        s.push_str("  ]
-}
-");
+        s.push_str("  ]\n}\n");
         s
     }
 }
@@ -930,6 +967,98 @@ mod tests {
     fn a_local_coin_offers_no_proof() {
         let mut p = a_pool();
         assert!(p.make_job(0, 8).unwrap().proof.is_none());
+    }
+
+    /// Equal effort must earn equal credit, whatever difficulty it was at.
+    ///
+    /// This is the property that pays people fairly, and it is exactly what
+    /// VarDiff broke about a raw share count: a miner retargeted to 12 bits
+    /// finds 256 times as many shares as one at 20 for the same work. Counting
+    /// shares would pay it 256 times as much.
+    ///
+    /// So: mine the *same nonce range* twice, once at an easy target and once
+    /// at a hard one, and require the credited work to land close. The share
+    /// counts will differ by orders of magnitude, which is the point.
+    #[test]
+    fn credit_follows_work_and_not_share_count() {
+        const SPAN: u32 = 400_000;
+
+        fn run(bits: u32) -> Tally {
+            let mut p = a_pool();
+            let job = p.make_job(0, bits).unwrap();
+            let mut h = Hasher::new(&job.algo, &job.header).unwrap();
+            for n in 0..SPAN {
+                if below_target(&h.hash(&job.header, n), &job.target) {
+                    p.submit(
+                        "w",
+                        &proto::Share {
+                            job: job.job.clone(),
+                            nonce: n,
+                            echo: vec![],
+                        },
+                    );
+                }
+            }
+            p.ledger().into_iter().next().map(|(_, _, t)| t).unwrap_or_default()
+        }
+
+        let easy = run(10);
+        let hard = run(16);
+        // Measured, and worth keeping in the record: 394 shares against 5 for
+        // the same nonce sweep, with the work landing within 1.2x. That ratio
+        // is what a share count would have paid out on.
+
+        // The counts differ enormously -- that is the whole hazard.
+        assert!(
+            easy.accepted > hard.accepted * 8,
+            "the two difficulties were not far enough apart to test anything: \
+             {} vs {}",
+            easy.accepted,
+            hard.accepted
+        );
+
+        // The work does not. Both swept the same nonces, so the expected work
+        // is the same span; a factor of two either way is the luck of where the
+        // solutions fell, and is generous rather than tight because share
+        // intervals are exponentially distributed.
+        assert!(easy.work > 0 && hard.work > 0);
+        let (lo, hi) = if easy.work < hard.work {
+            (easy.work, hard.work)
+        } else {
+            (hard.work, easy.work)
+        };
+        assert!(
+            hi <= lo * 3,
+            "credited work diverged with difficulty: {} at 10 bits against {} at 16",
+            easy.work,
+            hard.work
+        );
+    }
+
+    /// A ledger from before work was recorded is refused by name.
+    ///
+    /// Refusing it as a *digest mismatch* would be the wrong error entirely: a
+    /// format change and a damaged file are different problems, and one
+    /// confusing message for both is how somebody concludes their record was
+    /// corrupted when it was merely old.
+    #[test]
+    fn an_older_ledger_format_is_refused_for_the_right_reason() {
+        let old = r#"{
+  "epoch": 1,
+  "generated_at": 1,
+  "digest": "00",
+  "coins": [],
+  "shares": [
+    {"worker": "w", "coin": "t", "accepted": 1, "stale": 0, "bad": 0, "duplicate": 0}
+  ]
+}"#;
+        let mut p = a_pool();
+        let err = p.load_ledger(old).expect_err("an old ledger was accepted");
+        assert!(
+            err.contains("older pool"),
+            "refused for the wrong reason: {err}"
+        );
+        assert!(p.ledger().is_empty());
     }
 
     /// A share is forwarded only when it beats *upstream's* target, not ours.

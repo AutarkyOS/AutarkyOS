@@ -240,9 +240,11 @@ fn main() {
         std::thread::sleep(std::time::Duration::from_secs(60));
         let p = reporter.lock().unwrap();
         for (w, c, t) in p.ledger() {
+            // Work first, because it is the number a payout comes from and
+            // the share count is only how you tell a miner is alive.
             println!(
-                "[ledger] {w}  {c}  {} accepted, {} stale, {} bad, {} dup",
-                t.accepted, t.stale, t.bad, t.duplicate
+                "[ledger] {w}  {c}  {} work, {} accepted, {} stale, {} bad, {} dup",
+                t.work, t.accepted, t.stale, t.bad, t.duplicate
             );
         }
         if let Some(path) = &ledger {
