@@ -6,16 +6,23 @@
 //! glados-pool --bench
 //! ```
 //!
-//! A coin is one token, `label:algo:bits`, because an algorithm is parameters
-//! and not a name -- BitZeny, Yenten and Koto all run yespower and all run it
-//! differently, so a preset table would be this program asserting numbers about
-//! somebody else's chain. `bits` is how many leading zero bits a share must
-//! have, which is a difficulty said in a way that has no float in it.
+//! A coin is one token, `label:algo:bits[@host:port,user[,pass]]`.
+//!
+//! The algorithm is parameters and not a name -- BitZeny, Yenten and Koto all
+//! run yespower and all run it differently, so a preset table would be this
+//! program asserting numbers about somebody else's chain. `bits` is how many
+//! leading zero bits a *share* must have, which is a difficulty said in a way
+//! that has no float in it, and it is deliberately not upstream's difficulty:
+//! ours decides what a miner is credited for, upstream's decides what is worth
+//! forwarding.
+//!
+//! Without the `@` part the pool builds its own headers and there is no chain
+//! behind the coin. With it, work comes from a real Stratum V1 pool.
 //!
 //! ```text
-//! bitzeny:yespower-10-2048-8:16
-//! yenten:yespower-10-2048-32-59656e74656e:16
 //! testnet:sha256d:20
+//! yenten:yespower-10-2048-32-59656e74656e:16
+//! bitzeny:yespower-10-2048-8:16@stratum.example.com:3333,waLLet.rig1,x
 //! ```
 
 use std::sync::{Arc, Mutex};
@@ -26,6 +33,42 @@ use glados_pool::pool::{target_with_leading_zeros, Coin, Pool, Source};
 use glados_pool::server;
 
 fn parse_coin(spec: &str) -> Result<Coin, String> {
+    // Split the upstream off first. `@` rather than another `:`, because a
+    // `host:port` already contains one and a positional parser would have to
+    // count colons from the right to tell them apart -- which breaks the first
+    // time somebody omits the port.
+    let (spec, source) = match spec.split_once('@') {
+        None => (spec, Source::Local),
+        Some((left, up)) => {
+            let mut f = up.split(',');
+            let hostport = f.next().unwrap_or("");
+            let user = f.next().unwrap_or("");
+            // Most pools ignore the password entirely and the convention is a
+            // single `x`. Defaulted rather than required, since demanding a
+            // field nobody reads is how a config gets copied wrong.
+            let pass = f.next().unwrap_or("x");
+            if user.is_empty() {
+                return Err(format!("'{up}' has no worker name after the host"));
+            }
+            let (host, port) = match hostport.rsplit_once(':') {
+                Some((h, p)) => match p.parse::<u16>() {
+                    Ok(n) => (h.to_string(), n),
+                    Err(_) => return Err(format!("'{p}' is not a port")),
+                },
+                None => return Err(format!("'{hostport}' needs a :port")),
+            };
+            (
+                left,
+                Source::Upstream {
+                    host,
+                    port,
+                    user: String::from(user),
+                    pass: String::from(pass),
+                },
+            )
+        }
+    };
+
     let mut it = spec.split(':');
     let label = it.next().unwrap_or("").trim();
     let algo_s = it.next().unwrap_or("");
@@ -75,11 +118,14 @@ fn parse_coin(spec: &str) -> Result<Coin, String> {
         label: String::from(label),
         algo,
         share_target: target_with_leading_zeros(bits),
-        // No chain behind it, so no network target, and it is `None` rather
-        // than a plausible constant: an expected value derived from an invented
-        // difficulty is worse than one that refuses to print.
+        // Filled from upstream's `set_difficulty` when there is an upstream,
+        // and `None` otherwise -- rather than a plausible constant, because an
+        // expected value derived from an invented difficulty is worse than one
+        // that refuses to print.
         network_target: None,
-        source: Source::Local,
+        source,
+        work: None,
+        e2: 0,
     })
 }
 
@@ -114,7 +160,10 @@ fn main() {
                 }
             },
             "-h" | "--help" => {
-                println!("glados-pool [--listen ADDR] [--ledger PATH] [label:algo:bits ...]");
+                println!("glados-pool [--listen ADDR] [--ledger PATH] [COIN ...]");
+                println!();
+                println!("  COIN is label:algo:bits[@host:port,user[,pass]]");
+                println!("  without @, the pool builds its own headers and there is no chain");
                 println!("            --selftest");
                 println!();
                 println!("--ledger writes the share log as canonical JSON, for publishing.");
@@ -137,6 +186,10 @@ fn main() {
     }
 
     let pool = Arc::new(Mutex::new(Pool::new(coins)));
+    // One client thread per coin that has an upstream, started before the
+    // listener so a miner connecting immediately is more likely to find work
+    // already in hand rather than a coin that answers no job.
+    glados_pool::upstream::start_all(Arc::clone(&pool));
     let reporter = Arc::clone(&pool);
     // The share log is the whole product of a non-custodial pool: Layer 1
     // never holds a miner's coins, so there is no wallet to audit and this

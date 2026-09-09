@@ -12,6 +12,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::mine::algo::{Algo, Hasher};
 use crate::mine::hash::below_target;
+use crate::mine::header;
 use crate::mine::proto;
 use crate::mine::u256::U256;
 
@@ -30,16 +31,31 @@ pub struct Coin {
     pub network_target: Option<U256>,
     /// Where the header comes from. See `Source`.
     pub source: Source,
+    /// The latest `mining.notify` from upstream. `None` for a local coin, and
+    /// also for an upstream one that has not connected yet -- which is why
+    /// `make_job` answers `None` rather than inventing a header.
+    pub work: Option<Work>,
+    /// Counter feeding extranonce2, so two jobs from one `mining.notify` search
+    /// different coinbases. Monotonic and never reset within a connection: a
+    /// repeat would hand two miners the same space and pay one of them for the
+    /// other's work.
+    pub e2: u64,
 }
 
+#[derive(Clone)]
 pub enum Source {
     /// The pool builds the header itself. No chain, so a share that beat the
     /// network target would still be worth nothing -- which is why a coin in
     /// this state is reported as such rather than quietly served.
     Local,
-    /// An upstream Stratum V1 pool. Not implemented; the variant exists so the
-    /// table has somewhere to put one and the report can say what is missing.
-    Upstream { host: String, port: u16, user: String },
+    /// A real Stratum V1 pool upstream. Work comes from its `mining.notify`
+    /// and qualifying shares go back as `mining.submit`.
+    Upstream {
+        host: String,
+        port: u16,
+        user: String,
+        pass: String,
+    },
 }
 
 impl Source {
@@ -51,6 +67,29 @@ impl Source {
     }
 }
 
+/// What an upstream pool last told us, before any of it becomes a header.
+///
+/// Held verbatim rather than pre-assembled, because the extranonce2 changes per
+/// job handed downstream and the coinbase has to be rebuilt around it -- which
+/// is the whole mechanism by which two miners search different spaces.
+#[derive(Clone)]
+pub struct Work {
+    pub job_id: String,
+    pub prev_wire: [u8; 32],
+    pub coinb1: Vec<u8>,
+    pub coinb2: Vec<u8>,
+    pub branch: Vec<[u8; 32]>,
+    pub version: u32,
+    pub ntime: u32,
+    pub nbits: u32,
+    pub extranonce1: Vec<u8>,
+    pub extranonce2_size: usize,
+    /// What upstream will actually credit, from `mining.set_difficulty`. A
+    /// share beating our own target is worth counting; a share beating this one
+    /// is worth *sending*, and the two are different numbers on purpose.
+    pub up_target: U256,
+}
+
 /// A job that has been handed out and may still have shares arriving for it.
 #[derive(Clone)]
 pub struct Issued {
@@ -60,6 +99,33 @@ pub struct Issued {
     pub header: [u8; 80],
     pub target: U256,
     pub echo: proto::Echo,
+    /// Everything a `mining.submit` needs, kept from when the header was built.
+    ///
+    /// Stored rather than recomputed, for the reason `client::Template` gives
+    /// about the same fields: formatting them a second time at submit is how a
+    /// client sends a share for a header it never built. The miner's `echo`
+    /// carries them too and is deliberately not trusted for this -- it comes
+    /// back over the network and this did not.
+    pub up: Option<UpstreamRef>,
+}
+
+/// The parts of an issued job that only matter if it goes back upstream.
+#[derive(Clone)]
+pub struct UpstreamRef {
+    pub job_id: String,
+    pub extranonce2: Vec<u8>,
+    pub ntime_be: Vec<u8>,
+    pub up_target: U256,
+}
+
+/// A share good enough to be worth sending upstream.
+#[derive(Clone)]
+pub struct Forward {
+    pub slot: u32,
+    pub job_id: String,
+    pub extranonce2: Vec<u8>,
+    pub ntime_be: Vec<u8>,
+    pub nonce_be: Vec<u8>,
 }
 
 /// What happened to a submitted share. One enum so a caller cannot invent a
@@ -114,6 +180,12 @@ pub struct Pool {
     /// global set would refuse the second as a duplicate of work it is not.
     seen: Vec<(String, u32)>,
     tallies: HashMap<(String, String), Tally>,
+    /// Shares that beat upstream's target, waiting for the upstream thread.
+    ///
+    /// A queue rather than a call, because `Pool` holds no sockets -- the same
+    /// split `server.rs` has, and the same shape the kernel's own `SHARES`
+    /// queue uses between its hash loop and its socket task.
+    forwards: Vec<Forward>,
     next_job: u64,
 }
 
@@ -132,6 +204,7 @@ impl Pool {
             issued: Vec::new(),
             seen: Vec::new(),
             tallies: HashMap::new(),
+            forwards: Vec::new(),
             next_job: 1,
         }
     }
@@ -146,35 +219,84 @@ impl Pool {
         let label = coin.label.clone();
         let algo = coin.algo.clone();
         let target = coin.share_target;
+        let work = coin.work.clone();
+        let upstream = matches!(coin.source, Source::Upstream { .. });
+
+        // An upstream coin with no work yet yields no job. Building one anyway
+        // would mean inventing a header, and a miner would then spend real time
+        // on a search that can never pay -- which from `mine coins` looks
+        // exactly like a coin that is working.
+        if upstream && work.is_none() {
+            return None;
+        }
 
         let id = self.next_job;
         self.next_job += 1;
         let job = format!("{id:08x}");
 
-        // A local coin has no chain, so the header is this pool's own: a
-        // version, a previous hash of nothing, a merkle root standing for an
-        // empty block, and the clock. It is deliberately *not* a fixed fixture
-        // -- an unchanging header means every job is the same search and a
-        // miner that reported a share for one would report it for all of them.
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_secs() as u32)
-            .unwrap_or(0);
-        let mut header = [0u8; 80];
-        header[0..4].copy_from_slice(&1u32.to_le_bytes());
-        header[36..44].copy_from_slice(&id.to_le_bytes());
-        header[68..72].copy_from_slice(&now.to_le_bytes());
-        header[72..76].copy_from_slice(&0x1d00_ffffu32.to_le_bytes());
+        let (header, up) = match &work {
+            Some(w) => {
+                // The extranonce2 is what makes two jobs from one `notify` into
+                // two different searches, so it advances per job and not per
+                // notify.
+                let c = self.coins.get_mut(slot as usize)?;
+                c.e2 = c.e2.wrapping_add(1);
+                let counter = c.e2;
 
-        let issued = Issued {
-            slot,
-            coin: label.clone(),
-            algo: algo.clone(),
-            header,
-            target,
-            echo: Vec::new(),
+                let mut e2 = Vec::with_capacity(w.extranonce2_size);
+                // Big-endian, so a hex dump reads in order. Which encoding is
+                // used does not matter for validity; what matters is that the
+                // same bytes reach the coinbase and the submit, which is why
+                // they are stored below rather than formatted twice.
+                for i in (0..w.extranonce2_size).rev() {
+                    e2.push((counter >> (8 * (i % 8))) as u8);
+                }
+
+                let coinbase = header::coinbase(&w.coinb1, &w.extranonce1, &e2, &w.coinb2);
+                let root = header::merkle_root(&coinbase, &w.branch);
+                let h = header::assemble(w.version, &w.prev_wire, &root, w.ntime, w.nbits, 0);
+                let (ntime_be, _) = header::submit_hex(&h);
+                (
+                    h,
+                    Some(UpstreamRef {
+                        job_id: w.job_id.clone(),
+                        extranonce2: e2,
+                        ntime_be,
+                        up_target: w.up_target,
+                    }),
+                )
+            }
+            None => {
+                // A local coin has no chain, so the header is this pool's own:
+                // a version, an id where the previous hash goes, and the clock.
+                // Deliberately *not* a fixed fixture -- an unchanging header
+                // means every job is the same search, and a nonce found once
+                // would be a share forever.
+                let now = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .map(|d| d.as_secs() as u32)
+                    .unwrap_or(0);
+                let mut h = [0u8; 80];
+                h[0..4].copy_from_slice(&1u32.to_le_bytes());
+                h[36..44].copy_from_slice(&id.to_le_bytes());
+                h[68..72].copy_from_slice(&now.to_le_bytes());
+                h[72..76].copy_from_slice(&0x1d00_ffffu32.to_le_bytes());
+                (h, None)
+            }
         };
-        self.issued.push((job.clone(), issued));
+
+        self.issued.push((
+            job.clone(),
+            Issued {
+                slot,
+                coin: label.clone(),
+                algo: algo.clone(),
+                header,
+                target,
+                echo: Vec::new(),
+                up,
+            },
+        ));
         if self.issued.len() > KEEP_JOBS {
             self.issued.remove(0);
         }
@@ -189,6 +311,33 @@ impl Pool {
             echo: Vec::new(),
             clean: true,
         })
+    }
+
+    /// Install what upstream just sent.
+    pub fn set_work(&mut self, slot: usize, w: Work) -> bool {
+        let Some(coin) = self.coins.get_mut(slot) else {
+            return false;
+        };
+        coin.work = Some(w);
+        true
+    }
+
+    /// Whether a coin has upstream work in hand.
+    pub fn has_work(&self, slot: usize) -> bool {
+        self.coins
+            .get(slot)
+            .map(|c| c.work.is_some())
+            .unwrap_or(false)
+    }
+
+    /// Take the shares that beat upstream's target.
+    ///
+    /// Drains, so a caller that fails to send them loses them -- which is
+    /// correct rather than careless: a share is only worth anything on the
+    /// connection whose extranonce1 it was found under, so holding one for a
+    /// reconnection would be keeping something already worthless.
+    pub fn take_forwards(&mut self) -> Vec<Forward> {
+        core::mem::take(&mut self.forwards)
     }
 
     /// Validate a submitted share by computing the hash the miner computed.
@@ -225,6 +374,25 @@ impl Pool {
         if self.seen.len() > KEEP_NONCES {
             self.seen.remove(0);
         }
+
+        // Two targets, and the difference between them is the whole of being a
+        // proxy. Ours decides what a miner is *credited* for and is set low
+        // enough that a laptop reports in regularly; upstream's decides what is
+        // worth *sending*, and most accepted shares do not meet it. One number
+        // for both would either flood upstream with work it rejects or leave a
+        // miner silent for hours.
+        if let Some(up) = &job.up {
+            if below_target(&digest, &up.up_target) {
+                self.forwards.push(Forward {
+                    slot: job.slot,
+                    job_id: up.job_id.clone(),
+                    extranonce2: up.extranonce2.clone(),
+                    ntime_be: up.ntime_be.clone(),
+                    nonce_be: sh.nonce.to_be_bytes().to_vec(),
+                });
+            }
+        }
+
         self.tally(worker, &job.coin).accepted += 1;
         Verdict::Accepted
     }
@@ -366,6 +534,8 @@ mod tests {
             share_target: target_with_leading_zeros(8),
             network_target: None,
             source: Source::Local,
+            work: None,
+            e2: 0,
         }])
     }
 
@@ -425,6 +595,8 @@ mod tests {
                 share_target: target_with_leading_zeros(8),
                 network_target: None,
                 source: Source::Local,
+                work: None,
+                e2: 0,
             },
             Coin {
                 label: String::from("b"),
@@ -432,6 +604,8 @@ mod tests {
                 share_target: target_with_leading_zeros(8),
                 network_target: None,
                 source: Source::Local,
+                work: None,
+                e2: 0,
             },
         ]);
         let ja = p.make_job(0).unwrap();
@@ -497,6 +671,124 @@ mod tests {
         let c = p.ledger_json(1, 1_000);
         let dc = c.lines().find(|l| l.contains("digest")).unwrap();
         assert_ne!(da, dc, "a new share did not move the digest");
+    }
+
+    fn some_work() -> Work {
+        Work {
+            job_id: String::from("job1"),
+            prev_wire: [0x11; 32],
+            coinb1: vec![0x01, 0x00, 0x00, 0x00],
+            coinb2: vec![0xff, 0xff, 0xff, 0xff],
+            branch: vec![[0xaa; 32], [0xbb; 32]],
+            version: 1,
+            ntime: 0x4dd7_f5c7,
+            nbits: 0x1a44_b9f2,
+            extranonce1: vec![0xde, 0xad, 0xbe, 0xef],
+            extranonce2_size: 4,
+            up_target: target_with_leading_zeros(24),
+        }
+    }
+
+    fn upstream_pool() -> Pool {
+        Pool::new(vec![Coin {
+            label: String::from("chain"),
+            algo: Algo::Sha256d,
+            share_target: target_with_leading_zeros(8),
+            network_target: None,
+            source: Source::Upstream {
+                host: String::from("nowhere"),
+                port: 1,
+                user: String::from("w"),
+                pass: String::from("x"),
+            },
+            work: None,
+            e2: 0,
+        }])
+    }
+
+    /// An upstream coin with no work must not invent a header.
+    ///
+    /// The alternative is a miner spending real time on a search that can never
+    /// pay, which from the report looks exactly like a coin that is working.
+    #[test]
+    fn an_upstream_coin_with_no_work_yields_no_job() {
+        let mut p = upstream_pool();
+        assert!(p.make_job(0).is_none());
+        assert!(!p.has_work(0));
+        p.set_work(0, some_work());
+        assert!(p.has_work(0));
+        assert!(p.make_job(0).is_some());
+    }
+
+    /// Two jobs from one `mining.notify` must be two different searches.
+    ///
+    /// The extranonce2 is the only thing separating them, so a counter that
+    /// failed to advance would hand two miners identical work and pay one of
+    /// them for the other's -- with both looking busy while it happened.
+    #[test]
+    fn two_jobs_from_one_notify_use_different_extranonces() {
+        let mut p = upstream_pool();
+        p.set_work(0, some_work());
+        let a = p.make_job(0).unwrap();
+        let b = p.make_job(0).unwrap();
+        assert_ne!(a.header, b.header, "same header means the same search");
+        // And the difference is in the merkle root, since that is the only part
+        // of the header an extranonce reaches. Everything else is upstream's,
+        // so a job differing anywhere else would mean something was invented.
+        assert_eq!(a.header[..36], b.header[..36]);
+        assert_ne!(a.header[36..68], b.header[36..68]);
+        assert_eq!(a.header[68..], b.header[68..]);
+    }
+
+    /// A share is forwarded only when it beats *upstream's* target, not ours.
+    ///
+    /// One number for both would either flood upstream with work it rejects or
+    /// leave a miner silent for hours, which is why there are two.
+    #[test]
+    fn only_shares_beating_the_upstream_target_are_forwarded() {
+        let mut p = upstream_pool();
+        // Ours easy, upstream's hard enough that almost nothing passes it.
+        p.set_work(
+            0,
+            Work {
+                up_target: target_with_leading_zeros(28),
+                ..some_work()
+            },
+        );
+        let job = p.make_job(0).unwrap();
+        let mut h = Hasher::new(&job.algo, &job.header).unwrap();
+
+        let mut accepted = 0;
+        for n in 0..200_000u32 {
+            if below_target(&h.hash(&job.header, n), &job.target)
+                && p.submit(
+                    "w",
+                    &proto::Share {
+                        job: job.job.clone(),
+                        nonce: n,
+                        echo: vec![],
+                    },
+                ) == Verdict::Accepted
+            {
+                accepted += 1;
+            }
+        }
+        assert!(accepted > 0, "no share met even the easy target");
+        let fwd = p.take_forwards();
+        assert!(
+            fwd.len() < accepted,
+            "every accepted share was forwarded, so the two targets are not distinct"
+        );
+        // Whatever was forwarded carries exactly what a `mining.submit` needs.
+        for f in &fwd {
+            assert_eq!(f.job_id, "job1");
+            assert_eq!(f.extranonce2.len(), 4);
+            assert_eq!(f.ntime_be.len(), 4);
+            assert_eq!(f.nonce_be.len(), 4);
+        }
+        // Draining is draining: a share is only worth anything on the
+        // connection whose extranonce1 it was found under.
+        assert!(p.take_forwards().is_empty());
     }
 
     /// Two jobs must not be the same search. A fixed header would make every

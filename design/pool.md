@@ -1,9 +1,11 @@
 # The pool, and the one protocol it speaks downstream
 
-Status: **the kernel mines three coins on three algorithms against this pool
-over one connection, and every share is recomputed and accepted.** What has
-not happened is a real chain behind any of it: the pool builds its own headers,
-so a share that beat a network target would still be worth nothing.
+Status: **there is a chain behind it now.** The pool speaks Stratum V1 to a
+real upstream, builds headers from its `mining.notify`, serves them to the
+kernel over the glados protocol, and sends back the shares good enough to
+matter. Driven end to end against a controlled server that verified every
+forwarded share independently. What has not happened is any of it meeting a
+pool on the actual internet.
 
 `design/mining.md` is the other half and should be read first: it covers what
 the kernel does with the work this pool hands it.
@@ -401,14 +403,84 @@ zero-byte coinbase: three lines that read as three things being broken. It
 names the absence now, which is `src/linux/proc.rs`'s rule -- a field this
 machine does not know means the answer does not exist.
 
-## What does not
+## The upstream, which closes the loop
 
-- **The upstream.** Every coin's `Source` is `Local`, which means the pool
-  builds the header itself and there is no chain behind it: a share that beat a
-  network target would still be worth nothing. `Source::Upstream` is in the
-  enum with no code behind it, so the report says "local" rather than implying
-  otherwise. Filling it in is `stratum.rs` -- already shared -- driven by a
-  host socket.
+`pool/src/upstream.rs`, one thread per coin that has one. A coin spec grows an
+optional suffix and that is the whole of the configuration:
+
+```
+bitzeny:yespower-10-2048-8:16@stratum.example.com:3333,waLLet.rig1,x
+```
+
+`@` rather than another `:`, because a `host:port` already contains one and a
+positional parser would have to count colons from the right -- which breaks the
+first time somebody omits the port.
+
+**It is not a port of the kernel's client. It is the kernel's client.**
+`mine::stratum` is included by `#[path]` like everything else, so the bytes
+this puts on the wire and the bytes the kernel would put there are built by one
+function each. `design/mining.md` predicted the move and it turned out not to
+be a move at all.
+
+### Two targets, and the difference is the whole of being a proxy
+
+Ours decides what a miner is **credited** for and is set low enough that a
+laptop reports in every few seconds. Upstream's decides what is worth
+**sending**, and most accepted shares do not meet it. One number for both would
+either flood upstream with work it rejects or leave a miner silent for hours.
+So `Coin` carries a share target from the config and `Work` carries upstream's
+from `set_difficulty`, and `submit` queues a forward only when a share beats
+both.
+
+`set_difficulty` goes through `stratum::decimal` and never `as_i64`, which is
+the trap that module exists to document: altcoin pools routinely send a
+fractional difficulty, `as_i64` reads `0.001` as `0`, and a target built from
+zero accepts everything. The end-to-end run below deliberately used 0.0005 for
+that reason.
+
+### Measured, the whole chain
+
+Kernel in QEMU, pool on the host, `tools/stratumstub.py` upstream with a
+three-level merkle branch and a fractional difficulty:
+
+```
+[up chain] subscribed and authorized, extranonce1 4 bytes, extranonce2 4
+[up chain] job job1, 3 merkle level(s), target 000007cf..
+
+  slot  label   slices  source   rate          algorithm
+  0     chain   2       pool     652033 H/s    sha256d
+        1031 share(s) found
+
+[up chain] forwarding a share for job job1      x5
+[up chain] submit accepted                      x5
+```
+
+1,031 shares credited at our 14-bit target, of which 5 beat upstream's and were
+sent. **The stub verified all five and refused none** -- and that is the result
+rather than the share count.
+
+### The stub became an oracle, which is where the value is
+
+`--verify` rebuilds each submitted header *in Python* from what it sent plus
+what came back: coinbase from `coinb1 || extranonce1 || extranonce2 || coinb2`,
+the merkle fold over its own branch, the prevhash word swap, ntime and nonce
+reversed out of their big-endian submit form. Then it hashes and checks its own
+difficulty. It shares no code with the Rust.
+
+That is the `tokenizer.py --verify` bargain applied to a wire protocol, and it
+covers a stretch nothing else did. **`--branch` matters most.** The stub sent an
+empty merkle branch before this, so the fold loop had never executed against
+real data outside a one-element synthetic case -- `mine::probe` exists in the
+kernel precisely because that gap was known and could not be closed without a
+live pool. Three levels closes it here, repeatably, offline.
+
+Also newly exercised end to end: extranonce2 generation and its round-trip
+through a submit, and the fractional-difficulty path.
+
+## What does not
+- **A real pool.** Everything above ran against a stub on loopback. No upstream
+  on the internet has been asked for work, which needs an account and an
+  address rather than any more code.
 - Accounting beyond a per-worker tally: no VarDiff, no PPLNS, no persistence.
   `--ledger` writes the log every minute but nothing reads it back at start, so
   a restart begins from zero.

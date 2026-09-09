@@ -19,6 +19,7 @@ Under QEMU the guest reaches the host at 10.0.2.2, so:
 """
 
 import argparse
+import hashlib
 import json
 import socket
 import sys
@@ -108,17 +109,44 @@ def serve_one(conn, args):
                 # client does not discard notifications while awaiting an id.
                 send(conn, {"id": None, "method": "mining.set_difficulty",
                             "params": [args.difficulty]})
-                params = ["job1", PREV, COINB1, COINB2, [],
+                params = ["job1", PREV, COINB1, COINB2, branch_hex(args),
                           VERSION, NBITS, NTIME, True]
                 if args.short_notify:
                     params = params[:8]
                 send(conn, {"id": None, "method": "mining.notify", "params": params})
 
             elif method == "mining.submit":
-                # Accept nothing. This stub is for the connection path; a share
-                # it accepted would be a share nobody checked.
-                send(conn, {"id": mid, "result": None,
-                            "error": [21, "Job not found", None]})
+                if not args.verify:
+                    # Accept nothing. In this mode the stub is only for the
+                    # connection path, and a share it accepted would be a share
+                    # nobody checked.
+                    send(conn, {"id": mid, "result": None,
+                                "error": [21, "Job not found", None]})
+                    continue
+
+                # Verify it, which is a different thing from accepting it and is
+                # the whole reason this mode exists.
+                #
+                # The stub sent coinb1, coinb2, the branch and the extranonce1;
+                # the client sends back extranonce2, ntime and the nonce. That
+                # is everything, so the header can be rebuilt here from an
+                # implementation that shares no code with the one under test --
+                # this is Python and hashlib against Rust. A pool that assembles
+                # a header wrongly produces shares that are perfectly valid
+                # arithmetic about a block that does not exist, and nothing but
+                # a second implementation catches it.
+                try:
+                    _w, jid, e2h, ntimeh, nonceh = msg["params"][:5]
+                    ok, why = verify_share(jid, e2h, ntimeh, nonceh, args)
+                except Exception as exc:               # noqa: BLE001
+                    ok, why = False, "malformed submit: %s" % exc
+                if ok:
+                    print("  share verified: %s" % why, flush=True)
+                    send(conn, {"id": mid, "result": True, "error": None})
+                else:
+                    print("  share REFUSED: %s" % why, flush=True)
+                    send(conn, {"id": mid, "result": None,
+                                "error": [23, why, None]})
 
             elif method is not None:
                 send(conn, {"id": mid, "result": None,
@@ -127,6 +155,86 @@ def serve_one(conn, args):
         if subscribed and args.hangup_after_subscribe:
             print("  (hanging up on purpose)", flush=True)
             return
+
+
+def swap_words(b):
+    """The prevhash transform: eight words keep their order, each one flips.
+
+    Not a whole-string reversal and not a no-op, which are the two things
+    somebody writes instead. `src/mine/header.rs` has the same table and this
+    is deliberately a separate expression of it.
+    """
+    out = bytearray(32)
+    for w in range(8):
+        for i in range(4):
+            out[w * 4 + i] = b[w * 4 + 3 - i]
+    return bytes(out)
+
+
+def d2(b):
+    return hashlib.sha256(hashlib.sha256(b).digest()).digest()
+
+
+def verify_share(jid, e2h, ntimeh, nonceh, args):
+    """Rebuild the header from what we sent plus what came back, and hash it."""
+    if jid != "job1":
+        return False, "unknown job %r" % jid
+    e2 = bytes.fromhex(e2h)
+    if len(e2) != EXTRANONCE2_SIZE:
+        return False, ("extranonce2 is %d bytes, this pool asked for %d"
+                       % (len(e2), EXTRANONCE2_SIZE))
+
+    coinbase = (bytes.fromhex(COINB1) + bytes.fromhex(EXTRANONCE1)
+                + e2 + bytes.fromhex(COINB2))
+    root = d2(coinbase)
+    for sib in branch_bytes(args):
+        root = d2(root + sib)
+
+    # `mining.submit` sends ntime and nonce big-endian; the header holds them
+    # little-endian. Reversing here rather than reinterpreting is the same rule
+    # `submit_hex` follows in the other direction.
+    header = (bytes.fromhex(VERSION)[::-1]
+              + swap_words(bytes.fromhex(PREV))
+              + root
+              + bytes.fromhex(ntimeh)[::-1]
+              + bytes.fromhex(NBITS)[::-1]
+              + bytes.fromhex(nonceh)[::-1])
+    if len(header) != 80:
+        return False, "rebuilt header is %d bytes" % len(header)
+
+    digest = d2(header)
+    # Displayed reversed, the way a block id is shown everywhere.
+    shown = digest[::-1].hex()
+
+    # The stub's own target, from the difficulty it announced. diff-1 is
+    # 0x00000000FFFF << 208, which is the number every Bitcoin-family pool
+    # divides.
+    diff1 = 0x00000000FFFF0000000000000000000000000000000000000000000000000000
+    target = int(diff1 / float(args.difficulty))
+    value = int.from_bytes(digest[::-1], "big")
+    if value > target:
+        return False, "hash %s does not meet difficulty %s" % (shown[:16], args.difficulty)
+    return True, "%s meets difficulty %s" % (shown[:16], args.difficulty)
+
+
+def branch_bytes(args):
+    """The merkle branch this stub advertises, as bytes.
+
+    Non-empty when asked for, because an empty branch never runs the fold loop
+    at all -- so a client whose fold is wrong passes every test built on the
+    default. `algocheck.py` makes the same point about its eleven-leaf tree.
+    """
+    return [bytes.fromhex(h) for h in branch_hex(args)]
+
+
+def branch_hex(args):
+    if args.branch <= 0:
+        return []
+    # Derived rather than random, so two runs of the stub agree and a failure is
+    # reproducible. Nothing about these has to be a real transaction: a merkle
+    # branch is 32-byte siblings and the fold does not care where they came from.
+    return [hashlib.sha256(b"glados stub branch %d" % i).hexdigest()
+            for i in range(args.branch)]
 
 
 def main():
@@ -138,6 +246,12 @@ def main():
     ap.add_argument("--short-notify", action="store_true")
     ap.add_argument("--hangup-after-subscribe", action="store_true")
     ap.add_argument("--forever", action="store_true")
+    ap.add_argument("--branch", type=int, default=0,
+                    help="emit a merkle branch this many levels deep; an empty "
+                         "one never runs the fold loop at all")
+    ap.add_argument("--verify", action="store_true",
+                    help="rebuild each submitted header here and check its hash, "
+                         "so accepting a share means something")
     args = ap.parse_args()
 
     # The difficulty must reach the wire as a number and not a string, or the
