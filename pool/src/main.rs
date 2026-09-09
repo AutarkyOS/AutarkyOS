@@ -1,7 +1,7 @@
 //! `glados-pool`, the thing GLaDOS mines against.
 //!
 //! ```text
-//! glados-pool [--listen ADDR] [COIN ...]
+//! glados-pool [--listen ADDR] [--ledger PATH] [COIN ...]
 //! glados-pool --selftest
 //! ```
 //!
@@ -89,6 +89,7 @@ fn main() {
     }
 
     let mut listen = String::from("0.0.0.0:3334");
+    let mut ledger: Option<String> = None;
     let mut coins: Vec<Coin> = Vec::new();
     let mut it = args.iter();
     while let Some(a) = it.next() {
@@ -100,9 +101,18 @@ fn main() {
                     std::process::exit(2);
                 }
             },
+            "--ledger" => match it.next() {
+                Some(v) => ledger = Some(v.clone()),
+                None => {
+                    eprintln!("--ledger wants a path");
+                    std::process::exit(2);
+                }
+            },
             "-h" | "--help" => {
-                println!("glados-pool [--listen ADDR] [label:algo:bits ...]");
+                println!("glados-pool [--listen ADDR] [--ledger PATH] [label:algo:bits ...]");
                 println!("            --selftest");
+                println!();
+                println!("--ledger writes the share log as canonical JSON, for publishing.");
                 return;
             }
             other => match parse_coin(other) {
@@ -123,16 +133,40 @@ fn main() {
 
     let pool = Arc::new(Mutex::new(Pool::new(coins)));
     let reporter = Arc::clone(&pool);
-    // The share log is the whole product of a non-custodial pool, so it is
-    // printed rather than merely kept. Publishing it properly is Part B4 and
-    // this is the placeholder that makes the absence visible.
+    // The share log is the whole product of a non-custodial pool: Layer 1
+    // never holds a miner's coins, so there is no wallet to audit and this
+    // record plus whatever checks against it is all a miner has. It goes to
+    // stdout always, and to a file when asked.
+    //
+    // **A file rather than an endpoint, deliberately.** The intended home is a
+    // static site whose history is a commit chain, and a commit chain cannot
+    // be quietly rewritten where a live endpoint can. For a pool whose only
+    // asset is being checkable, tamper-evidence beats freshness.
     std::thread::spawn(move || loop {
         std::thread::sleep(std::time::Duration::from_secs(60));
-        for (w, c, t) in reporter.lock().unwrap().ledger() {
+        let p = reporter.lock().unwrap();
+        for (w, c, t) in p.ledger() {
             println!(
                 "[ledger] {w}  {c}  {} accepted, {} stale, {} bad, {} dup",
                 t.accepted, t.stale, t.bad, t.duplicate
             );
+        }
+        if let Some(path) = &ledger {
+            let at = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+            let doc = p.ledger_json(1, at);
+            // Written through a temporary and renamed, because a publisher may
+            // be reading this file at any moment and half a document is worse
+            // than a stale one -- it parses as far as the truncation and then
+            // does not.
+            let tmp = format!("{path}.new");
+            let wrote = std::fs::write(&tmp, doc.as_bytes())
+                .and_then(|_| std::fs::rename(&tmp, path));
+            if let Err(e) = wrote {
+                eprintln!("[pool] could not write {path}: {e}");
+            }
         }
     });
 

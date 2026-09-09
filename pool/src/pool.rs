@@ -251,6 +251,89 @@ impl Pool {
     pub fn slots(&self) -> u32 {
         self.coins.len() as u32
     }
+
+    /// The share log as a publishable document.
+    ///
+    /// This is the whole product of a non-custodial pool. Layer 1 never holds
+    /// a miner's coins, so there is nothing to audit by looking at a wallet;
+    /// what a miner has instead is this record and whatever can be checked
+    /// against it. `design/pool.md` says that out loud and it constrains the
+    /// format rather than only the paperwork.
+    ///
+    /// **Canonical, so the digest means something.** Rows are sorted and every
+    /// field is written in one fixed order, so two runs over the same history
+    /// produce identical bytes -- a document whose hash depended on a
+    /// `HashMap`'s iteration order would have a different digest every time it
+    /// was regenerated, which is indistinguishable from a record that changed.
+    ///
+    /// The digest is over the rows and not over the whole file, because
+    /// `generated_at` moves on every write and would otherwise make an
+    /// unchanged log look edited.
+    ///
+    /// **This is not a Merkle root and does not claim to be.** A distributor
+    /// needs a tree whose leaves are per-address payouts and whose proofs a
+    /// contract can verify; this is a flat digest over a tally. It exists so
+    /// the published record is fixed to a value now, and so the day the tree
+    /// is built there is something to check it against.
+    pub fn ledger_json(&self, epoch: u64, generated_at: u64) -> String {
+        let rows = self.ledger();
+
+        let mut canon = String::new();
+        for (w, c, t) in &rows {
+            // Tab-separated and newline-terminated rather than JSON, because
+            // the digest must not depend on how a JSON writer spaces or
+            // escapes. Two encoders that agree about a document can still
+            // disagree about its bytes.
+            canon.push_str(&format!(
+                "{w}	{c}	{}	{}	{}	{}
+",
+                t.accepted, t.stale, t.bad, t.duplicate
+            ));
+        }
+        let digest = crate::store::sha256::hash(canon.as_bytes());
+
+        let mut s = String::from("{
+");
+        s.push_str(&format!("  \"epoch\": {epoch},
+"));
+        s.push_str(&format!("  \"generated_at\": {generated_at},
+"));
+        s.push_str(&format!(
+            "  \"digest\": \"{}\",
+",
+            crate::mine::stratum::hex(&digest)
+        ));
+        s.push_str("  \"coins\": [
+");
+        for (i, c) in self.coins.iter().enumerate() {
+            s.push_str(&format!(
+                "    {{\"slot\": {i}, \"label\": \"{}\", \"algo\": \"{}\", \"source\": \"{}\"}}{}
+",
+                c.label,
+                c.algo.detail(),
+                c.source.name(),
+                if i + 1 == self.coins.len() { "" } else { "," }
+            ));
+        }
+        s.push_str("  ],
+  \"shares\": [
+");
+        for (i, (w, c, t)) in rows.iter().enumerate() {
+            s.push_str(&format!(
+                "    {{\"worker\": \"{w}\", \"coin\": \"{c}\", \"accepted\": {}, \"stale\": {}, \"bad\": {}, \"duplicate\": {}}}{}
+",
+                t.accepted,
+                t.stale,
+                t.bad,
+                t.duplicate,
+                if i + 1 == rows.len() { "" } else { "," }
+            ));
+        }
+        s.push_str("  ]
+}
+");
+        s
+    }
 }
 
 /// A target easy enough that a laptop finds shares in seconds.
@@ -378,6 +461,42 @@ mod tests {
         // Zero leading bits is every digest, which is what a pool with the
         // difficulty turned all the way down should mean rather than an error.
         assert_eq!(target_with_leading_zeros(0).to_be_bytes()[0], 0xff);
+    }
+
+    /// The digest is a function of the record and of nothing else.
+    ///
+    /// The property that makes a published log worth publishing: regenerating
+    /// it must not change it. A digest that moved with the clock, or with a
+    /// map's iteration order, would make every routine republish look like an
+    /// edit -- and a record nobody can tell has changed is not evidence.
+    #[test]
+    fn the_ledger_digest_depends_on_the_record_and_not_the_run() {
+        let mut p = a_pool();
+        let job = p.make_job(0).unwrap();
+        let mut h = Hasher::new(&job.algo, &job.header).unwrap();
+        let n = (0..200_000u32)
+            .find(|n| below_target(&h.hash(&job.header, *n), &job.target))
+            .expect("no share found");
+        p.submit("w1", &proto::Share { job: job.job, nonce: n, echo: vec![] });
+
+        let a = p.ledger_json(1, 1_000);
+        let b = p.ledger_json(1, 9_999);
+        let da = a.lines().find(|l| l.contains("digest")).unwrap();
+        let db = b.lines().find(|l| l.contains("digest")).unwrap();
+        assert_eq!(da, db, "the clock moved the digest");
+        assert_ne!(a, b, "generated_at should still be recorded");
+
+        // And a record that genuinely changed must change it, or the digest is
+        // decoration rather than evidence.
+        let job2 = p.make_job(0).unwrap();
+        let mut h2 = Hasher::new(&job2.algo, &job2.header).unwrap();
+        let n2 = (0..200_000u32)
+            .find(|n| below_target(&h2.hash(&job2.header, *n), &job2.target))
+            .expect("no second share found");
+        p.submit("w2", &proto::Share { job: job2.job, nonce: n2, echo: vec![] });
+        let c = p.ledger_json(1, 1_000);
+        let dc = c.lines().find(|l| l.contains("digest")).unwrap();
+        assert_ne!(da, dc, "a new share did not move the digest");
     }
 
     /// Two jobs must not be the same search. A fixed header would make every

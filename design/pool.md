@@ -179,6 +179,79 @@ as covering host binaries too. Measured, this session: a plain host binary
 compiles, links and runs. Whatever was missing has been installed since. The
 proc-macro and `-Zbuild-std` findings were not re-tested and are left standing.
 
+## Where this runs, and the one thing GitHub Pages cannot do
+
+The intended home is `pool.aperture.institute`, on a domain this project owns,
+and the intended host was GitHub Pages. **Pages cannot run the daemon**, and
+the reason is not a setting: it serves static files over 80 and 443 from a CDN,
+with no long-lived process and no listener on a port of its own. The pool is a
+TCP server that holds connections open for hours and speaks line-delimited JSON
+on :3334. Nothing about that is static.
+
+What Pages *is* right for is the half that matters most, which is the published
+record. So the two halves get two names, because one hostname resolves to one
+place and it can be GitHub's CDN or a server, never both:
+
+| | where | what |
+|---|---|---|
+| `pool.aperture.institute` | its own repo, GitHub Pages | the published share log, the docs, how to point a miner |
+| `stratum.aperture.institute:3334` | a host that runs a binary | the daemon |
+
+**A second repository is genuinely required for the site**, and not as tidiness:
+one repository serves one Pages site with one `CNAME`, and this one's is
+already `glados.aperture.institute` in `docs/CNAME`.
+
+**The daemon's source stays in this repository**, though, and that is the whole
+argument of this file. `pool/` works by including twelve of the kernel's own
+files with `#[path]`; move it out and that becomes a submodule or a vendored
+copy, and a vendored copy is precisely the drift the arrangement exists to
+prevent. The site repository holds published data and HTML and needs none of
+the Rust.
+
+### The record goes as files, not as an endpoint
+
+`--ledger PATH` writes the share log as canonical JSON. A static site whose
+history is a commit chain is **tamper-evident by construction**: a live JSON
+endpoint can be quietly rewritten and a commit chain cannot, without it showing.
+For a pool whose only asset is being checkable, that beats freshness. It is the
+same trade `site.yml` already makes for the download tables, and the same reason
+`godel`'s ledger is a file rather than a query.
+
+Three details in the format, each with a worse alternative:
+
+- **The digest covers the rows and not the file.** `generated_at` moves on
+  every write, so hashing the whole document would make an unchanged log look
+  edited at every republish -- and a record nobody can tell has changed is not
+  evidence.
+- **The rows are canonicalised to tab-separated text before hashing**, not to
+  JSON. Two JSON writers can agree about a document and disagree about its
+  bytes, over spacing or escaping, and the digest would then depend on which
+  one ran.
+- **The write goes through a temporary and a rename.** A publisher may be
+  reading at any moment, and half a document is worse than a stale one: it
+  parses up to the truncation and then does not.
+
+Checked both ways -- a claim that the digest does not move when only the clock
+does, and does move when a share arrives -- and cross-checked against Python's
+`hashlib` on a real file: an empty log digests to `e3b0c442...`, which is
+sha256 of nothing, computed here by the kernel's own sha256.
+
+**It is not a Merkle root and does not claim to be.** A distributor needs a
+tree whose leaves are per-address payouts and whose proofs a contract can
+verify. This is a flat digest over a tally: it fixes the published record to a
+value now, and gives the tree something to be checked against when it is built.
+
+### What is not secured yet
+
+The protocol is **plaintext**, and over the public internet that is a real
+exposure rather than a theoretical one: worker names travel in the clear, and
+anything between the miner and the pool can rewrite a job. The kernel has one
+TLS session and the updater owns it -- `mine pool` refuses `stratum+tls://` by
+name for that reason -- so a TLS miner needs `tls.rs` to stop being welded to
+the single-connection API. Until then a miner on an untrusted network is
+trusting the network, and that has to be said before anybody points a machine
+at this rather than after.
+
 ## Non-custodial, which is a structure and not a promise
 
 `design/mining.md` and the plan behind it settle this and it is repeated here
@@ -277,7 +350,10 @@ machine does not know means the answer does not exist.
   otherwise. Filling it in is `stratum.rs` -- already shared -- driven by a
   host socket.
 - Accounting beyond a per-worker tally: no VarDiff, no PPLNS, no persistence.
-  The ledger prints to stdout every minute and is lost on restart.
+  `--ledger` writes the log every minute but nothing reads it back at start, so
+  a restart begins from zero.
+- TLS, and therefore any safety on an untrusted network. See above.
+- The site repository, the DNS record, and the host. None of them exist yet.
 - Worker identity, which is `supabase/functions/link` already and needs joining
   up rather than writing.
 - Publishing any of it, which is the whole of B4 and the only thing standing in
