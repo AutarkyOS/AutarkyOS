@@ -38,3 +38,7 @@ supabase/.temp/
 # The miner and the compute pool it runs on live on exp/xpu. Checking that
 # branch out and building it must not leave this one's status dirty.
 cuda/
+
+# The pool is its own workspace, so its build directory is its own too.
+# `/target` above is anchored at the repository root and does not reach it.
+pool/target

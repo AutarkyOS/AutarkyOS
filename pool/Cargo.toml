@@ -1,0 +1,39 @@
+[package]
+name = "glados-pool"
+version = "0.1.0"
+edition = "2021"
+description = "The multi-coin mining pool GLaDOS talks to"
+
+# Its own workspace root, deliberately. The kernel's Cargo.toml declares no
+# `[workspace]`, so it is a single-package workspace rooted at the repository
+# top -- and a nested package inside one is an error rather than a member.
+# Declaring an empty workspace here severs that without editing the kernel's
+# manifest at all, which is the file least worth disturbing.
+[workspace]
+
+# No dependencies, for the reason the kernel's manifest gives at greater
+# length: writing it here is the point. The pool is a TCP listener, a TCP
+# client and a JSON codec, and the standard library has sockets and threads.
+# The share validation is not written here at all -- it is the kernel's own
+# source, included. See `src/kernel.rs`.
+[dependencies]
+
+[lib]
+name = "glados_pool"
+path = "src/lib.rs"
+
+[[bin]]
+name = "glados-pool"
+path = "src/main.rs"
+
+[profile.release]
+opt-level = 3
+lto = true
+
+# Tests are optimised, and that is not a preference. `yespower.rs` is the
+# *reference* implementation, transliterated from upstream and deliberately
+# unoptimised so the vectors have something plain to check; at opt-level 0 a
+# single N=4096 r=32 hash is seconds, so the thirteen upstream vectors would
+# turn `cargo test` into something nobody runs.
+[profile.test]
+opt-level = 2
