@@ -72,7 +72,24 @@ systemctl status glados-pool
 Edit the `ExecStart` line first: the coins and their share targets are the only
 thing in the unit that is a decision rather than a measurement.
 
-### Without root
+### Without root, which is the expected case here
+
+The daemon needs no privilege: a port above 1024, one directory to write, and
+nothing else read that it did not create. What is lost is *enforcement* of the
+resource limits, not function.
+
+**Everything turns on one command.** Try it first, because it decides which of
+the two paths below applies:
+
+```bash
+loginctl enable-linger "$USER" && echo "lingering: yes" || echo "lingering: no"
+```
+
+Lingering is what keeps a user service running after you log out. It is
+governed by polkit and some systems grant it to a user for themselves while
+others want an administrator, so the only way to know is to ask.
+
+#### If lingering worked
 
 ```bash
 mkdir -p ~/.local/bin ~/.config/systemd/user
@@ -80,13 +97,76 @@ install -m 0755 glados-pool ~/.local/bin/glados-pool
 install -m 0644 glados-pool.user.service ~/.config/systemd/user/glados-pool.service
 systemctl --user daemon-reload
 systemctl --user enable --now glados-pool
-loginctl enable-linger "$USER"    # or it stops when you log out
 systemctl --user status glados-pool
 ```
 
-The daemon needs no privilege: a port above 1024, one directory to write, and
-nothing else. What is lost is *enforcement* of the limits, not function -- see
-the header of `glados-pool.user.service`, and check `cgroup.controllers` above.
+If the unit refuses to start, read the reason before changing anything: a user
+manager *fails* a unit on a directive it cannot apply rather than skipping it,
+so the fix is to delete the offending line, and the message names it.
+
+#### If lingering did not
+
+`run-pool.sh` is the fallback: a restart loop with a capped log and a pidfile,
+started from `cron`, with no systemd involved at all.
+
+```bash
+mkdir -p ~/.local/bin ~/.local/state/glados-pool
+install -m 0755 glados-pool ~/.local/bin/
+install -m 0755 run-pool.sh ~/.local/bin/
+( crontab -l 2>/dev/null; echo "@reboot /bin/sh \$HOME/.local/bin/run-pool.sh" ) | crontab -
+nohup ~/.local/bin/run-pool.sh >/dev/null 2>&1 &
+tail -f ~/.local/state/glados-pool/pool.log
+```
+
+Edit the coins at the top of the script first -- that is the only line in it
+which is a decision rather than plumbing.
+
+Stopping it, and checking on it:
+
+```bash
+kill "$(cat ~/.local/state/glados-pool/run-pool.pid)"   # stops cleanly
+tail -n 40 ~/.local/state/glados-pool/pool.log
+cat ~/.local/state/glados-pool/ledger.json
+```
+
+A plain `kill` is enough and that is worth stating, because it was not true of
+the first version of the script: a trap handler that does not call `exit`
+returns to what it was doing, so it removed its pidfile and carried on. Found
+by sending it a signal rather than by reading it.
+
+It is worse than the systemd path in ways worth knowing rather than
+discovering: no resource limits at all, `@reboot` needs `cron` to be running
+and the user to be allowed a crontab, and the log is capped by the script
+itself at 4 MB because nothing else is going to rotate it.
+
+#### Either way, the limits are probably not enforced
+
+A user manager applies `MemoryMax` and `CPUQuota` only where the controllers
+are delegated to it, and `cpu` frequently is not:
+
+```bash
+cat /sys/fs/cgroup/user.slice/user-$(id -u).slice/cgroup.controllers
+```
+
+If `memory` and `cpu` are missing, those lines in the unit are documentation.
+The daemon still only uses what it uses -- 3.49 MB resident plus at most one
+8,296 KiB working set, measured -- but nothing is holding it there, so watch it
+for a day before trusting it unattended. With the cron fallback there are no
+limits at all.
+
+#### The two things that may still need him
+
+**A firewall rule**, if one is running. Most server installs have none active
+by default, so try connecting from another machine before asking:
+
+```bash
+ss -ltn | grep 3334        # on the server: is it listening
+# from another machine on the same network:
+timeout 5 nc -z <server-ip> 3334 && echo open || echo blocked
+```
+
+**Nothing else.** No port forward and no DNS while this stays on a private
+network, which is what the home-server section above argues for.
 
 ## Check it before opening any port
 

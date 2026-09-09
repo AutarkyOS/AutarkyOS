@@ -57,7 +57,14 @@ TasksMax=512
 # copied list is a service that will not start. These are the ones that work
 # unprivileged.
 NoNewPrivileges=true
-PrivateTmp=true
+# **`PrivateTmp` is deliberately absent**, and it was here first, which is the
+# reason it is worth a note rather than a silent omission. In a user manager it
+# needs unprivileged user namespaces, and on the distributions that disable
+# those it does not degrade -- the unit fails to start. That is exactly the
+# trap this file's own header warns about, walked into by the file itself.
+#
+# It also buys nothing here. The daemon writes `StateDirectory` and reads
+# nothing it did not create; it never opens `/tmp` at all.
 RestrictRealtime=true
 RestrictSUIDSGID=true
 LockPersonality=true
