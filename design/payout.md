@@ -64,11 +64,16 @@ that drove most of the earlier analysis here.
 is an Across origin into 4663, so unMineable's POL and Kryptex's USDC are the
 two that reach the destination in one hop. BSC is not an Across origin into 4663.
 
-**Tokenized stock is not on this list and `rwa.md` says why.** The chain the
-token lives on was built for real-world assets, so paying in NVDA or SPY is a
-fair question and the answer is measured rather than argued: the tokens are
-permissionlessly transferable, and the deepest pair on the chain holds about ten
-dollars. It fails on availability, not on mechanism.
+**Tokenized stock is not on this list and `rwa.md` now argues it should be
+considered.** That file spent two rounds concluding the opposite on liquidity
+that was not there, and both times it had measured Uniswap v2, which carries
+about 0.04% of the tokenized-stock market on 4663. On v3 the same six tokens
+hold **$8.4M** of quote-side depth, so a settlement of a few hundred dollars is
+a few basis points and the acquisition problem does not exist. What is left is
+counterparty risk of an unusual kind -- one beacon can pause, blocklist and
+`adminBurn` all 194 tokens, and they cannot leave the chain -- which is a
+judgement rather than a blocker, and the same judgement this table already makes
+about unMineable.
 
 **Counterparty risk is a first-order term here and was not treated as one.** At
 $0.07 a day the balance sits on somebody else's books for weeks before it is
