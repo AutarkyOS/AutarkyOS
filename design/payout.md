@@ -1,5 +1,101 @@
 # The GLADOS payout loop, sized
 
+## Read this first: three corrections, all found by being told it felt too expensive
+
+**1. The granularity is the cost, not the route.** This is the large one and it
+was never examined. At an 800-miner 36-hour event the pot is $84 and a share is
+$0.105, and *every* way of paying that on chain costs more than the pot:
+
+    Market: the miner claims and swaps       $455.96    543% of the pot
+    Direct: the miner claims a transfer      $195.41    233%
+    Push:   the operator sends, one by one   $108.56    129%
+    Push:   batched, ~25k gas per recipient   $54.28     65%
+
+No amount of bridge-shopping touches that. A claim pays for its own gas only
+when a share clears it:
+
+    36 hours   each $0.1050   market gas 543%   direct gas 233%
+    weekly     each $0.4900   market gas 116%   direct gas  50%
+    monthly    each $2.1000   market gas  27%   direct gas  12%
+    quarterly  each $6.3000   market gas   9%   direct gas   4%
+
+**So the event may run for 36 hours and the paying must accumulate and settle
+quarterly.** Two cadences, only the second constrained. Visible buying comes
+from the operator converting in tranches on whatever schedule it likes;
+distribution comes from claims, which have to be rare to be worth making.
+
+**2. Ethereum L1 was never required, and is not the dominant cost either.**
+Sixteen chains are Across origins into 4663 -- Base, Arbitrum, Optimism, Linea,
+Polygon, zkSync among them. And a *measured* Across deposit on L1 is **$0.027**
+across 37 real transactions at a 0.10 gwei base fee, against $0.0022 from Base.
+The dominant costs are two flat fees, not gas: THORChain's ~$0.25 outbound and
+Across's ~$0.20 destination fill.
+
+**3. THORChain was never down; this network could not see it.** Recorded
+because the mistake is instructive. Every `thornode.*` subdomain under
+`ninerealms.com` returns NODATA -- the records are withdrawn, confirmed against
+an off-network resolver -- so four endpoint failures read as a dead protocol.
+It is running v3.20.1 with 87 active nodes and no halt flags, reachable at
+`thorchain.ibs.team/api`. An unreachable endpoint is not evidence about a
+protocol, and this document said it was.
+
+## The two routes, both now priced
+
+Neither touches Ethereum mainnet.
+
+**A. Fastest, and the operator is not trustworthy.** unMineable pays **POL
+directly to a `0x` address on Polygon PoS**, minimum **3 POL, about $0.28**,
+"sent automatically once a day with no network fees" -- read from
+`unmineable.com/coins/POL`. Then one cheap Polygon swap and Across from Polygon.
+
+    mine -> POL on Polygon (4 days) -> swap -> Across 137->4663 -> WETH
+
+**B. Slower, better-run counterparties.** zpool to LTC, then THORChain to ETH
+**on Base**, then Across from Base.
+
+    mine -> LTC (37 days) -> THORChain -> BASE.ETH -> Across 8453->4663 -> WETH
+
+Measured for route B, at 18:07 UTC:
+
+    $10   THORChain $0.2750 (2.750%) + Across $0.09-0.28   = $0.48   4.80%
+    $100  THORChain $0.4523 (0.452%) + Across $0.10-0.45   = $0.65   0.65%
+    $500  THORChain $1.2492 (0.250%) + Across $0.17-0.47   = $1.45   0.29%
+
+**Batching dominates everything else here**: five $100 trips cost $3.27 against
+$1.45 for one $500 trip. The cost is nearly all flat fees, so the only lever
+that matters is trip size.
+
+Against route A at $100 the totals are close -- roughly 1.5% against 1.65% --
+so **A buys nine times faster settlement and one fewer hop, and B buys
+counterparties worth trusting.** They are independent and cost nothing to run
+side by side, which is also the only way to learn what unMineable's real take
+is.
+
+### unMineable is the cheap route and is not a trusted one
+
+Its terms reserve fees "up to 10%" and say payouts "may be subject to fees,
+including network fees", contradicting the "no network fees" on every coin page.
+Trustpilot is 55% one-star. A balance with no reward activity for six months is
+forfeited. **The mitigation is the same fact that makes it attractive**: a $0.28
+threshold paid daily means exposure at any moment is about one day of earnings.
+Tolerable here, and not at scale.
+
+Kryptex is the trustworthy alternative -- **USDC on Polygon**, 1.5 USDC minimum,
+flat 0.5 USDC fee, so 33% at the minimum and 5% if allowed to reach 10.
+
+### Two things to check before trusting any of this with money
+
+**Nobody has observed a completed Across fill on 4663.** The SpokePool bytecode
+is deployed and the API prices routes into it, but a priced route is not a
+delivered one. Do one $10 trip before believing the table.
+
+**The Across fee moved 5x in nine minutes** -- $0.09 to $0.47, same route, same
+size, 97% of it destination fill gas -- and it is flat in dollars regardless of
+transfer size. Quote it live per trip rather than reading a number from here.
+
+---
+
+
 > **Superseded in its premise, kept for its arithmetic.** This document was
 > written against the design where GLADOS came out of the *operator's fee* and
 > arrived as a bonus on top of a coin payout. The decision since taken is
@@ -210,12 +306,13 @@ can be paid from mining a different algorithm rather than requiring you to mine
 that coin. That was worth checking: 158 of the 219 have conversion disabled and
 would have looked available while refusing the one thing needed.
 
-**What is not measured here** is the swap from the payout coin to ETH, because
-no THORChain endpoint was reachable from this network -- three have no A record
-and one is behind a bot challenge. The reasoning that it also favours LTC is
-that THORChain's outbound fee is derived from the source chain's own fee, so
-BTC's congestion would carry through; but that is reasoning, not a measurement,
-and it is the largest single cost in the chain. Nor is the per-coin minimum
+**The swap is measured now** and the earlier reasoning here was wrong twice
+over. It guessed that THORChain's cost would favour LTC because the outbound fee
+derives from the source chain's own fee. Measured, **LTC, DOGE and BTC cost
+within $0.004 of each other on THORChain** -- the real differences are the
+minimum swap ($0.91 / $1.00 / $6.23) and the speed, not the fee. So the payout
+coin should be chosen on threshold and withdrawal fee, which is where LTC
+genuinely wins, and not on what the swap costs. Nor is the per-coin minimum
 payout threshold, which zpool publishes on its site rather than in its API and
 which decides how long until any of this happens at all.
 
