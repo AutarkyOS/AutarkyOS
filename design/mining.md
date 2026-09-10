@@ -586,6 +586,12 @@ Three implementations, one oracle, and the oracle came first.
     cuda/neoscrypt.cu      the RTX 3050, 190 kH/s
     src/mine/neoscrypt.rs  ring 0, 34,144 bytes of working set
 
+All three are checked by the same two blocks, and the ring-0 one is checked in
+ring 0: `diag mine` is **111 claims** now, up from 89, and the Feathercoin
+vectors are among them. The cache budget from the previous section picks the
+new algorithm up for free -- `mine slices` reports `slot 1 wants 33 KiB a
+slice, so 737 fit`, against yespower's 2,146 KiB and eleven.
+
 **Upstream ships no test vectors, so the chain is the vector.** Feathercoin
 forked to NeoScrypt at block 432,000, and a block is only on that chain because
 its digest beat the target its own `nbits` declares -- so reproducing one is a

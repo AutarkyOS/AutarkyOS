@@ -820,6 +820,10 @@ fn stratum_checks() -> Vec<(&'static str, bool)> {
             .unwrap_or(false),
     ));
 
+    // NeoScrypt's own, which are two real Feathercoin blocks and the keyed
+    // BLAKE2s underneath them. Extended here rather than duplicated, because a
+    // second copy of a vector is a second thing to get wrong.
+    out.extend(neoscrypt::checks());
     out.extend(work::checks());
 
     out
