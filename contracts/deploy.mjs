@@ -3,6 +3,7 @@
 //   node deploy.mjs status
 //   node deploy.mjs deploy                       --send
 //   node deploy.mjs open   epoch.json --amount 0.005 --send
+//   node deploy.mjs open   epoch.json --amount 0.005 --v3-pool 0x.. --reward 0x.. --send
 //   node deploy.mjs claim  epoch.json --epoch 0      --send
 //
 // ### Simulation is the default and `--send` is the whole safety model
@@ -138,6 +139,19 @@ async function main() {
       process.exit(2);
     }
 
+    // **Which mode, decided by whether a pool was named.** The two are not
+    // interchangeable and the contract will not let them be: `claimOnMarket`
+    // refuses a V3 epoch and `claimOnV3` refuses a Market one, so opening in
+    // the wrong mode is an epoch nobody can claim from until it expires.
+    const v3pool = flag("v3-pool", "");
+    const reward = flag("reward", "");
+    if ((v3pool === "") !== (reward === "")) {
+      console.error("--v3-pool and --reward go together: the pool says where to swap,");
+      console.error("the reward says what should come out, and the contract checks they agree.");
+      process.exit(2);
+    }
+    const onV3 = v3pool !== "";
+
     const q = new ethers.Contract(QUOTE, ERC20, wallet);
     const have = await q.balanceOf(wallet.address);
     console.log(`epoch root  ${doc.root}`);
@@ -145,6 +159,33 @@ async function main() {
     console.log(`funding     ${ethers.formatEther(amount)} quote (you hold ${ethers.formatEther(have)})`);
     console.log(`gate        ${ethers.formatEther(gate)}`);
     console.log(`deadline    in ${days} day(s)`);
+    if (onV3) {
+      console.log(`venue       Uniswap V3 pool ${v3pool}`);
+      console.log(`reward      ${reward}`);
+      // Read back rather than trusted, and printed, because the contract's own
+      // check happens inside a transaction the operator is about to sign. A
+      // pool for the wrong pair reverts with `BadPool` and costs gas to find
+      // out; reading it here costs one call and prints the pair.
+      try {
+        const pool = new ethers.Contract(v3pool,
+          ["function token0() view returns (address)",
+           "function token1() view returns (address)",
+           "function fee() view returns (uint24)"], provider);
+        const [t0, t1, fee] = await Promise.all([pool.token0(), pool.token1(), pool.fee()]);
+        console.log(`pool pair   ${t0} / ${t1}  fee ${fee}`);
+        const ok = (t0.toLowerCase() === QUOTE.toLowerCase() && t1.toLowerCase() === reward.toLowerCase())
+                || (t1.toLowerCase() === QUOTE.toLowerCase() && t0.toLowerCase() === reward.toLowerCase());
+        if (!ok) {
+          console.error("\nthat pool is not the quote/reward pair. The contract would refuse it.");
+          process.exit(1);
+        }
+      } catch {
+        console.error("\nthat address does not answer token0/token1/fee, so it is not a V3 pool.");
+        process.exit(1);
+      }
+    } else {
+      console.log(`venue       the V2 pair the contract was built with`);
+    }
     if (have < amount) {
       console.error("\nnot enough quote token. Wrap some first:");
       console.error(`  node deploy.mjs wrap --amount ${ethers.formatEther(amount)} --send`);
@@ -167,7 +208,9 @@ async function main() {
       console.log(`  approve ${a.hash}`);
       await a.wait();
     }
-    const tx = await dist.openEpochOnMarket(doc.root, amount, gate, deadline);
+    const tx = onV3
+      ? await dist.openEpochOnV3(doc.root, amount, gate, deadline, v3pool, reward)
+      : await dist.openEpochOnMarket(doc.root, amount, gate, deadline);
     console.log(`  open    ${tx.hash}`);
     const rc = await tx.wait();
     const ev = rc.logs.map((l) => { try { return iface.parseLog(l); } catch { return null; } })

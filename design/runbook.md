@@ -1,0 +1,225 @@
+# Running an event, from first miner to paid claim
+
+Every other document here explains a decision. This one is the sequence, in
+order, with the commands. It exists because the path from "the event ended" to
+"an epoch is open on chain" runs through five tools, and until it was written
+down it lived in one person's head.
+
+**Nothing here has been run end to end with real money.** Each step has been
+exercised on its own; the joins have not. That is the honest status and it is
+what step 8 is for.
+
+---
+
+## 0. Before anything: decide two numbers
+
+**The gate.** `design/live800.md` shows 1,000,000 is unreachable for 800
+entrants -- the pool holds about 130 whole gates -- and that 50,000 is the
+number at which an event can happen. The contract takes it per epoch and does
+not care what you choose, so this is a decision nobody will make for you.
+
+**The payout basis.** `window` or `tally`, and they are not the same number.
+See step 5; choosing wrong cannot be undone.
+
+---
+
+## 1. Build and install the pool
+
+```bash
+cargo build --release --manifest-path pool/Cargo.toml --target x86_64-unknown-linux-musl
+```
+
+musl and `rust-lld` so a fully static binary comes out of a machine with no C
+toolchain. `pool/.cargo/config.toml` carries the linker line and says why.
+
+```bash
+mkdir -p ~/.local/bin ~/.local/state/glados-pool
+install -m 0755 target/x86_64-unknown-linux-musl/release/glados-pool ~/.local/bin/
+```
+
+Check it before it faces anybody:
+
+```bash
+~/.local/bin/glados-pool --selftest
+python tools/poolroster.py ~/.local/bin/glados-pool
+```
+
+The first is 18 roster claims plus the socket exchange; the second drives the
+refusal path over a real socket, which `--selftest` structurally cannot.
+
+## 2. Deploy the worker mapping
+
+```bash
+supabase db push                      # 0003_workers.sql
+supabase functions deploy worker
+```
+
+Then set `WORKER_NAME_CAP`, and confirm `TOKEN_CHAIN_ID` and `LINK_DOMAIN` are
+already set from the `link` deployment -- they are shared, and the signed
+message names the domain, so the two functions disagreeing about it makes every
+signature fail to verify with no obvious cause.
+
+Check it answers:
+
+```bash
+curl -s https://<project>.supabase.co/functions/v1/worker/map
+```
+
+## 3. Refresh the roster on the pool host
+
+The pool reads a file and does not fetch, for the reason `pool/src/roster.rs`
+gives at length: it has no dependencies and no TLS, and a hidden `curl` inside
+the process fails differently on every host with nothing saying why.
+
+```bash
+# once, then in cron
+curl -fsS https://<project>.supabase.co/functions/v1/worker/map \
+  -o ~/.local/state/glados-pool/roster.json.tmp \
+  && mv ~/.local/state/glados-pool/roster.json.tmp \
+        ~/.local/state/glados-pool/roster.json
+```
+
+**The `.tmp` and the `mv` are the point.** `mv` within one filesystem is
+atomic, so the pool never reads a half-written file. Writing directly would
+give it a truncated document to parse, and although a parse failure leaves the
+previous roster in place, that is a safety net rather than a plan.
+
+```cron
+*/5 * * * * curl -fsS <url> -o <state>/roster.json.tmp && mv <state>/roster.json.tmp <state>/roster.json
+```
+
+## 4. Run the pool
+
+```bash
+~/.local/bin/glados-pool \
+  --listen 0.0.0.0:3334 \
+  --ledger ~/.local/state/glados-pool/ledger.json \
+  --roster ~/.local/state/glados-pool/roster.json \
+  --roster-url https://glados.aperture.institute/pool/ \
+  --require-roster
+```
+
+`pool/deploy/run-pool.sh` wraps this with `ulimit -n 65536` and log rotation.
+
+**On `--require-roster`.** With it, a miner whose name is not registered is
+refused at the greeting with a message pointing at `--roster-url`. Without it
+they are admitted and a warning is logged, and they find out after the event
+that their work cannot be paid. Leave it off only for an event where everybody
+mines under their own `0x` address as the worker name, which needs no mapping
+service at all and is a perfectly good way to run one.
+
+**The pool fails open.** If the roster file is missing or unparseable, every
+name is admitted regardless of `--require-roster`, and the startup log says so
+in those words. Read that line.
+
+## 5. Close the epoch and build the tree
+
+```bash
+python tools/distribute.py ~/.local/state/glados-pool/ledger.json \
+  --basis tally \
+  --total 1e21 \
+  --coin btc \
+  --map <(curl -fsS https://<project>.supabase.co/functions/v1/worker/map) \
+  --map-since 2026-09-08T00:00:00Z \
+  --gate 50000e18 --token 0x3d609ecafc6aa7dba67dd7ad1d10b49c52d57777 \
+  --out epoch.json
+```
+
+**`--basis` has no default and the two answers differ by 4x** on a real ledger.
+`tally` is every share the pool credited and is what a bounded event wants;
+`window` is the PPLNS sliding window and is what continuous operation wants,
+because a miner who arrives for the profitable part of a round finds their
+shares aged out. A 36-hour event settled weeks later would have almost nothing
+left in the window, so `tally` is the answer for an event. The tool refuses to
+guess.
+
+**`--map-since` should be when the epoch began accruing.** Shares accrue against
+a *name* for days and the mapping is read once, at the end, so a name that
+changed hands in between would collect work its previous holder did. Entries
+that moved after this timestamp are refused and land in the "no payout address"
+list, which is where they belong.
+
+**If any name comes back unmapped, the command exits 1 and pays nobody.** That
+is deliberate. Chase the names, or accept that they cannot be paid and rerun --
+but decide it, do not discover it.
+
+## 6. Check the tree with something that did not build it
+
+```bash
+node contracts/test/cross.mjs epoch.json
+node contracts/test/fork.mjs  epoch.json          # against a fork of the live chain
+```
+
+`cross.mjs` verifies every proof against the contract's own `verifyProof`, run
+in an EVM, rather than against the Python that produced them. Two
+implementations that are supposed to agree do not stay agreeing on their own.
+
+## 7. Open the epoch
+
+```bash
+export GLADOS_KEY=0x...            # never printed, never stored; see deploy.mjs
+node contracts/deploy.mjs status
+node contracts/deploy.mjs deploy --send                    # first time only
+```
+
+Then, paying in $GLADOS through the V2 pair:
+
+```bash
+node contracts/deploy.mjs open epoch.json --amount 0.005 --gate 50000
+node contracts/deploy.mjs open epoch.json --amount 0.005 --gate 50000 --send
+```
+
+Or paying in a tokenized equity through a Uniswap V3 pool:
+
+```bash
+node contracts/deploy.mjs open epoch.json --amount 0.005 --gate 50000 \
+  --v3-pool 0xd4eb21209c4d6093f80b5b84f5c45cc093ea14a3 \
+  --reward  0xd0601ce157db5bdc3162bbac2a2c8af5320d9eec        # NVDA
+```
+
+**Run it once without `--send` and read the output.** Simulation is the default
+and it is the whole safety model: the difference between a correct epoch and one
+funded with the wrong number is a transaction that succeeds either way, and the
+only moment anybody can catch it is before it is signed. The tree's sum is
+checked against `--amount` here, and a V3 pool is read back and its pair
+printed, because the contract's own `BadPool` check happens inside a
+transaction you have already paid for.
+
+**The two modes are not interchangeable.** `claimOnMarket` refuses a V3 epoch
+and `claimOnV3` refuses a Market one, so opening in the wrong mode is an epoch
+nobody can claim from until it expires and you `reclaim` it.
+
+## 8. The step nobody has taken
+
+Before an event with strangers in it, run the whole of the above with **one
+address, your own, and a few dollars**. Mine to the pool for an hour, build a
+one-leaf tree, open the epoch, and claim it.
+
+Every piece has been exercised alone. The joins have not, and the two most
+likely to bite are the ones this document cannot check for you: whether the
+ledger the pool wrote is the ledger `distribute.py` reads on a host that is not
+this one, and whether a V3 swap actually fills at the price the quoter
+promised. A quote is not a fill.
+
+## 9. Publish
+
+The share log, every epoch root, and the transaction hash of every conversion.
+`design/pool.md` argues why at length; the short version is that a
+non-custodial pool has no wallet to audit, so the arithmetic being reproducible
+from published documents is the whole of what it offers instead of trust.
+
+---
+
+## What can still go wrong that nothing above prevents
+
+- **The contract has not been read by anybody who did not write it.** It holds
+  tokens. This is the largest open risk in the system and no amount of testing
+  substitutes for it.
+- **`reclaim` is the operator's one power over committed funds**, bounded to
+  the unclaimed remainder after a deadline fixed when the epoch opened. A
+  miner should be told the deadline, because it is the date their allocation
+  stops existing.
+- **The conversion leg is manual.** Mined coin to pool credit to withdrawal to
+  a bridge to USDG is entirely operator-run, with no tool in this repository
+  driving it. `design/payout.md` prices the route and `tools/economics.py`
+  models it, and neither executes anything.
