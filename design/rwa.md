@@ -92,9 +92,34 @@ against a quarterly settlement of a few hundred dollars that is roughly $5,000
 of two-sided depth. Nothing on the chain is within two orders of magnitude of
 it.
 
-Two things remain open and are being checked separately: who the issuer of
-record is, and whether distributing a tokenized equity to strangers is a
-securities distribution in the operator's jurisdiction regardless of what the
-contract permits. **Neither can rescue the route while the depth is $10**, which
-is why the mechanical half is written down first and the legal half is not
-blocking anything.
+## The legal question was being chased and it does not bind
+
+It was, and the chase is called off. The argument against it is good and worth
+recording, because it is a correction to how this file was framed rather than to
+anything it measured.
+
+**A tokenized RWA is not the RWA.** The thing on chain is an ERC-20 whose value
+rests entirely on an issuer's promise to track something; the share itself is
+somewhere else, in a custodian's book, and no amount of holding the token
+reaches it. Every measurement above says the same thing from the other end: no
+identity registry, no whitelist, no transfer agent, and a transfer to a
+never-used address that simply works. **Mechanically, `NVDA` on 4663 is
+indistinguishable from any other ERC-20 launched by a private entity**, which is
+to say it is indistinguishable from a memecoin. Treating it as though the
+securities weight of NVIDIA stock travels with the token is a category error,
+and this file was drifting toward making it.
+
+Where the reasoning stops, stated once so nobody has to re-derive it: the
+distinction that would matter is not what the token *is* but what it is *sold
+as*. A thing that names itself "NVIDIA . Robinhood Token" is representing a
+relationship, which is a different position from a token representing nothing
+and claiming nothing. That is a fact about the **issuer's** conduct, though, not
+about a downstream holder's -- and this pool would be a downstream holder buying
+on a market like anyone else.
+
+**Either way it changes no decision here**, and that is the reason to stop
+rather than resolve it. The route died on ten dollars of depth. A legal finding
+in either direction leaves it dead, and one that came back permissive would
+change nothing about a pair that cannot fill an $84 order. The one number to
+watch is still depth, and the legal question is worth reopening exactly when
+that number moves and not before.
