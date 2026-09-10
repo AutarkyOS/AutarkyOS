@@ -620,6 +620,109 @@ fn abuse_check(addr: std::net::SocketAddr) -> bool {
     false
 }
 
+/// One connection is one worker, and this is the only place that is checked
+/// without a Python harness and a server somebody has to remember to start.
+///
+/// It matters more than it looks. A second `hello` under a different name used
+/// to overwrite the first, so a single socket could register worker names at
+/// the per-connection message rate -- nineteen a second, measured -- and each
+/// one bought a permanent record in the tally while costing **no validation at
+/// all**, because a submit naming a job the pool does not hold is answered
+/// before anything is hashed. The pool-wide validation budget, the bound that
+/// exists precisely to stop a stranger spending this machine, never saw any of
+/// it.
+///
+/// So the claim has two halves and the second is the one a naive fix breaks:
+/// the rename is refused, **and the connection survives it**. Dropping the
+/// connection would be a denial of service handed to anybody who can send one
+/// malformed handshake.
+fn rename_check(addr: std::net::SocketAddr) -> bool {
+    use glados_pool::json::Json;
+    use glados_pool::mine::proto;
+    use glados_pool::mine::stratum::take_line;
+    use std::io::{Read, Write};
+
+    let Ok(mut sock) = std::net::TcpStream::connect(addr) else {
+        println!("FAIL  could not open a third connection");
+        return false;
+    };
+    sock.set_read_timeout(Some(std::time::Duration::from_secs(10)))
+        .unwrap();
+    if sock
+        .write_all(proto::encode_hello(1, "rename.first", "rename-check").as_bytes())
+        .is_err()
+        || sock
+            .write_all(proto::encode_hello(2, "rename.second", "rename-check").as_bytes())
+            .is_err()
+    {
+        println!("FAIL  could not greet twice");
+        return false;
+    }
+
+    let mut buf: Vec<u8> = Vec::new();
+    let mut chunk = [0u8; 4096];
+    let mut refused = false;
+    let mut welcomes = 0usize;
+    for _ in 0..40 {
+        let Ok(n) = sock.read(&mut chunk) else { break };
+        if n == 0 {
+            break;
+        }
+        buf.extend_from_slice(&chunk[..n]);
+        while let Ok(Some(line)) = take_line(&mut buf) {
+            let Some(v) = Json::parse(line.trim()) else { continue };
+            if let Some(r) = v.get("result") {
+                if proto::parse_welcome(r).is_some() {
+                    welcomes += 1;
+                }
+            }
+            if let Some(e) = v.get("error").and_then(|x| x.as_str()) {
+                if e.contains("one worker per connection") {
+                    refused = true;
+                }
+            }
+        }
+        if refused {
+            break;
+        }
+    }
+
+    if welcomes > 1 {
+        println!("FAIL  a second worker name was welcomed on one connection");
+        return false;
+    }
+    if !refused {
+        println!("FAIL  a rename was neither refused nor answered");
+        return false;
+    }
+
+    // Still usable afterwards, which is the half a refusal that dropped the
+    // connection would fail. Asking for work is the cheapest proof.
+    if sock
+        .write_all(proto::encode_work(3, 0).as_bytes())
+        .is_err()
+    {
+        println!("FAIL  the connection was dropped over a refused rename");
+        return false;
+    }
+    for _ in 0..40 {
+        let Ok(n) = sock.read(&mut chunk) else { break };
+        if n == 0 {
+            break;
+        }
+        buf.extend_from_slice(&chunk[..n]);
+        while let Ok(Some(line)) = take_line(&mut buf) {
+            let Some(v) = Json::parse(line.trim()) else { continue };
+            if v.get("method").and_then(|m| m.as_str()) == Some("glados.job") {
+                println!("ok    a rename was refused and the connection kept working");
+                return true;
+            }
+        }
+    }
+    println!("FAIL  no work after a refused rename");
+    false
+}
+
 /// The whole path, in one process, with no kernel and no network beyond
 /// loopback: listen, greet, take a job, mine it, submit, be believed.
 ///
@@ -737,7 +840,7 @@ fn selftest() -> bool {
                         // The second half. A pool that accepts good shares and
                         // never refuses a stranger is half checked, and on a
                         // machine somebody lent us it is the wrong half.
-                        return abuse_check(addr);
+                        return rename_check(addr) && abuse_check(addr);
                     }
                 }
             }
