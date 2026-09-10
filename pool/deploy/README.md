@@ -247,6 +247,43 @@ Prints what one share costs to validate here, which is the number that decides
 whether the share targets in the unit are sane. Compare against `design/pool.md`;
 a much slower machine wants harder targets, not a bigger box.
 
+**Read the algorithm names on that table rather than skimming for "yespower".**
+The 2 MiB and 8 MiB profiles differ by 3.5x and both are spelled yespower; the
+unit configures the 2 MiB one. Sizing `--cpu-percent` against the wrong row is
+sizing it for a coin you are not serving.
+
+### And make it refuse things, which is the half a selftest cannot do
+
+`tools/poolabuse.py` goes past every limit in `server.rs` on purpose. Point it
+at a **throwaway instance on its own port with its own ledger** -- it submits
+garbage by design and the share log it leaves is worthless:
+
+```bash
+# a second pool, out of the way of the real one
+glados-pool --listen 127.0.0.1:3335 --ledger /tmp/abuse.json \
+    --cpu-percent 1 abuse:neoscrypt:16 &
+
+python3 tools/poolabuse.py --port 3335 badshares    # 33 answered, then dropped
+python3 tools/poolabuse.py --port 3335 ratelimit    # 20 of 60, still connected
+python3 tools/poolabuse.py --port 3335 bigline      # desynchronised, closed
+python3 tools/poolabuse.py --port 3335 conns -n 300 --hold 20
+python3 tools/poolabuse.py --port 3335 names -n 6000
+python3 tools/poolabuse.py --port 3335 flood --conns 4 --seconds 20
+```
+
+`--hold` on the connection test is not optional if you want to *measure*
+anything: without it the connections open and close inside a sampling interval
+and every counter reads idle. Sample the daemon while it holds them:
+
+```bash
+watch -n2 'grep -E "VmRSS|Threads" /proc/$(pgrep -f "listen 127.0.0.1:333[5]")/status'
+```
+
+What each one should say is in `design/pool.md`. Two of them exist because they
+found something: `names` because one connection could re-greet under nineteen
+new worker names a second, each a permanent record and none of them costing a
+single validation, and `flood` because the per-connection limits do not sum.
+
 ## If it is a home server, read this before the port section
 
 A machine in somebody's house is not a small VPS. Four things change, and the

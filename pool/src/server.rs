@@ -268,6 +268,34 @@ fn handle(mut stream: TcpStream, pool: Arc<Mutex<Pool>>, peer: &str) -> std::io:
                         stream.write_all(msg.as_bytes())?;
                         return Ok(());
                     }
+                    // **One connection is one worker.** A second `hello` under
+                    // a different name was accepted and simply overwrote the
+                    // first, which made a single socket a way to be as many
+                    // miners as you like: measured at nineteen names a second
+                    // against the per-connection submit cap, each one a
+                    // permanent record in the tally, and each costing the pool
+                    // *no validation at all* -- a submit naming a job the pool
+                    // does not hold answers `stale` before it hashes, so the
+                    // budget never sees any of it. Two hundred and fifty-six
+                    // connections is around forty-nine hundred a second.
+                    //
+                    // The tally cap bounds the damage and this removes the
+                    // cheap path to it. Refused rather than dropped, because
+                    // unlike a flood this is one message and the sender may
+                    // genuinely be a confused client.
+                    //
+                    // Re-greeting under the *same* name is allowed and is a
+                    // no-op that re-issues work, since a client retrying its
+                    // handshake after a timeout is doing something reasonable
+                    // and there is nothing to change.
+                    if greeted && h.worker != worker {
+                        println!("[pool] {peer} tried to become {} having greeted as {worker}", h.worker);
+                        let msg = format!(
+                            "{{\"id\":{id},\"result\":null,\"error\":\"this connection already greeted as {worker}; one worker per connection\"}}\n"
+                        );
+                        stream.write_all(msg.as_bytes())?;
+                        continue;
+                    }
                     worker = h.worker.clone();
                     println!("[pool] {peer} hello  worker={} agent={}", h.worker, h.agent);
                     let slots = pool.lock().unwrap().slots();

@@ -645,6 +645,42 @@ connection limits held perfectly while it happened.** It is the same shape as
 the hole `budget.rs` was written to close: each bound correct, and the quantity
 they were collectively bounding not bounded at all.
 
+**And a fresh name per connection was the slow way in.** `hello` could be
+re-sent on a live connection and simply overwrote the worker name, so one
+socket could be as many miners as it liked -- measured at **nineteen names a
+second**, the per-connection submit cap, from a single connection. Each name
+became a permanent tally record, and each cost the pool *no validation at all*:
+a submit naming a job the pool does not hold answers `stale` before anything is
+hashed, so the validation budget, the one bound that is pool-wide, never sees
+any of it. Six thousand names in five minutes from one socket took the process
+from 836 KB to 1,824 KB resident and the published ledger to 641 KB, which is
+then re-serialised and rewritten every sixty seconds. At the connection ceiling
+that is about forty-nine hundred names a second.
+
+One worker per connection now. Re-greeting under the same name stays legal and
+is a no-op that re-issues work, because a client retrying its handshake after a
+timeout is doing something reasonable.
+
+**Two fixes, and it is worth being exact about what each one buys**, because
+the cap alone looked better in the argument than it measured. The same six
+thousand names, same host, one connection:
+
+    unbounded   836 -> 1,824 KiB resident   641 KiB of published ledger
+    capped      740 -> 1,588 KiB resident   204 KiB
+
+Bounded rather than cheap. `retain` clears the map when it fills and it refills,
+so the ledger is capped at 4,096 rows -- about half a megabyte -- however many
+names arrive, where before it was linear in them and 60,000 names would have
+been 6.4 MB. Resident memory does not come back down either: the allocator
+keeps the high-water mark of having held them. The cap turns unbounded growth
+into a ceiling, which is the whole of what a cap can do.
+
+What actually removes the cost is the handshake rule, which takes the rate from
+nineteen names a second per connection to one *ever*. Two thousand attempts
+against the same host: **one distinct worker reached the tally, 1,920 renames
+refused, 852 KiB resident** -- against 1,588 with the cap alone and 1,824 with
+neither.
+
 The cap is not a plain ceiling, because a plain ceiling is the same denial of
 service one step later -- the flood simply arrives first and the real miner is
 refused. Room is made by dropping records with **zero credited work**, and
@@ -798,4 +834,16 @@ when there is a live upstream there is also a chain to read it from.
 - **An expected value per coin**, and therefore weights a miner could derive
   rather than be given. `miner/src/main.rs` shares one device across coins by
   weight and every weight is 1, which is honest and is not a policy. See above
-  for the two things missing.
+  for the two things missing. `choose`'s doc now says what the weights *should*
+  be and cites the first-order condition it comes from, which is a step short
+  of setting them.
+- **Hopping-proof PPLNS.** What is here is Rosenfeld's simple variant, which is
+  hopping-proof only while difficulty is constant. The proof variant needs each
+  share's difficulty relative to the network, which is the same missing number
+  that blocks expected value. One absent quantity, three consequences.
+- **The window's own dial, said in units.** Variance times maturity is fixed,
+  so `--window` is a choice between paying smoothly and paying soon; printing
+  which end the operator picked needs `p`, so it waits on the same thing.
+- **A distributed flood.** Every bound here is per connection or per pool and
+  none of them is per source. On a home connection the upstream link saturates
+  long before the daemon does, and nothing running on the server can help.

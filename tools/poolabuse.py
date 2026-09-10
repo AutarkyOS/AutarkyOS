@@ -282,6 +282,7 @@ def t_names(a):
     c.hello()
     collect_jobs(c, want=1, timeout=6.0)
     made = 0
+    refused = 0
     t0 = time.time()
     while made < a.n and time.time() - t0 < a.seconds:
         for _ in range(20):
@@ -298,14 +299,20 @@ def t_names(a):
         end = time.time() + 1.05
         while time.time() < end:
             try:
-                if c.line(timeout=end - time.time()) is None:
-                    break
+                v = c.line(timeout=end - time.time())
             except socket.timeout:
                 break
+            if v is None:
+                break
+            if isinstance(v.get("error"), str) and "one worker per connection" in v["error"]:
+                refused += 1
     c.close()
     took = time.time() - t0
-    out({"test": "tally-names", "names_offered": made, "seconds": round(took, 1),
-         "names_per_s": round(made / took, 1)})
+    # **A high `refused` is the pass, not a failure.** A pool that lets this
+    # through is the one with the problem: every name it accepts is a permanent
+    # record bought with no validation at all.
+    out({"test": "tally-names", "names_offered": made, "renames_refused": refused,
+         "seconds": round(took, 1), "names_per_s": round(made / took, 1)})
     return 0
 
 

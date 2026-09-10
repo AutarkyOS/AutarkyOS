@@ -413,6 +413,17 @@ const MAX_REMEMBERED: usize = 4096;
 /// one of them held perfectly while this grew underneath them. It is the same
 /// shape of failure `budget.rs` was written about -- each bound correct, and
 /// the thing they were all bounding not bounded at all.
+///
+/// **A cap turns unbounded growth into a ceiling and does not make the attack
+/// free, which is worth measuring rather than assuming.** The same six thousand
+/// names from one connection: 641 KiB of published ledger uncapped against 204
+/// capped, and 988 KiB of resident growth against 848. `retain` clears the map
+/// when it fills and it refills, so the ceiling is 4,096 rows -- about half a
+/// megabyte -- however many names arrive, where before it was linear in them.
+/// Resident memory does not come back either; the allocator keeps the
+/// high-water mark. What actually removed the cost was refusing a second
+/// `hello` under a different name, in `server.rs`, which takes the rate from
+/// nineteen a second per connection to one ever.
 pub const MAX_TALLIES: usize = 4096;
 
 /// A window of 2^32, which is the work in one difficulty-1 share.

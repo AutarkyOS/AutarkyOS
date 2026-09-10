@@ -110,6 +110,14 @@ rotate_between_runs() {
 # Checked every minute rather than every byte: the cost of being a minute late
 # is at most a minute of log past the cap, and the cost of checking constantly
 # is a `wc` on a growing file forever.
+#
+# **So the cap is a ceiling plus one interval of growth, not a hard limit**, and
+# the difference is only invisible at the ordinary rate. At a kilobyte a minute
+# the overshoot is a kilobyte; under a flood writing sixteen a second the test
+# run rotated a file of 82 KB against a 20 KB cap on a five-second check, which
+# is the arithmetic behaving exactly as stated and looking alarming anyway.
+# What bounds the disk is `MAX_LOG_BYTES` times two plus that overshoot, since
+# there is one `.old` and it is overwritten.
 LOG_CHECK_SECS=60
 
 watch_log() {
