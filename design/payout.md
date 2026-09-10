@@ -64,6 +64,12 @@ that drove most of the earlier analysis here.
 is an Across origin into 4663, so unMineable's POL and Kryptex's USDC are the
 two that reach the destination in one hop. BSC is not an Across origin into 4663.
 
+**Tokenized stock is not on this list and `rwa.md` says why.** The chain the
+token lives on was built for real-world assets, so paying in NVDA or SPY is a
+fair question and the answer is measured rather than argued: the tokens are
+permissionlessly transferable, and the deepest pair on the chain holds about ten
+dollars. It fails on availability, not on mechanism.
+
 **Counterparty risk is a first-order term here and was not treated as one.** At
 $0.07 a day the balance sits on somebody else's books for weeks before it is
 payable at all, so the question is not only what a venue charges but whether it
