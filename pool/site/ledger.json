@@ -1,0 +1,27 @@
+{
+  "v": 3,
+  "epoch": 1,
+  "generated_at": 1789037622,
+  "digest": "da279d5b4574d128dd3f3d98f186c7b46989336fbcfc863f377ad00968bddafe",
+  "coins": [
+    {"slot": 0, "label": "btc", "algo": "sha256d", "source": "local"}
+  ],
+  "window_work": 268435456,
+  "windows": [
+    {"coin": "btc", "total": 1157627904, "shares": [
+      {"worker": "rig-a", "work": 1073741824},
+      {"worker": "rig-b", "work": 16777216},
+      {"worker": "rig-b", "work": 16777216},
+      {"worker": "rig-b", "work": 16777216},
+      {"worker": "rig-b", "work": 16777216},
+      {"worker": "rig-b", "work": 16777216}
+    ], "payout": [
+      {"worker": "rig-a", "work": 1073741824, "share": 0.927536232},
+      {"worker": "rig-b", "work": 83886080, "share": 0.072463768}
+    ]}
+  ],
+  "shares": [
+    {"worker": "rig-a", "coin": "btc", "work": 8740929536, "accepted": 24, "stale": 0, "bad": 0, "duplicate": 0},
+    {"worker": "rig-b", "coin": "btc", "work": 100663296, "accepted": 6, "stale": 0, "bad": 0, "duplicate": 0}
+  ]
+}

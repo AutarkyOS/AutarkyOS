@@ -32,6 +32,8 @@ on:
       - 'tools/prices.py'
       - 'tools/payrate.py'
       - 'tools/neoscrypt.py'
+      - 'tools/ledgercheck.py'
+      - 'pool/site/**'
       - '.github/workflows/pool.yml'
   pull_request:
   workflow_dispatch:
@@ -125,6 +127,15 @@ jobs:
       # under its own target -- one in 7e7 and one in 4e9 by chance.
       - name: NeoScrypt reproduces blocks the chain accepted
         run: python3 tools/neoscrypt.py --selftest
+
+      # The published record, checked by a reader that is not its writer. The
+      # site recomputes the digest in a browser and CI cannot run one, so this
+      # is the headless half of the same claim -- including that a single unit
+      # of work moved between workers is caught.
+      - name: The share log verifies, and tampering with it does not
+        run: |
+          python3 tools/ledgercheck.py --selftest
+          python3 tools/ledgercheck.py pool/site/ledger.json --quiet
 
       # A real Stratum server, a real merkle branch, and a pool that has to
       # produce headers the server will accept. `--verify` rebuilds every
