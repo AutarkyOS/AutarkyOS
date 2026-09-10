@@ -168,7 +168,17 @@ delivered one. Do one $10 trip before believing the table.
 
 **The Across fee moved 5x in nine minutes** -- $0.09 to $0.47, same route, same
 size, 97% of it destination fill gas -- and it is flat in dollars regardless of
-transfer size. Quote it live per trip rather than reading a number from here.
+transfer size. Quote it live per trip rather than reading a number from here,
+which `contracts/bridge.mjs quote` now does.
+
+**Measured again since, and the shape held while the level did not.** On the
+Polygon USDC route the whole fee is $0.106 on $100 and fills in about a second,
+against the $0.20 assumed above. Swept across sizes it is almost entirely flat
+relayer gas: 0.527% at $10, 0.106% at $100, 0.069% at $500, 0.065% at $1,000,
+and below roughly $5 the route is refused outright because the flat part
+exceeds the transfer. So the earlier conclusion -- that trip size is the only
+lever worth pulling -- is unchanged, and the number to put in a model is a
+quote rather than any of these.
 
 ---
 

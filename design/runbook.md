@@ -154,6 +154,51 @@ node contracts/test/fork.mjs  epoch.json          # against a fork of the live c
 in an EVM, rather than against the Python that produced them. Two
 implementations that are supposed to agree do not stay agreeing on their own.
 
+## 6a. Get the money onto 4663
+
+The epoch is funded in USDG, so mining proceeds have to arrive there first.
+`contracts/bridge.mjs` is the one leg of that which is a transaction somebody
+has to build:
+
+```
+mine -> the venue credits a balance        the venue does this
+     -> it pays out to your address        the venue does this, at a threshold
+     -> [swap to a bridgeable token]       avoidable, see below
+     -> bridge to 4663                     bridge.mjs
+     -> fund an epoch                      deploy.mjs open
+```
+
+**Pick the venue that pays the token the bridge already takes.** unMineable
+pays POL on Polygon, which has to be sold for USDC before it can cross;
+Kryptex pays USDC on Polygon directly, and Across carries USDC from Polygon to
+USDG on 4663 in one hop. That choice removes a DEX integration, a slippage
+bound and a second approval from a path that moves real money, which is worth
+more than automating the swap would be.
+
+```bash
+node contracts/bridge.mjs routes                          # what Across reaches 4663 from
+node contracts/bridge.mjs status --address 0x...          # where the money is now
+node contracts/bridge.mjs quote  --amount 100 --chain 137
+node contracts/bridge.mjs send   --amount 100 --chain 137 --send
+```
+
+**Trip size is the only lever.** The fee is almost entirely flat relayer gas,
+measured live on the Polygon route:
+
+    $10     0.5270%        $250    0.0785%
+    $25     0.2458%        $500    0.0692%
+    $50     0.1529%      $1,000    0.0646%
+    $100    0.1062%
+
+So one $500 trip costs $0.35 where five $100 trips cost $0.53, and anything
+under about $5 is refused outright because the flat part exceeds it. Fill time
+is around a second.
+
+**The recipient is always the sender and there is no flag for it.** This moves
+the operator's own float; a recipient argument is one typo away from bridging
+an event's funding to a stranger, irreversibly, with the transaction
+succeeding.
+
 ## 7. Open the epoch
 
 ```bash
@@ -219,7 +264,9 @@ from published documents is the whole of what it offers instead of trust.
   the unclaimed remainder after a deadline fixed when the epoch opened. A
   miner should be told the deadline, because it is the date their allocation
   stops existing.
-- **The conversion leg is manual.** Mined coin to pool credit to withdrawal to
-  a bridge to USDG is entirely operator-run, with no tool in this repository
-  driving it. `design/payout.md` prices the route and `tools/economics.py`
-  models it, and neither executes anything.
+- **The bridge has never been run with real money.** `bridge.mjs` quotes
+  against the live API and its refusals are exercised, but no deposit has been
+  broadcast. The legs either side of it -- the venue paying out, and
+  `deploy.mjs open` -- are still entirely operator-run, and the venue half
+  cannot be automated at all: it is a threshold somebody else's server decides
+  to cross.
