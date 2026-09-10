@@ -113,6 +113,11 @@ else. `test/evm.mjs` is ninety lines and is the whole harness.
 
 ## What is not done
 
+- **Never executed against a real pool.** Every swap in the suite is against a
+  mock. The mock pays out before it asks and then checks it was paid, which is
+  the shape that makes a broken callback fail here rather than on the chain, but
+  a passing mock is not a filled trade. One small real swap comes before
+  anything else uses this.
 - **Not deployed.** No address, no verified source on any explorer.
 - **Not reviewed by anybody.** Written and tested in one sitting. A contract
   that holds tokens should be read by somebody who did not write it.

@@ -186,14 +186,36 @@ a fill. But a quote off the real quoter against live reserves is a much stronger
 position than the priced-route-never-observed one, and nothing about the
 liquidity is in question any more.
 
-**One engineering consequence, because it is easy to miss.**
-`contracts/src/GladosDistributor.sol` talks to `IUniswapV2Pair` directly -- it
-reads `getReserves()` and calls `swap()`, which was the right choice when the
-target was the launchpad's own V2 pair and there was no trustworthy router. None
-of that reaches a V3 pool. Paying in tokenized stock means a second swap path in
-that contract, against `SwapRouter02`
-(`0xCaf681a66D020601342297493863E78C959E5cb2`) or a direct pool swap with the V3
-callback. The distributor is not a few lines from doing this.
+**The distributor can do this now**, and what it took is worth recording since
+the first version of this paragraph guessed at it.
+
+It read `getReserves()` and called `swap()` on a V2 pair, which was right when
+the target was the launchpad's own pair. None of that reaches a V3 pool, so
+`Mode.MarketV3` was added along with a reward token the epoch names rather than
+the one the contract gates on. **Those two changes had to travel together**: the
+entire point is paying somebody in NVDA while still gating on GLADOS, so a mode
+that changed venue without splitting reward from gate would have had no caller.
+
+The swap goes direct to the pool rather than through `SwapRouter02`, keeping the
+argument the contract already made about routers, and the cost of that is a
+callback. V3 inverts V2's shape: a pair is paid and then told to send, while a
+pool sends and then calls `uniswapV3SwapCallback` on the caller, which must pay
+before the call returns. So the contract now exposes a function whose job is to
+pay somebody, and **the authorisation on that function is the whole security
+surface of this feature**.
+
+It is a single-call `_inFlight` address, set immediately before `swap` and
+cleared immediately after. Authorising by factory lookup instead is the standard
+way this callback gets drained, and it is worth naming because it looks
+correct: `getPool` says yes to every genuine pool, including one an attacker
+deployed for two worthless tokens of their own, from which they can call the
+callback and be paid in `quote` for nothing. A test does exactly that, with a
+real pool the factory knows about, and asserts both the refusal and that the
+contract's balance did not move.
+
+79 tests, 0 failures, up from 59. Deployed size 12,868 bytes against the 24,576
+limit. What has still never happened is a swap against a real pool, which needs
+funds on the chain.
 
 **A method note, since this is the third time.** Every wrong number here came
 from finding one contract that answered and treating it as the population.
