@@ -42,7 +42,7 @@ const GATE = 1_000_000n * ONE;
 const DAY = 86_400n;
 
 function artifacts() {
-  const c = compile(["GladosDistributor.sol", "TestToken.sol", "MockPair.sol"]);
+  const c = compile(["GladosDistributor.sol", "TestToken.sol", "MockPair.sol", "MockV3.sol"]);
   return {
     dist: {
       abi: c["GladosDistributor.sol"].GladosDistributor.abi,
@@ -55,6 +55,14 @@ function artifacts() {
     pair: {
       abi: c["MockPair.sol"].MockPair.abi,
       bytecode: c["MockPair.sol"].MockPair.evm.bytecode.object,
+    },
+    v3pool: {
+      abi: c["MockV3.sol"].MockV3Pool.abi,
+      bytecode: c["MockV3.sol"].MockV3Pool.evm.bytecode.object,
+    },
+    v3factory: {
+      abi: c["MockV3.sol"].MockV3Factory.abi,
+      bytecode: c["MockV3.sol"].MockV3Factory.evm.bytecode.object,
     },
   };
 }
@@ -73,7 +81,18 @@ async function main() {
   const token = await deploy(vm, OPERATOR, art.token, [10n ** 27n]);
   const quote = await deploy(vm, OPERATOR, art.token, [10n ** 27n]);
   const pair = await deploy(vm, OPERATOR, art.pair, [quote, token]);
-  const dist = await deploy(vm, OPERATOR, art.dist, [token, OPERATOR, pair, quote]);
+
+  // The reward token for the V3 path is deliberately *not* `token`: the whole
+  // point of that mode is paying something this contract does not gate on, and
+  // a fixture where the two coincide could not tell the two apart.
+  const reward = await deploy(vm, OPERATOR, art.token, [10n ** 27n]);
+  const factory = await deploy(vm, OPERATOR, art.v3factory, []);
+  const v3 = await deploy(vm, OPERATOR, art.v3pool, [quote, reward, 500]);
+  await call(vm, OPERATOR, factory, art.v3factory, "record", [v3, quote, reward, 500]);
+  await call(vm, OPERATOR, quote, art.token, "mint", [v3, 400_000n * ONE]);
+  await call(vm, OPERATOR, reward, art.token, "mint", [v3, 2_000n * ONE]);
+
+  const dist = await deploy(vm, OPERATOR, art.dist, [token, OPERATOR, pair, quote, factory]);
 
   // Everybody who will claim holds exactly the gate, except D, who holds one
   // short -- the boundary is where a `>=` becomes a `>` by accident.
@@ -398,10 +417,139 @@ async function main() {
     ok(ok2.ok, "and the same claim works once the tax is back");
   }
 
+  // ------------------------------------------------- the Uniswap V3 path
+  //
+  // The reward here is a token the distributor does not gate on, which is the
+  // whole reason this mode exists: gate on GLADOS, pay in something else. Most
+  // of what follows is the callback, because a function whose job is to pay
+  // somebody is the only part of this carrying real risk.
+  {
+    const t = build([{ account: A, amount: 4n * ONE }, { account: B, amount: 4n * ONE }]);
+    await call(vm, OPERATOR, quote, art.token, "approve", [dist, 100n * ONE]);
+    const open = await call(vm, OPERATOR, dist, art.dist, "openEpochOnV3",
+      [t.root, 8n * ONE, GATE, 200_000n, v3, reward], { block: at(1000n) });
+    ok(open.ok, `a V3 epoch opens${open.ok ? "" : "  (" + open.reason + ")"}`);
+    const id = (await call(vm, OPERATOR, dist, art.dist, "epochCount")).result - 1n;
+
+    {
+      const gBefore = await call(vm, OPERATOR, token, art.token, "balanceOf", [A]);
+      const before = await call(vm, OPERATOR, reward, art.token, "balanceOf", [A]);
+      const r = await call(vm, A, dist, art.dist, "claimOnV3",
+        [id, 4n * ONE, t.proof(A), 1n], { block: at(2000n) });
+      ok(r.ok, `a V3 claim swaps and pays${r.ok ? "" : "  (" + r.reason + ")"}`);
+      const after = await call(vm, OPERATOR, reward, art.token, "balanceOf", [A]);
+      ok(after.result > before.result, "the claimant receives the reward token");
+      const gAfter = await call(vm, OPERATOR, token, art.token, "balanceOf", [A]);
+      eq(gAfter.result, gBefore.result, "and their gate-token balance is untouched");
+    }
+
+    // The gate is still the gate. D holds one under it and holds no reward
+    // token at all, so a contract that had started gating on the reward would
+    // refuse for the wrong reason and this would still pass -- hence the
+    // explicit selector rather than merely asserting failure.
+    {
+      const t2 = build([{ account: D, amount: 1n * ONE }]);
+      await call(vm, OPERATOR, quote, art.token, "approve", [dist, 10n * ONE]);
+      const o2 = await call(vm, OPERATOR, dist, art.dist, "openEpochOnV3",
+        [t2.root, 1n * ONE, GATE, 200_000n, v3, reward], { block: at(1000n) });
+      const id2 = (await call(vm, OPERATOR, dist, art.dist, "epochCount")).result - 1n;
+      ok(o2.ok, "a second V3 epoch opens");
+      const r = await call(vm, D, dist, art.dist, "claimOnV3",
+        [id2, 1n * ONE, t2.proof(D), 1n], { block: at(2000n) });
+      ok(r.reason.startsWith("BelowGate"), `the gate is still measured on the gate token (${r.reason})`);
+    }
+
+    eq((await call(vm, A, dist, art.dist, "claimOnV3",
+        [id, 4n * ONE, t.proof(A), 1n], { block: at(2000n) })).reason,
+      "AlreadyClaimed", "a V3 claim cannot be made twice");
+
+    eq((await call(vm, B, dist, art.dist, "claimOnV3",
+        [id, 4n * ONE, t.proof(B), 0n], { block: at(2000n) })).reason,
+      "NoSlippageBound", "a V3 claim with no slippage bound is refused");
+
+    eq((await call(vm, B, dist, art.dist, "claimOnMarket",
+        [id, 4n * ONE, t.proof(B), 1n], { block: at(2000n) })).reason,
+      "WrongMode", "claimOnMarket refuses a V3 epoch");
+
+    // The slippage bound has to be reachable or the test asserting it fires is
+    // asserting nothing, so the pool is told to underpay.
+    {
+      await call(vm, OPERATOR, v3, art.v3pool, "setShortfall", [5000n]);
+      const r = await call(vm, B, dist, art.dist, "claimOnV3",
+        [id, 4n * ONE, t.proof(B), 10n ** 18n], { block: at(2000n) });
+      ok(r.reason.startsWith("TooLittleOut"), "a V3 claim under its slippage bound is refused");
+      await call(vm, OPERATOR, v3, art.v3pool, "setShortfall", [0n]);
+    }
+
+    // ---- the callback, which is the part that can lose money
+    //
+    // Anybody may call it, so the check is that it refuses everybody. The
+    // second case is the one that matters: a *genuine* pool, of the attacker's
+    // own creation, which a factory lookup would happily authorise.
+    eq((await call(vm, STRANGER, dist, art.dist, "uniswapV3SwapCallback",
+        [1n * ONE, 0n, "0x"], { block: at(2000n) })).reason,
+      "BadCallback", "a stranger cannot call the swap callback");
+
+    eq((await call(vm, OPERATOR, dist, art.dist, "uniswapV3SwapCallback",
+        [1n * ONE, 0n, "0x"], { block: at(2000n) })).reason,
+      "BadCallback", "nor can the operator");
+
+    {
+      const evil = await deploy(vm, STRANGER, art.v3pool, [quote, reward, 3000]);
+      await call(vm, STRANGER, factory, art.v3factory, "record", [evil, quote, reward, 3000]);
+      const before = await call(vm, OPERATOR, quote, art.token, "balanceOf", [dist]);
+      const r = await call(vm, STRANGER, dist, art.dist, "uniswapV3SwapCallback",
+        [1n * ONE, 0n, "0x"], { block: at(2000n) });
+      eq(r.reason, "BadCallback", "nor can a real pool the factory knows about");
+      const after = await call(vm, OPERATOR, quote, art.token, "balanceOf", [dist]);
+      eq(after.result, before.result, "and nothing left the contract while it was refusing");
+    }
+
+    // ---- the pool argument, which the operator could get wrong
+    {
+      const rogue = await deploy(vm, STRANGER, art.v3pool, [quote, reward, 10000]);
+      const r = await call(vm, OPERATOR, dist, art.dist, "openEpochOnV3",
+        [t.root, 1n * ONE, GATE, 200_000n, rogue, reward], { block: at(1000n) });
+      eq(r.reason, "BadPool", "a pool the factory does not name is refused");
+    }
+    {
+      const other = await deploy(vm, OPERATOR, art.token, [10n ** 27n]);
+      const wrong = await deploy(vm, OPERATOR, art.v3pool, [quote, other, 500]);
+      await call(vm, OPERATOR, factory, art.v3factory, "record", [wrong, quote, other, 500]);
+      const r = await call(vm, OPERATOR, dist, art.dist, "openEpochOnV3",
+        [t.root, 1n * ONE, GATE, 200_000n, wrong, reward], { block: at(1000n) });
+      eq(r.reason, "BadPool", "a real pool for a different pair is refused");
+    }
+    eq((await call(vm, OPERATOR, dist, art.dist, "openEpochOnV3",
+        [t.root, 1n * ONE, GATE, 200_000n, v3, quote], { block: at(1000n) })).reason,
+      "BadPool", "an epoch rewarding the quote token itself is refused");
+
+    // A pool that asks for nothing back would, against a callback that paid
+    // whatever it was told, be a way to take the output for free. Here it is
+    // refused on the way in.
+    {
+      await call(vm, OPERATOR, v3, art.v3pool, "setAskForNothing", [true]);
+      const r = await call(vm, B, dist, art.dist, "claimOnV3",
+        [id, 4n * ONE, t.proof(B), 1n], { block: at(2000n) });
+      eq(r.reason, "BadCallback", "a pool asking for nothing back is refused");
+      await call(vm, OPERATOR, v3, art.v3pool, "setAskForNothing", [false]);
+    }
+
+    // Reclaim hands back the asset the epoch actually holds, which for a V3
+    // epoch is the quote and never the reward.
+    {
+      const before = await call(vm, OPERATOR, quote, art.token, "balanceOf", [OPERATOR]);
+      const r = await call(vm, OPERATOR, dist, art.dist, "reclaim", [id], { block: at(300_000n) });
+      ok(r.ok, `a V3 epoch reclaims${r.ok ? "" : "  (" + r.reason + ")"}`);
+      const after = await call(vm, OPERATOR, quote, art.token, "balanceOf", [OPERATOR]);
+      ok(after.result > before.result, "and what comes back is the quote token");
+    }
+  }
+
   // ------------------------------- a distributor with no market configured
   {
     const lone = await deploy(vm, OPERATOR, art.dist,
-      [token, OPERATOR, ethers.ZeroAddress, ethers.ZeroAddress]);
+      [token, OPERATOR, ethers.ZeroAddress, ethers.ZeroAddress, ethers.ZeroAddress]);
     const t = build([{ account: A, amount: 1n }]);
     const r = await call(vm, OPERATOR, lone, art.dist, "openEpochOnMarket",
       [t.root, 1n, 0n, 200_000n], { block: at(1000n) });

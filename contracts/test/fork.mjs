@@ -31,6 +31,11 @@ const RPC = process.env.GLADOS_RPC || "https://rpc.mainnet.chain.robinhood.com";
 const TOKEN = "0x3d609ecafc6aa7dba67dd7ad1d10b49c52d57777";
 const PAIR = "0x93f777932d98d15b351d1bce8c76b34381eede5b";
 const WETH = "0x0bd7d308f8e1639fab988df18a8011f41eacad73";
+/// Uniswap's V3 factory on 4663, verified by reading its code and its
+/// PoolCreated log rather than by the address looking canonical -- the
+/// canonical V3 factory address on every other chain *also* has code here and
+/// is not a factory, which is a trap worth one line of comment.
+const V3_FACTORY = "0x1f7d7550B1b028f7571E69A784071F0205FD2EfA";
 
 const args = process.argv.slice(2);
 const file = args.find((x) => !x.startsWith("--"));
@@ -140,7 +145,7 @@ async function main() {
     abi: art["GladosDistributor.sol"].GladosDistributor.abi,
     bytecode: art["GladosDistributor.sol"].GladosDistributor.evm.bytecode.object,
   };
-  const at = await deploy(vm, OPERATOR, dist, [TOKEN, OPERATOR, PAIR, WETH]);
+  const at = await deploy(vm, OPERATOR, dist, [TOKEN, OPERATOR, PAIR, WETH, V3_FACTORY]);
   console.log(`distributor deployed into the fork at ${at}`);
 
   const iface = new ethers.Interface(dist.abi);

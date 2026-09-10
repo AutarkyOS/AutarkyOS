@@ -62,6 +62,35 @@ interface IUniswapV2Pair {
     function swap(uint256 amount0Out, uint256 amount1Out, address to, bytes calldata data) external;
 }
 
+/// Uniswap V3's pool, which pays out first and asks to be paid back.
+///
+/// That inversion is the whole reason this needed a second code path rather
+/// than a second address. A V2 pair is sent the input and then told to send the
+/// output; a V3 pool sends the output and then calls `uniswapV3SwapCallback` on
+/// whoever asked, which must move the input before that call returns or the
+/// entire swap unwinds. So a contract trading on V3 has to expose a function
+/// whose job is to pay somebody, and the authorisation on that function is the
+/// only thing standing between this contract's balance and anyone who asks for
+/// it. See `_inFlight`.
+interface IUniswapV3Pool {
+    function token0() external view returns (address);
+    function token1() external view returns (address);
+    function fee() external view returns (uint24);
+    function swap(
+        address recipient,
+        bool zeroForOne,
+        int256 amountSpecified,
+        uint160 sqrtPriceLimitX96,
+        bytes calldata data
+    ) external returns (int256 amount0, int256 amount1);
+}
+
+/// Only `getPool`, because that is the one question worth asking it: does this
+/// factory consider this address to be the pool for these three keys.
+interface IUniswapV3Factory {
+    function getPool(address tokenA, address tokenB, uint24 fee) external view returns (address);
+}
+
 contract GladosDistributor {
     /// How an epoch pays.
     ///
@@ -83,7 +112,17 @@ contract GladosDistributor {
         Direct,
         /// The epoch holds an input token. A claim swaps it on the market and
         /// the reward token goes straight to the claimant.
-        Market
+        Market,
+        /// As `Market`, on a Uniswap V3 pool, and paying a reward token the
+        /// epoch names rather than the one this contract gates on.
+        ///
+        /// **Those two changes travel together on purpose.** V3 is where the
+        /// tokenized-equity pools live on 4663 -- the V2 market for them is
+        /// four hundredths of a percent of the real one -- and the reason to
+        /// reach them at all is to pay somebody in NVDA while still gating on
+        /// GLADOS. A mode that swapped venue without splitting reward from gate
+        /// would have no caller.
+        MarketV3
     }
 
     struct Epoch {
@@ -101,6 +140,12 @@ contract GladosDistributor {
         bool reclaimed;
         /// How this epoch pays. Fixed when the epoch opens, like the gate.
         Mode mode;
+        /// `MarketV3` only: the pool a claim swaps through, checked against the
+        /// factory when the epoch opened. Zero in every other mode.
+        address pool;
+        /// `MarketV3` only: what a claim buys. Zero in every other mode, where
+        /// the reward is `token` and there is nothing to choose.
+        address reward;
     }
 
     /// The token being distributed. Immutable: a distributor that could be
@@ -132,6 +177,38 @@ contract GladosDistributor {
     /// GLADOS pool is quoted against -- read from the token's own
     /// `quoteToken()` rather than chosen, so the path is the pool that exists.
     address public immutable quote;
+
+    /// The V3 factory, and the only reason a pool address is worth believing.
+    ///
+    /// Immutable for the reason `pair` is: a distributor that could be
+    /// repointed at a different factory could be pointed at one whose `getPool`
+    /// says yes to anything. Zero disables `MarketV3` entirely, which is the
+    /// right configuration on a chain that has no V3 deployment.
+    address public immutable v3Factory;
+
+    /// The pool a swap is in flight with, and the whole of the callback's
+    /// authorisation.
+    ///
+    /// Set immediately before `swap` and cleared immediately after, so it holds
+    /// a non-zero value only inside one call this contract itself started. A
+    /// callback arriving at any other moment finds zero and reverts.
+    ///
+    /// **Authorising by factory lookup instead would be the bug**, and it is
+    /// the standard way this callback gets drained: `getPool` says yes to every
+    /// genuine pool, including one an attacker deployed for a pair of worthless
+    /// tokens of their own, from which they can call this callback and be paid
+    /// in `quote` for nothing.
+    address private _inFlight;
+
+    /// The two ends of V3's price range, from the reference `TickMath`.
+    ///
+    /// A `swap` must name a price limit, and these are the values that mean "no
+    /// limit" in each direction. Passing them is deliberate: the protection a
+    /// claimant actually gets is `minOut`, measured on their own balance after
+    /// the fact, and a second bound expressed as a square-rooted Q64.96 price
+    /// would be a number no caller could sanity-check.
+    uint160 private constant MIN_SQRT_RATIO = 4295128739;
+    uint160 private constant MAX_SQRT_RATIO = 1461446703485210103287273052203988822378723970342;
 
     Epoch[] private _epochs;
 
@@ -166,8 +243,10 @@ contract GladosDistributor {
     error WrongMode();
     error NoSlippageBound();
     error TooLittleOut(uint256 got, uint256 wanted);
+    error BadPool();
+    error BadCallback();
 
-    constructor(address token_, address operator_, address pair_, address quote_) {
+    constructor(address token_, address operator_, address pair_, address quote_, address v3Factory_) {
         require(token_ != address(0) && operator_ != address(0), "zero address");
         // `pair` and `quote` may both be zero, which simply means this
         // distributor cannot open `Market` epochs. Requiring them would make
@@ -179,6 +258,11 @@ contract GladosDistributor {
         pair = pair_;
         quote = quote_;
         quoteIsToken0 = quote_ < token_;
+        // Deliberately not tied to `quote`: a chain can have a V3 deployment
+        // and no V2 pair for this token, or the reverse, and refusing either
+        // combination would make the contract undeployable for a reason that
+        // has nothing to do with the epoch being opened.
+        v3Factory = v3Factory_;
     }
 
     modifier onlyOperator() {
@@ -216,7 +300,9 @@ contract GladosDistributor {
             gate: gate,
             deadline: deadline,
             reclaimed: false,
-            mode: Mode.Direct
+            mode: Mode.Direct,
+            pool: address(0),
+            reward: address(0)
         }));
         emit EpochOpened(epochId, root, got, gate, deadline, Mode.Direct);
     }
@@ -258,9 +344,122 @@ contract GladosDistributor {
             gate: gate,
             deadline: deadline,
             reclaimed: false,
-            mode: Mode.Market
+            mode: Mode.Market,
+            pool: address(0),
+            reward: address(0)
         }));
         emit EpochOpened(epochId, root, got, gate, deadline, Mode.Market);
+    }
+
+    /// Open an epoch that pays a token this contract does not gate on, bought
+    /// on a Uniswap V3 pool.
+    ///
+    /// Funded in `quote`, like `openEpochOnMarket`, and for the same reason:
+    /// the operator never holds the reward and every claimant's purchase is a
+    /// buy on the open market that anybody can see.
+    ///
+    /// **The pool is verified rather than trusted, and the check is worth
+    /// reading.** Anything can be deployed at an address and answer `swap`.
+    /// Reading the candidate's own three keys and asking the factory to name
+    /// the pool for those keys is a check a liar cannot pass, because a lie
+    /// about any key resolves to a different address than the one being asked
+    /// about. Then the keys must be the pair this epoch claims, or an operator
+    /// could point a NVDA epoch at a real pool for something else entirely.
+    function openEpochOnV3(
+        bytes32 root,
+        uint256 amount,
+        uint256 gate,
+        uint64 deadline,
+        address pool_,
+        address reward_
+    ) external onlyOperator returns (uint256 epochId) {
+        if (v3Factory == address(0) || quote == address(0)) revert NoMarket();
+        if (root == bytes32(0)) revert NoRoot();
+        if (amount == 0) revert NothingFunded();
+        if (deadline <= block.timestamp) revert DeadlineInPast();
+        if (reward_ == address(0) || reward_ == quote) revert BadPool();
+
+        address t0 = IUniswapV3Pool(pool_).token0();
+        address t1 = IUniswapV3Pool(pool_).token1();
+        if (IUniswapV3Factory(v3Factory).getPool(t0, t1, IUniswapV3Pool(pool_).fee()) != pool_) revert BadPool();
+        if (!((t0 == quote && t1 == reward_) || (t0 == reward_ && t1 == quote))) revert BadPool();
+
+        uint256 before = IERC20(quote).balanceOf(address(this));
+        _move(quote, abi.encodeWithSelector(0x23b872dd, msg.sender, address(this), amount));
+        uint256 got = IERC20(quote).balanceOf(address(this)) - before;
+        if (got == 0) revert NothingFunded();
+
+        epochId = _epochs.length;
+        _epochs.push(Epoch({
+            root: root,
+            funded: got,
+            claimed: 0,
+            gate: gate,
+            deadline: deadline,
+            reclaimed: false,
+            mode: Mode.MarketV3,
+            pool: pool_,
+            reward: reward_
+        }));
+        emit EpochOpened(epochId, root, got, gate, deadline, Mode.MarketV3);
+    }
+
+    /// Claim from a `MarketV3` epoch, swapping the allocation on the way out.
+    ///
+    /// `minOut` carries the same rule as `claimOnMarket` and is measured the
+    /// same way, on the claimant's own balance after the fact. That matters
+    /// more here than it did there: the reward may be a token with a transfer
+    /// hook this contract has never seen, since the operator names it per
+    /// epoch, so what the pool reports having sent is not evidence of what
+    /// arrived.
+    function claimOnV3(uint256 epochId, uint256 amount, bytes32[] calldata proof, uint256 minOut)
+        external
+        returns (uint256 received)
+    {
+        if (minOut == 0) revert NoSlippageBound();
+        Epoch storage e = _admit(epochId, amount, proof);
+        if (e.mode != Mode.MarketV3) revert WrongMode();
+
+        address pool_ = e.pool;
+        address reward_ = e.reward;
+        // Recomputed rather than stored: the ordering is a property of the two
+        // addresses and storing it would be a second place for it to be wrong.
+        bool zeroForOne = quote < reward_;
+
+        uint256 before = IERC20(reward_).balanceOf(msg.sender);
+        _inFlight = pool_;
+        IUniswapV3Pool(pool_).swap(
+            msg.sender,
+            zeroForOne,
+            int256(amount),
+            zeroForOne ? MIN_SQRT_RATIO + 1 : MAX_SQRT_RATIO - 1,
+            ""
+        );
+        // Cleared on the way out rather than left for the next call to
+        // overwrite: a stale value here is a standing authorisation to be paid.
+        _inFlight = address(0);
+
+        received = IERC20(reward_).balanceOf(msg.sender) - before;
+        if (received < minOut) revert TooLittleOut(received, minOut);
+        emit Claimed(epochId, msg.sender, amount, received);
+    }
+
+    /// Pay the pool for a swap this contract is in the middle of.
+    ///
+    /// The deltas are signed from the pool's point of view, so the positive one
+    /// is what the pool is owed. Only one of the two can be positive on an
+    /// exact-input swap, and it is always `quote` here, because that is the
+    /// only thing any epoch pays in.
+    ///
+    /// Everything protecting this is the `_inFlight` check on the first line.
+    function uniswapV3SwapCallback(int256 amount0Delta, int256 amount1Delta, bytes calldata) external {
+        if (msg.sender != _inFlight || _inFlight == address(0)) revert BadCallback();
+        int256 owed = amount0Delta > 0 ? amount0Delta : amount1Delta;
+        // A pool asking for nothing, or paying us on both legs, is not a swap
+        // this contract started correctly. Refuse rather than send zero and
+        // let the pool decide what that meant.
+        if (owed <= 0) revert BadCallback();
+        _send(quote, msg.sender, uint256(owed));
     }
 
     /// Claim one epoch's allocation.

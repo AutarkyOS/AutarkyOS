@@ -66,7 +66,7 @@ const tok = {
 const vm = await makeVm();
 await fund(vm, OPERATOR);
 const token = await deploy(vm, OPERATOR, tok, [10n ** 27n]);
-const at = await deploy(vm, OPERATOR, dist, [token, OPERATOR, ethers.ZeroAddress, ethers.ZeroAddress]);
+const at = await deploy(vm, OPERATOR, dist, [token, OPERATOR, ethers.ZeroAddress, ethers.ZeroAddress, ethers.ZeroAddress]);
 
 let allVerify = true;
 let sum = 0n;
