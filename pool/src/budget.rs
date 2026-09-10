@@ -29,6 +29,28 @@
 //! serving expensive coins is bounded hard, with no per-algorithm rule to keep
 //! in step with anything.
 //!
+//! **"A yespower share" is not one number, and the deployed coin is the cheap
+//! one.** `--bench` on that machine reports 5,527 us for the 2 MiB profile and
+//! 19,359 us for the 8 MiB one -- a factor of 3.5 between two coins that both
+//! spell their algorithm `yespower`, because the working set is the cost and
+//! `N` and `r` set it. The 19,000 above is the 8 MiB figure; `run-pool.sh`
+//! configures `yespower-10-2048-8`, which is 2 MiB. So the ninety-seven cores
+//! is the right arithmetic for the worst profile and about 28 for the one
+//! actually running. Both are far past four, so the conclusion does not move --
+//! but a reader taking 19 ms as a property of the algorithm would size the
+//! budget for a coin they are not serving.
+//!
+//! **And the live estimate runs above the bench, which is the direction a
+//! safety bound should err in.** Driven against that host: 6,008 us a share on
+//! one connection and 7,153 us with four, against the bench's uncontended
+//! 5,527. A 2 MiB working set on a four-thread part shares one last-level
+//! cache, so four connections validating at once cost 30% more each than one
+//! does -- the same memory-bandwidth story `smp bench` records in the kernel,
+//! arriving here as a budget that tightens exactly when the machine is busy.
+//! Process CPU over the same run was 7,338 us per admitted share, so the
+//! estimate is if anything slightly *under* the true cost rather than inflated
+//! by lock waiting, which was the other candidate explanation and is refuted.
+//!
 //! ### The cost is measured, because assuming it is what went wrong
 //!
 //! Every validation is timed and folded into a per-algorithm estimate. There
@@ -190,12 +212,24 @@ impl Budget {
 
     /// What the budget would allow per second, per algorithm, at the measured
     /// costs. The line an operator lending a machine actually wants.
+    ///
+    /// **An unlimited budget answers infinity and not zero.** `rate_us_per_s`
+    /// is zero when there is no cap, so the division gave 0 and the line read
+    /// "so 0 a second within the cap" -- which is the arithmetic of no budget
+    /// wearing the words of the tightest possible one, and it is the operator
+    /// of an *unbounded* pool who most needs to not be told that. Caught by
+    /// running a flood against `--cpu-percent 0`, where the pool answered
+    /// every share and reported it could answer none.
     pub fn report(&self) -> Vec<(String, f64, f64)> {
         let mut v: Vec<(String, f64, f64)> = self
             .cost
             .iter()
             .map(|(a, c)| {
-                let per_s = if *c > 0.0 { self.rate_us_per_s / c } else { f64::INFINITY };
+                let per_s = if self.unlimited() || *c <= 0.0 {
+                    f64::INFINITY
+                } else {
+                    self.rate_us_per_s / c
+                };
                 (a.clone(), *c, per_s)
             })
             .collect();

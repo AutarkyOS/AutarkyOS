@@ -355,9 +355,13 @@ fn main() {
         // 2.5x, so a pool that did not print its own would repeat that.
         let denied = server::budget_denied();
         for (algo, us, per_s) in server::budget_report() {
-            println!(
-                "[budget] {algo}  {us:.1} us a share, so {per_s:.0} a second within the cap"
-            );
+            if per_s.is_finite() {
+                println!(
+                    "[budget] {algo}  {us:.1} us a share, so {per_s:.0} a second within the cap"
+                );
+            } else {
+                println!("[budget] {algo}  {us:.1} us a share, and no cap on how many");
+            }
         }
         if denied > 0 {
             println!("[budget] {denied} share(s) deferred so far; raise --cpu-percent to admit more");

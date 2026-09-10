@@ -21,6 +21,19 @@
 //! repository's rule about those is stated in the kernel's own manifest --
 //! so a thread that sleeps in `read` is both simpler and the right shape until
 //! there are enough connections for the stacks to matter.
+//!
+//! **What a connection actually costs, measured rather than assumed.** Three
+//! hundred were opened at once against the deployed binary on the host it runs
+//! on, held for twenty seconds and sampled: 258 threads, 260 descriptors and
+//! 8,184 KiB resident against a 904 KiB idle baseline. So a connection is one
+//! thread, one descriptor and **28 KiB**, and the full ceiling is 7.3 MiB --
+//! which is what "until the stacks matter" was worth as a number and had never
+//! been. Everything came back to 2 threads, 4 descriptors and 908 KiB
+//! afterwards, so the ceiling does not leak.
+//!
+//! A first attempt at that measurement reported `Threads: 2` throughout, which
+//! is not a pool serving 256 connections -- it is a sampler that opened and
+//! closed inside its own sampling interval. The hold is the measurement.
 
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
@@ -168,6 +181,8 @@ fn handle(mut stream: TcpStream, pool: Arc<Mutex<Pool>>, peer: &str) -> std::io:
     let mut worker = String::from("(unauthenticated)");
     let mut greeted = false;
     let mut bad: u32 = 0;
+    let mut deferred: u32 = 0;
+    let mut malformed: u32 = 0;
     let mut submits_this_second: u32 = 0;
     let mut works_this_second: u32 = 0;
     let mut window = Instant::now();
@@ -275,7 +290,36 @@ fn handle(mut stream: TcpStream, pool: Arc<Mutex<Pool>>, peer: &str) -> std::io:
                     if !greeted {
                         return Ok(());
                     }
+                    // **Answered, where the other two refusals are not, and the
+                    // difference is who is on the other end.** The rate limit
+                    // and the budget drop silently because the peer is already
+                    // sending more than the pool can serve and a reply is a
+                    // second thing to send them. A submit that will not parse
+                    // is a *client bug* on a connection that greeted correctly
+                    // and may be sending one message every ten seconds.
+                    //
+                    // Silence there cost this project a whole soak run. A test
+                    // miner hashed correctly for forty minutes and was credited
+                    // nothing, because it spelled the nonce as a JSON number
+                    // where `parse_share` wants big-endian hex -- and the pool
+                    // dropped every one of them without a word, so the miner's
+                    // log said "connected, working" and the pool's said
+                    // nothing at all. One line here is the difference between
+                    // that and a fix in ten seconds.
+                    //
+                    // Bounded the same way everything else here is: a peer that
+                    // sends malformed submits forever gets four replies and
+                    // then silence, so this cannot become the flood it exists
+                    // to make visible.
                     let Some(sh) = params.and_then(proto::parse_share) else {
+                        malformed += 1;
+                        if malformed <= 4 {
+                            println!("[pool] {worker} sent a submit that will not parse");
+                            let msg = format!(
+                                "{{\"id\":{id},\"result\":null,\"error\":\"submit needs job (string) and nonce (8 hex digits, big-endian)\"}}\n"
+                            );
+                            stream.write_all(msg.as_bytes())?;
+                        }
                         continue;
                     };
 
@@ -324,8 +368,23 @@ fn handle(mut stream: TcpStream, pool: Arc<Mutex<Pool>>, peer: &str) -> std::io:
                         // thing to send to somebody the pool is already
                         // struggling to serve. The miner treats an unanswered
                         // submit as its own category, which is what it is.
-                        if bad < 4 {
+                        //
+                        // **Quietened against its own counter and not against
+                        // `bad`.** It was `bad < 4`, and a deferred share is
+                        // never validated, so `bad` never moves on this path
+                        // and the guard never engaged: a twenty-second flood
+                        // at 1% of a core wrote 785 log lines, one per
+                        // deferral, unbounded. That is the exact failure the
+                        // bad-share quietening exists to prevent -- filling
+                        // somebody's disk is a worse way to fail than dropping
+                        // a connection -- arriving through the one path that
+                        // had been given the wrong counter to read.
+                        deferred += 1;
+                        if deferred <= 4 {
                             println!("[pool] {worker} share deferred: validation budget spent");
+                            if deferred == 4 {
+                                println!("[pool] {worker} is over the validation budget; quietening the log");
+                            }
                         }
                         continue;
                     }
