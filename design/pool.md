@@ -1,11 +1,12 @@
 # The pool, and the one protocol it speaks downstream
 
-Status: **there is a chain behind it now.** The pool speaks Stratum V1 to a
+Status: **it has met the actual internet.** The pool speaks Stratum V1 to a
 real upstream, builds headers from its `mining.notify`, serves them to the
 kernel over the glados protocol, and sends back the shares good enough to
 matter. Driven end to end against a controlled server that verified every
-forwarded share independently. What has not happened is any of it meeting a
-pool on the actual internet.
+forwarded share independently, and then against `solo.ckpool.org`, whose real
+coinbase it rebuilt and named the outputs of. What has *not* happened is a
+share going back up to a chain, because at this hashrate none will.
 
 `design/mining.md` is the other half and should be read first: it covers what
 the kernel does with the work this pool hands it.
@@ -820,17 +821,59 @@ when there is a live upstream there is also a chain to read it from.
   reachable from the public internet -- that needs a forwarded port -- and not
   yet left running, which needs the operator's `enable-linger`.
 
+## It has met a real chain
+
+The largest thing on the list below was "no upstream on the internet has been
+asked for work". That is done, and it went further than a connectivity check.
+
+    [up btc] connecting to solo.ckpool.org:3333
+    [up btc] subscribed and authorized, extranonce1 4 bytes, extranonce2 8
+    [up btc] job 6a72bdc00001adec, 10 merkle level(s), target 00000000..
+
+    00000002 on btc: proof VERIFIES, pays 3.13499712
+      3.07229718 to bc1q070w...thvst
+      0.06269994 to bc1q28kk...wfzu
+
+solo.ckpool.org because it wants **no account**: the username is a payout
+address, which is the only arrangement that can be tested at all without
+somebody registering somewhere first. Bounded runs, nothing left connected.
+
+Every line of that is a separate thing working. A real pool's `mining.subscribe`
+and `mining.authorize`; a real `mining.notify` with a ten-level merkle branch,
+which is the case `mine::probe` exists in the kernel because nothing could
+exercise; a downstream job built from it; and `tools/prooftest.py` -- Python,
+sharing no code with the Rust -- rebuilding the coinbase from
+`coinb1 || extranonce1 || extranonce2 || coinb2`, folding that branch, and
+landing on the merkle root inside the 80-byte header it was handed.
+
+**And the second line is the one that matters for a non-custodial pool.** The
+value alone never answered the question a miner is actually asking, which is
+*whose address*. `prooftest.py` names the outputs now and `--expect-paid` makes
+it a check rather than a report. The split is ckpool's own two percent, read off
+the chain's data rather than off their website.
+
+The bech32 encoder is written out in that file rather than imported, for the
+reason the file exists: it is meant to be runnable by a miner with nothing
+installed, before they point hardware at anybody, and a dependency is a reason
+not to bother. Checked against BIP-173's own vectors.
+
+**What this still does not prove** is that any of it earns anything. Solo
+mining Bitcoin from a laptop is a lottery ticket with no realistic prospect,
+and `mine ev` says so on every run. What was under test is the plumbing, and
+the plumbing is now the only part that has been demonstrated against something
+this project does not control.
+
 ## What does not
-- **A real upstream.** Everything above ran against local coins the pool
-  invents. No upstream on the internet has been asked for work, which needs an
-  account and an address rather than any more code.
+- **Shares going back upstream.** The forward path exists and is claimed in
+  tests, but nothing here has ever produced a share that beat Bitcoin's network
+  target, and nothing ever will at this hashrate. That leg is checked against
+  `stratumstub.py` and not against a chain, and that is the honest state of it.
 - TLS, and therefore any safety on an untrusted network. See above.
 - The site repository, the DNS record, and the host. None of them exist yet.
 - Worker identity, which is `supabase/functions/link` already and needs joining
   up rather than writing.
 - Publishing any of it, which is the whole of B4 and the only thing standing in
   for trust.
-- Any of it having met a real network.
 - **An expected value per coin**, and therefore weights a miner could derive
   rather than be given. `miner/src/main.rs` shares one device across coins by
   weight and every weight is 1, which is honest and is not a policy. See above

@@ -48,12 +48,86 @@ def root_of(proof):
     return root, coinbase
 
 
+BECH32 = "qpzry9x8gf2tvdw0s3jn54khce6mua7l"
+
+
+def bech32_polymod(values):
+    gen = [0x3b6a57b2, 0x26508e6d, 0x1ea119fa, 0x3d4233dd, 0x2a1462b3]
+    chk = 1
+    for v in values:
+        top = chk >> 25
+        chk = ((chk & 0x1ffffff) << 5) ^ v
+        for i in range(5):
+            chk ^= gen[i] if ((top >> i) & 1) else 0
+    return chk
+
+
+def bech32_encode(hrp, witver, prog):
+    """Just enough bech32/bech32m to name a v0 or v1 witness output.
+
+    Written out rather than pulled from a library because this file is meant to
+    be runnable by a miner with nothing installed -- the whole point of it is
+    that somebody can check a pool before pointing hardware at it, and a
+    dependency is a reason not to bother.
+    """
+    data = [witver] + [b for b in convertbits(prog, 8, 5)]
+    const = 1 if witver == 0 else 0x2bc830a3
+    values = [ord(c) >> 5 for c in hrp] + [0] + [ord(c) & 31 for c in hrp] + data
+    polymod = bech32_polymod(values + [0, 0, 0, 0, 0, 0]) ^ const
+    checksum = [(polymod >> 5 * (5 - i)) & 31 for i in range(6)]
+    return hrp + "1" + "".join(BECH32[d] for d in data + checksum)
+
+
+def convertbits(data, frm, to):
+    acc = 0
+    bits = 0
+    out = []
+    maxv = (1 << to) - 1
+    for b in data:
+        acc = (acc << frm) | b
+        bits += frm
+        while bits >= to:
+            bits -= to
+            out.append((acc >> bits) & maxv)
+    if bits:
+        out.append((acc << (to - bits)) & maxv)
+    return out
+
+
+def script_address(spk):
+    """Name a coinbase output's script, or say what shape it is.
+
+    **This is the question a non-custodial pool has to answer** and the one the
+    value alone does not: a miner can verify that the coinbase committed to is
+    the coinbase it was shown, and still have no idea whose address it pays.
+    Only P2WPKH, P2WSH, P2TR and P2PKH are named, because those cover what a
+    pool actually emits; anything else is reported by its shape rather than
+    guessed at, since an address printed wrong is worse than none.
+    """
+    if len(spk) == 22 and spk[0] == 0x00 and spk[1] == 0x14:
+        return bech32_encode("bc", 0, spk[2:])
+    if len(spk) == 34 and spk[0] == 0x00 and spk[1] == 0x20:
+        return bech32_encode("bc", 0, spk[2:])
+    if len(spk) == 34 and spk[0] == 0x51 and spk[1] == 0x20:
+        return bech32_encode("bc", 1, spk[2:])
+    if len(spk) == 25 and spk[0] == 0x76 and spk[1] == 0xa9 and spk[2] == 0x14:
+        return "p2pkh:" + spk[3:23].hex()
+    if len(spk) >= 2 and spk[0] == 0x6a:
+        # The witness commitment, and every block after segwit has one. Named
+        # rather than listed as an unknown, or every run reports a mystery.
+        return "op_return (witness commitment)"
+    return "unrecognised script, %d bytes" % len(spk)
+
+
 def coinbase_value(cb):
     """Sum the coinbase outputs, or None if it does not parse exactly.
 
     Walks and must land on the last byte, which is the same bargain
     `ev::coinbase_value` makes: a transaction that *nearly* parses is one this
     has misread, and a plausible number from a misread is worse than none.
+
+    Answers `(total, [(value, script)])` so the caller can say *who* is paid
+    and not only how much.
     """
     try:
         i = 4                                     # version
@@ -72,14 +146,16 @@ def coinbase_value(cb):
         if n_out >= 0xfd:
             return None
         total = 0
+        outs = []
         for _ in range(n_out):
-            total += int.from_bytes(cb[i:i + 8], "little"); i += 8
+            v = int.from_bytes(cb[i:i + 8], "little"); i += 8
+            total += v
             ln = cb[i]; i += 1
             if ln >= 0xfd:
                 return None
-            i += ln
+            outs.append((v, cb[i:i + ln])); i += ln
         i += 4                                    # locktime
-        return total if i == len(cb) else None
+        return (total, outs) if i == len(cb) else None
     except IndexError:
         return None
 
@@ -122,6 +198,10 @@ def main():
     ap.add_argument("--host", default="127.0.0.1")
     ap.add_argument("--port", type=int, default=3334)
     ap.add_argument("--seconds", type=float, default=20.0)
+    ap.add_argument("--expect-paid", metavar="ADDRESS",
+                    help="require this address among the coinbase outputs; "
+                         "the check a miner actually wants before pointing "
+                         "hardware at a pool")
     ap.add_argument("--expect-fail", action="store_true",
                     help="require the proof NOT to verify, for checking a pool "
                          "that is deliberately lying")
@@ -149,10 +229,30 @@ def main():
     ok = root == header[36:68]
 
     if ok:
-        value = coinbase_value(coinbase)
-        paid = ("pays %d.%08d" % (value // 100_000_000, value % 100_000_000)
-                if value is not None else "coinbase did not parse exactly")
-        print("%s on %s: proof VERIFIES, %s" % (job["job"], job["coin"], paid))
+        parsed = coinbase_value(coinbase)
+        if parsed is None:
+            print("%s on %s: proof VERIFIES, coinbase did not parse exactly"
+                  % (job["job"], job["coin"]))
+        else:
+            value, outs = parsed
+            print("%s on %s: proof VERIFIES, pays %d.%08d"
+                  % (job["job"], job["coin"], value // 100_000_000,
+                     value % 100_000_000))
+            # **Who, and not only how much.** A miner can verify that the
+            # coinbase committed to is the coinbase it was shown and still have
+            # no idea whose address it pays, which for a pool whose whole claim
+            # is that it never holds your coins is the question.
+            for v, spk in outs:
+                if v == 0:
+                    continue
+                print("  %d.%08d to %s" % (v // 100_000_000, v % 100_000_000,
+                                           script_address(spk)))
+            if a.expect_paid:
+                names = [script_address(spk) for v, spk in outs if v > 0]
+                if a.expect_paid not in names:
+                    print("  FAIL: nothing pays %s" % a.expect_paid)
+                    return 1
+                print("  and %s is among them" % a.expect_paid)
     else:
         print("%s on %s: proof DOES NOT match the header it came with"
               % (job["job"], job["coin"]))
