@@ -175,6 +175,52 @@ def allocate(work, total):
 
 # ---------------------------------------------------------------- ledger
 
+def shares_from(ledger, basis, coin=None):
+    """The rows a payout is computed from, under one of two incompatible bases.
+
+    **The pool publishes both and they are not the same number.** Its top-level
+    `shares` is a lifetime tally per (worker, coin); its `windows` is the PPLNS
+    sliding window. On a real ledger from the soak, one worker showed
+    18,387,828,736 of tallied work against 4,294,967,296 in the window -- a
+    factor of 4.28 for the same person in the same file.
+
+    Nothing here can decide which is right, because the answer depends on what
+    the epoch is:
+
+    - **`window`** is PPLNS, and it is what `design/pool.md` argues for during
+      continuous operation: it is resistant to pool-hopping, since a miner who
+      arrives for the profitable part of a round finds their shares aged out
+      before the payout. Its window holds the last N shares, so work older than
+      that is not in it at all.
+    - **`tally`** is every share the pool ever credited. Right for an *event*,
+      where the whole point is to pay for the entire 36 hours and a sliding
+      window would have discarded most of it by the time the epoch closes.
+
+    So there is no safe default and this refuses to pick one. Paying the wrong
+    basis is not a mistake anybody can undo, and the two agree exactly when
+    there is one worker -- which is what every test until now had.
+    """
+    if basis == "tally":
+        return ledger.get("shares", [])
+    if basis != "window":
+        raise ValueError("basis must be 'window' or 'tally'")
+    rows = []
+    for w in ledger.get("windows", []):
+        c = w.get("coin")
+        if coin is not None and c != coin:
+            continue
+        # `payout` is the pool's own per-worker fold of the same window, so
+        # preferring it means this tool and the pool cannot disagree about an
+        # arithmetic they both do. Falling back to the raw shares keeps a
+        # ledger written before `payout` existed readable.
+        src = w.get("payout")
+        if src is None:
+            src = w.get("shares", [])
+        for r in src:
+            rows.append({"worker": r.get("worker", ""), "coin": c, "work": r.get("work", 0)})
+    return rows
+
+
 def load_mapping(doc, since=None):
     """Accept either a flat `{name: address}` file or the service's document.
 
@@ -226,7 +272,8 @@ def work_by_address(ledger, mapping, coin=None):
     """
     out = {}
     unknown = []
-    for row in ledger.get("shares", []):
+    rows = ledger.get("shares", []) if isinstance(ledger, dict) else ledger
+    for row in rows:
         if coin is not None and row.get("coin") != coin:
             continue
         name = row.get("worker", "")
@@ -344,6 +391,53 @@ def selftest():
     claim(w3 == {} and unknown3 == ["late"],
           "work under a refused mapping is reported unknown rather than paid")
 
+    # ---- the two payout bases, which are not the same number --------------
+    #
+    # The fixture is deliberately two workers whose *recent* effort inverts
+    # their lifetime effort, because that is the only shape where the bases
+    # disagree and it is exactly the shape PPLNS exists to handle. With one
+    # worker both answer 1.0, which is why a real ledger from the soak looked
+    # fine under either.
+    both = {
+        "shares": [
+            {"worker": A, "coin": "btc", "work": 900},
+            {"worker": B, "coin": "btc", "work": 100},
+        ],
+        "windows": [
+            {"coin": "btc", "total": 1000, "payout": [
+                {"worker": A, "work": 100},
+                {"worker": B, "work": 900},
+            ]},
+        ],
+    }
+    wt, _ = work_by_address(shares_from(both, "tally", "btc"), {})
+    ww, _ = work_by_address(shares_from(both, "window", "btc"), {})
+    claim(wt[A.lower()] == 900 and wt[B.lower()] == 100, "the tally basis pays lifetime work")
+    claim(ww[A.lower()] == 100 and ww[B.lower()] == 900, "the window basis pays the PPLNS window")
+    claim(wt != ww, "and the two bases genuinely disagree, which is the whole point")
+
+    # A window with no `payout` fold still reads, from its raw shares, so a
+    # ledger written before that field existed is not silently empty.
+    old = {"windows": [{"coin": "btc", "total": 30, "shares": [
+        {"worker": A, "work": 10}, {"worker": A, "work": 20}]}]}
+    wo, _ = work_by_address(shares_from(old, "window", "btc"), {})
+    claim(wo[A.lower()] == 30, "a window with no payout fold is read from its shares")
+
+    # A coin filter applies to the window basis too. It did not have to -- the
+    # rows are built here rather than filtered later -- so it is asserted.
+    two = {"windows": [
+        {"coin": "btc", "total": 5, "payout": [{"worker": A, "work": 5}]},
+        {"coin": "ftc", "total": 7, "payout": [{"worker": B, "work": 7}]},
+    ]}
+    wc, _ = work_by_address(shares_from(two, "window", "btc"), {})
+    claim(wc == {A.lower(): 5}, "the coin filter reaches the window basis")
+
+    try:
+        shares_from(both, "lifetime")
+        claim(False, "an unknown basis is refused")
+    except ValueError:
+        claim(True, "an unknown basis is refused")
+
     print("\n%s" % ("selftest passed" if fails == 0 else "%d FAILED" % fails))
     return 0 if fails == 0 else 1
 
@@ -377,6 +471,12 @@ def main():
     ap.add_argument("--gate", help="only pay addresses holding this much of --token")
     ap.add_argument("--token", help="the ERC-20 the gate is measured in")
     ap.add_argument("--rpc", default="https://rpc.mainnet.chain.robinhood.com")
+    ap.add_argument("--basis", choices=["window", "tally"],
+                    help="which of the ledger's two payout bases to pay on. "
+                         "window is PPLNS and right for continuous operation; "
+                         "tally is every credited share and right for a bounded "
+                         "event. There is no default: they differ by 4x on a "
+                         "real ledger and paying the wrong one cannot be undone")
     ap.add_argument("--selftest", action="store_true")
     a = ap.parse_args()
 
@@ -397,7 +497,21 @@ def main():
         mapping, moved = {}, {}
     total = parse_amount(a.total)
 
-    work, unknown = work_by_address(ledger, mapping, a.coin)
+    if not a.basis:
+        has_window = bool(ledger.get("windows"))
+        has_tally = bool(ledger.get("shares"))
+        if has_window and has_tally:
+            print("this ledger carries both a PPLNS window and a lifetime tally, and they",
+                  file=sys.stderr)
+            print("are different numbers. Choose with --basis window or --basis tally;",
+                  file=sys.stderr)
+            print("see the note on shares_from() for which an epoch wants.", file=sys.stderr)
+            return 1
+        # Only one basis present, so there is nothing to get wrong.
+        a.basis = "window" if has_window else "tally"
+
+    rows = shares_from(ledger, a.basis, a.coin)
+    work, unknown = work_by_address(rows, mapping, a.coin)
     if unknown:
         # Refused rather than dropped. Silently omitting a miner who did work is
         # the one failure this document cannot be checked for from outside.
