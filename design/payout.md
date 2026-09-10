@@ -39,6 +39,40 @@ It is running v3.20.1 with 87 active nodes and no halt flags, reachable at
 `thorchain.ibs.team/api`. An unreachable endpoint is not evidence about a
 protocol, and this document said it was.
 
+## Every payout venue, in one table
+
+Time to a first payout at the measured $0.0703/day net, which is the only figure
+that separates them at this scale. Fees are shown but mostly do not bind.
+
+| venue | asset / chain | threshold | days | fee on the payout |
+|---|---|---|---:|---|
+| **unMineable** | **POL / Polygon** | **$0.28** | **4** | none claimed |
+| zpool | DOGE | $0.42 | 6 | none, pool pays |
+| unMineable | USDT / BSC | $1.50 | 21 | none claimed |
+| Kryptex | USDC / Polygon | $1.50 | 21 | 0.5 USDC, 33% of the minimum |
+| zpool | LTC | $2.60 | 37 | none, pool pays |
+| NiceHash | USDC / Ethereum | $10.00 | 142 | 1.2 USDC, and see below |
+| zpool | BTC | $57.99 | 825 | none, pool pays |
+| unMineable | ETH / Arbitrum | $61.37 | 873 | none claimed |
+
+**The threshold is set by the denomination, not by the chain.** ETH on Arbitrum
+is the cheapest chain on the list and the second-worst option on it, because a
+minimum of 0.025 ETH is $61 whatever the gas costs. That inverts the intuition
+that drove most of the earlier analysis here.
+
+**Only three of these land on an EVM chain at all**, and of those only Polygon
+is an Across origin into 4663, so unMineable's POL and Kryptex's USDC are the
+two that reach the destination in one hop. BSC is not an Across origin into 4663.
+
+**Counterparty risk is a first-order term here and was not treated as one.** At
+$0.07 a day the balance sits on somebody else's books for weeks before it is
+payable at all, so the question is not only what a venue charges but whether it
+is there in a month. The field has thinned badly: **zergpool shut down at the
+end of September 2025**, blockmasters and ahashpool are gone, prohashing returns
+410, and **zpool is the only anonymous wallet-as-username yiimp pool still
+operating**. There is no second one to compare it against, which is itself the
+finding.
+
 ## The two routes, both now priced
 
 Neither touches Ethereum mainnet.

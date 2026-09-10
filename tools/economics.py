@@ -65,11 +65,16 @@ INPUTS = [
           "mempool.space 1 sat/vB x 141 vB at $77,334/BTC. This is the FLOOR."),
     Input("withdraw_btc_busy", 5.45, "$/tx", MEASURED,
           "the same transaction at 50 sat/vB, an ordinary busy day."),
+    Input("payout_threshold_pol", 0.28, "$", MEASURED,
+          "3 POL on Polygon PoS at unMineable, read from unmineable.com/coins/POL. "
+          "4 days at this machine's rate, and the only sub-week option that "
+          "lands on an EVM chain Across reaches from."),
+    Input("payout_threshold_doge", 0.42, "$", MEASURED,
+          "5 DOGE at zpool, from the undocumented minimum_payout field. 6 days, "
+          "and zpool pays the chain fee itself."),
     Input("payout_threshold_ltc", 2.62, "$", MEASURED,
           "0.05 LTC, from an undocumented `minimum_payout` field in zpool's "
           "/api/currencies, at $52.39/LTC. 37 days at this machine's rate."),
-    Input("payout_threshold_doge", 0.42, "$", MEASURED,
-          "5 DOGE, same source. 6 days -- the fastest of the candidates."),
     Input("payout_threshold_btc", 58.00, "$", QUOTED,
           "0.00075 BTC, from zpool's site rather than its API: BTC is not among "
           "the 219 payout currencies the API lists. 825 days, which is why the "
