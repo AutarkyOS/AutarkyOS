@@ -150,6 +150,48 @@ path. On a yiimp pool the payout coin is inferred from the address you mine
 with, and their currency list carries 219 of them: LTC, DOGE and RVN would all
 do, and the route would be identical.
 
+### Which payout coin, measured rather than assumed
+
+Liquidity is the wrong criterion at this size. A payout is tens of dollars, so
+the *fixed* costs decide and BTC is the worst of the candidates on the one that
+matters. Measured at the time of writing, a 1-in-2-out transaction on each
+chain, priced through CoinGecko:
+
+    BTC    1 sat/vB x 141 vB          $0.1090      an empty mempool
+    LTC    9,443 per kB x 0.25 kB     $0.0012
+    DOGE   59,811,274 per kB x 0.25   $0.0126
+
+**LTC is 91x cheaper than BTC at BTC's cheapest.** And BTC's cheapest is the
+whole problem: 1 sat/vB is the floor, and the same transaction at an ordinary
+busy-day 50 sat/vB is **$5.45**, which makes LTC 4,542x cheaper. Against $25.55
+of annual mining revenue:
+
+    cadence      BTC (quiet)   BTC (busy)      LTC
+    monthly            5.12%      255.97%    0.056%
+    quarterly          1.71%       85.32%    0.019%
+    yearly             0.43%       21.33%    0.005%
+
+Monthly withdrawals in BTC on a busy day cost **two and a half times what the
+mining earned**. LTC's fee is not merely lower, it is *stable* -- it does not
+have a congestion mode -- and at this size that predictability is worth more
+than the depth BTC brings.
+
+zpool's own fee is a flat 1% on all 219 currencies, so the pool is not a
+differentiator; only the chain is.
+
+**Cadence and coin multiply, and both are free to choose.** Yearly withdrawals
+in LTC cost 0.005% of revenue. Monthly in BTC on a bad day costs 256%. That is
+a factor of fifty thousand between two arrangements of the same mining.
+
+**What is not measured here** is the swap from the payout coin to ETH, because
+no THORChain endpoint was reachable from this network -- three have no A record
+and one is behind a bot challenge. The reasoning that it also favours LTC is
+that THORChain's outbound fee is derived from the source chain's own fee, so
+BTC's congestion would carry through; but that is reasoning, not a measurement,
+and it is the largest single cost in the chain. Nor is the per-coin minimum
+payout threshold, which zpool publishes on its site rather than in its API and
+which decides how long until any of this happens at all.
+
 **ETH is not among them and cannot be**, which is the constraint underneath the
 whole leg. Ethereum has not been mineable since the merge, so no mining pool
 pays in it. GLADOS lives on an EVM L2 and nothing mineable is native there, so
