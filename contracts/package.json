@@ -1,0 +1,19 @@
+{
+  "name": "glados-distributor",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "description": "The claim contract for the GLaDOS mining pool's GLADOS reward.",
+  "scripts": {
+    "build": "node test/build.mjs",
+    "test": "node test/run.mjs"
+  },
+  "dependencies": {
+    "@ethereumjs/common": "^4.4.0",
+    "@ethereumjs/tx": "^5.4.0",
+    "@ethereumjs/util": "^9.1.0",
+    "@ethereumjs/vm": "^8.1.1",
+    "ethers": "^6.13.4",
+    "solc": "^0.8.28"
+  }
+}
