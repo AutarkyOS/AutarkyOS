@@ -1,5 +1,81 @@
 # The GLADOS payout loop, sized
 
+> **Superseded in its premise, kept for its arithmetic.** This document was
+> written against the design where GLADOS came out of the *operator's fee* and
+> arrived as a bonus on top of a coin payout. The decision since taken is
+> different and larger: **the mining reward itself converts**, so the payout
+> *is* GLADOS, bought on the market with the proceeds of what was mined. See
+> "The decision" below. The numbers in the rest of this file are correct for
+> what they measure and are a 50x understatement of the flow that will actually
+> run.
+
+## The decision
+
+Four choices, taken deliberately, and the contract already supports all of them
+because the gate and the mode are per-epoch rather than global.
+
+**The reward is the whole mining proceeds, not the fee.** What a miner earned is
+converted and comes back as GLADOS. That is 50x the fee-only figure this
+document sizes: $84 over a 36-hour event at 800 miners against $1.68, and a
+claim worth $0.105 rather than $0.0021.
+
+**Two epochs, and only the second has a gate.** The payout epoch is ungated, so
+everybody who mined is paid -- which is what makes 800 participants possible at
+all, since the pool holds only about 130 whole 1,000,000-token gates and gating
+the payout would strand most of a crowd. A second, gated epoch pays a bonus on
+top to holders. One mechanism, two configurations, no code.
+
+**One hundred percent converts, for now.** Deliberately "for now": nothing in
+the contract requires it, the split is a property of how the tree is built, and
+a later epoch can pay part in something else without redeploying anything.
+
+**`Mode.Market`: each claim is the claimant's own buy.** Chosen on visibility,
+after the two candidates were measured against each other rather than argued.
+
+### Why Market, given the arithmetic says Direct converts more
+
+Because the first answer was optimising the wrong axis, and the correction is
+worth keeping.
+
+**Total price impact is identical**, which is the fact that removes the usual
+reason to prefer one. One $84 buy against the real pool yields 370,115 GLADOS;
+eight hundred buys of $0.105 yield 370,113. Constant product is path-independent
+for a given total input, and both the 0.3% pool fee and the 1% buy tax are
+proportional. "Many small buys are gentler on the pool" is simply false. All
+that differs is the share-out: first claimant 464 GLADOS, last 461, a 0.57%
+spread.
+
+So the choice came down to four other things:
+
+| | Market | Direct |
+|---|---|---|
+| gas, per miner | $0.048, **46%** of their $0.105 | $0.029, **28%** |
+| converted at a 40% claim rate | $33.60 | $84.00 |
+| operator touches the trade | no | yes, and must be believed on rate |
+| **buys on the chart** | **up to 800** | **1** |
+| **unique buyers** | **up to 800** | **1** |
+
+The first recommendation here was Direct, on the claim-rate row. That was wrong
+for this project's purpose. **Under Direct the eight hundred payouts are
+invisible to the market**: they are wallet-to-wallet transfers, untaxed, they
+never touch the pair, and no chart shows them. The screener reads one buy from
+one address. Under Market it reads eight hundred buys from eight hundred
+addresses, for the same $84. Unique buyers is the one figure on those pages
+that is hard to fake, and the difference is categorical rather than marginal.
+
+**And the claim-rate objection has an answer that costs nothing.** `reclaim`
+returns the *unclaimed quote token* to the operator after the deadline -- a
+deliberate line, since a Market epoch holds WETH and sending it back as GLADOS
+would be sending what it does not have. So the operator converts the tail
+themselves and the whole pot still reaches the market, after eight hundred real
+buyers have already been on the chart.
+
+One honest caveat about the candles: **claims cluster.** They are front-loaded,
+a burst then a long tail, not an even drip across 36 hours. Direct-tranched is
+the opposite -- perfectly schedulable, and perfectly obviously one wallet.
+
+---
+
 The plan for Part C argued about custody, routing and slippage. All three were
 real questions and none of them is the binding one. **The binding one is
 magnitude, and nobody had multiplied it out.**
@@ -108,12 +184,21 @@ whole file exists to avoid.
 
 ## What to build, in order
 
-1. **Nothing on the conversion leg.** It is four hops, three verified, and it is
-   worth $51 a year at a hundred miners. Do it by hand, publish the hashes.
-2. **The distributor and the 1M gate**, because that is the part that is
-   enforced rather than promised, and it is the same amount of work whatever the
-   amount flowing through it.
-3. **Publishing the share log** (B4), which is what a miner has instead of a
+Revised against the decision at the top of this file.
+
+1. **The conversion leg still does not need automating.** Four hops, three
+   verified, and $84 an event. Do it by hand and publish the hashes. What
+   changed is only the amount, and $84 is not the threshold at which a daemon
+   becomes cheaper than a person.
+2. **The distributor exists.** `contracts/GladosDistributor.sol`, sixty claims,
+   and the whole pipeline runs locally in one command. What it needs is a
+   deploy, an operator address, and somebody who did not write it reading it.
+3. **A gated bonus epoch needs one thing the builder does not do yet**: filter
+   the tree to addresses that actually hold the gate. Without it, a
+   non-holder's allocation sits in the tree unclaimable and dilutes everybody
+   who can claim, until the deadline reclaims it. That is one balance query per
+   address at build time.
+4. **Publishing the share log** (B4), which is what a miner has instead of a
    wallet to audit and is the only thing standing in for trust.
 
 And the honest note for the announcement: the mechanism is real, the amounts are

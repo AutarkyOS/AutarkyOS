@@ -3,6 +3,7 @@
 
     distribute.py ledger.json --total 1000000e18 --out epoch.json
     distribute.py ledger.json --total 1e21 --map workers.json --coin btc
+    distribute.py ledger.json --total 5e22 --gate 1000000e18 --token 0x3d60...7777
     distribute.py --selftest
 
 ### Why this is Python when the tree is already written in JavaScript
@@ -104,6 +105,46 @@ def verify(proof, root, address, amount):
 
 
 # ------------------------------------------------------------- allocation
+
+def holders(addresses, token, gate, rpc):
+    """Which of these addresses hold at least `gate` of `token`, on chain.
+
+    **Only needed for a gated epoch, and needed badly.** The contract checks the
+    gate at claim time, so a non-holder in the tree is not a security problem --
+    they simply cannot claim. What they are is a *dilution* problem: their slice
+    is computed, sits unclaimable until the deadline, and every holder is paid
+    less than their share of what was actually claimable. Filtering here is the
+    difference between a bonus epoch that pays what it says and one that quietly
+    pays less.
+
+    One `eth_call` per address, sequential and unhurried. A bonus epoch is built
+    once and the list is at most a few thousand long.
+    """
+    import urllib.request
+
+    out = []
+    for i, a in enumerate(addresses):
+        data = "0x70a08231" + "0" * 24 + a[2:].lower()   # balanceOf(address)
+        body = json.dumps({
+            "jsonrpc": "2.0", "id": i, "method": "eth_call",
+            "params": [{"to": token, "data": data}, "latest"],
+        }).encode()
+        # A User-Agent, because the public endpoint answers 403 without one.
+        # urllib sends `Python-urllib/3.x` by default and that is enough to be
+        # refused where curl is not -- which reads as the node being down.
+        req = urllib.request.Request(rpc, data=body, headers={
+            "content-type": "application/json",
+            "user-agent": "glados-distribute/1",
+        })
+        with urllib.request.urlopen(req, timeout=30) as r:
+            got = json.loads(r.read().decode())
+        if "error" in got:
+            raise RuntimeError("%s: %s" % (a, got["error"]))
+        bal = int(got["result"], 16)
+        if bal >= gate:
+            out.append(a)
+    return out
+
 
 def allocate(work, total):
     """Split `total` across `work` in proportion, summing to exactly `total`.
@@ -258,6 +299,9 @@ def main():
     ap.add_argument("--coin", help="only this coin's work")
     ap.add_argument("--map", help="JSON object of worker name -> address")
     ap.add_argument("--out", help="where to write the epoch document")
+    ap.add_argument("--gate", help="only pay addresses holding this much of --token")
+    ap.add_argument("--token", help="the ERC-20 the gate is measured in")
+    ap.add_argument("--rpc", default="https://rpc.mainnet.chain.robinhood.com")
     ap.add_argument("--selftest", action="store_true")
     a = ap.parse_args()
 
@@ -282,6 +326,23 @@ def main():
     if not work:
         print("no credited work in that ledger", file=sys.stderr)
         return 1
+
+    # A gated epoch pays only those who can actually claim, or the ones who can
+    # are diluted by the ones who cannot. See `holders`.
+    if a.gate:
+        if not a.token:
+            ap.error("--gate needs --token")
+        want = parse_amount(a.gate)
+        keep = set(holders(sorted(work), a.token, want, a.rpc))
+        dropped = [x for x in work if x not in keep]
+        for x in dropped:
+            del work[x]
+        print("gate %s: %d of %d address(es) qualify, %d dropped"
+              % (a.gate, len(keep), len(keep) + len(dropped), len(dropped)),
+              file=sys.stderr)
+        if not work:
+            print("nobody holds the gate; there is no epoch to build", file=sys.stderr)
+            return 1
 
     amounts = allocate(work, total)
     entries = sorted(amounts.items(), key=lambda kv: kv[0])
