@@ -56,6 +56,19 @@ set -- \
 # has no journal behind it to rotate this for us.
 MAX_LOG_BYTES=4194304
 
+# **Descriptors, raised before the pool starts rather than discovered during an
+# event.** Every connection is one, and the login default on the host this was
+# deployed to is 1024 -- so the connection ceiling cannot usefully go past about
+# a thousand however `--max-connections` is set. The hard limit there is 524288,
+# and raising the soft limit up to the hard one needs no privilege at all, which
+# is the one resource question on this box that root was never the answer to.
+#
+# `|| true` because a shell that refuses `ulimit` is a shell where the pool
+# should still start with whatever it has; the daemon reads the real limit and
+# clamps its own ceiling to it, so the failure is a smaller pool rather than a
+# broken one.
+ulimit -n 65536 2>/dev/null || ulimit -n unlimited 2>/dev/null || true
+
 mkdir -p "${STATE}"
 
 # One copy. `@reboot` plus a manual start is the ordinary way to end up with

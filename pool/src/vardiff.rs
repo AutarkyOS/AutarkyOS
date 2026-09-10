@@ -24,6 +24,7 @@
 //! `stratum::decimal` exists to survive on the way in; there is no reason to
 //! introduce one here on the way out.
 
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
 /// How often a miner should find a share.
@@ -32,7 +33,36 @@ use std::time::Instant;
 /// rather than throughput: it is short enough that a rate estimate settles in
 /// under a minute, and long enough that the validation cost stays negligible
 /// even for the expensive algorithms.
-const TARGET_SECS: u64 = 10;
+const DEFAULT_TARGET_SECS: u64 = 10;
+
+/// Live, because it is the single biggest lever on what a busy pool costs.
+///
+/// Validation is per *share*, so the offered share rate is
+/// `connections x coins / TARGET_SECS` and the CPU bill is that times the
+/// algorithm's cost. Measured on the deployed host: 800 connections on two
+/// coins at ten seconds offers 160 shares a second, which is 114% of a core on
+/// yespower-2MiB and 8% on neoscrypt. At sixty seconds the same crowd is 19%
+/// and 1%.
+///
+/// So this is the knob that decides whether an expensive algorithm is servable
+/// at all at a given size, and having it be a `const` meant the only available
+/// answer was to defer a share of the traffic. Longer costs information -- a
+/// rate estimate settles more slowly and a dead miner takes longer to notice --
+/// which is a real trade and the reason the default does not move.
+static TARGET_SECS: AtomicU64 = AtomicU64::new(DEFAULT_TARGET_SECS);
+
+/// Seconds a miner should take to find a share. Clamped to something sane:
+/// zero would divide by zero below, and an hour makes a pool that cannot tell
+/// a working miner from a departed one.
+pub fn set_target_secs(s: u64) -> u64 {
+    let s = s.clamp(2, 600);
+    TARGET_SECS.store(s, Ordering::Relaxed);
+    s
+}
+
+pub fn target_secs() -> u64 {
+    TARGET_SECS.load(Ordering::Relaxed)
+}
 
 /// How many shares to watch before moving. Fewer and the estimate is dominated
 /// by luck -- share intervals are exponentially distributed, so a single
@@ -109,7 +139,7 @@ impl VarDiff {
         // How many shares this window *should* have produced. Floored at one,
         // which is also what keeps the division below safe on a window too
         // short to have wanted any.
-        let wanted = (elapsed_ms / (TARGET_SECS * 1000)).max(1);
+        let wanted = (elapsed_ms / (target_secs() * 1000)).max(1);
         let got = self.shares as u64;
 
         // The step is a base-2 logarithm of the ratio, computed by halving,

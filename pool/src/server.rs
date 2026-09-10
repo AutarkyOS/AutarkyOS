@@ -93,7 +93,61 @@ const MAX_WORK_PER_SEC: u32 = 4;
 /// A ceiling on threads as much as on miners, and deliberately below the
 /// `TasksMax=512` in the systemd unit so the daemon refuses before the service
 /// manager kills it. A refusal is a log line; being killed is an outage.
-const MAX_CONNECTIONS: usize = 256;
+///
+/// **The default, not the limit.** It was a `const`, which was right while the
+/// only question was whether a stranger could exhaust the box. It stops being
+/// right the moment somebody plans an event: 256 is below the plausible peak of
+/// a launch drawing several hundred people in timezone waves, and a ceiling
+/// that turns away the fourth wave is indistinguishable from an outage to the
+/// people in it. `--max-connections` moves it, and the cost is stated rather
+/// than guessed -- one thread, one descriptor and 28 KiB each, measured.
+const DEFAULT_MAX_CONNECTIONS: usize = 256;
+
+static MAX_CONNECTIONS: AtomicUsize = AtomicUsize::new(DEFAULT_MAX_CONNECTIONS);
+
+/// Set the connection ceiling. Answers what it actually stored.
+///
+/// **Refused above the descriptor limit rather than accepted and then failing
+/// per connection.** Each connection is a descriptor and so are the listener,
+/// the ledger and the three standard ones, so a ceiling above `RLIMIT_NOFILE`
+/// is a promise the process cannot keep -- and the way it fails is `accept`
+/// returning `EMFILE` in the middle of an event, which reads as the network
+/// breaking rather than as a setting being wrong.
+pub fn set_max_connections(n: usize) -> usize {
+    let n = n.max(1);
+    let room = fd_limit().saturating_sub(16);
+    let n = if room > 0 && n > room {
+        println!("[pool] --max-connections {n} is above the descriptor limit; using {room}");
+        room
+    } else {
+        n
+    };
+    MAX_CONNECTIONS.store(n, Ordering::Relaxed);
+    n
+}
+
+/// The soft `RLIMIT_NOFILE`, or zero when it cannot be read.
+///
+/// Read from `/proc` rather than through `libc`, because this crate has no
+/// dependencies and adding one to learn a number is the wrong trade. Zero means
+/// "do not know", and the caller treats not knowing as no constraint rather
+/// than as zero descriptors -- guessing low here would cap a healthy pool for
+/// no reason.
+fn fd_limit() -> usize {
+    let Ok(text) = std::fs::read_to_string("/proc/self/limits") else {
+        return 0;
+    };
+    for line in text.lines() {
+        if !line.starts_with("Max open files") {
+            continue;
+        }
+        // "Max open files   1024   524288   files"
+        if let Some(soft) = line.split_whitespace().nth(3) {
+            return soft.parse().unwrap_or(0);
+        }
+    }
+    0
+}
 
 static LIVE_CONNECTIONS: AtomicUsize = AtomicUsize::new(0);
 
@@ -154,9 +208,10 @@ pub fn serve(addr: &str, pool: Arc<Mutex<Pool>>) -> std::io::Result<()> {
         // Counted before the thread exists. Spawning first and checking inside
         // would make the ceiling a suggestion: what is being bounded is the
         // thread and its stack, and by then it is already allocated.
-        if LIVE_CONNECTIONS.fetch_add(1, Ordering::Relaxed) >= MAX_CONNECTIONS {
+        let ceiling = MAX_CONNECTIONS.load(Ordering::Relaxed);
+        if LIVE_CONNECTIONS.fetch_add(1, Ordering::Relaxed) >= ceiling {
             LIVE_CONNECTIONS.fetch_sub(1, Ordering::Relaxed);
-            println!("[pool] refused a connection: {MAX_CONNECTIONS} already open");
+            println!("[pool] refused a connection: {ceiling} already open");
             continue;
         }
         let pool = Arc::clone(&pool);

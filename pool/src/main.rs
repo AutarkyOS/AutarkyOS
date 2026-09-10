@@ -155,6 +155,8 @@ fn main() {
     let mut ledger: Option<String> = None;
     let mut prices: Option<String> = None;
     let mut window: Option<u64> = None;
+    let mut max_conns: Option<usize> = None;
+    let mut share_secs: Option<u64> = None;
     let mut cpu_percent: f64 = 50.0;
     let mut coins: Vec<Coin> = Vec::new();
     let mut it = args.iter();
@@ -189,6 +191,23 @@ fn main() {
                     std::process::exit(2);
                 }
             },
+            // Both of these exist because a planned event is a different
+            // problem from a stranger poking at the box, and the numbers that
+            // were right for the second are wrong for the first.
+            "--max-connections" => match it.next().and_then(|v| v.parse::<usize>().ok()) {
+                Some(v) => max_conns = Some(v),
+                None => {
+                    eprintln!("--max-connections wants a count (default 256)");
+                    std::process::exit(2);
+                }
+            },
+            "--share-seconds" => match it.next().and_then(|v| v.parse::<u64>().ok()) {
+                Some(v) => share_secs = Some(v),
+                None => {
+                    eprintln!("--share-seconds wants 2..600, how often a miner should find a share (default 10)");
+                    std::process::exit(2);
+                }
+            },
             "--window" => match it.next().and_then(|v| v.parse::<u64>().ok()) {
                 Some(w) if w > 0 => window = Some(w),
                 _ => {
@@ -210,6 +229,12 @@ fn main() {
                 println!("  --prices PATH reads what tools/prices.py wrote and says");
                 println!("            whether each coin can be sold at all");
                 println!("  --cpu-percent N caps *total* validation at N% of one core.");
+                println!("  --max-connections N is the ceiling on concurrent miners (default 256).");
+                println!("     Each costs one thread, one descriptor and about 28 KiB. Refused");
+                println!("     above the process descriptor limit rather than failing later.");
+                println!("  --share-seconds N is how often a miner should find a share (default 10).");
+                println!("     Offered validation is connections x coins / N, so this is the");
+                println!("     largest lever on what an expensive algorithm costs at scale.");
                 println!("            Per-connection limits never bounded the sum: 256");
                 println!("            connections at 20 submits a second of yespower is");
                 println!("            ninety-seven cores. Default 50. 0 is no limit.");
@@ -353,6 +378,16 @@ fn main() {
     }
     // Before the listener, so the bound exists from the first connection
     // rather than from whenever a share happens to arrive.
+    if let Some(n) = max_conns {
+        let got = server::set_max_connections(n);
+        println!("[pool] connection ceiling {got} (one thread, one descriptor and ~28 KiB each)");
+    }
+    if let Some(v) = share_secs {
+        let got = glados_pool::vardiff::set_target_secs(v);
+        // Printed with what it implies, because the number that matters is not
+        // the cadence but the share rate it produces against the ceiling.
+        println!("[pool] retargeting for one share per {got}s per coin");
+    }
     server::set_cpu_percent(cpu_percent);
     if cpu_percent <= 0.0 {
         eprintln!("[pool] no validation budget: this pool will use whatever the machine has");

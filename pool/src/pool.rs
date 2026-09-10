@@ -1278,9 +1278,22 @@ mod tests {
             Verdict::Duplicate
         );
         // A nonce that does not meet the target is refused however confidently
-        // it is sent. `n + 1` is overwhelmingly not a solution.
+        // it is sent.
+        //
+        // **The bad nonce is found rather than assumed, and that is a fix.**
+        // This was `n + 1` under a comment saying it is "overwhelmingly not a
+        // solution", which at an eight-bit target is true 255 times in 256 --
+        // so the suite failed about once every few hundred runs, on correct
+        // code, and did exactly that during this session. It is the same shape
+        // as the flake already fixed in `credit_follows_work_and_not_share_count`
+        // and it gets the same treatment: make the case deterministic rather
+        // than make the bound wider, because a test that is right 99.6% of the
+        // time teaches everybody to rerun the suite instead of reading it.
+        let bad = (0..200_000u32)
+            .find(|n| !below_target(&h.hash(&job.header, *n), &job.target))
+            .expect("some nonce misses an eight-bit target");
         assert_eq!(
-            p.submit("w1", &proto::Share { job: job.job.clone(), nonce: n.wrapping_add(1), echo: vec![] }),
+            p.submit("w1", &proto::Share { job: job.job.clone(), nonce: bad, echo: vec![] }),
             Verdict::Bad
         );
         // And a job the pool never issued is stale, not bad -- the distinction
