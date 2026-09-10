@@ -91,7 +91,28 @@ and nothing on it is a prediction about price.</p>
 
 <h2 class="sect">Tax, and who gets it</h2>
 
-<p>The trading tax is split four ways by the launchpad contract:</p>
+<p>The rates are <strong>1% on a buy and 3% on a sell</strong>, and you do not
+have to take that from this page. They are public reads on the token contract,
+and so is the fact that <code>owner()</code> is the zero address:</p>
+
+<pre><code>curl -s -X POST -H 'content-type: application/json' \
+  --data '{"jsonrpc":"2.0","id":1,"method":"eth_call","params":[
+    {"to":"0x3d609ecafc6aa7dba67dd7ad1d10b49c52d57777","data":"0x691f224f"},
+    "latest"]}' \
+  https://rpc.mainnet.chain.robinhood.com
+
+buyTaxRate()   data 0x691f224f  -&gt; 0x64  = 100 = 1.00%
+sellTaxRate()  data 0x24024efd  -&gt; 0x12c = 300 = 3.00%
+owner()        data 0x8da5cb5b  -&gt; the zero address
+</code></pre>
+
+<p class="note">Read at block 59,463,301. What this page deliberately does
+<em>not</em> claim is that the rates therefore cannot ever change: that would
+need the verified source to show the setters are gated on <code>owner</code>,
+and the block explorer for this chain is behind a bot challenge. The reads
+above are facts; the inference is not one this page is entitled to yet.</p>
+
+<p>The tax is split four ways:</p>
 
 <table class="data">
 <tr><th>40%</th><td>Dividends to holders</td></tr>
