@@ -661,16 +661,30 @@ that constant is not on the wire. Writing 1e8 because Bitcoin uses it is the
 invented figure `ev.rs` refuses in its own header. Both blockers lift together:
 when there is a live upstream there is also a chain to read it from.
 
+## What now does
+
+- **PPLNS.** `pool/src/pool.rs` carries a `Window` per coin, denominated in
+  work rather than shares for the reason the tally already is -- VarDiff makes
+  a share meaningless as a unit. It is persisted share by share and folded into
+  the published digest, so the number a payout comes from is attested rather
+  than only the all-time tally. `--window` sets it. The one thing it does not
+  do is fairness under load, which is written into the module.
+- **A total validation budget.** `pool/src/budget.rs`, `--cpu-percent`. The
+  per-connection rate limit never summed -- 256 connections at 20 yespower
+  submits a second is ninety-seven cores on a four-thread box -- and this is
+  the aggregate bound, in microseconds of measured validation. Found by
+  deploying to a borrowed 2012 i3 and reading its own bench: a yespower share
+  is 19 ms there, not the 7.5 ms the old comment assumed.
+- **It has run on real hardware over WireGuard.** A cross-compiled static musl
+  binary, no toolchain on the server, two algorithms mined into it from the
+  GF63 across the tunnel: 36 shares accepted, 0 bad, the box unmoved. Not yet
+  reachable from the public internet -- that needs a forwarded port -- and not
+  yet left running, which needs the operator's `enable-linger`.
+
 ## What does not
-- **A real pool.** Everything above ran against a stub on loopback. No upstream
-  on the internet has been asked for work, which needs an account and an
-  address rather than any more code.
-- PPLNS, and any notion of a payout window. The tally is cumulative, and it
-  records **work** rather than share count -- `2^bits` per accepted share --
-  because VarDiff made counting shares unfair. Measured over one 400,000-nonce
-  sweep: 394 shares at 10 bits against 5 at 16, with the credited work within
-  1.2x. A share count would have paid the first miner seventy-nine times as
-  much for the same effort.
+- **A real upstream.** Everything above ran against local coins the pool
+  invents. No upstream on the internet has been asked for work, which needs an
+  account and an address rather than any more code.
 - TLS, and therefore any safety on an untrusted network. See above.
 - The site repository, the DNS record, and the host. None of them exist yet.
 - Worker identity, which is `supabase/functions/link` already and needs joining

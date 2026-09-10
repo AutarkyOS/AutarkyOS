@@ -35,9 +35,19 @@ PIDFILE="${STATE}/run-pool.pid"
 # `bits` is how many leading zero bits a share must have -- a difficulty said
 # in a way that has no float in it. Twelve suits a laptop on yespower; sha256d
 # and blake2s are thousands of times cheaper to check and can afford far more.
+# `--cpu-percent` is the total validation budget, as a share of *one* core,
+# and on a borrowed machine it is the setting that matters most. The
+# per-connection rate limit does not sum -- 256 connections were never bounded
+# in aggregate -- so this is what decides how much of somebody else's box a
+# flood can take. 25% of one core is conservative on a four-thread 2012 i3 that
+# is also serving media; raise it on a machine with headroom, or 0 for no cap.
+#
+# `--window` is the PPLNS payout window in work; a share credits 2^bits, so the
+# default 2^32 is one difficulty-1 share's worth. Left default here.
 set -- \
     --listen 0.0.0.0:3334 \
     --ledger "${STATE}/ledger.json" \
+    --cpu-percent 25 \
     bitzeny:yespower-10-2048-8:12 \
     testnet:sha256d:24
 
