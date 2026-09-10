@@ -723,6 +723,50 @@ pool-average equihash192 worker is 49.57 Sol/s. Whether an RTX 3050 Laptop
 reaches that is unmeasured, and it is the single measurement standing between
 $0.47 a worker a day and any claim about this machine.
 
+## What mining costs the model, and standing down for it
+
+The hash loop was built to avoid `smp::parallel_split` precisely so it would
+not stall inference, and that argument is in `client.rs` and is correct. What
+nobody had measured is what it costs anyway, simply by being runnable tasks on
+a machine with four cores.
+
+Measured under WHPX at `-smp 4`, three decodes of twelve tokens per condition,
+one boot, SmolLM2:
+
+    no mining              692  751  686 ms/token    median  692
+    4 slices, no yield    1538 1452 1347             median 1452
+    4 slices, yielding    1074 1109 1089             median 1089
+
+**Mining doubles the cost of a token.** That is not a scheduling subtlety, it
+is half the machine.
+
+`YIELD_TO_MODEL` is the answer and it is on by default. A slice checks
+`ai::engine_holder()` immediately before it hashes and parks if anybody holds
+the engine. That recovers `(1452 - 1089) / (1452 - 692)` = **48% of the
+penalty**.
+
+**Why only half, stated rather than left to be found.** `with_engine` claims
+the engine for one call, so a decode releases it between tokens and a slice
+correctly works in the gap; and a parked slice keeps its working set resident,
+which on a memory-bound algorithm costs the model bandwidth whether or not
+anybody is hashing. Getting the rest means holding a claim across a whole
+generation, which is a change to the engine and not to the miner.
+
+**The default is an argument about what this machine is for.** The model in
+ring 0 is the reason the kernel exists; mining is a side job that pays for the
+token. A miner that silently takes half the arithmetic has inverted that, and
+it does so invisibly -- the model does not visibly stall, it is merely slower
+than it should be. `mine yield off` is there for anybody who disagrees, and it
+prints what the choice costs.
+
+**The first version of this measurement was worthless and that is worth
+recording.** One sample per condition on the `bench` matmul put idle anywhere
+between 2.64 and 5.30 GFLOP/s -- a 2x spread across a measurement of nothing
+changing, entirely the host's scheduler. It is the same error `video bench` was
+rewritten to stop making, made again, in a different subsystem, by somebody who
+had read that note. Three samples with tight within-condition spreads is what
+made the figures above quotable.
+
 ## Splitting one device across a field, which is mechanism and not policy
 
 A card at half a gigahash is not one coin's worth of hashrate. The question is

@@ -49,6 +49,55 @@ const BACKOFF_MAX: u64 = 60_000;
 /// Journal depth for `mine log`.
 const JOURNAL: usize = 32;
 
+/// Whether a slice stands down while the model is working.
+///
+/// **On by default, and the default is the argument.** This kernel's reason for
+/// existing is the model in it; mining is a side job that pays for the token.
+/// A miner that quietly takes a third of the machine's arithmetic away from
+/// inference has inverted that, and it does so invisibly -- the model does not
+/// get slower in a way anybody can see, it just is slower.
+///
+/// Measured under WHPX at `-smp 4`, three decodes of twelve tokens per
+/// condition, in one boot on SmolLM2:
+///
+///     no mining              692  751  686 ms/token    median  692
+///     4 slices, no yield    1538 1452 1347             median 1452
+///     4 slices, yielding    1074 1109 1089             median 1089
+///
+/// So mining **doubles** the cost of a token, and standing down gives back
+/// about half of that: `(1452 - 1089) / (1452 - 692)` is 48%.
+///
+/// **It does not give back all of it, and the reason is structural.**
+/// `with_engine` claims the engine for the length of one call, so a decode
+/// releases it between tokens and a slice legitimately works in those gaps.
+/// Parked slices also keep their working sets resident, and on a
+/// memory-bound algorithm that costs the model bandwidth whether or not
+/// anybody is hashing. Recovering the rest means a claim that spans a whole
+/// generation, which is a change to the engine rather than to the miner.
+///
+/// The absolute figures are a fact about the host, a hypervisor being present.
+/// The *ratios* between conditions in one boot are the part worth quoting,
+/// which is the argument `video bench` makes about its own control -- and it
+/// had to be made here too: a first attempt at this comparison with one sample
+/// per condition put idle anywhere between 2.64 and 5.30 GFLOP/s on the matmul
+/// bench, which is a 2x spread across a measurement of nothing changing.
+static YIELD_TO_MODEL: AtomicBool = AtomicBool::new(true);
+
+pub fn yield_to_model() -> bool {
+    YIELD_TO_MODEL.load(Ordering::Relaxed)
+}
+
+pub fn set_yield_to_model(on: bool) {
+    YIELD_TO_MODEL.store(on, Ordering::Relaxed);
+}
+
+/// How many batches stood down, so the cost is visible rather than assumed.
+///
+/// A miner that yields is a miner whose rate is lower than the hardware could
+/// deliver, and an operator comparing this machine against a hashrate
+/// calculator deserves to know why rather than to conclude the kernel is slow.
+pub static YIELDED: AtomicU64 = AtomicU64::new(0);
+
 /// Set by `mine on`, cleared by `mine off`. The task never exits.
 pub static ENABLED: AtomicBool = AtomicBool::new(false);
 /// Serial of the current template. Bumped on every job and on every
@@ -1107,6 +1156,27 @@ fn mine_task() {
             park();
             continue;
         };
+
+        // **Stand down while the model is working.**
+        //
+        // Checked here rather than at the top of the loop on purpose: every
+        // `continue` above is a slice with nothing to do, which parks anyway,
+        // and putting the check before them would spend an atomic load on a
+        // path that does not hash. This is the last gate before arithmetic.
+        //
+        // `engine_holder` is a claim rather than a lock, and it is held for a
+        // whole episode by the mind and the agent, and for the length of one
+        // call by a foreground `ask`. So a decode makes this flap on and off
+        // per call, which is exactly right: the slice sleeps through the
+        // forward passes and works in the gaps between them.
+        //
+        // `park()` and not `idle()`, for the reason `park` gives: an unpinned
+        // slice spinning is a whole core held at full power computing nothing.
+        if yield_to_model() && crate::ai::engine_holder().is_some() {
+            YIELDED.fetch_add(1, Ordering::Relaxed);
+            park();
+            continue;
+        }
 
         if HASH_SINCE.load(Ordering::Relaxed) == 0 {
             HASH_SINCE.store(now_ms(), Ordering::Relaxed);

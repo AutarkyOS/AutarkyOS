@@ -7825,6 +7825,44 @@ fn mine_cmd(rest: &str) {
             kprintln!("  slot {}  {}  {}  ({})", n, label, a.detail(), src.name());
             mine_coins();
         }
+        // Whether mining stands down while the model is working.
+        //
+        // A verb rather than a constant because it is a policy about what this
+        // machine is for, and the two defensible answers differ by which of the
+        // two jobs somebody thinks is the point. The default says the model is.
+        "yield" => {
+            let on = match arg.trim() {
+                "" => {
+                    kprintln!(
+                        "  mining {} to the model",
+                        if client::yield_to_model() { "yields" } else { "does not yield" }
+                    );
+                    kprintln!(
+                        "  {} batch(es) stood down so far",
+                        client::YIELDED.load(core::sync::atomic::Ordering::Relaxed)
+                    );
+                    kprintln!("  usage: mine yield on|off");
+                    return;
+                }
+                "on" => true,
+                "off" => false,
+                _ => {
+                    kprintln!("  usage: mine yield on|off");
+                    return;
+                }
+            };
+            client::set_yield_to_model(on);
+            if on {
+                kprintln!("  mining yields to the model");
+            } else {
+                // Said plainly, because the number it costs is measured and
+                // the operator turning this off should see it here rather
+                // than find it in a design document.
+                kprintln!("  mining no longer yields to the model");
+                kprintln!("  measured: four slices cost about a third of this");
+                kprintln!("  machine's arithmetic while they run");
+            }
+        }
         "slices" => {
             use crate::mine::client::MAX_SLICES;
             if arg.is_empty() {
