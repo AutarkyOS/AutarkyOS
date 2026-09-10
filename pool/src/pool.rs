@@ -7,7 +7,7 @@
 //! decisions, and a decision that needs a TCP connection to reproduce is one
 //! nobody reproduces.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::mine::algo::{Algo, Hasher};
@@ -200,6 +200,100 @@ pub struct Tally {
     pub duplicate: u64,
 }
 
+/// One accepted share, kept only long enough to be paid for.
+#[derive(Clone)]
+pub struct Contribution {
+    pub worker: String,
+    /// `2^bits`, the same figure the cumulative tally credits. Denominated in
+    /// work rather than in shares because VarDiff makes a share meaningless as
+    /// a unit -- measured on one sweep, 394 shares at 10 bits against 5 at 16,
+    /// for the same effort.
+    pub work: u64,
+}
+
+/// The last N units of work on one coin, and what each worker did of it.
+///
+/// **This is the difference between a share log and something that can pay.**
+/// The cumulative tally answers "how much has this worker ever done", which is
+/// the wrong question at the moment a block is found: the coins in that block
+/// were produced by the hashing that happened *recently*, and paying them out
+/// against all-time work pays a miner who left last year out of a block they
+/// had nothing to do with.
+///
+/// It is also the standard defence against pool-hopping, and the reason PPLNS
+/// exists rather than proportional payment. Under proportional, a miner who
+/// mines only early in a round -- when the expected shares to a block are
+/// still low -- collects a larger slice per unit of work than one who stays,
+/// and the difference comes out of everybody who stayed. Under PPLNS the
+/// window keeps moving whether or not you are in it, so leaving costs you the
+/// window and there is nothing to game.
+pub struct Window {
+    /// Oldest first. A `Vec` and not a `VecDeque` because the whole thing is
+    /// walked to compute a payout anyway, and the front is popped a handful of
+    /// times per share rather than in a loop.
+    pub(crate) shares: Vec<Contribution>,
+    /// Kept alongside rather than summed on demand: a payout report over a
+    /// window of tens of thousands of shares would otherwise re-add every one
+    /// of them on every call, and the pool publishes on a timer.
+    total: u64,
+}
+
+impl Window {
+    /// Add a share and drop whatever has fallen out of the back.
+    ///
+    /// The window holds **at least** `limit` work, and the smallest suffix
+    /// that does. Dropping down to exactly `limit` would mean discarding part
+    /// of a share, and a share is indivisible -- it is one miner's one
+    /// discovery.
+    pub fn push(&mut self, worker: &str, work: u64, limit: u64) {
+        self.shares.push(Contribution { worker: String::from(worker), work });
+        self.total = self.total.saturating_add(work);
+        let mut drop_to = 0usize;
+        let mut running = self.total;
+        for c in &self.shares {
+            if running.saturating_sub(c.work) < limit {
+                break;
+            }
+            running -= c.work;
+            drop_to += 1;
+        }
+        if drop_to > 0 {
+            self.shares.drain(..drop_to);
+            self.total = running;
+        }
+    }
+
+    pub fn total(&self) -> u64 {
+        self.total
+    }
+
+    pub fn len(&self) -> usize {
+        self.shares.len()
+    }
+
+    /// Each worker's work in the window, largest first, ties by name.
+    ///
+    /// Sorted totally rather than by share alone, so two runs over one history
+    /// print the same order -- the property `ledger` already has and for the
+    /// same reason: a published document whose row order moved would look
+    /// edited every time it was regenerated.
+    pub fn shares_by_worker(&self) -> Vec<(String, u64)> {
+        let mut by: BTreeMap<String, u64> = BTreeMap::new();
+        for c in &self.shares {
+            *by.entry(c.worker.clone()).or_insert(0) += c.work;
+        }
+        let mut v: Vec<(String, u64)> = by.into_iter().collect();
+        v.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+        v
+    }
+}
+
+impl Default for Window {
+    fn default() -> Window {
+        Window { shares: Vec::new(), total: 0 }
+    }
+}
+
 pub struct Pool {
     pub coins: Vec<Coin>,
     /// Jobs still accepting shares, newest last. Bounded, because a miner that
@@ -217,12 +311,43 @@ pub struct Pool {
     /// split `server.rs` has, and the same shape the kernel's own `SHARES`
     /// queue uses between its hash loop and its socket task.
     forwards: Vec<Forward>,
+    /// The payout window per coin. Per coin because a unit of btc work and a
+    /// unit of zeny work are not the same thing and never become comparable --
+    /// the same reason the tally is keyed by coin.
+    windows: HashMap<String, Window>,
+    /// How much work a window holds before its oldest shares fall out.
+    ///
+    /// **Set rather than derived, and that is stated rather than hidden.** The
+    /// textbook figure is a multiple of the expected shares to a block, which
+    /// needs the network difficulty -- available for an upstream coin and
+    /// simply absent for a local one, which has no chain behind it at all. So
+    /// this is the operator's number. `payout_report` prints the window
+    /// against a coin's own network target where one is known, which is the
+    /// figure needed to choose it well; inventing a default that looked
+    /// derived would be worse than asking.
+    window_work: u64,
     next_job: u64,
 }
 
+/// A window of 2^32, which is the work in one difficulty-1 share.
+///
+/// Chosen so a pool nobody has configured still behaves like a pool rather
+/// than like a payout of the last share, and small enough that a test can fill
+/// it. It is a starting point and `--window` is how it stops being one.
+pub const DEFAULT_WINDOW_WORK: u64 = 1u64 << 32;
+
 /// Bumped when a change makes an older document unreadable rather than merely
-/// different. Recording `work` did exactly that.
-const LEDGER_VERSION: u32 = 2;
+/// different. Recording `work` did exactly that, and so did the payout window.
+///
+/// **Version 2 is still loaded, with its consequence said out loud.** A v2
+/// file has tallies and no window, so the tallies restore and the window
+/// starts empty -- which is a real loss (everybody's recent contribution goes
+/// to zero) and is much better than refusing to start. Refusing was the old
+/// behaviour for v1 and was right there: a v1 row has no `work` at all, so
+/// loading it would credit every past share as zero effort and rewrite the
+/// record the file exists to preserve. Missing data and *wrong* data are
+/// different, and only one of them is worth refusing over.
+const LEDGER_VERSION: u32 = 3;
 
 /// How many issued jobs to remember. Sixty-four is four coins' worth of a
 /// couple of minutes at a thirty-second job cadence, which is comfortably
@@ -240,8 +365,53 @@ impl Pool {
             seen: Vec::new(),
             tallies: HashMap::new(),
             forwards: Vec::new(),
+            windows: HashMap::new(),
+            window_work: DEFAULT_WINDOW_WORK,
             next_job: 1,
         }
+    }
+
+    /// How much work the payout window holds. Zero is refused rather than
+    /// stored: a window of nothing pays only the miner who found the last
+    /// share, which is not a payout scheme but a lottery with one ticket.
+    pub fn set_window(&mut self, work: u64) -> bool {
+        if work == 0 {
+            return false;
+        }
+        self.window_work = work;
+        true
+    }
+
+    pub fn window_work(&self) -> u64 {
+        self.window_work
+    }
+
+    /// What each worker is owed of one coin, as a fraction of the window.
+    ///
+    /// Answers `None` for a coin nobody has mined, which is different from a
+    /// coin everybody has mined equally and must not print as zeroes.
+    pub fn payouts(&self, coin: &str) -> Option<Vec<(String, u64, f64)>> {
+        let w = self.windows.get(coin)?;
+        let total = w.total();
+        if total == 0 {
+            return None;
+        }
+        Some(
+            w.shares_by_worker()
+                .into_iter()
+                .map(|(name, work)| (name, work, work as f64 / total as f64))
+                .collect(),
+        )
+    }
+
+    /// Every configured coin's label, in slot order.
+    pub fn coin_labels(&self) -> Vec<String> {
+        self.coins.iter().map(|c| c.label.clone()).collect()
+    }
+
+    /// The window for a coin, for the report and for the claims.
+    pub fn window(&self, coin: &str) -> Option<&Window> {
+        self.windows.get(coin)
     }
 
     /// Build the next job for a coin.
@@ -481,6 +651,17 @@ impl Pool {
         }
 
         let credit = if job.bits >= 64 { u64::MAX } else { 1u64 << job.bits };
+        // Both records, and they answer different questions. The tally is
+        // all-time and is what a miner checks their own history against; the
+        // window is recent and is what a payout comes from. Keeping one and
+        // deriving the other is not available -- a cumulative total cannot be
+        // walked backwards into a window, and a window has forgotten the past
+        // by construction.
+        let limit = self.window_work;
+        self.windows
+            .entry(job.coin.clone())
+            .or_default()
+            .push(worker, credit, limit);
         let t = self.tally(worker, &job.coin);
         t.accepted += 1;
         t.work = t.work.saturating_add(credit);
@@ -534,7 +715,7 @@ impl Pool {
         // `work` field, so loading them would credit every past share as zero
         // effort and quietly rewrite the record the file exists to preserve.
         let v = doc.get("v").and_then(|x| x.as_i64()).unwrap_or(1);
-        if v != LEDGER_VERSION as i64 {
+        if v != LEDGER_VERSION as i64 && v != 2 {
             return Err(format!(
                 "written by an older pool (format {v}, this one writes {LEDGER_VERSION})"
             ));
@@ -573,6 +754,36 @@ impl Pool {
             restored.push(((String::from(worker), String::from(coin)), t));
         }
 
+        // The window, share by share and in order, because the order is what
+        // decides who falls out next. Restoring an aggregate instead would put
+        // back the right payout today and evict the wrong worker tomorrow.
+        let mut windows: HashMap<String, Window> = HashMap::new();
+        if let Some(crate::json::Json::Arr(cw)) = doc.get("windows") {
+            for entry in cw.iter() {
+                let coin = entry.get("coin").and_then(|x| x.as_str()).ok_or("window has no coin")?;
+                let Some(crate::json::Json::Arr(items)) = entry.get("shares") else {
+                    return Err(format!("window for {coin} has no shares array"));
+                };
+                let mut w = Window::default();
+                for it in items.iter() {
+                    let name = it.get("worker").and_then(|x| x.as_str())
+                        .ok_or("a window share has no worker")?;
+                    let work = match it.get("work").and_then(|x| x.as_i64()) {
+                        Some(v) if v >= 0 => v as u64,
+                        Some(v) => return Err(format!("a window share has work {v}")),
+                        None => return Err(String::from("a window share has no work")),
+                    };
+                    canon.push_str(&format!("w\t{coin}\t{name}\t{work}\n"));
+                    // `u64::MAX` as the limit, so restoring never evicts: the
+                    // file already holds a window that was bounded when it was
+                    // written, and re-applying the bound here would trim it
+                    // again against a limit the operator may since have raised.
+                    w.push(name, work, u64::MAX);
+                }
+                windows.insert(String::from(coin), w);
+            }
+        }
+
         // The rows are canonicalised the same way `ledger_json` does, so this
         // check is against the writer rather than against a second idea of what
         // the document says.
@@ -586,6 +797,7 @@ impl Pool {
         for (k, v) in restored {
             self.tallies.insert(k, v);
         }
+        self.windows = windows;
         Ok(n)
     }
 
@@ -628,6 +840,19 @@ impl Pool {
                 t.work, t.accepted, t.stale, t.bad, t.duplicate
             ));
         }
+        // The window is inside the digest too. A payout comes from it, so a
+        // document that fixed only the tallies would leave the number anybody
+        // is actually paid on unattested -- which is the wrong half to leave
+        // open on the one record standing in for trust.
+        let mut coins_sorted: Vec<&String> = self.windows.keys().collect();
+        coins_sorted.sort();
+        for c in &coins_sorted {
+            if let Some(w) = self.windows.get(*c) {
+                for sh in &w.shares {
+                    canon.push_str(&format!("w\t{c}\t{}\t{}\n", sh.worker, sh.work));
+                }
+            }
+        }
         let digest = crate::store::sha256::hash(canon.as_bytes());
 
         let mut s = String::from("{\n");
@@ -651,6 +876,41 @@ impl Pool {
                 c.algo.detail(),
                 c.source.name(),
                 if i + 1 == self.coins.len() { "" } else { "," }
+            ));
+        }
+        s.push_str(&format!("  ],\n  \"window_work\": {},\n", self.window_work));
+        // Every share in the window, in order, and the payout each implies.
+        // **Verbose on purpose.** A PPLNS payout that cannot be checked share
+        // by share is exactly the opacity a non-custodial pool has nothing else
+        // to offer against -- there is no wallet to audit, so the arithmetic
+        // has to be reproducible from the published document alone.
+        s.push_str("  \"windows\": [\n");
+        for (i, c) in coins_sorted.iter().enumerate() {
+            let Some(w) = self.windows.get(*c) else { continue };
+            s.push_str(&format!(
+                "    {{\"coin\": \"{c}\", \"total\": {}, \"shares\": [\n",
+                w.total()
+            ));
+            for (j, sh) in w.shares.iter().enumerate() {
+                s.push_str(&format!(
+                    "      {{\"worker\": \"{}\", \"work\": {}}}{}\n",
+                    sh.worker,
+                    sh.work,
+                    if j + 1 == w.shares.len() { "" } else { "," }
+                ));
+            }
+            s.push_str("    ], \"payout\": [\n");
+            let by = w.shares_by_worker();
+            for (j, (name, work)) in by.iter().enumerate() {
+                s.push_str(&format!(
+                    "      {{\"worker\": \"{name}\", \"work\": {work}, \"share\": {:.9}}}{}\n",
+                    *work as f64 / w.total().max(1) as f64,
+                    if j + 1 == by.len() { "" } else { "," }
+                ));
+            }
+            s.push_str(&format!(
+                "    ]}}{}\n",
+                if i + 1 == coins_sorted.len() { "" } else { "," }
             ));
         }
         s.push_str("  ],\n  \"shares\": [\n");
@@ -993,21 +1253,39 @@ mod tests {
     #[test]
     fn credit_follows_work_and_not_share_count() {
         const SPAN: u32 = 400_000;
+        // **Several jobs, not one, and that is a fix rather than thoroughness.**
+        //
+        // A local coin's header carries `SystemTime::now()`, so every run of
+        // this test sweeps a *different* header and finds its solutions in
+        // different places. One job at 16 bits expects six shares over this
+        // span, and six is small enough that the ratio below swings past a
+        // factor of three by luck alone -- which it did, once, in a suite run,
+        // and passed on every re-run afterwards.
+        //
+        // That is the worst shape a check can have: it fails rarely enough to
+        // be re-run rather than read, which is how a real regression gets
+        // dismissed as "the flaky one". Eight jobs is eight times the shares
+        // and cuts the spread by about the root of that, without widening the
+        // bound -- widening it would have hidden the variance instead of
+        // reducing it, and the bound is the thing being asserted.
+        const JOBS: u32 = 8;
 
         fn run(bits: u32) -> Tally {
             let mut p = a_pool();
-            let job = p.make_job(0, bits).unwrap();
-            let mut h = Hasher::new(&job.algo, &job.header).unwrap();
-            for n in 0..SPAN {
-                if below_target(&h.hash(&job.header, n), &job.target) {
-                    p.submit(
-                        "w",
-                        &proto::Share {
-                            job: job.job.clone(),
-                            nonce: n,
-                            echo: vec![],
-                        },
-                    );
+            for _ in 0..JOBS {
+                let job = p.make_job(0, bits).unwrap();
+                let mut h = Hasher::new(&job.algo, &job.header).unwrap();
+                for n in 0..SPAN {
+                    if below_target(&h.hash(&job.header, n), &job.target) {
+                        p.submit(
+                            "w",
+                            &proto::Share {
+                                job: job.job.clone(),
+                                nonce: n,
+                                echo: vec![],
+                            },
+                        );
+                    }
                 }
             }
             p.ledger().into_iter().next().map(|(_, _, t)| t).unwrap_or_default()
@@ -1040,9 +1318,14 @@ mod tests {
         };
         assert!(
             hi <= lo * 3,
-            "credited work diverged with difficulty: {} at 10 bits against {} at 16",
+            "credited work diverged with difficulty: {} at 10 bits against {} at 16 \
+             (over {} jobs of {} nonces; {} shares against {})",
             easy.work,
-            hard.work
+            hard.work,
+            JOBS,
+            SPAN,
+            easy.accepted,
+            hard.accepted
         );
     }
 

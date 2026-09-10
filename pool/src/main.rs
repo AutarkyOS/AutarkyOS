@@ -154,6 +154,7 @@ fn main() {
     let mut lie = false;
     let mut ledger: Option<String> = None;
     let mut prices: Option<String> = None;
+    let mut window: Option<u64> = None;
     let mut coins: Vec<Coin> = Vec::new();
     let mut it = args.iter();
     while let Some(a) = it.next() {
@@ -179,6 +180,13 @@ fn main() {
                     std::process::exit(2);
                 }
             },
+            "--window" => match it.next().and_then(|v| v.parse::<u64>().ok()) {
+                Some(w) if w > 0 => window = Some(w),
+                _ => {
+                    eprintln!("--window wants a positive amount of work, e.g. 4294967296");
+                    std::process::exit(2);
+                }
+            },
             "--prices" => match it.next() {
                 Some(v) => prices = Some(v.clone()),
                 None => {
@@ -192,6 +200,11 @@ fn main() {
                 println!("  COIN is label:algo:bits[:asset][@host:port,user[,pass]]");
                 println!("  --prices PATH reads what tools/prices.py wrote and says");
                 println!("            whether each coin can be sold at all");
+                println!("  --window N is the payout window, in work. A share credits");
+                println!("            2^bits, so the default 2^32 is one difficulty-1");
+                println!("            share's worth. PPLNS pays a worker its slice of");
+                println!("            the last N, which is what a block found now was");
+                println!("            actually produced by.");
                 println!("  --bad-proof deliberately corrupts every proof, to watch a miner refuse");
                 println!("  without @, the pool builds its own headers and there is no chain");
                 println!("            --selftest");
@@ -258,7 +271,11 @@ fn main() {
         println!("[pool] {}", glados_pool::market::verdict(market.as_ref(), &c.label, &c.asset));
     }
 
-    let pool = Arc::new(Mutex::new(Pool::new(coins)));
+    let mut built = Pool::new(coins);
+    if let Some(w) = window {
+        built.set_window(w);
+    }
+    let pool = Arc::new(Mutex::new(built));
 
     // Read the log back before anything can add to it. A pool that began at
     // zero after every restart would lose a miner's whole record to a reboot
@@ -309,6 +326,24 @@ fn main() {
                 "[ledger] {w}  {c}  {} work, {} accepted, {} stale, {} bad, {} dup",
                 t.work, t.accepted, t.stale, t.bad, t.duplicate
             );
+        }
+        // **What each worker is actually owed, which the tally does not say.**
+        // The tally is all-time; a payout comes from the window. Printing only
+        // the first is how an operator ends up paying against the wrong number
+        // -- the coins in a block found now were produced by recent hashing,
+        // not by somebody who left last year.
+        for c in p.coin_labels() {
+            let Some(rows) = p.payouts(&c) else { continue };
+            let Some(w) = p.window(&c) else { continue };
+            println!(
+                "[payout] {c}  window {} of {} work over {} share(s)",
+                w.total(),
+                p.window_work(),
+                w.len()
+            );
+            for (name, work, share) in rows {
+                println!("[payout]   {name}  {work} work  {:.4}%", share * 100.0);
+            }
         }
         if let Some(path) = &ledger {
             let at = std::time::SystemTime::now()

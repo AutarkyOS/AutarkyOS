@@ -461,3 +461,153 @@ fn contention_follows_the_bound_and_not_the_algorithm() {
     assert!(Algo::Sha256d.working_set() <= 4096);
     assert!(yes.working_set() > 2 * 1024 * 1024);
 }
+
+// --------------------------------------------------------------- PPLNS
+
+/// **The window is bounded by work, not by shares, and this is why.**
+///
+/// VarDiff means one worker's share is not another's: measured on one sweep,
+/// 394 shares at 10 bits against 5 at 16, for the same effort. A window of
+/// "the last 100 shares" would hand the low-difficulty miner almost all of it.
+#[test]
+fn the_payout_window_is_measured_in_work() {
+    use glados_pool::pool::Window;
+    let mut w = Window::default();
+    // 8 shares of 16 units each into a window holding 64.
+    for i in 0..8 {
+        w.push(if i % 2 == 0 { "even" } else { "odd" }, 16, 64);
+    }
+    assert!(w.total() >= 64, "window holds at least the limit: {}", w.total());
+    // The smallest suffix that does: 64 exactly, which is four shares.
+    assert_eq!(w.total(), 64);
+    assert_eq!(w.len(), 4);
+    let by = w.shares_by_worker();
+    assert_eq!(by.len(), 2);
+    assert_eq!(by[0].1, 32);
+    assert_eq!(by[1].1, 32);
+}
+
+/// One big share and many small ones. The big one must not be split, because a
+/// share is one miner's one discovery and half of it is not a thing.
+#[test]
+fn a_share_is_never_divided_to_fit_the_window() {
+    use glados_pool::pool::Window;
+    let mut w = Window::default();
+    w.push("whale", 1000, 100);
+    assert_eq!(w.total(), 1000);
+    assert_eq!(w.len(), 1);
+    // And it leaves as soon as anything else can carry the window alone.
+    w.push("minnow", 100, 100);
+    assert_eq!(w.len(), 1);
+    assert_eq!(w.shares_by_worker()[0].0, "minnow");
+}
+
+/// **The property that makes PPLNS resist pool-hopping.** A worker who stops
+/// gets diluted out of the window by everybody who kept going -- their slice
+/// falls to zero on its own, without anything having to notice they left.
+#[test]
+fn a_worker_who_stops_falls_out_of_the_window() {
+    use glados_pool::pool::Window;
+    let mut w = Window::default();
+    for _ in 0..10 {
+        w.push("hopper", 10, 100);
+    }
+    assert_eq!(w.shares_by_worker()[0].0, "hopper");
+    // The hopper leaves; somebody else keeps hashing.
+    for _ in 0..10 {
+        w.push("steady", 10, 100);
+    }
+    let by = w.shares_by_worker();
+    assert_eq!(by.len(), 1, "the hopper is gone entirely");
+    assert_eq!(by[0].0, "steady");
+}
+
+/// Ordering is total, so a published document does not look edited every time
+/// it is regenerated -- the property `ledger` already has.
+#[test]
+fn the_payout_order_is_the_same_on_every_run() {
+    use glados_pool::pool::Window;
+    let build = || {
+        let mut w = Window::default();
+        for name in ["c", "a", "b", "a", "b", "a"] {
+            w.push(name, 10, u64::MAX);
+        }
+        w.shares_by_worker()
+    };
+    let first = build();
+    assert_eq!(first, build());
+    // Largest first, ties by name: a=30, b=20, c=10.
+    assert_eq!(first[0], (String::from("a"), 30));
+    assert_eq!(first[1], (String::from("b"), 20));
+    assert_eq!(first[2], (String::from("c"), 10));
+}
+
+/// A window of nothing pays only whoever found the last share, which is a
+/// lottery with one ticket rather than a payout scheme.
+#[test]
+fn a_window_of_zero_work_is_refused() {
+    use glados_pool::pool::{Coin, Pool, Source, target_with_leading_zeros};
+    use glados_pool::mine::algo::Algo;
+    let mut p = Pool::new(vec![Coin {
+        label: String::from("t"),
+        asset: String::from("t"),
+        algo: Algo::Sha256d,
+        share_bits: 8,
+        share_target: target_with_leading_zeros(8),
+        network_target: None,
+        source: Source::Local,
+        work: None,
+        e2: 0,
+    }]);
+    let before = p.window_work();
+    assert!(!p.set_window(0));
+    assert_eq!(p.window_work(), before);
+    assert!(p.set_window(4096));
+    assert_eq!(p.window_work(), 4096);
+}
+
+/// **NeoScrypt, in the tests CI actually runs.**
+///
+/// `src/mine/neoscrypt.rs` carries its own claims and the kernel runs them at
+/// boot, which CI cannot do -- it is a `no_std` UEFI binary with no host test
+/// runner. The pool compiles the same file by `#[path]`, so this is where those
+/// vectors become something a push can check. Two real Feathercoin blocks: the
+/// network accepted each because its digest beat the target its own `nbits`
+/// declares, which is a coincidence at 1 in 6.9e7 and 1 in 4.1e9.
+#[test]
+fn neoscrypt_reproduces_blocks_the_chain_accepted() {
+    use glados_pool::mine::hash::below_target;
+    use glados_pool::mine::stratum::hex;
+    use glados_pool::mine::neoscrypt::Neoscrypt;
+    use glados_pool::mine::u256::U256;
+
+    const BLOCKS: [(&str, &str, u32); 2] = [
+        ("0200000054aa94a46a70931d29f2a2ed3ee4ab5832cd6446a090f6f63292d004dd306e96\
+          bca6f3f22928ee4aa468ed5d5ff0f0a31137c2f9e780e0a70411a4a39b98d91c1b364d54\
+          dcdd3d1d52660400",
+         "aac8eaaea3c756f584d884f2de9e0e8c401f3ba0a640a14221550d2d06000000",
+         0x1d3ddddc),
+        ("040000200a9245b1198825ab30d6dbae2b185e31f342d1058cc36851629bf435fc682b55\
+          4d100771e4a23d210cd3a1503e3b1ca524e8482913ee5b4036edf4bd20db6a2993c0a16a\
+          dc09011d002c5f48",
+         "ff87010b15afee123759c6cb14fe33078d1795ca6f39286c3566d52500000000",
+         0x1d0109dc),
+    ];
+
+    let mut n = Neoscrypt::new();
+    for (hdr_hex, want, nbits) in BLOCKS {
+        let bytes = unhex(&hdr_hex.replace([' ', '\n'], "")).expect("header is hex");
+        let hdr: [u8; 80] = bytes.as_slice().try_into().expect("a header is 80 bytes");
+        let got = n.hash(&hdr);
+        assert_eq!(hex(&got), want, "nbits {nbits:08x}");
+        // The part that makes it a proof rather than a stored answer: the
+        // network only accepted this block because the digest beat its target.
+        let target = U256::from_nbits(nbits).expect("nbits decodes");
+        assert!(below_target(&got, &target), "digest is not under its own target");
+    }
+    // The same instance twice, because it holds a 32 KiB working set across
+    // calls and a hasher that did not reset would pass the first and fail here.
+    let bytes = unhex(&BLOCKS[0].0.replace([' ', '\n'], "")).unwrap();
+    let hdr: [u8; 80] = bytes.as_slice().try_into().unwrap();
+    assert_eq!(hex(&n.hash(&hdr)), BLOCKS[0].1);
+}
