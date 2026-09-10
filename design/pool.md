@@ -332,6 +332,23 @@ second per miner means the target is wrong rather than the server small.
 Network and disk are noise: a job is a few hundred bytes per coin per thirty
 seconds, a share is under two hundred, and the ledger is a few kilobytes.
 
+**The log is not noise, and rotating it at restart was rotating it never.**
+`run-pool.sh` caps `pool.log` at 4 MiB and checked that once per iteration of
+its supervisor loop -- which is once per pool *exit*. So the healthier the pool
+the less often the check ran, and a pool that never crashes never rotates at
+all. Measured on the deployed instance with two miners on it: about a kilobyte
+a minute, 1.4 MB a day, three days to the cap and then nothing, forever, on
+somebody else's disk. Only a soak long enough for the pool not to restart could
+show that, which is why it survived every earlier test of the script.
+
+The fix is a watcher beside the running pool, and it cannot use the same verb.
+`mv` renames the file while the pool's stdout descriptor still points at the
+inode, so the pool goes on writing into `pool.log.old` and `pool.log` sits at
+zero bytes -- which reads as a pool that stopped logging. The redirection is
+`>>`, so copy-then-truncate works: every later write lands at the new end of a
+file that is now empty. `mv` stays in the loop, between runs, where nothing has
+it open.
+
 **Do not build on the small machine.** Cross-compile and copy one file:
 
 ```bash

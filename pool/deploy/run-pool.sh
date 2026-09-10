@@ -78,7 +78,27 @@ trap 'rm -f "${PIDFILE}"' EXIT
 # Found by sending it a TERM rather than by reading it.
 trap 'rm -f "${PIDFILE}"; exit 0' INT TERM
 
-rotate() {
+# **Rotation had to stop happening only at restart, and a soak is what showed
+# it.** This was called once per loop iteration, which is once per pool exit --
+# so the healthier the pool, the less often its log was checked, and a pool
+# that simply never crashes never rotates at all. Measured on the deployed
+# instance: about a kilobyte a minute with two miners on it, so 1.4 MB a day
+# against a 4 MiB cap. Three days to the limit and then nothing, forever, on
+# somebody else's disk.
+#
+# **`mv` is also the wrong verb while the pool is running.** The pool's stdout
+# is an open descriptor onto this file; renaming it moves the name and not the
+# descriptor, so the pool goes on writing into `pool.log.old` and `pool.log`
+# stays empty at zero bytes -- which reads as a pool that stopped logging. It
+# is correct only in the loop, between runs, where no descriptor is open.
+#
+# So there are two of them. `rotate_between_runs` keeps the rename, which is
+# atomic and loses nothing. `watch_log` runs beside a live pool and copies then
+# truncates: the redirection is `>>`, which is `O_APPEND`, so every subsequent
+# write goes to the new end of a file that is now empty. Writes that land
+# between the copy and the truncate are lost, which is a line or two of a log
+# and is the price of not having a signal handler in the daemon to reopen it.
+rotate_between_runs() {
     if [ -f "${LOG}" ]; then
         size=$(wc -c < "${LOG}" 2>/dev/null || echo 0)
         if [ "${size}" -gt "${MAX_LOG_BYTES}" ]; then
@@ -87,14 +107,40 @@ rotate() {
     fi
 }
 
+# Checked every minute rather than every byte: the cost of being a minute late
+# is at most a minute of log past the cap, and the cost of checking constantly
+# is a `wc` on a growing file forever.
+LOG_CHECK_SECS=60
+
+watch_log() {
+    while : ; do
+        sleep "${LOG_CHECK_SECS}"
+        [ -f "${LOG}" ] || continue
+        size=$(wc -c < "${LOG}" 2>/dev/null || echo 0)
+        if [ "${size}" -gt "${MAX_LOG_BYTES}" ]; then
+            cp -f "${LOG}" "${LOG}.old" 2>/dev/null || continue
+            : > "${LOG}"
+            echo "[run-pool] rotated at ${size} bytes $(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "${LOG}"
+        fi
+    done
+}
+
 # How long a run has to last before it counts as having worked. Under this and
 # the pool is failing at startup -- a taken port, a missing file -- and the
 # backoff should keep climbing. Over it and whatever happened was a one-off.
 HEALTHY_AFTER=60
 
+# Started once and killed with the script, so a stop leaves nothing behind.
+# It is added to the existing traps rather than replacing them, because the
+# pidfile removal is what stops the *next* start refusing.
+watch_log &
+WATCHER=$!
+trap 'rm -f "${PIDFILE}"; kill "${WATCHER}" 2>/dev/null || true' EXIT
+trap 'rm -f "${PIDFILE}"; kill "${WATCHER}" 2>/dev/null || true; exit 0' INT TERM
+
 backoff=1
 while : ; do
-    rotate
+    rotate_between_runs
     echo "[run-pool] starting $(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "${LOG}"
     started=$(date +%s)
     "${BIN}" "$@" >> "${LOG}" 2>&1 || true

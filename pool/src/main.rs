@@ -296,14 +296,47 @@ fn main() {
     // ordinary rather than exceptional.
     if let Some(path) = &ledger {
         match std::fs::read_to_string(path) {
-            Ok(text) => match pool.lock().unwrap().load_ledger(&text) {
-                Ok(n) => println!("[pool] resumed {n} row(s) from {path}"),
+            // **The lock is taken once and released before anything else
+            // touches it.** Written first as `match pool.lock()...load_ledger()`
+            // with a second `pool.lock()` inside an arm, which compiles and
+            // then deadlocks on every restart that has a ledger to read: a
+            // scrutinee's temporary lives to the end of the `match`, and a
+            // `std::sync::Mutex` is not reentrant.
+            Ok(text) => {
+                let outcome = {
+                    let mut p = pool.lock().unwrap();
+                    let r = p.load_ledger(&text);
+                    // **PPLNS has no round boundary, so there is no safe
+                    // moment to change the window.** The restored shares were
+                    // accumulated under whatever the file says, the command
+                    // line now says something else, and nothing rescales the
+                    // stored values -- so every outstanding miner's pending
+                    // reward has just moved. Rosenfeld's remedy is to scale
+                    // each share by the ratio; this does not do that, and the
+                    // one thing worse than not doing it is not saying so.
+                    let moved = p
+                        .loaded_window_work()
+                        .filter(|was| *was != p.window_work())
+                        .map(|was| (was, p.window_work()));
+                    (r, moved)
+                };
+                match outcome {
+                    (Ok(n), moved) => {
+                        println!("[pool] resumed {n} row(s) from {path}");
+                        if let Some((was, now)) = moved {
+                            eprintln!("[pool] the window changed across this restart: {was} -> {now} work.");
+                            eprintln!("[pool] the restored shares were credited under the old one and are not rescaled, so every pending payout has moved. Intended, or a config that got copied wrong?");
+                        }
+                    }
                 // Loud, and it carries on with an empty tally rather than
                 // refusing to start. A pool that will not run because its
                 // history is unreadable helps nobody; one that starts quietly
                 // and silently forgets is what has to be avoided.
-                Err(e) => eprintln!("[pool] {path} could not be read ({e}); starting from zero"),
-            },
+                    (Err(e), _) => {
+                        eprintln!("[pool] {path} could not be read ({e}); starting from zero")
+                    }
+                }
+            }
             // Absent is the ordinary first run and is not an error.
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                 println!("[pool] no ledger at {path} yet; starting from zero")

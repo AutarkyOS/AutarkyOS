@@ -382,6 +382,9 @@ pub struct Pool {
     /// `tally`. Never read; it exists so the refusal costs nothing and needs
     /// no second signature.
     discard: Tally,
+    /// What `--window` was when the loaded ledger was written. See
+    /// `load_ledger`; recorded rather than applied.
+    loaded_window_work: Option<u64>,
     /// How many verdicts went to `discard`. Printed, because a cap that bites
     /// silently is a cap nobody knows about.
     untallied: u64,
@@ -453,6 +456,7 @@ impl Pool {
             next_job: 1,
             converged: HashMap::new(),
             discard: Tally::default(),
+            loaded_window_work: None,
             untallied: 0,
         }
     }
@@ -956,7 +960,27 @@ impl Pool {
             self.tallies.insert(k, v);
         }
         self.windows = windows;
+        // **Recorded and not applied.** The file's window is what the restored
+        // shares were accumulated under; the command line is what the operator
+        // is asking for now, and the command line wins for the reason the coin
+        // list does -- a file that silently overrode it would change what the
+        // pool serves and leave the operator reading their own config to find
+        // out why.
+        //
+        // But a difference is not nothing. PPLNS has no round boundaries, so
+        // there is no safe moment to change the window: Rosenfeld's fix is to
+        // rescale every stored share by the ratio, and nothing here does that,
+        // so raising or lowering `--window` across a restart moves every
+        // outstanding miner's pending reward without saying so. Kept so the
+        // caller can say so.
+        self.loaded_window_work = doc.get("window_work").and_then(|x| x.as_i64()).map(|v| v as u64);
         Ok(n)
+    }
+
+    /// The window the restored shares were accumulated under, when the file
+    /// recorded one. `None` for a format that predates the field.
+    pub fn loaded_window_work(&self) -> Option<u64> {
+        self.loaded_window_work
     }
 
     /// The share log as a publishable document.
