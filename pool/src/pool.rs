@@ -353,6 +353,25 @@ pub struct Pool {
     /// against a coin's own network target where one is known, which is the
     /// figure needed to choose it well; inventing a default that looked
     /// derived would be worse than asking.
+    /// **A `u64` reaches difficulty 4.3e9 and no further, which is a real
+    /// ceiling and is not the one it looks like.** A block is `D * 2^32`
+    /// expected hashes, `u64::MAX` is 1.845e19, so the largest window this
+    /// type can express is one block only while `D < 4.295e9`.
+    ///
+    /// Against Bitcoin that fails by **21,432x** -- one block at the `nbits`
+    /// this pool took off `solo.ckpool.org` is 3.95e23 hashes, so *no* value
+    /// of `--window` would have been well chosen and PPLNS degenerates to
+    /// paying the most recent shares whatever is passed. Against everything
+    /// this pool is actually pointed at it is not close: Feathercoin fits
+    /// 14,000 blocks of work, Bitzeny 210,000, Yenten 860,000.
+    ///
+    /// So the ceiling bites exactly one chain, and it is the chain `payrate.py`
+    /// exists to steer away from -- the whole selection criterion is
+    /// ASIC-free algorithms, which is to say small networks. Recorded rather
+    /// than fixed, because widening this to `u128` touches the ledger format,
+    /// its digest and every stored window, and buying that with a coin nobody
+    /// will serve is the wrong trade. The day an upstream has a difficulty
+    /// over 4.3e9, this is the line that explains the symptom.
     window_work: u64,
     next_job: u64,
     /// Where each worker's difficulty had got to, per `(worker, slot)`.
