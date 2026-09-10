@@ -175,6 +175,46 @@ def allocate(work, total):
 
 # ---------------------------------------------------------------- ledger
 
+def load_mapping(doc, since=None):
+    """Accept either a flat `{name: address}` file or the service's document.
+
+    `supabase/functions/worker` serves `{workers: {...}, updated_at: {...}}`,
+    and a hand-written file is the flat object. Both are taken, because the
+    flat one is what an event with no server uses and there is no reason to
+    make that case worse.
+
+    **`since` is the guard against a name that changed hands mid-epoch.**
+    Shares accrue against a *name* over days and the mapping is read once, at
+    the end, so an address that moved after the epoch began would collect work
+    somebody else did. Passing the epoch's start refuses those entries rather
+    than paying them, and they surface in the same `unknown` list as a name
+    nobody ever registered -- which is the right place, because both mean "this
+    work has no address anybody can defend".
+
+    A flat file carries no timestamps, so `since` cannot be enforced against
+    one. That is stated by refusing rather than by ignoring the flag.
+    """
+    if not isinstance(doc, dict):
+        raise ValueError("the mapping must be a JSON object")
+    if "workers" not in doc:
+        if since is not None:
+            raise ValueError("--map-since needs a mapping with timestamps; this file has none")
+        return {k: v for k, v in doc.items()}, {}
+    workers = doc.get("workers") or {}
+    moved = doc.get("updated_at") or {}
+    if since is None:
+        return dict(workers), dict(moved)
+    keep = {}
+    for name, addr in workers.items():
+        when = moved.get(name)
+        # No timestamp is not "recent enough", it is unknown, and unknown is
+        # the case this flag exists to refuse.
+        if when is None or when > since:
+            continue
+        keep[name] = addr
+    return keep, dict(moved)
+
+
 def work_by_address(ledger, mapping, coin=None):
     """Cumulative work per payout address, from the pool's own share log.
 
@@ -272,6 +312,38 @@ def selftest():
     w2, unknown2 = work_by_address(led, {"nickname": B})
     claim(w2.get(B.lower()) == 70 and unknown2 == [], "and is used once it is mapped")
 
+    # ---- the mapping document, in both shapes it arrives in ---------------
+    m, moved = load_mapping({"nickname": A})
+    claim(m == {"nickname": A} and moved == {}, "a flat mapping file loads unchanged")
+
+    served = {
+        "workers": {"early": A, "late": B},
+        "updated_at": {"early": "2026-09-01T00:00:00Z", "late": "2026-09-09T00:00:00Z"},
+    }
+    m, _ = load_mapping(served)
+    claim(m == {"early": A, "late": B}, "the served document loads both entries with no cutoff")
+
+    m, _ = load_mapping(served, since="2026-09-05T00:00:00Z")
+    claim(m == {"early": A}, "a name that moved after the epoch began is refused")
+
+    m, _ = load_mapping({"workers": {"nostamp": A}, "updated_at": {}},
+                        since="2026-09-05T00:00:00Z")
+    claim(m == {}, "an entry with no timestamp is refused, unknown not being recent enough")
+
+    try:
+        load_mapping({"nickname": A}, since="2026-09-05T00:00:00Z")
+        claim(False, "a flat file with --map-since is refused")
+    except ValueError:
+        claim(True, "a flat file with --map-since is refused")
+
+    # A refused entry has to reach the operator rather than vanish. It lands in
+    # the same `unknown` list a never-registered name does, which is what makes
+    # the existing "map them or they cannot be paid" warning cover this too.
+    m, _ = load_mapping(served, since="2026-09-05T00:00:00Z")
+    w3, unknown3 = work_by_address({"shares": [{"worker": "late", "coin": "btc", "work": 40}]}, m)
+    claim(w3 == {} and unknown3 == ["late"],
+          "work under a refused mapping is reported unknown rather than paid")
+
     print("\n%s" % ("selftest passed" if fails == 0 else "%d FAILED" % fails))
     return 0 if fails == 0 else 1
 
@@ -297,7 +369,10 @@ def main():
     ap.add_argument("ledger", nargs="?", help="the pool's ledger.json")
     ap.add_argument("--total", help="how much to distribute, in wei (1e21 accepted)")
     ap.add_argument("--coin", help="only this coin's work")
-    ap.add_argument("--map", help="JSON object of worker name -> address")
+    ap.add_argument("--map", help="worker mapping: a flat JSON object, or what /worker/map serves")
+    ap.add_argument("--map-since",
+                    help="refuse mapping entries changed after this ISO timestamp, "
+                         "which should be when the epoch began accruing")
     ap.add_argument("--out", help="where to write the epoch document")
     ap.add_argument("--gate", help="only pay addresses holding this much of --token")
     ap.add_argument("--token", help="the ERC-20 the gate is measured in")
@@ -311,7 +386,15 @@ def main():
         ap.error("a ledger and --total are required")
 
     ledger = json.load(io.open(a.ledger, encoding="utf-8"))
-    mapping = json.load(io.open(a.map, encoding="utf-8")) if a.map else {}
+    if a.map:
+        mapping, moved = load_mapping(json.load(io.open(a.map, encoding="utf-8")), a.map_since)
+        if a.map_since:
+            dropped = len(moved) - len(mapping) if moved else 0
+            if dropped > 0:
+                print("%d mapping entr(ies) changed after %s and were refused"
+                      % (dropped, a.map_since), file=sys.stderr)
+    else:
+        mapping, moved = {}, {}
     total = parse_amount(a.total)
 
     work, unknown = work_by_address(ledger, mapping, a.coin)

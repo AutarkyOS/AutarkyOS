@@ -125,7 +125,11 @@ else. `test/evm.mjs` is ninety lines and is the whole harness.
   unreachable for 800 entrants -- the pool holds 130 gates -- and that 50,000
   is the number that lets an event happen. The contract takes it per epoch and
   does not care.
-- **No worker-to-address mapping service.** `distribute.py` takes a worker name
-  that *is* an address, which is the convention every no-account pool uses, and
-  a `--map` file otherwise. `supabase/functions/link` already does signature
-  recovery and would replace the file.
+- ~~**No worker-to-address mapping service.**~~ Built:
+  `supabase/functions/worker`, migration `0003_workers.sql`. A miner signs a
+  message naming the address and the worker name, and `distribute.py --map`
+  reads what it serves. The flat file still works, because an event with no
+  server is worth keeping cheap. What is new beyond the plan is `--map-since`:
+  shares accrue against a name for days while the mapping is read once at the
+  end, so a name that changed hands in between would collect somebody else's
+  work.

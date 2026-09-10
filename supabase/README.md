@@ -138,6 +138,61 @@ trusts, and `channel` reads the same three, from the same place, so the door
 that issues a code and the door that honours one cannot disagree about what
 counts as holding.
 
+## The worker function
+
+Which address a mining worker name's shares are owed to. Run migration
+`0003_workers.sql` first.
+
+```
+POST /functions/v1/worker/nonce    {address, worker, verb?}    -> {nonce, message, ...}
+POST /functions/v1/worker/claim    {address, signature, worker} -> {worker, address}
+POST /functions/v1/worker/release  {address, signature, worker} -> {released}
+GET  /functions/v1/worker/map                                   -> {workers, updated_at}
+```
+
+`tools/distribute.py --map` reads what `/worker/map` serves, and also still
+reads a flat `{name: address}` file, because an event with no server at all is
+a case worth keeping cheap.
+
+**It is not gated on a balance and `link` is.** The difference is what each
+hands out. `link` gives access to builds, so it checks the holding. This
+records who a name's work belongs to, and gating it would mean buying before
+mining -- which inverts the order the design depends on. The gate is the
+contract's, checked at claim time against a balance held then; a miner who
+never buys never claims, and the allocation returns through `reclaim`.
+
+**A worker name shaped like an address is refused.** `distribute.py` already
+takes an address-shaped name as the address itself, before consulting the
+mapping, so a row saying `0xVICTIM -> attacker` would be dead weight. It is
+refused anyway, because the only thing keeping it dead is the order of two
+branches in one Python function.
+
+**Names are unique case-folded and stored as spelled.** Two people holding
+`Alice` and `alice` is not a collision a pool would notice and is the shape a
+lookalike attack takes, so the database enforces one. What is served back is
+the exact spelling, because that is the string the ledger will carry.
+
+### The one hazard worth knowing before running an event
+
+Shares accrue against a *name* over days and the mapping is read once, at the
+end. A name that changes hands in between would collect work its previous
+holder did. `updated_at` travels in the map for exactly this, and
+`distribute.py --map-since <epoch start>` refuses entries that moved after the
+epoch began. They land in the same "cannot be paid" list as a name nobody ever
+registered, which is the honest place for them.
+
+### Secrets it needs
+
+| Where | Name | What |
+|---|---|---|
+| Supabase → Function secrets | `TOKEN_CHAIN_ID` | `4663`, shared with `link` |
+| | `LINK_DOMAIN` | `glados.aperture.institute`, shared with `link` |
+| | `WORKER_NAME_CAP` | `10`, how many names one address may hold |
+
+Both shared names are read from the same place `link` reads them, so the
+signed message cannot claim one domain while the other function checks
+another.
+
 ### Both functions deploy with `--no-verify-jwt`
 
 ```
