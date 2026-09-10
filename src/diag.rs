@@ -351,7 +351,18 @@ fn wifi_selftest() -> bool {
     use crate::kprintln;
     let mut ok = true;
     let mut n = 0usize;
+    // Two drivers, one suite, because they answer the same question from
+    // opposite ends: rtl8188eu is one chip identified by vendor id, and rndis
+    // is an interface class that covers every phone that speaks it. The second
+    // is the one that gets an arbitrary machine onto a network.
     for (what, good) in crate::dev::rtl8188eu::init::checks() {
+        n += 1;
+        if !good {
+            kprintln!("    FAIL: {}", what);
+            ok = false;
+        }
+    }
+    for (what, good) in crate::dev::rndis::checks() {
         n += 1;
         if !good {
             kprintln!("    FAIL: {}", what);
