@@ -31,6 +31,20 @@ use super::blake2s;
 use super::hash;
 use super::yespower::{Version, Yespower};
 
+/// What a hash is waiting on.
+///
+/// Two classes and not six, deliberately. A machine has more resources than
+/// this -- integer units, shared memory, VRAM bandwidth, three levels of CPU
+/// cache -- but an `Algo` cannot know which device it landed on, and the split
+/// that survives that ignorance is whether the work is arithmetic or whether
+/// it is waiting for memory. Anything finer would be a claim about hardware
+/// made in a file that has never seen any.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Bound {
+    Arithmetic,
+    Memory,
+}
+
 #[derive(Clone, PartialEq)]
 pub enum Algo {
     /// Bitcoin's own.
@@ -93,6 +107,74 @@ impl Algo {
             // sha256d, by design.
             Algo::Yespower { .. } => 8,
         }
+    }
+
+    /// Bytes of working memory one concurrent hash needs.
+    ///
+    /// **This is the number that decides how many fit**, and it is the whole
+    /// reason a GPU is not automatically better at everything. A device runs
+    /// as many hashes at once as its memory divides by this, so an algorithm
+    /// at two megabytes puts a 4 GiB card at about two thousand concurrent
+    /// hashes against the thousands of threads it wants -- while sha256d at a
+    /// couple of hundred bytes puts no limit on it at all.
+    ///
+    /// The yespower figure is the formula rather than a measurement, and
+    /// `checks` asserts it against `Yespower::footprint()` for real parameter
+    /// sets. Two expressions of one quantity is a thing this tree normally
+    /// refuses; here the alternative is allocating eight megabytes to answer a
+    /// scheduling question, so the duplication is bought and then checked.
+    pub fn working_set(&self) -> usize {
+        match self {
+            // A midstate, a header and a digest. Register and L1 territory,
+            // which is why these two never bound a device on memory.
+            Algo::Sha256d | Algo::Blake2s => 256,
+            Algo::Yespower { v10, n, r, .. } => {
+                let (swidth, sboxes) = if *v10 { (11usize, 3usize) } else { (8, 2) };
+                // S-boxes, then V at 128*r*N, then X, B and the 128-byte
+                // scratch `smix1` runs at r=1 in.
+                let s = sboxes * (1usize << swidth) * 2 * 8;
+                let b = 128 * *r as usize;
+                s + b * *n as usize + b + b + 128
+            }
+        }
+    }
+
+    /// What a hash spends its time waiting for, and therefore what two of them
+    /// on one device take from each other.
+    ///
+    /// **Two algorithms sharing a device contend only when they share this.**
+    /// A sha256d kernel saturates integer units and barely touches memory
+    /// bandwidth; yespower saturates a cache and leaves the arithmetic units
+    /// idle. Run those two together on hardware that has both and the second
+    /// is close to free -- run two arithmetic ones together and they simply
+    /// halve each other.
+    ///
+    /// That is the honest form of "mine many coins at once". Concurrency over
+    /// one bottleneck cannot beat picking the best thing that bottleneck can
+    /// do, because the total is fixed and the split only averages the rates
+    /// down. Concurrency over *different* bottlenecks is the case where the
+    /// machine genuinely does more work.
+    pub fn bound(&self) -> Bound {
+        match self {
+            // ARX and integer addition over a working set that fits in
+            // registers.
+            Algo::Sha256d | Algo::Blake2s => Bound::Arithmetic,
+            // Sequentially dependent random reads over megabytes. The limit is
+            // a cache's latency and nothing about the ALUs -- which is what
+            // `design/mining.md` means by the budget being L3, and what makes
+            // this family CPU-only by construction rather than by convention.
+            Algo::Yespower { .. } => Bound::Memory,
+        }
+    }
+
+    /// Whether running these two at once on **one device** divides it.
+    ///
+    /// The device is the caller's to know: two algorithms on a GPU and a CPU
+    /// never contend however they are bound, and nothing in an `Algo` says
+    /// which silicon it landed on. Keeping that out of here is what stops this
+    /// predicate quietly becoming a scheduler.
+    pub fn contends_with(&self, other: &Algo) -> bool {
+        self.bound() == other.bound()
     }
 
     /// A human-readable parameter line for the report.

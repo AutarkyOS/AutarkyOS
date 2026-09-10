@@ -31,6 +31,7 @@ pub mod yespower;
 
 use alloc::vec::Vec;
 
+use algo::Algo;
 use u256::U256;
 
 /// Block 125552's header, as bytes. The same array `tools/algocheck.py` holds.
@@ -388,6 +389,59 @@ fn yespower_checks() -> Vec<(&'static str, bool)> {
         Yespower::new(Version::V1_0, 512, 8).is_none()
             && Yespower::new(Version::V1_0, 1024, 7).is_none()
             && Yespower::new(Version::V1_0, 1024, 33).is_none(),
+    ));
+
+    // --- the resource fingerprint, and the one part of it that can drift ---
+    //
+    // `Algo::working_set` is the formula and `Yespower::footprint` is the
+    // allocation, written independently because asking the second costs eight
+    // megabytes and a scheduler cannot pay that to decide what to run next.
+    // Two expressions of one quantity is exactly the arrangement this tree
+    // warns about, so it is checked rather than trusted: a table that said two
+    // megabytes where the allocator takes eight would pack a device wrong and
+    // report nothing at all.
+    let mut agree = true;
+    for (v10, n, r) in [
+        (true, 1024u32, 8u32),
+        (true, 2048, 8),
+        (true, 1024, 32),
+        (false, 1024, 8),
+        (false, 2048, 16),
+    ] {
+        let a = Algo::Yespower { v10, n, r, pers: None };
+        let ver = if v10 { Version::V1_0 } else { Version::V0_5 };
+        match Yespower::new(ver, n, r) {
+            Some(y) => agree = agree && a.working_set() == y.footprint(),
+            None => agree = false,
+        }
+    }
+    out.push((
+        "the declared working set is the one yespower actually allocates",
+        agree,
+    ));
+
+    // The whole point of the fingerprint: what two algorithms take from each
+    // other on one device. Two arithmetic ones halve each other; an arithmetic
+    // one beside a memory-bound one is close to free, which is the only shape
+    // in which running several coins at once does more work rather than the
+    // same work divided up.
+    out.push((
+        "two arithmetic algorithms contend and sha256d does not contend with yespower",
+        Algo::Sha256d.contends_with(&Algo::Blake2s)
+            && !Algo::Sha256d.contends_with(&Algo::Yespower {
+                v10: true,
+                n: 2048,
+                r: 8,
+                pers: None,
+            }),
+    ));
+    // And the size gap is the reason the bound differs, so it is asserted
+    // rather than left as a story: four orders of magnitude between them.
+    out.push((
+        "an arithmetic hash is cache-resident and a memory-bound one is megabytes",
+        Algo::Sha256d.working_set() <= 4096
+            && Algo::Yespower { v10: true, n: 2048, r: 8, pers: None }.working_set()
+                > 2 * 1024 * 1024,
     ));
 
     out

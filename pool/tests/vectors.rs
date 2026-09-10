@@ -407,3 +407,57 @@ fn the_optional_proof_reproduces_the_header_it_came_with() {
     let flipped: [[u8; 32]; 2] = [branch[1], branch[0]];
     assert_ne!(header::merkle_root(&coinbase, &flipped), root);
 }
+
+/// **The declared working set against the one actually allocated.**
+///
+/// `Algo::working_set` is a formula and `Yespower::footprint` is the
+/// allocation, written separately because asking the second costs eight
+/// megabytes and a scheduler cannot pay that to decide what to run next. Two
+/// expressions of one quantity is the arrangement this tree warns about, so it
+/// is checked: a table claiming two megabytes where the allocator takes eight
+/// would pack a device wrong and report nothing.
+#[test]
+fn the_declared_working_set_is_the_one_yespower_allocates() {
+    use glados_pool::mine::yespower::{Version, Yespower};
+    for (v10, n, r) in [
+        (true, 1024u32, 8u32),
+        (true, 2048, 8),
+        (true, 1024, 32),
+        (false, 1024, 8),
+        (false, 2048, 16),
+    ] {
+        let a = Algo::Yespower { v10, n, r, pers: None };
+        let ver = if v10 { Version::V1_0 } else { Version::V0_5 };
+        let y = Yespower::new(ver, n, r).expect("constructible");
+        assert_eq!(
+            a.working_set(),
+            y.footprint(),
+            "v10={v10} N={n} r={r}"
+        );
+    }
+}
+
+/// The predicate the scheduler will rest on. Two algorithms sharing a device
+/// contend only when they wait on the same thing -- two arithmetic ones halve
+/// each other, while an arithmetic one beside a memory-bound one is close to
+/// free. That difference is the only reason running several coins at once does
+/// more work rather than the same work divided up.
+#[test]
+fn contention_follows_the_bound_and_not_the_algorithm() {
+    use glados_pool::mine::algo::Bound;
+    let yes = Algo::Yespower { v10: true, n: 2048, r: 8, pers: None };
+    assert_eq!(Algo::Sha256d.bound(), Bound::Arithmetic);
+    assert_eq!(Algo::Blake2s.bound(), Bound::Arithmetic);
+    assert_eq!(yes.bound(), Bound::Memory);
+
+    assert!(Algo::Sha256d.contends_with(&Algo::Blake2s));
+    assert!(!Algo::Sha256d.contends_with(&yes));
+    // Reflexive, or a slot would not contend with a second copy of itself --
+    // which is the commonest case a scheduler actually meets.
+    assert!(Algo::Sha256d.contends_with(&Algo::Sha256d));
+    assert!(yes.contends_with(&yes));
+
+    // And the size gap that justifies the split, asserted rather than told.
+    assert!(Algo::Sha256d.working_set() <= 4096);
+    assert!(yes.working_set() > 2 * 1024 * 1024);
+}
