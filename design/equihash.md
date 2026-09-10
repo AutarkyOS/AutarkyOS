@@ -26,6 +26,14 @@
 > solution field this is the document that makes the work possible in an
 > afternoon rather than a fortnight.
 >
+> **The refusal has a price now and it is 7x.** Measured after this was written,
+> on an axis the decision did not have: zpool pays $0.4742 a worker a day on
+> `equihash192` and $0.4721 on `equihash144`, against $0.0499 for the next
+> reachable algorithm down and $0.0271 for NeoScrypt, which was built instead.
+> Two readings seven minutes apart put the pair's position at the top beyond
+> noise. The decision stands -- it was never about the money -- but a decision
+> held open should say what it costs, and `design/mining.md` carries the table.
+>
 > NeoScrypt was built instead: `tools/neoscrypt.py`, `cuda/neoscrypt.cu`,
 > `src/mine/neoscrypt.rs`, all checked against two real Feathercoin blocks.
 
