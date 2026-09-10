@@ -146,9 +146,15 @@ made for an unrelated reason:
 "BTC" any more. zpool's API denominates everything in BTC -- `estimate_current`
 is BTC per day per unit of hashrate, after they sold what you mined -- so BTC is
 the *accounting unit of that class of pool* rather than anything in the mining
-path. On a yiimp pool the payout coin is inferred from the address you mine
-with, and their currency list carries 219 of them: LTC, DOGE and RVN would all
-do, and the route would be identical.
+path. Their currency list carries 219 of them and LTC, DOGE and RVN would all do,
+with the route identical.
+
+**How the payout coin is chosen was written wrongly here and it matters.** It
+is not inferred from the address you mine with. zpool takes `c=<SYMBOL>` in the
+*password* field, and with no `c=` the currency is "randomly chosen from any
+matching coins we have used" and cannot be changed once a balance has posted.
+So the LTC route needs an explicit `c=LTC`, and a rig configured with only an
+LTC address gets whatever the pool felt like.
 
 ### Which payout coin, measured rather than assumed
 
@@ -183,6 +189,27 @@ differentiator; only the chain is.
 in LTC cost 0.005% of revenue. Monthly in BTC on a bad day costs 256%. That is
 a factor of fifty thousand between two arrangements of the same mining.
 
+### The threshold, which was the biggest unknown and is now the clearest number
+
+zpool carries an undocumented `minimum_payout` in `/api/currencies` -- 219 coins,
+202 of them at 0.05 of whatever the coin is -- and it decides how long until a
+first payout exists at all. At this machine's measured $0.0703 a day net:
+
+    BTC     0.00075 BTC   $58.00    825 days     the default, and the worst
+    LTC     0.05 LTC       $2.62     37 days
+    DOGE    5 DOGE         $0.42      6 days     the fastest
+    RVN     0.05 RVN       $0.0001    same day
+
+**LTC wins on both axes at once**, which is the useful part: 22x faster to a
+first payout than BTC *and* the smallest withdrawal fee as a fraction of that
+payout, 0.05% against DOGE's 3.00%. DOGE reaches a payout six times sooner and
+gives up sixty times more of it in fees.
+
+All three are `only_direct: 0` and `conversion_disabled: 0`, checked, so they
+can be paid from mining a different algorithm rather than requiring you to mine
+that coin. That was worth checking: 158 of the 219 have conversion disabled and
+would have looked available while refusing the one thing needed.
+
 **What is not measured here** is the swap from the payout coin to ETH, because
 no THORChain endpoint was reachable from this network -- three have no A record
 and one is behind a bot challenge. The reasoning that it also favours LTC is
@@ -192,9 +219,19 @@ and it is the largest single cost in the chain. Nor is the per-coin minimum
 payout threshold, which zpool publishes on its site rather than in its API and
 which decides how long until any of this happens at all.
 
-**ETH is not among them and cannot be**, which is the constraint underneath the
-whole leg. Ethereum has not been mineable since the merge, so no mining pool
-pays in it. GLADOS lives on an EVM L2 and nothing mineable is native there, so
+**ETH is not among them**, which is the constraint underneath the whole leg --
+though the reason given here was wrong, and the correction is worth keeping
+because it was a category error. This said ETH "cannot be" a payout currency
+because Ethereum stopped being mineable at the merge. That conflates *mineable*
+with *payable*: an auto-exchange pool sells whatever you mined and credits you
+in something else, which is exactly how it pays in 219 coins nobody mined on it.
+zpool's refusal is **policy, not physics** -- its own site says "ETH style (0x*)
+wallets are not supported", and the API corroborates it with zero of 219
+currencies matching ether, usd, tether, polygon, arbitrum, base or optimism.
+
+Which means a pool that settled to an EVM address is not impossible, merely
+absent from this one, and finding one would delete the most expensive leg of
+the design. GLADOS lives on an EVM L2 and nothing mineable is native there, so
 there is always a swap between what was mined and what buys the token. The only
 question is how many hops, and BTC is simply the most liquid place to start.
 
