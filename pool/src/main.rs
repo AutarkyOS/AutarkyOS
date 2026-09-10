@@ -426,6 +426,31 @@ fn main() {
                 p.window_work(),
                 w.len()
             );
+            // **The window said in the only unit that means anything**, which
+            // needs the network target and therefore an upstream. Rosenfeld:
+            // variance goes as `pB^2/N` and mean time to payment as `pN/2`, so
+            // their product is fixed however `N` is chosen -- the window is a
+            // dial between paying smoothly and paying soon, not an optimum, and
+            // an operator cannot pick a point on a dial with no markings.
+            //
+            // Printed as a ratio to one block's expected work because that is
+            // the number with the surprise in it: a window far below a block is
+            // a window that pays out the last few shares, whatever it was meant
+            // to be, and the arithmetic says so where the raw figure looks
+            // perfectly large.
+            if let Some(blocks) = p.window_in_blocks(&c) {
+                if blocks >= 0.01 {
+                    println!(
+                        "[payout]   the window is {blocks:.2} block(s) of work; mean wait to be paid for a share is about {:.2} block(s)",
+                        blocks / 2.0
+                    );
+                } else {
+                    println!(
+                        "[payout]   the window is 1/{:.0} of one block's work -- far too small to be a payout window on this chain; it pays the most recent shares and nothing else",
+                        1.0 / blocks.max(f64::MIN_POSITIVE)
+                    );
+                }
+            }
             for (name, work, share) in rows {
                 println!("[payout]   {name}  {work} work  {:.4}%", share * 100.0);
             }

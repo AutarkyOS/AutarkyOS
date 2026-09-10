@@ -821,6 +821,36 @@ when there is a live upstream there is also a chain to read it from.
   reachable from the public internet -- that needs a forwarded port -- and not
   yet left running, which needs the operator's `enable-linger`.
 
+## The window had no units, and now that it does the number is wrong
+
+`Coin::network_target` has existed since the struct did. `U256::from_nbits` has
+existed, with a claim, since `u256` did. **Nothing ever joined them**, so three
+separate things sat blocked on a number that was arriving in every single
+`mining.notify`: expected value per coin, the payout window having any unit at
+all, and telling this PPLNS from the hopping-proof one. One line in `set_work`.
+
+The unit is Rosenfeld's. Reward variance goes as `pB^2/N` and mean time to
+payment as `pN/2`, so their **product is fixed whatever `N` is** -- the window
+is a dial between paying smoothly and paying soon rather than an optimisation
+with a right answer, and `--window` being the operator's number is correct. What
+was missing is any way for them to know which end they had picked. A block is
+`2^256 / target` expected hashes and the window is already denominated in
+expected hashes, so the ratio is the whole of it.
+
+**And the deployed setting is a rounding error.** `run-pool.sh` passes
+`--window 268435456`, which against Bitcoin's own `nbits` from that live
+`mining.notify` is under `1e-12` of one block's work. That is not a window that
+pays smoothly or a window that pays soon; it is a window that pays the last few
+shares and nothing else. The figure looked perfectly large as a bare integer,
+which is exactly the failure a missing unit produces, and it went unnoticed for
+as long as every coin was local and there was nothing to compare against.
+
+The claim checks both halves: a difficulty-1 target with a `2^32` window is one
+block of work by construction, halving the window halves the answer -- which is
+what separates a real ratio from a constant that happens to be 1 -- and then
+Bitcoin's real `nbits` says what the shipped configuration is worth. A coin with
+no chain behind it answers nothing rather than a plausible number.
+
 ## It has met a real chain
 
 The largest thing on the list below was "no upstream on the internet has been
@@ -884,9 +914,9 @@ this project does not control.
   hopping-proof only while difficulty is constant. The proof variant needs each
   share's difficulty relative to the network, which is the same missing number
   that blocks expected value. One absent quantity, three consequences.
-- **The window's own dial, said in units.** Variance times maturity is fixed,
-  so `--window` is a choice between paying smoothly and paying soon; printing
-  which end the operator picked needs `p`, so it waits on the same thing.
+- **A window sized for a real chain.** The dial has markings now -- see below --
+  and what they say about the deployed setting is that it is not a payout
+  window at all.
 - **A distributed flood.** Every bound here is per connection or per pool and
   none of them is per source. On a home connection the upstream link saturates
   long before the daemon does, and nothing running on the server can help.

@@ -694,8 +694,39 @@ impl Pool {
         let Some(coin) = self.coins.get_mut(slot) else {
             return false;
         };
+        // **The network target arrives in every `mining.notify` and was being
+        // thrown away.** `Coin::network_target` has existed since the struct
+        // did, `U256::from_nbits` has existed and been claimed since `u256`
+        // did, and nothing ever joined them -- so three separate things were
+        // blocked on a number that was on the wire the whole time: expected
+        // value per coin, the payout window having units, and telling simple
+        // PPLNS from the hopping-proof variant.
+        //
+        // `None` on a malformed `nbits` rather than a clamp, which is
+        // `from_nbits`'s own rule: a clamped target is a legal-looking number
+        // that is not the one the network asked for.
+        coin.network_target = U256::from_nbits(w.nbits);
         coin.work = Some(w);
         true
+    }
+
+    /// The payout window as a fraction of one block's expected work, where a
+    /// chain is known.
+    ///
+    /// **This is the unit `--window` never had.** Rosenfeld's analysis gives
+    /// reward variance as `pB^2/N` and mean time to payment as `pN/2`, whose
+    /// product is fixed whatever `N` is -- so the window is not an optimisation
+    /// with a right answer, it is a dial between paying smoothly and paying
+    /// soon. An operator cannot pick a point on a dial with no markings, and
+    /// the marking needs the network target.
+    ///
+    /// A block is `2^256 / target` expected hashes and the window is denominated
+    /// in expected hashes already, so the ratio is the whole of it.
+    pub fn window_in_blocks(&self, coin: &str) -> Option<f64> {
+        let c = self.coins.iter().find(|c| c.label == coin)?;
+        let t = c.network_target.as_ref()?;
+        let per_block = approx_hashes_per_block(t)?;
+        Some(self.window_work as f64 / per_block)
     }
 
     /// Which coin an issued job belongs to.
@@ -1140,6 +1171,36 @@ pub fn lie_about_proofs() {
 /// bits rather than as a difficulty because a difficulty is a float and the
 /// conversion is exactly where `stratum::decimal` records that `Json::as_i64`
 /// reads `0.001` as zero.
+/// `2^256 / target`, as a float, for reporting only.
+///
+/// Float on purpose and nowhere near a validation: what this feeds is a line an
+/// operator reads, and the answers span forty orders of magnitude, so what is
+/// wanted is the exponent rather than the units digit. Every place the number
+/// actually decides something -- `below_target`, `target_for` -- stays in
+/// `U256` for the reason `u256` exists.
+fn approx_hashes_per_block(t: &U256) -> Option<f64> {
+    let b = t.to_be_bytes();
+    // Where the target's leading one sits, and the value of the bytes from
+    // there. 2^256 / t is then 2^(256 - pos) / (mantissa scaled to that).
+    let first = b.iter().position(|x| *x != 0)?;
+    let mut mant = 0f64;
+    for i in 0..8usize.min(32 - first) {
+        mant = mant * 256.0 + b[first + i] as f64;
+    }
+    if mant == 0.0 {
+        return None;
+    }
+    // t = mant * 256^(32 - first - taken), so 2^256 / t = 2^256 / mant / 256^k.
+    let taken = 8usize.min(32 - first);
+    let k = (32 - first - taken) as i32;
+    let v = 2f64.powi(256) / mant / 256f64.powi(k);
+    if v.is_finite() && v > 0.0 {
+        Some(v)
+    } else {
+        None
+    }
+}
+
 pub fn target_with_leading_zeros(leading: u32) -> U256 {
     let mut b = [0xffu8; 32];
     let full = (leading / 8) as usize;
@@ -1436,6 +1497,52 @@ mod tests {
     /// Equal effort must earn equal credit, whatever difficulty it was at.
     ///
     /// This is the property that pays people fairly, and it is exactly what
+    /// The window is meaningless until it can be said in blocks, and against a
+    /// real chain the deployed number turns out to be far too small.
+    ///
+    /// Two claims in one because the second only has weight beside the first.
+    /// A synthetic target with a known exponent checks the arithmetic; then
+    /// Bitcoin's own `nbits` from a real `mining.notify` checks what it says
+    /// about the configuration actually shipped in `run-pool.sh`.
+    #[test]
+    fn the_window_can_be_said_in_blocks_and_the_deployed_one_is_a_rounding_error() {
+        let mut p = a_pool();
+
+        // 0x1d00ffff is difficulty 1: 2^32 expected hashes to a block. A window
+        // of exactly that is one block of work by construction, which is the
+        // cheapest possible check of the arithmetic and would catch an
+        // off-by-a-factor-of-256 in the mantissa placement.
+        p.coins[0].network_target = U256::from_nbits(0x1d00_ffff);
+        p.set_window(1u64 << 32);
+        let b = p.window_in_blocks(&p.coins[0].label.clone()).expect("a target is known");
+        assert!(
+            (b - 1.0).abs() < 0.01,
+            "a difficulty-1 chain and a 2^32 window is one block of work, got {b}"
+        );
+
+        // And with the window halved it is half a block, which is what
+        // separates a real ratio from a constant that happens to be 1.
+        p.set_window(1u64 << 31);
+        let h = p.window_in_blocks(&p.coins[0].label.clone()).unwrap();
+        assert!((h - 0.5).abs() < 0.01, "half the window is half a block, got {h}");
+
+        // Now the real one. `0x17030ecd` is Bitcoin's `nbits` as carried by a
+        // live `mining.notify` this pool took from solo.ckpool.org, and
+        // 268435456 is what `run-pool.sh` passes as `--window`.
+        p.coins[0].network_target = U256::from_nbits(0x1703_0ecd);
+        p.set_window(268_435_456);
+        let real = p.window_in_blocks(&p.coins[0].label.clone()).unwrap();
+        assert!(
+            real < 1e-12,
+            "the deployed window against Bitcoin is a rounding error, got {real}"
+        );
+
+        // A coin with no chain behind it answers nothing rather than a
+        // plausible number, which is the rule the whole file runs on.
+        p.coins[0].network_target = None;
+        assert!(p.window_in_blocks(&p.coins[0].label.clone()).is_none());
+    }
+
     /// A stranger cycling worker names must not be able to push a miner who
     /// has actually done work out of the ledger.
     ///
