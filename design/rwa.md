@@ -55,42 +55,106 @@ That is the whole finding. A never-seen address can receive the token, so
 nothing on the contract asks who the recipient is, and paying a stranger in
 NVDA is mechanically possible today.
 
-## And it still cannot be a payout, because there is nowhere to buy it
+## The depth figure in the first version of this file was wrong
 
-Mechanical possibility is not availability. The pool would have to **acquire**
-the token before it could distribute it, and on-chain there is nothing to
-acquire it from. Reading `getPair` off the factory at
-`0x8bceaa40b9acdfaedf85adf4ff01f5ad6517937f`:
+It said about ten dollars, from reading `getPair` on four pairs. **The factory
+carries 41,741 pairs**, and asking it properly -- `PairCreated` logs filtered on
+the indexed `token0`/`token1` -- finds **62 pairs involving these six tokens**,
+not four. Four of 41,741 is a sample, and it was reported as a fact about the
+chain.
 
-    NVDA/WETH    0.0039 WETH of depth   (about $10)
-    NVDA/USDG    ~0
-    SPY/USDG     ~0
-    SPCX/USDG    ~0
+Most of those 62 are not usable for acquisition. The counterparty is a memecoin
+somebody launched against a stock ticker -- `MVDA`, `NVDAs`, `Stockcoin`,
+`GAMECOIN`, `dont'buy`, `NVTEST963` -- and buying `NVDA` with `HODL` requires
+already holding `HODL`, which has the same problem one level down. **Seven of
+the 62 have a quote asset that can be arrived at from outside**, and this is
+their whole depth:
 
-**About ten dollars of liquidity across the whole venue.** The 36-hour event's
-entire pot is $84, so a single epoch's conversion is eight times the depth of
-the only pair that has any. There is no size at which this works, and it is not
-a matter of slippage tolerance: the pair cannot fill the order at any price.
+    AMZN / WETH    0.01177828 WETH     $28.99
+    GME  / WETH    0.00903404 WETH     $22.23
+    NVDA / WETH    0.00394343 WETH      $9.70
+    NVDA / USDG    0.18623300 USDG      $0.19
+    SPY  / USDG    0.00065300 USDG      $0.00
+    SPCX / USDG, SPCX / WETH           dust
+                                     -------
+                                       $61.11     at ETH $2,460.90
 
-So the acquisition path is not a DEX. It is Robinhood's own app, which means an
-account, an identity check, and an operator holding equities on behalf of
-people who are owed a payout -- which is precisely the custody shape the whole
-design was arranged to avoid (see `payout.md`, and the P2Pool argument in the
-plan). The chain being permissionless does not make the *on-ramp*
-permissionless, and the on-ramp is the part that binds.
+So the real figure is **$61, six times what this file first said**, and two of
+the three pairs that carry it were not in the original spot check at all.
 
-## What this changes about the design: nothing yet, and that is worth saying
+**And the chain has no working stablecoin market underneath any of it.** The
+`WETH`/`USDG` pair is `175.24 WETH` against `0.00000043 USDG`: a degenerate pool
+nobody can trade through, which is why ETH had to be priced off-chain to value
+the table above.
 
-The RWA route is **recorded and not adopted**. It fails on availability rather
-than on mechanism, and availability is the kind of fact that changes: a pair
-with $10 in it today is one liquidity provider away from having $100,000.
+## Slippage, which depends only on one ratio
 
-The thing to watch is therefore a single number -- **depth in NVDA/WETH or any
-stock/USDG pair on 4663** -- and the threshold is easy to state. A payout venue
-needs depth of at least an order of magnitude above one epoch's conversion, so
-against a quarterly settlement of a few hundred dollars that is roughly $5,000
-of two-sided depth. Nothing on the chain is within two orders of magnitude of
-it.
+Worth writing down because it makes the basket question answerable without
+knowing a single stock price. On a constant-product pool, spending `x` of the
+quote against reserve `R` returns, valued at the pool's own pre-trade price,
+
+    x * R / (x + R)
+
+Efficiency is `R/(x+R)` and **depends only on `x/R`** -- not on the price, not on
+which stock, not on how the basket is composed. Spreading `x` across several
+pairs in proportion to their reserves gives every pair the same ratio, so the
+basket behaves exactly like one pool of the summed depth. That is the honest
+version of "split it across a basket": it works, and what it buys is `R = $61`
+instead of `R = $9.70`.
+
+Against the 36-hour pot, and against the quarterly settlements the cadence
+argument in `payout.md` actually implies:
+
+    spend $84    receive $35.37    42.1% efficiency    57.9% lost
+    spend $250   receive $49.11    19.6%               80.4%
+    spend $630   receive $55.71     8.8%               91.2%
+
+    to keep 99%, one clip may be at most $0.62
+    to keep 95%,                          $3.22
+    to keep 90%,                          $6.79
+
+## But depth is a stock and the thing that matters is a flow
+
+**This is the correction that mattered**, and the first version of this file did
+not make it. A pool is not a budget that gets spent once. Buying pushes the
+price up, an arbitrageur with a cheaper source sells into it, and both the price
+and the stock-side reserve come back. So a $9.70 pool can pass far more than
+$9.70 through itself, and the question is not how deep it is but **how fast it
+refills**.
+
+That is measurable, so it was measured -- every `Swap` event on the seven pairs,
+bucketed by day, quote side only and in its own units:
+
+    day        d0      d1      d2      d3      d4      d5      d6
+    AMZN     2.71    0.40   18.95   12.34   49.22    0.00    0.00
+    GME      0.81   29.91    0.07    0.00    0.13    0.75    0.71
+    NVDA   488.67   16.26    0.22    5.42    0.00    0.00    0.00
+    total  492.18   46.57   19.24   17.75   49.34    0.75    0.71
+
+    14-day total $683.93    mean $48.85/day    median $12.89/day
+
+**The first day is 72% of the fortnight**, which is exactly why one reading is
+not a rate -- and why the $492 that showed up in the first 24-hour window would
+have been a second wrong number reported confidently, had it not been bucketed.
+
+## The verdict, on the flow rather than on the depth
+
+$84 is **12% of everything the entire RWA basket has traded in two weeks**, and
+at the median day it is six and a half days of the basket's whole turnover --
+turnover being two-directional, so the one-way buying required is a larger share
+still. A quarterly settlement of $250 to $630 is five to thirteen months of it.
+
+So the route does not work, and the reason is now a defensible one rather than a
+spot check: **not that the pools are shallow, which they can survive, but that
+the flow through them is one to two orders of magnitude below what a settlement
+needs.**
+
+The number to watch is therefore a rate and not a reserve, which is a better
+trigger than the one this file carried before: **sustained basket throughput
+around $5,000 a day**, at which point a $250 settlement is 5% of daily flow and
+can be clipped in under the 95% line without moving anything. Nothing here is
+within two orders of magnitude of that, and the measurement takes about a minute
+to repeat -- `PairCreated` for the pair set, `Swap` bucketed by day for the flow.
 
 ## The legal question was being chased and it does not bind
 
