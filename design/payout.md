@@ -136,11 +136,25 @@ Uniswap V2 rather than V3.
 What replaces it is shorter, and the first leg was already solved by a decision
 made for an unrelated reason:
 
-    mined altcoin
-      -> the upstream pool sells it and pays BTC     already true
-      -> BTC to ETH, non-custodially                 the one open leg
+    mined altcoin                                  yespower, neoscrypt, blake2s
+      -> the upstream sells it and pays you          already true
+      -> that payout to ETH, non-custodially         the one open leg
       -> Across delivers WETH into 4663              verified live
       -> one Uniswap V2 swap, WETH to GLADOS         verified on-chain
+
+**Nothing here mines BTC**, and the second line is deliberately not spelled
+"BTC" any more. zpool's API denominates everything in BTC -- `estimate_current`
+is BTC per day per unit of hashrate, after they sold what you mined -- so BTC is
+the *accounting unit of that class of pool* rather than anything in the mining
+path. On a yiimp pool the payout coin is inferred from the address you mine
+with, and their currency list carries 219 of them: LTC, DOGE and RVN would all
+do, and the route would be identical.
+
+**ETH is not among them and cannot be**, which is the constraint underneath the
+whole leg. Ethereum has not been mineable since the merge, so no mining pool
+pays in it. GLADOS lives on an EVM L2 and nothing mineable is native there, so
+there is always a swap between what was mined and what buys the token. The only
+question is how many hops, and BTC is simply the most liquid place to start.
 
 **`payrate.py` reads auto-exchange pools**, and its own header says what
 `estimate_current` means: what a unit of hashrate earned per day, *in BTC, after
@@ -148,6 +162,9 @@ the pool sold whatever it mined*. So the altcoin-to-liquid-asset problem --
 which is what THORChain was in the plan to solve -- is not this project's
 problem at all. It was solved by choosing that class of upstream, for reasons
 that had nothing to do with payouts.
+
+What remains is only the hop from *whatever the upstream pays* to ETH, and that
+is one swap rather than the three the plan had.
 
 The WETH leg is better than the USDG one it replaces, and for a reason worth
 stating: **WETH is the pool's own quote token**. Bridging WETH rather than USDC
