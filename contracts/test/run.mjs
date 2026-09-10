@@ -10,7 +10,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { ethers } from "ethers";
 import { compile } from "./build.mjs";
-import { makeVm, deploy, call, fund } from "./evm.mjs";
+import { makeVm, deploy, call, fund, decodeRevert } from "./evm.mjs";
 import { build, leaf } from "./merkle.mjs";
 
 const here = path.dirname(fileURLToPath(import.meta.url));
@@ -42,7 +42,7 @@ const GATE = 1_000_000n * ONE;
 const DAY = 86_400n;
 
 function artifacts() {
-  const c = compile(["GladosDistributor.sol", "TestToken.sol"]);
+  const c = compile(["GladosDistributor.sol", "TestToken.sol", "MockRouter.sol"]);
   return {
     dist: {
       abi: c["GladosDistributor.sol"].GladosDistributor.abi,
@@ -51,6 +51,10 @@ function artifacts() {
     token: {
       abi: c["TestToken.sol"].TestToken.abi,
       bytecode: c["TestToken.sol"].TestToken.evm.bytecode.object,
+    },
+    router: {
+      abi: c["MockRouter.sol"].MockRouter.abi,
+      bytecode: c["MockRouter.sol"].MockRouter.evm.bytecode.object,
     },
   };
 }
@@ -67,7 +71,9 @@ async function main() {
   for (const a of [OPERATOR, STRANGER, A, B, C, D]) await fund(vm, a);
 
   const token = await deploy(vm, OPERATOR, art.token, [10n ** 27n]);
-  const dist = await deploy(vm, OPERATOR, art.dist, [token, OPERATOR]);
+  const quote = await deploy(vm, OPERATOR, art.token, [10n ** 27n]);
+  const router = await deploy(vm, OPERATOR, art.router, [quote, token]);
+  const dist = await deploy(vm, OPERATOR, art.dist, [token, OPERATOR, router, quote]);
 
   // Everybody who will claim holds exactly the gate, except D, who holds one
   // short -- the boundary is where a `>=` becomes a `>` by accident.
@@ -271,6 +277,129 @@ async function main() {
     const c = await call(vm, A, dist, art.dist, "claim", [3, 7n * ONE, t4.proof(A)], { block: at(2000n) });
     ok(c.ok, "and the claim against it succeeds");
     await call(vm, OPERATOR, token, art.token, "setSilent", [false]);
+  }
+
+
+  // ------------------------------------------------ paying through the market
+  //
+  // The other mode: the epoch holds `quote`, and each claim is the claimant's
+  // own buy on the pool. What is being checked is not the AMM -- that is the
+  // router's problem -- but that the distributor takes what the market gave
+  // rather than what it asked for, bounds slippage, and cannot be used to
+  // claim twice.
+  {
+    // Seed the pool. 100 quote against 1,000,000 token is a thin pool on
+    // purpose: a thin one makes the price move visibly between claims, which is
+    // the property that separates this mode from the other.
+    await call(vm, OPERATOR, quote, art.token, "approve", [router, 10n ** 27n]);
+    await call(vm, OPERATOR, token, art.token, "approve", [router, 10n ** 27n]);
+    await call(vm, OPERATOR, token, art.token, "mint", [OPERATOR, 10n ** 24n]);
+    await call(vm, OPERATOR, router, art.router, "seed", [100n * ONE, 1_000_000n * ONE]);
+    await call(vm, OPERATOR, router, art.router, "setBuyTax", [100, STRANGER]); // the real 1%
+
+    const t = build([{ account: A, amount: 4n * ONE }, { account: B, amount: 4n * ONE }]);
+    await call(vm, OPERATOR, quote, art.token, "approve", [dist, 10n ** 27n]);
+    const open = await call(vm, OPERATOR, dist, art.dist, "openEpochOnMarket",
+      [t.root, 8n * ONE, 0n, 200_000n], { block: at(1000n) });
+    ok(open.ok, `a market epoch opens${open.ok ? "" : "  (" + open.reason + ")"}`);
+    const id = Number((await call(vm, OPERATOR, dist, art.dist, "epochCount")).result) - 1;
+
+    // A direct claim against a market epoch, and the reverse, must not work.
+    {
+      const r = await call(vm, A, dist, art.dist, "claim", [id, 4n * ONE, t.proof(A)], { block: at(2000n) });
+      eq(r.reason, "WrongMode", "a direct claim against a market epoch is refused");
+      const r2 = await call(vm, A, dist, art.dist, "claimOnMarket",
+        [0, 100n * ONE, tree.proof(A), 1n], { block: at(2000n) });
+      eq(r2.reason, "AlreadyClaimed", "and a market claim against a direct epoch stops at the earlier check");
+    }
+    {
+      const r = await call(vm, A, dist, art.dist, "claimOnMarket",
+        [id, 4n * ONE, t.proof(A), 0n], { block: at(2000n) });
+      eq(r.reason, "NoSlippageBound", "a swap with no slippage bound is refused");
+    }
+
+    // What the pool would give, asked before claiming, so the assertion is
+    // against the router's own arithmetic rather than a number written here.
+    const expect = (await call(vm, OPERATOR, router, art.router, "quoteOut", [4n * ONE])).result;
+    const afterTax = expect - expect / 100n;
+    {
+      const before = await call(vm, OPERATOR, token, art.token, "balanceOf", [A]);
+      const r = await call(vm, A, dist, art.dist, "claimOnMarket",
+        [id, 4n * ONE, t.proof(A), afterTax], { block: at(2000n) });
+      ok(r.ok, `a market claim buys on the pool${r.ok ? "" : "  (" + r.reason + ")"}`);
+      const after = await call(vm, OPERATOR, token, art.token, "balanceOf", [A]);
+      eq(after.result - before.result, afterTax, "and the claimant receives what the market gave, after the buy tax");
+    }
+    {
+      // The second claimant, same leaf amount, gets *less* -- the first claim
+      // moved the price. That is the cost of paying through a market and it is
+      // asserted rather than mentioned.
+      const second = (await call(vm, OPERATOR, router, art.router, "quoteOut", [4n * ONE])).result;
+      ok(second < expect, `the second claimant gets a worse price (${second} < ${expect})`);
+      const before = await call(vm, OPERATOR, token, art.token, "balanceOf", [B]);
+      const r = await call(vm, B, dist, art.dist, "claimOnMarket",
+        [id, 4n * ONE, t.proof(B), 1n], { block: at(2000n) });
+      ok(r.ok, "and can still claim");
+      const after = await call(vm, OPERATOR, token, art.token, "balanceOf", [B]);
+      ok(after.result - before.result < afterTax, "receiving less than the first did");
+    }
+    {
+      const r = await call(vm, A, dist, art.dist, "claimOnMarket",
+        [id, 4n * ONE, t.proof(A), 1n], { block: at(2000n) });
+      eq(r.reason, "AlreadyClaimed", "a market claim cannot be made twice");
+    }
+    {
+      // The distributor must hold no standing allowance to the router.
+      const a = await call(vm, OPERATOR, quote, art.token, "allowance", [dist, router]);
+      eq(a.result, 0n, "and leaves the router no standing allowance");
+    }
+  }
+
+  // --------------------------------------------- a market that shortchanges
+  //
+  // The router hands back less than its own arithmetic promised, which is what
+  // a sandwich looks like from inside the swap. The claim must revert and the
+  // claimant must keep their entitlement rather than losing it to a bad fill.
+  {
+    await call(vm, OPERATOR, router, art.router, "setSkim", [9000]); // give back a tenth
+    const t = build([{ account: C, amount: 2n * ONE }]);
+    await call(vm, OPERATOR, dist, art.dist, "openEpochOnMarket",
+      [t.root, 2n * ONE, 0n, 300_000n], { block: at(1000n) });
+    const id = Number((await call(vm, OPERATOR, dist, art.dist, "epochCount")).result) - 1;
+    const want = (await call(vm, OPERATOR, router, art.router, "quoteOut", [2n * ONE])).result;
+    const r = await call(vm, C, dist, art.dist, "claimOnMarket",
+      [id, 2n * ONE, t.proof(C), want], { block: at(2000n) });
+    // Decoded against the router's ABI, because the refusal comes from there
+    // and "it reverted" would not say whether the right thing refused.
+    const rIface = new ethers.Interface(art.router.abi);
+    ok(decodeRevert(rIface, r.raw).startsWith("TooLittle"),
+       `the router refuses a fill below the bound (${decodeRevert(rIface, r.raw)})`);
+    const still = await call(vm, OPERATOR, dist, art.dist, "hasClaimed", [id, C]);
+    eq(still.result, false, "and the claim is not marked used");
+
+    // **And now the case a well-behaved router hides.** With the router
+    // ignoring the bound, the distributor's own post-swap check is the only
+    // thing left -- which is exactly why it exists and why it has to be seen
+    // to fire rather than merely be present.
+    await call(vm, OPERATOR, router, art.router, "setIgnoreMin", [true]);
+    const r2 = await call(vm, C, dist, art.dist, "claimOnMarket",
+      [id, 2n * ONE, t.proof(C), want], { block: at(2000n) });
+    ok(r2.reason.startsWith("TooLittleOut"),
+       `the distributor refuses it too when the router will not (${r2.reason})`);
+    const still2 = await call(vm, OPERATOR, dist, art.dist, "hasClaimed", [id, C]);
+    eq(still2.result, false, "and that claim is not marked used either");
+    await call(vm, OPERATOR, router, art.router, "setIgnoreMin", [false]);
+    await call(vm, OPERATOR, router, art.router, "setSkim", [0]);
+  }
+
+  // ------------------------------- a distributor with no market configured
+  {
+    const lone = await deploy(vm, OPERATOR, art.dist,
+      [token, OPERATOR, ethers.ZeroAddress, ethers.ZeroAddress]);
+    const t = build([{ account: A, amount: 1n }]);
+    const r = await call(vm, OPERATOR, lone, art.dist, "openEpochOnMarket",
+      [t.root, 1n, 0n, 200_000n], { block: at(1000n) });
+    eq(r.reason, "NoMarket", "a distributor with no router refuses market epochs");
   }
 
   // ------------------------------------------------- the tree itself

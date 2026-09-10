@@ -7,7 +7,7 @@ GLADOS, against a Merkle root published from the share log.
 ```bash
 npm install          # solc, an EVM, and an ABI coder. No framework.
 npm run build        # compile
-npm test             # 44 claims, mostly about what it refuses
+npm test             # 60 claims, mostly about what it refuses
 ```
 
 The end-to-end check, which is the one that matters:
@@ -27,6 +27,35 @@ only thing that matters, because the third is what holds the tokens.
 `cross.mjs` then funds a real epoch with that root in a real EVM and has every
 address in the ledger claim, so a builder that got amounts or ordering wrong
 shows up as a claim that reverts rather than as a root that looks fine.
+
+## Two ways an epoch can pay, and the arithmetic picks
+
+`Direct` holds the reward token and a claim transfers it: one market buy, made
+by the operator when they convert, and every claimant gets the same rate.
+
+`Market` holds the quote token and **each claim is the claimant's own buy on
+the pool**. Every claim moves the price, pays the token's buy tax into whatever
+the token does with it, and appears on-chain as a trade rather than as an
+operator handing out tokens converted somewhere nobody watched. The operator
+never converts anything, so there is no conversion rate to have to trust.
+
+It is not a better mode, it is a different trade, and the numbers decide:
+
+| | pot | per claim | gas as a share of it |
+|---|---:|---:|---:|
+| 36h event, 256 miners | $0.54 | $0.0021 | 2,286% |
+| 36h event, 800 miners | $1.68 | $0.0021 | 2,286% |
+| a year, 1000 miners, quarterly | $127.75 | $0.1278 | 38% |
+| a year, 1000 miners, yearly | $511.00 | $0.5110 | 9% |
+
+A swap is about $0.048 of gas on this chain and a transfer $0.029, so a claim
+has to be worth more than that before either mode pays for itself. `Market` is
+right for a large annual epoch and absurd for a weekend.
+
+The cost `Market` carries beyond gas is stated in the contract and asserted in
+the tests: **the leaf is denominated in the quote token, so the first claimant
+gets a better price than the last.** That is a race, it is inherent to paying
+through a market rather than around one, and it is why `Direct` still exists.
 
 ## No hardhat, no foundry
 

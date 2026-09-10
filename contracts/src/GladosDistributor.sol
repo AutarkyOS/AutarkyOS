@@ -43,7 +43,47 @@ interface IERC20 {
     function balanceOf(address account) external view returns (uint256);
 }
 
+/// Uniswap V2's fee-on-transfer swap, which is the only one that works here.
+///
+/// The plain `swapExactTokensForTokens` asserts the amounts it computed up
+/// front actually arrive, and a token that takes a cut makes that assertion
+/// false -- the swap reverts on a tax token rather than handling one. The
+/// `SupportingFeeOnTransferTokens` variant measures balances instead, which is
+/// the same bargain `openEpoch` makes with `funded`.
+interface IUniswapV2Router {
+    function swapExactTokensForTokensSupportingFeeOnTransferTokens(
+        uint256 amountIn,
+        uint256 amountOutMin,
+        address[] calldata path,
+        address to,
+        uint256 deadline
+    ) external;
+}
+
 contract GladosDistributor {
+    /// How an epoch pays.
+    ///
+    /// **`Market` is not a better `Direct`, it is a different trade**, and the
+    /// arithmetic decides rather than taste. A swap costs about $0.048 of gas
+    /// on this chain against $0.029 for a transfer, and a claim is worth what
+    /// the fee pot divided by the miners says it is worth: $0.0021 each over a
+    /// 36-hour event, where the gas is 2,286% of the reward, and $0.51 each on
+    /// a yearly epoch with a thousand miners, where it is 9%.
+    ///
+    /// What `Market` buys is that every claim is a real trade -- it moves the
+    /// price, it pays the token's own buy tax into dividends, liquidity and the
+    /// burn, and it is visible on-chain as a buy rather than as an operator
+    /// handing out tokens they converted somewhere nobody watched. What it
+    /// costs is gas per claim and a price that moves between the first
+    /// claimant and the last.
+    enum Mode {
+        /// The epoch holds the reward token. A claim transfers it.
+        Direct,
+        /// The epoch holds an input token. A claim swaps it on the market and
+        /// the reward token goes straight to the claimant.
+        Market
+    }
+
     struct Epoch {
         /// Merkle root over `(account, amount)` leaves.
         bytes32 root;
@@ -57,6 +97,8 @@ contract GladosDistributor {
         uint64 deadline;
         /// Whether the remainder has already gone back.
         bool reclaimed;
+        /// How this epoch pays. Fixed when the epoch opens, like the gate.
+        Mode mode;
     }
 
     /// The token being distributed. Immutable: a distributor that could be
@@ -69,6 +111,17 @@ contract GladosDistributor {
     /// the whole of what this address can do is visible in two functions.
     address public immutable operator;
 
+    /// The market. Immutable: a distributor that could be repointed at a
+    /// different router is one that could route a claim into a pool the
+    /// operator controls. Zero disables `Market` epochs entirely, which is the
+    /// right configuration on a chain with no pool worth using.
+    address public immutable router;
+
+    /// What a `Market` epoch is funded in. WETH here, because that is what the
+    /// GLADOS pool is quoted against -- read from the token's own
+    /// `quoteToken()` rather than chosen, so the path is the pool that exists.
+    address public immutable quote;
+
     Epoch[] private _epochs;
 
     /// `epoch => account => claimed`. By address rather than by a bitmap over
@@ -77,8 +130,12 @@ contract GladosDistributor {
     /// that is the wrong side of the trade.
     mapping(uint256 => mapping(address => bool)) public hasClaimed;
 
-    event EpochOpened(uint256 indexed epoch, bytes32 root, uint256 funded, uint256 gate, uint64 deadline);
-    event Claimed(uint256 indexed epoch, address indexed account, uint256 amount);
+    event EpochOpened(uint256 indexed epoch, bytes32 root, uint256 funded, uint256 gate, uint64 deadline, Mode mode);
+    /// `amount` is the leaf and `received` is what reached the claimant. Equal
+    /// under `Direct`; under `Market` the leaf is denominated in `quote`, so
+    /// the two together are the record of what the market actually gave --
+    /// which is the whole point of paying through one.
+    event Claimed(uint256 indexed epoch, address indexed account, uint256 amount, uint256 received);
     event Reclaimed(uint256 indexed epoch, uint256 amount);
 
     error NotOperator();
@@ -94,11 +151,22 @@ contract GladosDistributor {
     error AlreadyReclaimed();
     error Insolvent(uint256 want, uint256 have);
     error TransferFailed();
+    error NoMarket();
+    error WrongMode();
+    error NoSlippageBound();
+    error TooLittleOut(uint256 got, uint256 wanted);
 
-    constructor(address token_, address operator_) {
+    constructor(address token_, address operator_, address router_, address quote_) {
         require(token_ != address(0) && operator_ != address(0), "zero address");
+        // `router` and `quote` may both be zero, which simply means this
+        // distributor cannot open `Market` epochs. Requiring them would make
+        // the contract undeployable on a chain where the pool does not exist
+        // yet, which is a state this project has been in twice.
+        require((router_ == address(0)) == (quote_ == address(0)), "router and quote go together");
         token = token_;
         operator = operator_;
+        router = router_;
+        quote = quote_;
     }
 
     modifier onlyOperator() {
@@ -135,9 +203,52 @@ contract GladosDistributor {
             claimed: 0,
             gate: gate,
             deadline: deadline,
-            reclaimed: false
+            reclaimed: false,
+            mode: Mode.Direct
         }));
-        emit EpochOpened(epochId, root, got, gate, deadline);
+        emit EpochOpened(epochId, root, got, gate, deadline, Mode.Direct);
+    }
+
+    /// Open an epoch that pays by buying on the market, one buy per claim.
+    ///
+    /// Funded in `quote` rather than in the reward token: the operator never
+    /// converts anything, so there is no conversion rate for anybody to have to
+    /// trust. Each claimant's own transaction is the trade, at the price the
+    /// pool has at that moment, and the reward token goes from the pair to them
+    /// -- which means the token's buy tax applies and feeds whatever the token
+    /// does with it.
+    ///
+    /// **The leaf is denominated in `quote`, and that has a consequence worth
+    /// stating before somebody discovers it.** Every claim moves the price, so
+    /// the first claimant gets more reward token per unit of quote than the
+    /// last. That is a race, it is inherent to paying through a market rather
+    /// than around one, and it is the reason `Direct` still exists.
+    function openEpochOnMarket(bytes32 root, uint256 amount, uint256 gate, uint64 deadline)
+        external
+        onlyOperator
+        returns (uint256 epochId)
+    {
+        if (router == address(0)) revert NoMarket();
+        if (root == bytes32(0)) revert NoRoot();
+        if (amount == 0) revert NothingFunded();
+        if (deadline <= block.timestamp) revert DeadlineInPast();
+
+        uint256 before = IERC20(quote).balanceOf(address(this));
+        _move(quote, abi.encodeWithSelector(0x23b872dd, msg.sender, address(this), amount));
+        uint256 got = IERC20(quote).balanceOf(address(this)) - before;
+        if (got == 0) revert NothingFunded();
+
+        epochId = _epochs.length;
+        _epochs.push(Epoch({
+            root: root,
+            funded: got,
+            claimed: 0,
+            gate: gate,
+            deadline: deadline,
+            reclaimed: false,
+            mode: Mode.Market
+        }));
+        emit EpochOpened(epochId, root, got, gate, deadline, Mode.Market);
     }
 
     /// Claim one epoch's allocation.
@@ -145,8 +256,62 @@ contract GladosDistributor {
     /// `amount` and `proof` come from the published root; anybody can compute
     /// them from the share log, which is the point of publishing it.
     function claim(uint256 epochId, uint256 amount, bytes32[] calldata proof) external {
+        Epoch storage e = _admit(epochId, amount, proof);
+        if (e.mode != Mode.Direct) revert WrongMode();
+        _send(token, msg.sender, amount);
+        emit Claimed(epochId, msg.sender, amount, amount);
+    }
+
+    /// Claim by buying on the market, in the claimant's own transaction.
+    ///
+    /// `minOut` is the claimant's slippage bound and must be non-zero. A swap
+    /// with no bound on a pool this thin is a sandwich waiting to happen, and
+    /// zero is never the right answer -- refusing it costs a revert and saves
+    /// somebody their reward.
+    function claimOnMarket(uint256 epochId, uint256 amount, bytes32[] calldata proof, uint256 minOut)
+        external
+        returns (uint256 received)
+    {
+        if (minOut == 0) revert NoSlippageBound();
+        Epoch storage e = _admit(epochId, amount, proof);
+        if (e.mode != Mode.Market) revert WrongMode();
+
+        address[] memory path = new address[](2);
+        path[0] = quote;
+        path[1] = token;
+
+        // **Approved for exactly this swap and left at zero afterwards.** A
+        // standing max allowance to the router would be a smaller contract and
+        // a larger blast radius, and nothing here needs the allowance to
+        // outlive the call.
+        _approve(quote, router, amount);
+        uint256 before = IERC20(token).balanceOf(msg.sender);
+        IUniswapV2Router(router).swapExactTokensForTokensSupportingFeeOnTransferTokens(
+            amount, minOut, path, msg.sender, block.timestamp
+        );
+        _approve(quote, router, 0);
+
+        // Measured on the claimant rather than trusted from the router, which
+        // is the rule `openEpoch` already follows about `funded`: this variant
+        // returns nothing, and a tax token means what arrives is not what was
+        // quoted.
+        received = IERC20(token).balanceOf(msg.sender) - before;
+        if (received < minOut) revert TooLittleOut(received, minOut);
+        emit Claimed(epochId, msg.sender, amount, received);
+    }
+
+    /// Everything both claim paths must do, in one place.
+    ///
+    /// Written once because two copies of a gate check is how one of them ends
+    /// up a `>` where the other is a `>=`. It marks the claim *before*
+    /// returning, so both callers are reentrancy-safe by the time they touch a
+    /// token.
+    function _admit(uint256 epochId, uint256 amount, bytes32[] calldata proof)
+        private
+        returns (Epoch storage e)
+    {
         if (epochId >= _epochs.length) revert NoSuchEpoch();
-        Epoch storage e = _epochs[epochId];
+        e = _epochs[epochId];
         if (block.timestamp > e.deadline) revert EpochClosed();
         if (hasClaimed[epochId][msg.sender]) revert AlreadyClaimed();
 
@@ -157,8 +322,8 @@ contract GladosDistributor {
         if (!_verify(proof, e.root, _leaf(msg.sender, amount))) revert BadProof();
 
         // A root that promises more than the epoch holds is an operator error,
-        // and it is caught here rather than by the last claimant getting a
-        // failed transfer they cannot explain.
+        // caught here rather than by the last claimant getting a failed
+        // transfer they cannot explain.
         uint256 left = e.funded - e.claimed;
         if (amount > left) revert Insolvent(amount, left);
 
@@ -168,9 +333,6 @@ contract GladosDistributor {
         // `hasClaimed` already true.
         hasClaimed[epochId][msg.sender] = true;
         e.claimed += amount;
-
-        _send(msg.sender, amount);
-        emit Claimed(epochId, msg.sender, amount);
     }
 
     /// Take back what nobody claimed, once the epoch has closed.
@@ -189,7 +351,9 @@ contract GladosDistributor {
 
         amount = e.funded - e.claimed;
         e.reclaimed = true;
-        if (amount > 0) _send(operator, amount);
+        // The epoch's own asset: a `Market` epoch holds `quote`, and sending it
+        // back as `token` would be sending tokens it does not have.
+        if (amount > 0) _send(e.mode == Mode.Direct ? token : quote, operator, amount);
         emit Reclaimed(epochId, amount);
     }
 
@@ -272,11 +436,15 @@ contract GladosDistributor {
     }
 
     function _pull(address from, uint256 amount) private {
-        _call(abi.encodeWithSelector(0x23b872dd, from, address(this), amount));
+        _move(token, abi.encodeWithSelector(0x23b872dd, from, address(this), amount));
     }
 
-    function _send(address to, uint256 amount) private {
-        _call(abi.encodeWithSelector(0xa9059cbb, to, amount));
+    function _send(address asset, address to, uint256 amount) private {
+        _move(asset, abi.encodeWithSelector(0xa9059cbb, to, amount));
+    }
+
+    function _approve(address asset, address spender, uint256 amount) private {
+        _move(asset, abi.encodeWithSelector(0x095ea7b3, spender, amount));
     }
 
     /// A transfer that accepts both conventions.
@@ -286,8 +454,8 @@ contract GladosDistributor {
     /// return data is treated as success and any other return must decode to
     /// true, which is the ordinary safe-transfer rule written out rather than
     /// imported.
-    function _call(bytes memory data) private {
-        (bool okCall, bytes memory ret) = token.call(data);
+    function _move(address asset, bytes memory data) private {
+        (bool okCall, bytes memory ret) = asset.call(data);
         if (!okCall) revert TransferFailed();
         if (ret.length != 0 && !abi.decode(ret, (bool))) revert TransferFailed();
     }
