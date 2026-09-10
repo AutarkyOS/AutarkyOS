@@ -31,6 +31,7 @@ on:
       - 'tools/algocheck.py'
       - 'tools/prices.py'
       - 'tools/payrate.py'
+      - 'tools/neoscrypt.py'
       - '.github/workflows/pool.yml'
   pull_request:
   workflow_dispatch:
@@ -118,6 +119,12 @@ jobs:
       # not here.
       - name: The payout arithmetic holds
         run: python3 tools/payrate.py --selftest --offline
+
+      # NeoScrypt against two real Feathercoin blocks, offline. Upstream ships
+      # no vectors, so the check is that a header the network accepted hashes
+      # under its own target -- one in 7e7 and one in 4e9 by chance.
+      - name: NeoScrypt reproduces blocks the chain accepted
+        run: python3 tools/neoscrypt.py --selftest
 
       # A real Stratum server, a real merkle branch, and a pool that has to
       # produce headers the server will accept. `--verify` rebuilds every
