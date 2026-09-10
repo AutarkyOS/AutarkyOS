@@ -43,21 +43,23 @@ interface IERC20 {
     function balanceOf(address account) external view returns (uint256);
 }
 
-/// Uniswap V2's fee-on-transfer swap, which is the only one that works here.
+/// The Uniswap V2 pair itself, which is what this talks to instead of a router.
 ///
-/// The plain `swapExactTokensForTokens` asserts the amounts it computed up
-/// front actually arrive, and a token that takes a cut makes that assertion
-/// false -- the swap reverts on a tax token rather than handling one. The
-/// `SupportingFeeOnTransferTokens` variant measures balances instead, which is
-/// the same bargain `openEpoch` makes with `funded`.
-interface IUniswapV2Router {
-    function swapExactTokensForTokensSupportingFeeOnTransferTokens(
-        uint256 amountIn,
-        uint256 amountOutMin,
-        address[] calldata path,
-        address to,
-        uint256 deadline
-    ) external;
+/// **There is no canonical V2 router on this chain**, checked rather than
+/// assumed: the two contracts real buyers actually call, found by reading the
+/// `to` of live swap transactions, answer neither `factory()` nor `WETH()`, so
+/// they are aggregators or the launchpad's own periphery rather than the
+/// router this would otherwise need.
+///
+/// Going direct is the better answer anyway and would have been even with a
+/// router available. A router is a convenience wrapper that computes the output
+/// and moves the input; doing both here removes a third-party contract from the
+/// path, removes the token approval that contract would need, and removes the
+/// question of which router is the real one -- which on a young chain is a
+/// question with an expensive wrong answer.
+interface IUniswapV2Pair {
+    function getReserves() external view returns (uint112, uint112, uint32);
+    function swap(uint256 amount0Out, uint256 amount1Out, address to, bytes calldata data) external;
 }
 
 contract GladosDistributor {
@@ -111,11 +113,20 @@ contract GladosDistributor {
     /// the whole of what this address can do is visible in two functions.
     address public immutable operator;
 
-    /// The market. Immutable: a distributor that could be repointed at a
-    /// different router is one that could route a claim into a pool the
-    /// operator controls. Zero disables `Market` epochs entirely, which is the
-    /// right configuration on a chain with no pool worth using.
-    address public immutable router;
+    /// The pool. Immutable: a distributor that could be repointed at a
+    /// different pair is one that could route a claim into a pool the operator
+    /// controls. Zero disables `Market` epochs entirely, which is the right
+    /// configuration on a chain with no pool worth using.
+    address public immutable pair;
+
+    /// Whether `quote` is the pair's `token0`, decided once at construction.
+    ///
+    /// A V2 pair orders its two tokens by address and `swap` takes the outputs
+    /// positionally, so getting this backwards asks the pool to pay out the
+    /// token being paid *in*. Computed from the addresses rather than read from
+    /// the pair, because the ordering rule is the pair's own and a constructor
+    /// that trusted a call here would trust the thing it is checking.
+    bool public immutable quoteIsToken0;
 
     /// What a `Market` epoch is funded in. WETH here, because that is what the
     /// GLADOS pool is quoted against -- read from the token's own
@@ -156,17 +167,18 @@ contract GladosDistributor {
     error NoSlippageBound();
     error TooLittleOut(uint256 got, uint256 wanted);
 
-    constructor(address token_, address operator_, address router_, address quote_) {
+    constructor(address token_, address operator_, address pair_, address quote_) {
         require(token_ != address(0) && operator_ != address(0), "zero address");
-        // `router` and `quote` may both be zero, which simply means this
+        // `pair` and `quote` may both be zero, which simply means this
         // distributor cannot open `Market` epochs. Requiring them would make
         // the contract undeployable on a chain where the pool does not exist
         // yet, which is a state this project has been in twice.
-        require((router_ == address(0)) == (quote_ == address(0)), "router and quote go together");
+        require((pair_ == address(0)) == (quote_ == address(0)), "pair and quote go together");
         token = token_;
         operator = operator_;
-        router = router_;
+        pair = pair_;
         quote = quote_;
+        quoteIsToken0 = quote_ < token_;
     }
 
     modifier onlyOperator() {
@@ -228,7 +240,7 @@ contract GladosDistributor {
         onlyOperator
         returns (uint256 epochId)
     {
-        if (router == address(0)) revert NoMarket();
+        if (pair == address(0)) revert NoMarket();
         if (root == bytes32(0)) revert NoRoot();
         if (amount == 0) revert NothingFunded();
         if (deadline <= block.timestamp) revert DeadlineInPast();
@@ -276,25 +288,29 @@ contract GladosDistributor {
         Epoch storage e = _admit(epochId, amount, proof);
         if (e.mode != Mode.Market) revert WrongMode();
 
-        address[] memory path = new address[](2);
-        path[0] = quote;
-        path[1] = token;
+        // The whole swap, without a router: send the input to the pair, work
+        // out what it owes from its own reserves, and ask for it.
+        (uint112 r0, uint112 r1,) = IUniswapV2Pair(pair).getReserves();
+        (uint256 rIn, uint256 rOut) = quoteIsToken0 ? (uint256(r0), uint256(r1)) : (uint256(r1), uint256(r0));
+        uint256 out = _amountOut(amount, rIn, rOut);
+        if (out == 0) revert TooLittleOut(0, minOut);
 
-        // **Approved for exactly this swap and left at zero afterwards.** A
-        // standing max allowance to the router would be a smaller contract and
-        // a larger blast radius, and nothing here needs the allowance to
-        // outlive the call.
-        _approve(quote, router, amount);
+        _send(quote, pair, amount);
         uint256 before = IERC20(token).balanceOf(msg.sender);
-        IUniswapV2Router(router).swapExactTokensForTokensSupportingFeeOnTransferTokens(
-            amount, minOut, path, msg.sender, block.timestamp
-        );
-        _approve(quote, router, 0);
+        // `swap` takes outputs positionally in the pair's own token order, and
+        // asking for the wrong one asks the pool to pay out what is being paid
+        // in. Hence `quoteIsToken0`, fixed at construction.
+        if (quoteIsToken0) {
+            IUniswapV2Pair(pair).swap(0, out, msg.sender, "");
+        } else {
+            IUniswapV2Pair(pair).swap(out, 0, msg.sender, "");
+        }
 
-        // Measured on the claimant rather than trusted from the router, which
-        // is the rule `openEpoch` already follows about `funded`: this variant
-        // returns nothing, and a tax token means what arrives is not what was
-        // quoted.
+        // **Measured on the claimant, not taken from `out`.** The pair sends
+        // `out` and the token takes its buy tax out of that transfer, so what
+        // arrives is smaller -- and by an amount this contract has no business
+        // predicting, since the tax rate is the token's and can be whatever it
+        // is on the day.
         received = IERC20(token).balanceOf(msg.sender) - before;
         if (received < minOut) revert TooLittleOut(received, minOut);
         emit Claimed(epochId, msg.sender, amount, received);
@@ -443,8 +459,17 @@ contract GladosDistributor {
         _move(asset, abi.encodeWithSelector(0xa9059cbb, to, amount));
     }
 
-    function _approve(address asset, address spender, uint256 amount) private {
-        _move(asset, abi.encodeWithSelector(0x095ea7b3, spender, amount));
+    /// Uniswap V2's constant-product formula with its 0.3% fee, written out.
+    ///
+    /// Written out rather than fetched from the pair, because a pair does not
+    /// offer it -- the arithmetic lives in the router, which is the thing this
+    /// contract is doing without. Three multiplications and a division, and the
+    /// numbers it works on came from `getReserves()` in the same transaction,
+    /// so there is no stale-price window between reading and swapping.
+    function _amountOut(uint256 amountIn, uint256 rIn, uint256 rOut) private pure returns (uint256) {
+        if (amountIn == 0 || rIn == 0 || rOut == 0) return 0;
+        uint256 withFee = amountIn * 997;
+        return (withFee * rOut) / (rIn * 1000 + withFee);
     }
 
     /// A transfer that accepts both conventions.

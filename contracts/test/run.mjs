@@ -42,7 +42,7 @@ const GATE = 1_000_000n * ONE;
 const DAY = 86_400n;
 
 function artifacts() {
-  const c = compile(["GladosDistributor.sol", "TestToken.sol", "MockRouter.sol"]);
+  const c = compile(["GladosDistributor.sol", "TestToken.sol", "MockPair.sol"]);
   return {
     dist: {
       abi: c["GladosDistributor.sol"].GladosDistributor.abi,
@@ -52,9 +52,9 @@ function artifacts() {
       abi: c["TestToken.sol"].TestToken.abi,
       bytecode: c["TestToken.sol"].TestToken.evm.bytecode.object,
     },
-    router: {
-      abi: c["MockRouter.sol"].MockRouter.abi,
-      bytecode: c["MockRouter.sol"].MockRouter.evm.bytecode.object,
+    pair: {
+      abi: c["MockPair.sol"].MockPair.abi,
+      bytecode: c["MockPair.sol"].MockPair.evm.bytecode.object,
     },
   };
 }
@@ -72,8 +72,8 @@ async function main() {
 
   const token = await deploy(vm, OPERATOR, art.token, [10n ** 27n]);
   const quote = await deploy(vm, OPERATOR, art.token, [10n ** 27n]);
-  const router = await deploy(vm, OPERATOR, art.router, [quote, token]);
-  const dist = await deploy(vm, OPERATOR, art.dist, [token, OPERATOR, router, quote]);
+  const pair = await deploy(vm, OPERATOR, art.pair, [quote, token]);
+  const dist = await deploy(vm, OPERATOR, art.dist, [token, OPERATOR, pair, quote]);
 
   // Everybody who will claim holds exactly the gate, except D, who holds one
   // short -- the boundary is where a `>=` becomes a `>` by accident.
@@ -280,6 +280,17 @@ async function main() {
   }
 
 
+  // What the pool owes for a given input, computed from its own reserves
+  // rather than asked of the thing under test. Declared out here because two
+  // separate sections need it.
+  let q0 = false;
+  const outFor = async (amt) => {
+    const r = await call(vm, OPERATOR, pair, art.pair, "getReserves");
+    const [rq, rt] = q0 ? [r.result[0], r.result[1]] : [r.result[1], r.result[0]];
+    const wf = amt * 997n;
+    return (wf * rt) / (rq * 1000n + wf);
+  };
+
   // ------------------------------------------------ paying through the market
   //
   // The other mode: the epoch holds `quote`, and each claim is the claimant's
@@ -291,11 +302,15 @@ async function main() {
     // Seed the pool. 100 quote against 1,000,000 token is a thin pool on
     // purpose: a thin one makes the price move visibly between claims, which is
     // the property that separates this mode from the other.
-    await call(vm, OPERATOR, quote, art.token, "approve", [router, 10n ** 27n]);
-    await call(vm, OPERATOR, token, art.token, "approve", [router, 10n ** 27n]);
+    await call(vm, OPERATOR, quote, art.token, "approve", [pair, 10n ** 27n]);
+    await call(vm, OPERATOR, token, art.token, "approve", [pair, 10n ** 27n]);
     await call(vm, OPERATOR, token, art.token, "mint", [OPERATOR, 10n ** 24n]);
-    await call(vm, OPERATOR, router, art.router, "seed", [100n * ONE, 1_000_000n * ONE]);
-    await call(vm, OPERATOR, router, art.router, "setBuyTax", [100, STRANGER]); // the real 1%
+    // The pair sorts by address, so seed in its own order rather than ours.
+    q0 = BigInt(quote) < BigInt(token);
+    await call(vm, OPERATOR, pair, art.pair, "seed",
+      q0 ? [100n * ONE, 1_000_000n * ONE] : [1_000_000n * ONE, 100n * ONE]);
+    // The real token's 1% buy tax, applied to every transfer out of the pair.
+    await call(vm, OPERATOR, token, art.token, "setTax", [100, STRANGER]);
 
     const t = build([{ account: A, amount: 4n * ONE }, { account: B, amount: 4n * ONE }]);
     await call(vm, OPERATOR, quote, art.token, "approve", [dist, 10n ** 27n]);
@@ -320,7 +335,7 @@ async function main() {
 
     // What the pool would give, asked before claiming, so the assertion is
     // against the router's own arithmetic rather than a number written here.
-    const expect = (await call(vm, OPERATOR, router, art.router, "quoteOut", [4n * ONE])).result;
+    const expect = await outFor(4n * ONE);
     const afterTax = expect - expect / 100n;
     {
       const before = await call(vm, OPERATOR, token, art.token, "balanceOf", [A]);
@@ -334,7 +349,7 @@ async function main() {
       // The second claimant, same leaf amount, gets *less* -- the first claim
       // moved the price. That is the cost of paying through a market and it is
       // asserted rather than mentioned.
-      const second = (await call(vm, OPERATOR, router, art.router, "quoteOut", [4n * ONE])).result;
+      const second = await outFor(4n * ONE);
       ok(second < expect, `the second claimant gets a worse price (${second} < ${expect})`);
       const before = await call(vm, OPERATOR, token, art.token, "balanceOf", [B]);
       const r = await call(vm, B, dist, art.dist, "claimOnMarket",
@@ -350,46 +365,37 @@ async function main() {
     }
     {
       // The distributor must hold no standing allowance to the router.
-      const a = await call(vm, OPERATOR, quote, art.token, "allowance", [dist, router]);
-      eq(a.result, 0n, "and leaves the router no standing allowance");
+      const a = await call(vm, OPERATOR, quote, art.token, "allowance", [dist, pair]);
+      eq(a.result, 0n, "and never grants the pair an allowance at all");
     }
   }
 
-  // --------------------------------------------- a market that shortchanges
+  // ------------------------------------ when the token takes more than expected
   //
-  // The router hands back less than its own arithmetic promised, which is what
-  // a sandwich looks like from inside the swap. The claim must revert and the
-  // claimant must keep their entitlement rather than losing it to a bad fill.
+  // Going direct to the pair means the pair's own `k` check bounds the swap and
+  // the distributor's post-swap check is the only thing standing between a
+  // claimant and a bad fill from the *token* side -- a tax rate that changed
+  // since the claimant computed their bound. Without exercising it, that check
+  // is unreachable code, and an unreachable check is one nobody has seen work.
   {
-    await call(vm, OPERATOR, router, art.router, "setSkim", [9000]); // give back a tenth
     const t = build([{ account: C, amount: 2n * ONE }]);
     await call(vm, OPERATOR, dist, art.dist, "openEpochOnMarket",
       [t.root, 2n * ONE, 0n, 300_000n], { block: at(1000n) });
     const id = Number((await call(vm, OPERATOR, dist, art.dist, "epochCount")).result) - 1;
-    const want = (await call(vm, OPERATOR, router, art.router, "quoteOut", [2n * ONE])).result;
+    const want = await outFor(2n * ONE);
+
+    await call(vm, OPERATOR, token, art.token, "setTax", [5000, STRANGER]); // 50%
     const r = await call(vm, C, dist, art.dist, "claimOnMarket",
       [id, 2n * ONE, t.proof(C), want], { block: at(2000n) });
-    // Decoded against the router's ABI, because the refusal comes from there
-    // and "it reverted" would not say whether the right thing refused.
-    const rIface = new ethers.Interface(art.router.abi);
-    ok(decodeRevert(rIface, r.raw).startsWith("TooLittle"),
-       `the router refuses a fill below the bound (${decodeRevert(rIface, r.raw)})`);
+    ok(r.reason.startsWith("TooLittleOut"),
+       `a tax that moved under the claimant is refused (${r.reason})`);
     const still = await call(vm, OPERATOR, dist, art.dist, "hasClaimed", [id, C]);
-    eq(still.result, false, "and the claim is not marked used");
+    eq(still.result, false, "and the claim is not marked used, so nothing is lost");
 
-    // **And now the case a well-behaved router hides.** With the router
-    // ignoring the bound, the distributor's own post-swap check is the only
-    // thing left -- which is exactly why it exists and why it has to be seen
-    // to fire rather than merely be present.
-    await call(vm, OPERATOR, router, art.router, "setIgnoreMin", [true]);
-    const r2 = await call(vm, C, dist, art.dist, "claimOnMarket",
-      [id, 2n * ONE, t.proof(C), want], { block: at(2000n) });
-    ok(r2.reason.startsWith("TooLittleOut"),
-       `the distributor refuses it too when the router will not (${r2.reason})`);
-    const still2 = await call(vm, OPERATOR, dist, art.dist, "hasClaimed", [id, C]);
-    eq(still2.result, false, "and that claim is not marked used either");
-    await call(vm, OPERATOR, router, art.router, "setIgnoreMin", [false]);
-    await call(vm, OPERATOR, router, art.router, "setSkim", [0]);
+    await call(vm, OPERATOR, token, art.token, "setTax", [100, STRANGER]);
+    const ok2 = await call(vm, C, dist, art.dist, "claimOnMarket",
+      [id, 2n * ONE, t.proof(C), 1n], { block: at(2000n) });
+    ok(ok2.ok, "and the same claim works once the tax is back");
   }
 
   // ------------------------------- a distributor with no market configured
@@ -399,7 +405,7 @@ async function main() {
     const t = build([{ account: A, amount: 1n }]);
     const r = await call(vm, OPERATOR, lone, art.dist, "openEpochOnMarket",
       [t.root, 1n, 0n, 200_000n], { block: at(1000n) });
-    eq(r.reason, "NoMarket", "a distributor with no router refuses market epochs");
+    eq(r.reason, "NoMarket", "a distributor with no pair refuses market epochs");
   }
 
   // ------------------------------------------------- the tree itself
