@@ -660,6 +660,69 @@ solver with one hardcoded prefix is wrong for two of the four, at full speed,
 producing structurally perfect solutions that every pool rejects with no
 diagnostic.
 
+### And the refusal has a price now, which it did not when it was made
+
+`$/worker/day` is a second ranking axis, and it is the one that says what a
+field is worth entering rather than what this machine gets out of it. It is the
+pool's own last-24h payout for an algorithm divided by the workers behind it,
+which `payrate.py` already computes. Measured against zpool, restricted to rows
+that are reachable -- not ASIC, no growing DAG, fits 3,836 MiB -- and not yet
+implemented:
+
+    equihash192      $0.4742 a worker a day    569 workers
+    equihash144      $0.4721                    69
+    yespowerEQPAY    $0.0499                   111
+    verthash         $0.0300                   676
+    yespowerURX      $0.0128                   129
+    yescryptR16      $0.0121                   304
+    yescrypt         $0.0111                  1843
+
+For contrast, of the three algorithms actually built: neoscrypt pays $0.0271 a
+worker a day over 62 workers and yespower $0.0058 over 332.
+
+**So the two Equihash variants are roughly 7x anything else reachable, and an
+order of magnitude above everything this repository has implemented.** That does
+not overturn the refusal, which was never about the money -- it was that a
+solver does not fit an abstraction built around `Hasher::hash` returning
+`[u8; 32]`. What it does is put a number on the cost of that abstraction, which
+is the honest way to hold a decision open: the wire needs a solution field, and
+what buying it gets is the top of this table.
+
+**A single reading cannot say which of these rankings are real, so there are
+two, seven minutes apart.** `actual_last24h` is a trailing window over a pool
+whose miners come and go:
+
+    equihash192      $0.4742 -> $0.4903    +3.4%
+    equihash144      $0.4721 -> $0.4689    -0.7%
+    verthash         $0.0300 -> $0.0314    +4.7%
+    yespowerEQPAY    $0.0499 -> $0.0325     -35%   and swapped rank with verthash
+
+The Equihash pair's position is robust; third place is not. Anything with a
+hundred-odd workers is noise at this resolution, which is the same objection
+this file makes about single-worker rows and is worth making twice.
+
+### What a pool-average worker is, which decides whether that table flatters us
+
+Within one algorithm the hashrate unit is comparable, so the pool's
+H/s-per-worker can be held against this machine's measured rate:
+
+    yespower     pool 137.1 H/s      ours 1,368 H/s (emulated floor)   10x bigger
+    neoscrypt    pool 403,400 H/s    ours 190,000 H/s                   0.47x
+    sha256       pool 5.012e12 H/s   ours 0.63e9 H/s                    0.00013x
+
+The CPU rows therefore **understate** what this machine would earn, before the
+emulation floor is even lifted; the GPU row roughly halves it. And the sha256
+row is the classifier's own conclusion arriving by a different route: an average
+worker eight thousand times this GPU is an ASIC farm, so per-worker revenue
+there is not an opportunity, it is a description of somebody else's hardware.
+
+**No such calibration exists for equihash192 or equihash144**, because nothing
+here has ever measured a rate on them -- which is exactly why `payrate.py`
+leaves `ours $/d` blank for those rows rather than filling it in. The
+pool-average equihash192 worker is 49.57 Sol/s. Whether an RTX 3050 Laptop
+reaches that is unmeasured, and it is the single measurement standing between
+$0.47 a worker a day and any claim about this machine.
+
 ## Splitting one device across a field, which is mechanism and not policy
 
 A card at half a gigahash is not one coin's worth of hashrate. The question is
