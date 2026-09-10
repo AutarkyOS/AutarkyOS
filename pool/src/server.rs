@@ -351,6 +351,33 @@ fn handle(mut stream: TcpStream, pool: Arc<Mutex<Pool>>, peer: &str) -> std::io:
                         stream.write_all(msg.as_bytes())?;
                         continue;
                     }
+                    // **Can this name be paid?** Asked here because the
+                    // alternative is finding out after the event, when
+                    // `distribute.py` prints a name with real work behind it
+                    // and no address to send it to. That is unrecoverable for
+                    // the miner and for the operator both; this is a
+                    // connection error the miner reads while they still have
+                    // their config open.
+                    //
+                    // Only `No` is actionable. `Unknown` means no roster has
+                    // ever loaded, and refusing on that would turn a missing
+                    // file into an outage -- see `roster`'s note on failing
+                    // open.
+                    if crate::roster::check(&h.worker) == crate::roster::Payability::No {
+                        if crate::roster::require() {
+                            println!("[pool] {peer} refused: {} has no payout address", h.worker);
+                            let msg = format!(
+                                "{{\"id\":{id},\"result\":null,\"error\":\"the worker name '{}' has no payout address, so its shares could not be paid. Register it, or mine under your 0x address as the worker name. {}\"}}\n",
+                                h.worker,
+                                crate::roster::where_to_register()
+                            );
+                            stream.write_all(msg.as_bytes())?;
+                            continue;
+                        }
+                        // Not refusing, but the operator should see it: this
+                        // is somebody about to do work nobody can pay for.
+                        println!("[pool] {peer} warning: {} is not in the roster", h.worker);
+                    }
                     worker = h.worker.clone();
                     println!("[pool] {peer} hello  worker={} agent={}", h.worker, h.agent);
                     let slots = pool.lock().unwrap().slots();

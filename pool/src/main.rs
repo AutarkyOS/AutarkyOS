@@ -142,8 +142,16 @@ fn parse_coin(spec: &str) -> Result<Coin, String> {
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
+    let mut roster_path: Option<String> = None;
+    let mut roster_url = String::new();
+    let mut require_roster = false;
     if args.iter().any(|a| a == "--selftest") {
-        std::process::exit(if selftest() { 0 } else { 1 });
+        // The roster first, and separately, because it needs no socket: a
+        // suite that binds a port before checking pure functions fails for the
+        // wrong reason on a machine where the port is busy.
+        let (rp, rf) = glados_pool::roster::checks();
+        println!("[roster] {rp} passed, {rf} failed");
+        std::process::exit(if selftest() && rf == 0 { 0 } else { 1 });
     }
     if args.iter().any(|a| a == "--bench") {
         bench();
@@ -215,6 +223,21 @@ fn main() {
                     std::process::exit(2);
                 }
             },
+            "--roster" => match it.next() {
+                Some(v) => roster_path = Some(v.clone()),
+                None => {
+                    eprintln!("--roster wants a path to the worker mapping, refreshed out of band");
+                    std::process::exit(2);
+                }
+            },
+            "--roster-url" => match it.next() {
+                Some(v) => roster_url = v.clone(),
+                None => {
+                    eprintln!("--roster-url wants the page a refused miner should be sent to");
+                    std::process::exit(2);
+                }
+            },
+            "--require-roster" => require_roster = true,
             "--prices" => match it.next() {
                 Some(v) => prices = Some(v.clone()),
                 None => {
@@ -248,6 +271,9 @@ fn main() {
                 println!("            --selftest");
                 println!();
                 println!("--ledger writes the share log as canonical JSON, for publishing.");
+                println!("--roster PATH checks worker names against a mapping file at greeting.");
+                println!("--roster-url URL is where a refused miner is told to register.");
+                println!("--require-roster refuses an unregistered name instead of warning.");
                 return;
             }
             other => match parse_coin(other) {
@@ -406,6 +432,46 @@ fn main() {
     // static site whose history is a commit chain, and a commit chain cannot
     // be quietly rewritten where a live endpoint can. For a pool whose only
     // asset is being checkable, tamper-evidence beats freshness.
+    // ---- the roster, if one was named ------------------------------------
+    //
+    // Loaded once here so a bad path is a complaint at startup rather than a
+    // surprise at the first greeting, then re-read on a timer. The interval is
+    // a minute because the thing it tracks is somebody registering a name and
+    // then starting their rig, and a miner will wait a minute.
+    if let Some(path) = roster_path.clone() {
+        *glados_pool::roster::WHERE.lock().unwrap() = roster_url.clone();
+        glados_pool::roster::REQUIRE
+            .store(require_roster, std::sync::atomic::Ordering::Relaxed);
+        let mut r = glados_pool::roster::Roster::new(
+            Some(path.clone()),
+            std::time::Duration::from_secs(60),
+        );
+        if let Some(note) = r.refresh() {
+            println!("{note}");
+        }
+        if !r.ready() {
+            // Said plainly at startup, because the consequence is invisible
+            // afterwards: with no roster every name is `Unknown`, everything
+            // is admitted, and `--require-roster` enforces nothing at all.
+            println!("[pool] no roster loaded, so every worker name is admitted");
+        }
+        *glados_pool::roster::ROSTER.lock().unwrap() = Some(r);
+
+        std::thread::spawn(move || loop {
+            std::thread::sleep(std::time::Duration::from_secs(30));
+            if let Some(r) = glados_pool::roster::ROSTER.lock().unwrap().as_mut() {
+                if let Some(note) = r.refresh() {
+                    println!("{note}");
+                }
+            }
+        });
+    } else if require_roster {
+        // A flag that cannot do anything is worse than a missing one: the
+        // operator believes names are being checked.
+        eprintln!("--require-roster needs --roster; nothing would be checked");
+        std::process::exit(2);
+    }
+
     std::thread::spawn(move || loop {
         std::thread::sleep(std::time::Duration::from_secs(60));
         let p = reporter.lock().unwrap();
