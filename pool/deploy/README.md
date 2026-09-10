@@ -89,6 +89,46 @@ Lingering is what keeps a user service running after you log out. It is
 governed by polkit and some systems grant it to a user for themselves while
 others want an administrator, so the only way to know is to ask.
 
+**Measured on a real deployment (Arch, systemd 258, over SSH): denied.**
+`Could not enable linger: Access denied`, and the session was `State=active` at
+the time, so an active session is not sufficient on its own -- this distribution
+wants an administrator for `set-self-linger` regardless. Plan for the ask rather
+than for the grant.
+
+**And the fallback is not universally available either.** That same host had no
+`crontab` binary and no cron daemon, which is ordinary on Arch -- systemd timers
+replaced it, and a systemd timer needs the user manager that lingering is what
+keeps alive. So on a box with neither, there is no unprivileged path to
+persistence at all and the honest answer is one line from whoever has root:
+
+```bash
+sudo loginctl enable-linger <user>      # the whole ask
+```
+
+Everything else can be installed, enabled and left correct *before* that
+happens: `systemctl --user enable` writes the `default.target.wants` symlink
+immediately, so the moment lingering is granted the service starts at boot with
+nothing further to do.
+
+#### The trap that hides all of this
+
+A stale session masks it completely. On that deployment the pool ran fine for
+an hour and a half with `Linger=no`, because an interactive SSH session was
+still open and the user manager lives as long as *any* session does. Every
+check said active, enabled, restarting cleanly -- and it would have vanished
+the moment that terminal closed. This is the unit file's own "works perfectly
+while you are watching it and is gone in the morning", observed rather than
+predicted.
+
+Check what is actually holding the manager up, not just that it is up:
+
+```bash
+loginctl show-user "$USER" -p Linger -p Sessions
+loginctl list-sessions --no-legend | awk -v u="$(id -u)" '$2==u'
+```
+
+If `Linger=no` and the only sessions are yours, the service is borrowed time.
+
 #### If lingering worked
 
 ```bash
@@ -103,6 +143,24 @@ systemctl --user status glados-pool
 If the unit refuses to start, read the reason before changing anything: a user
 manager *fails* a unit on a directive it cannot apply rather than skipping it,
 so the fix is to delete the offending line, and the message names it.
+
+**Check whether the limits are real rather than decorative**, which the unit
+file asks for and which is easy to skip:
+
+```bash
+cat /sys/fs/cgroup/user.slice/user-$(id -u).slice/cgroup.controllers
+systemctl --user show glados-pool -p MemoryMax -p CPUQuotaPerSecUSec
+```
+
+On the deployment above that read `cpu memory pids`, and the unit reported
+`MemoryMax=67108864` and `CPUQuotaPerSecUSec=500ms` -- so both were genuinely
+enforced. Where `cpu` and `memory` are absent from the first line, those
+directives are documentation and the daemon is bounded only by its own
+behaviour.
+
+What it actually used there, mining two coins over WireGuard: **228 KiB
+resident** against the 64 MiB cap, and 11.5 ms of CPU across several minutes.
+The limits exist for a bug, not for the steady state.
 
 #### If lingering did not
 
