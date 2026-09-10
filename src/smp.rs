@@ -314,8 +314,8 @@ unsafe fn mwait() {
 // One job at a time, claimed dynamically rather than divided up front.
 //
 // Static division would be the obvious thing and it is wrong on this laptop:
-// an i5-12450H has four performance cores and four efficiency cores, and an
-// equal split finishes when the slowest core finishes. Handing out small
+// the GF63's i7-12650H has six performance cores and four efficiency cores,
+// and an equal split finishes when the slowest core finishes. Handing out small
 // chunks from a shared cursor lets a P-core take three while an E-core takes
 // one, which is the same total work in less wall time and needs no knowledge
 // of which core is which.

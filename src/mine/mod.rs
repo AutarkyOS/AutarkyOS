@@ -444,6 +444,49 @@ fn yespower_checks() -> Vec<(&'static str, bool)> {
                 > 2 * 1024 * 1024,
     ));
 
+    // --- the cache budget, every branch of it, with no processor involved ---
+    //
+    // Slices run at once, so their working sets are resident at once, and a
+    // memory-bound algorithm exists to exceed a core's private cache. Handing
+    // out more slices than the last level holds buys thrashing -- a report
+    // where the rate went *down* when more of the machine was given to it.
+    let mib = 1024 * 1024;
+    out.push((
+        "a cache that holds twelve working sets does not cap four slices",
+        work::budget_from(Some(24 * mib), 2 * mib, 4) == 4,
+    ));
+    out.push((
+        "and one that holds three caps four to three",
+        work::budget_from(Some(24 * mib), 8 * mib, 4) == 3,
+    ));
+    // The two refusals, which are the branches worth having claims for.
+    out.push((
+        "an unreadable cache leaves the request alone rather than throttling it",
+        work::budget_from(None, 8 * mib, 4) == 4,
+    ));
+    out.push((
+        "and nothing memory-bound means the cache is not the resource",
+        work::budget_from(Some(24 * mib), 0, 4) == 4,
+    ));
+    // A working set larger than the whole cache still gets one slice. Zero
+    // would turn a large-parameter coin into a silent no-op, which reads from
+    // the report exactly like a pool that has gone quiet.
+    out.push((
+        "a working set larger than the cache still gets one slice, never none",
+        work::budget_from(Some(4 * mib), 16 * mib, 4) == 1,
+    ));
+
+    // The processor's own answer, when it gives one. Not a claim about a
+    // number -- this boots under an emulator and on a laptop and they differ --
+    // but that what comes back is a cache rather than nonsense.
+    out.push((
+        "the last-level cache reads as a plausible size, or refuses",
+        match crate::cpu::last_level_cache() {
+            None => true,
+            Some(n) => (256 * 1024..=512 * mib).contains(&n) && n % 4096 == 0,
+        },
+    ));
+
     out
 }
 

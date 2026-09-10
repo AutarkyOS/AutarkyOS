@@ -223,6 +223,62 @@ pub fn nx_on() -> bool {
     unsafe { rdmsr(IA32_EFER) & EFER_NXE != 0 }
 }
 
+/// Bytes of the largest cache this processor has, or `None` if it will not say.
+///
+/// **The last-level cache is a resource the miner spends and nothing here
+/// could previously measure.** yespower's working set is two to sixteen
+/// megabytes by construction, so how many jobs run concurrently before they
+/// steal from each other is a property of this number and of nothing else --
+/// and `design/mining.md` planned against 12 MB for a year because somebody
+/// wrote down the wrong processor. The machine is an i7-12650H with 24 MB, so
+/// the budget was half what it should have been.
+///
+/// Read rather than tabulated, for the reason `mem::fixed` gives about the
+/// memory map: a constant here would be a claim about one laptop, asserted in
+/// a kernel meant to boot on another.
+///
+/// CPUID leaf 4 enumerates caches in sub-leaves until it reports type 0. Size
+/// is `ways * partitions * line_size * sets`, each field stored one less than
+/// its value. The largest is taken rather than the one labelled level 3,
+/// because a part with no L3 and a large L2 has a last-level cache all the
+/// same and that is the quantity being asked for.
+pub fn last_level_cache() -> Option<usize> {
+    // Leaf 4 is Intel's. AMD reports the same shape at 0x8000_001D but only
+    // when leaf 0x8000_0001 ECX bit 22 says so, and this has no AMD to test
+    // against -- so it answers `None` there rather than reading a leaf that
+    // may not exist. A refused answer makes the caller fall back to a bound it
+    // can defend; a wrong one silently halves or doubles the budget.
+    if cpuid(0, 0)[0] < 4 {
+        return None;
+    }
+    let mut largest = 0usize;
+    for sub in 0..16 {
+        let r = cpuid(4, sub);
+        let kind = r[0] & 0x1f;
+        if kind == 0 {
+            break;
+        }
+        // 1 data, 2 instruction, 3 unified. An instruction cache is not a
+        // place a miner's working set can live.
+        if kind == 2 {
+            continue;
+        }
+        let line = (r[1] & 0xfff) as usize + 1;
+        let parts = ((r[1] >> 12) & 0x3ff) as usize + 1;
+        let ways = ((r[1] >> 22) & 0x3ff) as usize + 1;
+        let sets = r[2] as usize + 1;
+        let size = line * parts * ways * sets;
+        if size > largest {
+            largest = size;
+        }
+    }
+    if largest == 0 {
+        None
+    } else {
+        Some(largest)
+    }
+}
+
 pub fn cpuid(leaf: u32, sub: u32) -> [u32; 4] {
     let eax: u32;
     let ebx_slot: u64;

@@ -57,12 +57,20 @@ so directly:
 
 > running 8 threads results in substantial slowdown
 
-The GF63's i5-12450H has roughly 12 MB of L3. At the 2 MiB setting that is
-**about four to six concurrent jobs** before they steal from each other; at
-8 MiB, one or two.
+**The GF63's CPU is an i7-12650H: 10 cores, 16 threads, 24 MB of L3.** This
+document said i5-12450H and 12 MB, and so did `src/smp.rs`, and the figure was
+never read off the machine. At the 2 MiB setting 24 MB is **about twelve
+concurrent jobs** before they steal from each other, not four to six; at 8 MiB,
+about three.
+
+That correction runs the wrong way from the usual one -- the budget is twice
+what this document has been planning against, and the core count is four times
+what QEMU shows. Every yespower figure below is therefore a floor rather than
+an estimate, and by a margin nobody has measured.
 
 **That figure is arithmetic and not a measurement**, and `mine sweep` is the
-command that would settle it. Under QEMU it cannot:
+command that would settle it. Under QEMU it cannot, and the reason has got
+worse now the real core count is known -- the guest sees four of sixteen:
 
     [mine sweep] yespower 1.0 N=2048 r=8
       1 slice(s)  387 H/s  (100% of one)
@@ -106,6 +114,20 @@ older than the GF63. Those are four-thread figures on a four-core part, so they
 already include some contention.
 
 ## Measured, in ring 0
+
+**Everything in this section is a floor, and three separate factors say so.**
+The figures are QEMU under WHPX with `-smp 4`, running `yespower-ref.c`
+transliterated, on a guest that sees four of the machine's sixteen logical
+processors. Against that: the host is an i7-12650H with 24 MB of L3, upstream's
+own optimised implementation runs about 1000 H/s per core on bare metal, and
+this one runs 125. **The eight-times gap is emulation and the reference
+implementation together**, and neither has been separated from the other.
+
+So a bare-metal, optimised, sixteen-thread figure is not knowable from here and
+is not guessed at. What is knowable is the direction: every yespower number in
+this document and in `tools/payrate.py` understates the machine, and `mine
+sweep` on the GF63 is the one command that settles by how much. It is in the
+hardware runbook for exactly that reason.
 
 `mine bench <ms>` hashes flat out with no pool and no network. QEMU under WHPX,
 `-smp 4`, best of one, five-second samples:
@@ -509,6 +531,52 @@ So the way to score a coin is to point `mine probe` at its pool and read what
 prints. The catch is circular and worth stating: a pool will not hand out work
 a miner cannot do, so the algorithm has to exist before the coin can be scored.
 Which fixes the order.
+
+## The cache is a budget now, and the kernel reads it
+
+`assign` handed out slices against the core count and nothing else. Slices run
+at once, so their working sets are resident at once, and a memory-bound
+algorithm exists to exceed a core's private cache -- that is the mechanism, not
+a side effect. Handing out more slices than the last level holds is therefore
+not neutral: it buys thrashing, and the report shows a rate that went *down*
+when more of the machine was given to it.
+
+`cpu::last_level_cache` reads CPUID leaf 4 and takes the largest cache it
+enumerates. **Read rather than tabulated**, for the reason `mem::fixed` gives
+about the memory map: a constant would be a claim about one laptop asserted in
+a kernel meant to boot on another. It is also how the i5/i7 error above got
+found -- the number had never been read, only written down.
+
+    glados> mine slices
+      1 slice(s) wanted, 0 spawned, 4 is the ceiling
+      last-level cache 24576 KiB
+        slot 1 wants 2146 KiB a slice, so 11 fit
+        slot 2 wants 8296 KiB a slice, so 2 fit
+
+Three things agree there and none was made to. 24576 KiB is the host's real L3
+arriving through `-cpu max`; 2146 and 8296 KiB are what `Algo::working_set`
+computes; and they are the same figures `Yespower::footprint` reports in the
+table above, which a boot claim checks across five parameter sets.
+
+Two refusals are the interesting half. **A cache the processor will not
+describe leaves the request alone** rather than throttling it, which is what
+every build before this did -- a budget that silently capped a machine it could
+not measure would be worse than no budget. And **a working set larger than the
+whole cache still gets one slice**, never none, because zero would turn a
+large-parameter coin into a silent no-op that reads from the report exactly
+like a pool that has gone quiet.
+
+An arithmetic-bound algorithm costs nothing against this budget. sha256d's
+whole state is a few hundred bytes, so a slice on one is free however many are
+running -- which is the practical form of `Algo::bound`, and the reason a mixed
+table is worth more than a uniform one.
+
+**What is still not measured is whether the mix actually wins.** Nothing has
+run an arithmetic-bound and a memory-bound coin together and compared the pair
+against each alone. That measurement does not belong under QEMU for the same
+reason `mine sweep` does not: the guest sees four of sixteen threads, so the
+curve bends on cores long before it could bend on cache. It goes in the
+hardware runbook beside the sweep.
 
 ## Splitting one device across a field, which is mechanism and not policy
 

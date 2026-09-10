@@ -43,7 +43,7 @@ use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 use crate::sync::{Guard, Spin};
 
-use super::algo::Algo;
+use super::algo::{Algo, Bound};
 use super::client::{Template, MAX_SLICES};
 
 /// How many coins may be worked at once.
@@ -277,6 +277,69 @@ pub fn snapshot(slot: usize) -> Option<Snapshot> {
 /// Slices beyond the wanted count are cleared rather than left pointing at a
 /// slot, because a parked slice that still reads as assigned makes the report
 /// claim two slices on a coin that one is working.
+/// How many slices the last-level cache can actually carry, given what the
+/// workable slots are running.
+///
+/// **Slices run at once, so their working sets are resident at once.** A
+/// memory-bound algorithm exists to exceed a core's private cache -- that is
+/// the mechanism, not a side effect -- so concurrent jobs contend in the last
+/// level and upstream's own PERFORMANCE file says eight threads is already
+/// "substantial slowdown". Handing out more slices than the cache holds is
+/// therefore not neutral: it buys thrashing, and the report shows a rate that
+/// went *down* when more of the machine was given to it.
+///
+/// An arithmetic-bound algorithm costs nothing here. sha256d's whole state is
+/// a few hundred bytes, so a slice on one is free however many are running,
+/// which is the practical form of `Algo::bound` -- and the reason a mixed
+/// table is worth more than a uniform one.
+///
+/// **A cache this cannot read is not a reason to refuse to mine.** With no
+/// answer from CPUID the request stands unchanged, which is exactly the
+/// behaviour every build before this one had. A budget that silently throttled
+/// a machine it could not measure would be worse than no budget.
+fn cache_budget(slots: &[usize], want: usize) -> usize {
+    // The largest working set among the workable coins, because slices are
+    // handed out round-robin and any of them may land on the worst one. Taking
+    // the mean would be right on average and wrong exactly when it matters.
+    let mut worst = 0usize;
+    for &i in slots {
+        if let Some(c) = COINS[i].lock_irq().as_ref() {
+            if matches!(c.algo.bound(), Bound::Memory) {
+                let w = c.algo.working_set();
+                if w > worst {
+                    worst = w;
+                }
+            }
+        }
+    }
+    budget_from(crate::cpu::last_level_cache(), worst, want)
+}
+
+/// The arithmetic, pure and therefore assertable.
+///
+/// Separated from the gathering above for the reason `update::decide` and
+/// `code::locate` are: every branch here is a decision about how much of the
+/// machine to use, two of them are refusals, and a suite can walk all four
+/// without a processor, a coin table or a slice.
+pub fn budget_from(cache: Option<usize>, worst: usize, want: usize) -> usize {
+    // No answer from CPUID means the request stands, which is exactly what
+    // every build before this one did. A budget that silently throttled a
+    // machine it could not measure would be worse than no budget.
+    let Some(cache) = cache else {
+        return want;
+    };
+    // Nothing memory-bound is being worked, so the cache is not the resource
+    // in question and the core count is.
+    if worst == 0 {
+        return want;
+    }
+    // Never zero: one slice thrashing is still strictly better than a coin
+    // nobody works, and a budget that could refuse every slice would turn a
+    // large-parameter coin into a silent no-op that reads like a dead pool.
+    let fits = (cache / worst).max(1);
+    want.min(fits)
+}
+
 pub fn assign() {
     let before: [u32; MAX_COINS] = core::array::from_fn(|i| slices_on(i));
 
@@ -294,7 +357,7 @@ pub fn assign() {
             n += 1;
         }
     }
-    let want = super::client::slices() as usize;
+    let want = cache_budget(&slots[..n], super::client::slices() as usize);
     for (i, a) in ASSIGN.iter().enumerate() {
         if n == 0 || i >= want {
             a.store(NONE, Ordering::Relaxed);

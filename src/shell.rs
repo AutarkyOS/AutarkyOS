@@ -7830,6 +7830,32 @@ fn mine_cmd(rest: &str) {
                     client::spawned_slices(),
                     MAX_SLICES
                 );
+                // **The other ceiling, and the one nobody could see.** Slices
+                // run at once, so their working sets are resident at once, and
+                // a memory-bound algorithm is built to exceed a core's private
+                // cache. `design/mining.md` planned against 12 MB of L3 for a
+                // year because the wrong processor was written down; the
+                // machine has 24. Printing what was read, rather than what was
+                // assumed, is what stops that happening twice.
+                match crate::cpu::last_level_cache() {
+                    None => kprintln!("  the processor will not say how large its last cache is"),
+                    Some(c) => {
+                        kprintln!("  last-level cache {} KiB", c / 1024);
+                        for i in 0..crate::mine::work::MAX_COINS {
+                            if let Some(a) = crate::mine::work::algo(i) {
+                                let w = a.working_set();
+                                if w > 4096 {
+                                    kprintln!(
+                                        "    slot {} wants {} KiB a slice, so {} fit",
+                                        i,
+                                        w / 1024,
+                                        (c / w).max(1)
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
                 return;
             }
             match arg.parse::<u32>() {

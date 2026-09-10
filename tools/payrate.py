@@ -73,16 +73,28 @@ DEFAULT_POWER_USD_DAY = 0.36
 # a payout figure instead.
 MIN_WORKERS = 5
 
-# What this machine computes, in hashes a second, and where each figure comes
+# What this machine computes, in hashes a second, and where each figure came
 # from. **Measured rather than rated**: every one is a number this project
-# printed. The GPU figures are through the pool on a *busy* host -- the daemon
-# beside the miner on one laptop -- which `design/xpu.md` records as costing
-# about a fifth, so they are conservative.
+# printed.
+#
+# **Where it was measured is not decoration.** The GPU rows are native Windows
+# through the pool on a *busy* host, which `design/xpu.md` records as costing
+# about a fifth -- conservative, and within a fifth of the truth. The yespower
+# row is something else entirely: QEMU with four of the machine's sixteen
+# logical processors, running the transliterated `yespower-ref.c`. Upstream's
+# optimised implementation does about 1000 H/s per core on bare metal against
+# this one's 125, and the host's 24 MB of L3 would hold about twelve concurrent
+# 2 MiB jobs where the guest could only ever run three.
+#
+# So that figure is a **floor by an unmeasured margin**, and the tool says so
+# rather than scaling it: a multiplier picked to feel right is the invented
+# figure this file already got caught on once. `mine sweep` on the GF63 is what
+# settles it.
 OURS = {
-    "sha256": (0.63e9, "RTX 3050, cuda/xpu.cu, through the pool"),
-    "blake2s": (1.28e9, "RTX 3050, cuda/xpu.cu, through the pool"),
-    "heavyhash": (0.383e9, "RTX 3050, cuda/kheavy.cu heavy step only -- an upper bound"),
-    "yespower": (1368.0, "four kernel slices, ring 0, which measured 256% of one"),
+    "sha256": (0.63e9, "native", "RTX 3050, cuda/xpu.cu, through the pool"),
+    "blake2s": (1.28e9, "native", "RTX 3050, cuda/xpu.cu, through the pool"),
+    "heavyhash": (0.383e9, "native", "RTX 3050, cuda/kheavy.cu heavy step -- an upper bound"),
+    "yespower": (1368.0, "emulated", "4 kernel slices under QEMU on 4 of 16 threads, reference code"),
 }
 
 # Who wins each algorithm, and what it costs to join.
@@ -305,7 +317,8 @@ def survey(d, btc, vram_mib):
             "why": why,
             "thin": thin,
             "ours_usd": btc_per_day(v, ours[0], "actual_last24h") * btc if ours else None,
-            "ours_note": ours[1] if ours else None,
+            "ours_where": ours[1] if ours else None,
+            "ours_note": ours[2] if ours else None,
         })
     rows.sort(key=lambda r: -r["per_worker"])
     return rows
@@ -351,6 +364,8 @@ def main():
             verdict = "reachable, no rate measured here yet"
         else:
             verdict = r["ours_note"]
+            if r["ours_where"] == "emulated":
+                verdict += "  [FLOOR]"
         print("%-15s $%-10.4f %-13.4g %-7d %-11s %s"
               % (r["algo"], r["per_worker"], r["hs_per_worker"], r["workers"],
                  ("$%.6f" % r["ours_usd"]) if r["ours_usd"] is not None else "--",
@@ -389,7 +404,17 @@ def main():
         print()
         print("against $%.2f a day of electricity assumed: %.0fx underwater."
               % (a.power, a.power / total if total else float("inf")))
-        print("Three rankings have been overturned and this line has not moved once.")
+        floors = [r["algo"] for r in have if r["ours_where"] == "emulated"]
+        if floors:
+            # The one direction the error is known to run in. Saying which rows
+            # are floors is not the same as scaling them, and scaling them
+            # would be a number nobody measured driving a conclusion -- which
+            # is the failure this file was caught making about DAG sizes.
+            print("[FLOOR] %s measured under emulation on a quarter of the cores,"
+                  % ", ".join(floors))
+            print("        running reference rather than optimised code. The real"
+                  " figure is higher")
+            print("        by a margin only `mine sweep` on the hardware can say.")
     return 0
 
 
