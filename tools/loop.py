@@ -66,6 +66,9 @@ def main():
     ap.add_argument("--address", default="0x000000000000000000000000000000000000beef",
                     help="where the reward would go")
     ap.add_argument("--keep", action="store_true", help="leave the working directory behind")
+    ap.add_argument("--fork", action="store_true",
+                    help="claim against a fork of Robinhood Chain: the real GLADOS "
+                         "contract, the real pool, the real tax, and nothing spent")
     a = ap.parse_args()
 
     work = os.path.join(ROOT, "out", "loop")
@@ -143,8 +146,13 @@ def main():
         return rc
 
     # ---------------------------------------------------------------- 5
-    say("[5/5]", "deploying the distributor and claiming, in a real EVM")
-    rc = subprocess.call(["node", os.path.join("test", "cross.mjs"), epoch],
+    if a.fork:
+        say("[5/5]", "claiming against a fork of Robinhood Chain (real token, real pool)")
+        script = "fork.mjs"
+    else:
+        say("[5/5]", "deploying the distributor and claiming, in a real EVM")
+        script = "cross.mjs"
+    rc = subprocess.call(["node", os.path.join("test", script), epoch],
                          cwd=os.path.join(ROOT, "contracts"),
                          shell=(os.name == "nt"))
     if rc != 0:
@@ -159,6 +167,10 @@ def main():
     for addr, c in sorted(e["claims"].items()):
         print("  %s  %s GLADOS" % (addr, c["amount"]))
     print()
+    if a.fork:
+        print("Every contract in that last step except the distributor is the one")
+        print("deployed on Robinhood Chain, read over RPC. The GLADOS is real, the")
+        print("price is real, the tax is real. The fork died with the process.")
     print("What is not proven here is that anybody funded it. That is the")
     print("operator's own money and no simulation stands in for it.")
     print("-" * 68)
