@@ -57,6 +57,53 @@ the tests: **the leaf is denominated in the quote token, so the first claimant
 gets a better price than the last.** That is a race, it is inherent to paying
 through a market rather than around one, and it is why `Direct` still exists.
 
+## Testing it for real, and the one leg that cannot be rushed
+
+Three levels, each strictly more real than the last:
+
+```bash
+python ../tools/loop.py             # mine, credit, build, claim -- all local
+python ../tools/loop.py --fork      # same, but claiming against a fork of the
+                                    # real chain: real token, real pool, real tax
+node deploy.mjs status              # what the real chain says right now
+```
+
+And on the chain itself, with your own key and your own money:
+
+```bash
+node deploy.mjs deploy                            --send
+node deploy.mjs wrap  --amount 0.01               --send
+node deploy.mjs open  epoch.json --amount 0.01    --send
+node deploy.mjs claim epoch.json --epoch 0        --send   # from the miner's wallet
+```
+
+**Every command simulates first and refuses to broadcast without `--send`.**
+That is the whole safety model, and it is there because the difference between
+a correct epoch and one funded with the wrong number is a transaction that
+succeeds either way -- the only moment to catch it is before signing.
+
+The key comes from `GLADOS_KEY` in the environment, is used to sign, and is
+never printed, written or put in an error message.
+
+### What is real at each level
+
+| | mining | ledger | tree | contract | pool | money |
+|---|---|---|---|---|---|---|
+| `loop.py` | real | real | real | real | mock | none |
+| `loop.py --fork` | real | real | real | real | **real** | none |
+| `deploy.mjs` | real | real | real | **real, deployed** | **real** | **yours** |
+
+**The one leg that cannot be tested quickly** is actually receiving mining
+proceeds from an upstream. At the measured $0.07 a day, a common 0.001 BTC
+minimum payout is 3.7 years away and a generous 0.0001 BTC one is 136 days.
+That is not a test, it is a waiting game, and no amount of code shortens it.
+
+So a real end-to-end run funds the epoch from the operator's own wallet rather
+than from accumulated mining revenue. That is not a cheat: it is what the
+design says happens anyway -- Layer 2 distributes the *operator's* money -- and
+at this scale the difference between "funded by mining" and "funded by you" is
+ten cents against ten dollars.
+
 ## No hardhat, no foundry
 
 What is needed is a compiler and an EVM, and each is one package. A framework
