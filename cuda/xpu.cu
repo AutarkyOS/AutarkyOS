@@ -295,7 +295,169 @@ static int set_job(int algo, const uint8_t header[80], const uint8_t target_be[3
     return 0;
 }
 
-int main(void) {
+// Search `count` nonces from `base`, in as many launches as that takes.
+//
+// **The whole count, and that is the contract.** This rounded down to whole
+// blocks and reported what it had actually done, which the parent did not
+// read -- so a scan of 1,000 nonces searched 512, the parent advanced its
+// cursor by 1,000, and the difference was never searched by anybody. Silent,
+// and it grew teeth with NeoScrypt, whose launch is capped by a gigabyte of
+// scratchpad rather than by the range asked for: a request for 47,000 nonces
+// can only put 32,768 in flight.
+//
+// Looping here rather than reporting a short scan keeps the pipe's meaning
+// simple -- `scan N` searches N nonces -- and the parent already sizes N to
+// about a quarter second from a measured rate, so no single call runs long.
+//
+// One function, called by the pipe and by `--selftest`. A self-test driving a
+// second copy of this loop would be checking the copy.
+static uint32_t scan_range(int algo, uint32_t base, uint32_t count,
+                           uint32_t *d_found, uint32_t **ns_v, uint8_t **ns_kdf,
+                           uint32_t *scanned) {
+    const uint32_t none = 0xffffffffu;
+    if (cudaMemcpy(d_found, &none, 4, cudaMemcpyHostToDevice) != cudaSuccess) {
+        if (scanned) *scanned = 0;
+        return none;
+    }
+    uint32_t done = 0;
+    uint32_t got = none;
+    while (done < count) {
+        const uint32_t want = count - done;
+        uint32_t here;
+        if (algo == X_NEOSCRYPT) {
+            if (ns_setup(ns_v, ns_kdf)) {
+                fprintf(stderr, "[xpu] no room for a neoscrypt scratchpad\n");
+                break;
+            }
+            const int threads = 64;
+            here = want < NS_MAX_THREADS ? want : NS_MAX_THREADS;
+            const uint32_t blocks = (here + threads - 1) / threads;
+            xpu_neoscrypt_kernel<<<blocks, threads>>>(base + done, d_found, *ns_v,
+                                                     *ns_kdf, here);
+        } else {
+            // Rounded *up*, so the range asked for is covered. The last threads
+            // then work a few nonces past it, which is harmless: a hit above
+            // the range is still a hit on this header, and the parent resumes
+            // from the nonce it is told rather than from where it expected.
+            const int threads = 256;
+            const uint32_t per_block = (uint32_t)threads * NPT;
+            const uint32_t blocks = (want + per_block - 1) / per_block;
+            here = blocks * per_block;
+            if (algo == X_SHA256D)
+                xpu_scan_kernel<X_SHA256D><<<blocks, threads>>>(base + done, d_found);
+            else
+                xpu_scan_kernel<X_BLAKE2S><<<blocks, threads>>>(base + done, d_found);
+        }
+        if (cudaDeviceSynchronize() != cudaSuccess) {
+            fprintf(stderr, "[xpu] launch: %s\n", cudaGetErrorString(cudaGetLastError()));
+            got = none;
+            done = count;
+            break;
+        }
+        done += here;
+        if (cudaMemcpy(&got, d_found, 4, cudaMemcpyDeviceToHost) != cudaSuccess) {
+            fprintf(stderr, "[xpu] readback failed\n");
+            got = none;
+            break;
+        }
+        // Stop at the first hit: the parent resumes from that nonce, so
+        // searching past it would be work it is about to ask for again.
+        if (got != none) break;
+    }
+    if (scanned) *scanned = done;
+    return got;
+}
+
+// Every algorithm this device has, against a nonce somebody else established,
+// through the same `set_job` and scan path the pipe uses.
+//
+// **The odd range is the point of the second half.** The scan loop used to
+// round the requested count down to whole blocks and report what it had
+// actually done, which the parent did not read -- so a scan of 1,000 nonces
+// searched 512, the parent advanced its cursor by 1,000, and the difference
+// was never looked at by anybody. Silent, and it grew teeth with NeoScrypt,
+// whose launch is capped by a gigabyte of scratchpad rather than by the range
+// asked for. A count that is deliberately not a multiple of any block size is
+// what catches that coming back.
+struct Selftest {
+    const char *algo;
+    const char *header;
+    const char *target;
+    uint32_t base;
+    uint32_t count;
+    uint32_t want;
+};
+
+static int selftest(uint32_t *d_found, uint32_t **ns_v, uint8_t **ns_kdf) {
+    // Block 125552, whose nonce every explorer in the world agrees on, and the
+    // two Feathercoin blocks `tools/neoscrypt.py` derived from the live chain.
+    static const Selftest T[] = {
+        {"sha256d",
+         "0100000081cd02ab7e569e8bcd9317e2fe99f2de44d49ab2b8851ba4a3080000000000"
+         "00e320b6c2fffc8d750423db8b1eb942ae710e951ed797f7affc8892b0f1fc122bc7f5"
+         "d74df2b9441a42a14695",
+         "00000000000404cb000000000000000000000000000000000000000000000000",
+         0x95460000u, 262144u, 0x9546a142u},
+        {"neoscrypt",
+         "040000200a9245b1198825ab30d6dbae2b185e31f342d1058cc36851629bf435fc682b"
+         "554d100771e4a23d210cd3a1503e3b1ca524e8482913ee5b4036edf4bd20db6a2993c0"
+         "a16adc09011d002c5f48",
+         "0000000109dc0000000000000000000000000000000000000000000000000000",
+         0x485f2c00u, 64u, 0x485f2c00u},
+        // BLAKE2s over an 80-byte header, which no chain reachable from here
+        // publishes a block for -- so the vector comes from `hashlib`, which
+        // is the same oracle `cuda/blake2s.cuh` uses and is not ours. The
+        // nonce is the *lowest* in the range meeting a 16-leading-zero-bit
+        // target, so this also checks that `atomicMin` makes a scan a function
+        // of its range rather than of which warp retired first.
+        {"blake2s",
+         "040000200a9245b1198825ab30d6dbae2b185e31f342d1058cc36851629bf435fc682b"
+         "554d100771e4a23d210cd3a1503e3b1ca524e8482913ee5b4036edf4bd20db6a2993c0"
+         "a16adc09011d002c5f48",
+         "0000ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+         0x00000000u, 70000u, 0x0000438cu},
+        // The same sha256d block, over a range that is a multiple of nothing.
+        // 9546a142 - 95460000 = 41,282, so 41,283 nonces from the base is the
+        // smallest range containing it, and every block size here divides
+        // neither it nor the count.
+        {"sha256d",
+         "0100000081cd02ab7e569e8bcd9317e2fe99f2de44d49ab2b8851ba4a3080000000000"
+         "00e320b6c2fffc8d750423db8b1eb942ae710e951ed797f7affc8892b0f1fc122bc7f5"
+         "d74df2b9441a42a14695",
+         "00000000000404cb000000000000000000000000000000000000000000000000",
+         0x95460000u, 41283u, 0x9546a142u},
+    };
+
+    int bad = 0;
+    for (size_t i = 0; i < sizeof T / sizeof T[0]; ++i) {
+        uint8_t header[80], target[32];
+        if (strlen(T[i].header) != 160 || strlen(T[i].target) != 64 ||
+            unhex(T[i].header, header, 80) || unhex(T[i].target, target, 32)) {
+            printf("FAIL  %s: the vector in this file is malformed\n", T[i].algo);
+            bad++;
+            continue;
+        }
+        int a = !strcmp(T[i].algo, "sha256d") ? X_SHA256D
+              : !strcmp(T[i].algo, "blake2s") ? X_BLAKE2S : X_NEOSCRYPT;
+        if (set_job(a, header, target)) {
+            printf("FAIL  %s: upload\n", T[i].algo);
+            bad++;
+            continue;
+        }
+        const uint32_t got = scan_range(a, T[i].base, T[i].count, d_found,
+                                        ns_v, ns_kdf, NULL);
+        const bool ok = got == T[i].want;
+        printf("%-4s  %-9s over %6u nonces from %08x -> %08x\n",
+               ok ? "ok" : "FAIL", T[i].algo, T[i].count, T[i].base, got);
+        if (!ok) {
+            printf("      wanted %08x\n", T[i].want);
+            bad++;
+        }
+    }
+    return bad;
+}
+
+int main(int argc, char **argv) {
     // **Unbuffered, and _IOLBF is not good enough here.** Windows' CRT
     // documents line buffering as behaving like *full* buffering, so a reply
     // written to a pipe sits in a buffer while the parent blocks waiting for
@@ -317,6 +479,15 @@ int main(void) {
     // also paying for context creation -- about two hundred milliseconds that
     // would otherwise land inside a measured interval.
     cudaFree(0);
+
+    if (argc > 1 && !strcmp(argv[1], "--selftest")) {
+        const int bad = selftest(d_found, &d_ns_v, &d_ns_kdf);
+        cudaFree(d_found);
+        cudaFree(d_ns_v);
+        cudaFree(d_ns_kdf);
+        return bad ? 1 : 0;
+    }
+
     printf("ready\n");
 
     char line[512];
@@ -355,10 +526,7 @@ int main(void) {
             }
             if (algo < 0) { printf("err no job\n"); continue; }
 
-            uint32_t none = 0xffffffffu;
-            if (cudaMemcpy(d_found, &none, 4, cudaMemcpyHostToDevice) != cudaSuccess) {
-                printf("err upload\n"); continue;
-            }
+            const uint32_t none = 0xffffffffu;
             // **The whole count, in as many launches as it takes.**
             //
             // This rounded down to whole blocks and reported what it had
@@ -375,46 +543,8 @@ int main(void) {
             // already sizes N to about a quarter second from a measured rate,
             // so no single call runs long.
             uint32_t done = 0;
-            uint32_t got = none;
-            while (done < count) {
-                const uint32_t want = count - done;
-                uint32_t here;
-                if (algo == X_NEOSCRYPT) {
-                    if (ns_setup(&d_ns_v, &d_ns_kdf)) {
-                        printf("err no room for a neoscrypt scratchpad\n");
-                        break;
-                    }
-                    const int threads = 64;
-                    here = want < NS_MAX_THREADS ? want : NS_MAX_THREADS;
-                    const uint32_t blocks = (here + threads - 1) / threads;
-                    xpu_neoscrypt_kernel<<<blocks, threads>>>(
-                        base + done, d_found, d_ns_v, d_ns_kdf, here);
-                } else {
-                    const int threads = 256;
-                    const uint32_t per_block = (uint32_t)threads * NPT;
-                    uint32_t blocks = (want + per_block - 1) / per_block;
-                    here = blocks * per_block;
-                    if (algo == X_SHA256D)
-                        xpu_scan_kernel<X_SHA256D><<<blocks, threads>>>(base + done, d_found);
-                    else
-                        xpu_scan_kernel<X_BLAKE2S><<<blocks, threads>>>(base + done, d_found);
-                }
-                if (cudaDeviceSynchronize() != cudaSuccess) {
-                    printf("err launch: %s\n", cudaGetErrorString(cudaGetLastError()));
-                    got = none;
-                    done = count;
-                    break;
-                }
-                done += here;
-                if (cudaMemcpy(&got, d_found, 4, cudaMemcpyDeviceToHost) != cudaSuccess) {
-                    printf("err readback\n");
-                    got = none;
-                    break;
-                }
-                // Stop at the first hit: the parent resumes from that nonce, so
-                // searching past it would be work it is about to ask for again.
-                if (got != none) break;
-            }
+            const uint32_t got = scan_range(algo, base, count, d_found,
+                                            &d_ns_v, &d_ns_kdf, &done);
             if (got != none) printf("found %08x\n", got);
             else printf("none %u\n", done);
             continue;
