@@ -55,106 +55,124 @@ That is the whole finding. A never-seen address can receive the token, so
 nothing on the contract asks who the recipient is, and paying a stranger in
 NVDA is mechanically possible today.
 
-## The depth figure in the first version of this file was wrong
+## Every liquidity figure this file gave before was wrong, by five orders of magnitude
 
-It said about ten dollars, from reading `getPair` on four pairs. **The factory
-carries 41,741 pairs**, and asking it properly -- `PairCreated` logs filtered on
-the indexed `token0`/`token1` -- finds **62 pairs involving these six tokens**,
-not four. Four of 41,741 is a sample, and it was reported as a fact about the
-chain.
+Twice, and the second time with more confidence than the first. Both errors are
+the same one: **read one venue, report a fact about the chain.**
 
-Most of those 62 are not usable for acquisition. The counterparty is a memecoin
-somebody launched against a stock ticker -- `MVDA`, `NVDAs`, `Stockcoin`,
-`GAMECOIN`, `dont'buy`, `NVTEST963` -- and buying `NVDA` with `HODL` requires
-already holding `HODL`, which has the same problem one level down. **Seven of
-the 62 have a quote asset that can be arrived at from outside**, and this is
-their whole depth:
+There are at least nine AMM factories on 4663. The one this file measured,
+`0x8bceaa40...`, is **Uniswap v2**, and for tokenized stock it holds roughly
+**0.04%** of the liquidity. The market is on **Uniswap v3**
+(`0x1f7d7550B1b028f7571E69A784071F0205FD2EfA`, 24,535 bytes, 6,578 pools) and
+**Uniswap v4** (PoolManager singleton `0x8366a39CC670B4001A1121B8F6A443A643e40951`).
+Nothing pointed at v2 except that it was the first factory found.
 
-    AMZN / WETH    0.01177828 WETH     $28.99
-    GME  / WETH    0.00903404 WETH     $22.23
-    NVDA / WETH    0.00394343 WETH      $9.70
-    NVDA / USDG    0.18623300 USDG      $0.19
-    SPY  / USDG    0.00065300 USDG      $0.00
-    SPCX / USDG, SPCX / WETH           dust
-                                     -------
-                                       $61.11     at ETH $2,460.90
+The same six tokens, quote-side depth, v3 pools only, summed over every fee
+tier that exists:
 
-So the real figure is **$61, six times what this file first said**, and two of
-the three pairs that carry it were not in the original spot check at all.
+| token | USDG side | WETH side | USD |
+|---|---:|---:|---:|
+| NVDA | 2,658,529.90 | 246.4444 | **3,265,004.82** |
+| SPCX | 1,615,701.89 | 160.9038 | 2,011,669.97 |
+| GME | 1,498,504.41 | 17.4786 | 1,541,517.54 |
+| SPY | 84,870.78 | 250.8914 | 702,289.38 |
+| AMZN | 552,446.23 | ~0 | 552,446.23 |
+| GOOGL | 311,815.85 | 0.3610 | 312,704.11 |
+| | | | **$8,385,632** |
 
-**And the chain has no working stablecoin market underneath any of it.** The
-`WETH`/`USDG` pair is `175.24 WETH` against `0.00000043 USDG`: a degenerate pool
-nobody can trade through, which is why ETH had to be priced off-chain to value
-the table above.
+    on Uniswap v3   $8,385,632
+    on Uniswap v2       $61.11      <- what this file called "the chain"
 
-## Slippage, which depends only on one ratio
+**NVDA alone is $3.27M against the $9.70 reported here as its total depth**, a
+factor of 337,000. And v3 is not the largest venue: v4 holds more stock-token
+liquidity than v3 does, so the real total is roughly double the table above.
 
-Worth writing down because it makes the basket question answerable without
-knowing a single stock price. On a constant-product pool, spending `x` of the
-quote against reserve `R` returns, valued at the pool's own pre-trade price,
+The flow figure died the same way. This file measured `Swap` events on seven v2
+pairs, found $683.93 over fourteen days, and called it the basket's throughput.
+Chain-wide stock-token volume is in the hundreds of millions of dollars a day.
 
-    x * R / (x + R)
+## So the objection was never real, and neither was the reasoning under it
 
-Efficiency is `R/(x+R)` and **depends only on `x/R`** -- not on the price, not on
-which stock, not on how the basket is composed. Spreading `x` across several
-pairs in proportion to their reserves gives every pair the same ratio, so the
-basket behaves exactly like one pool of the summed depth. That is the honest
-version of "split it across a basket": it works, and what it buys is `R = $61`
-instead of `R = $9.70`.
+Both of the earlier verdicts fall:
 
-Against the 36-hour pot, and against the quarterly settlements the cadence
-argument in `payout.md` actually implies:
+- **"There is nowhere to buy it."** There is. $8.4M of v3 depth is reachable
+  with USDG or WETH from any address, and a settlement of a few hundred dollars
+  is a few basis points against a single pool. The custody objection -- that
+  acquisition must route through Robinhood's app, an account and an identity
+  check, putting the operator in the shape the whole design avoids -- **was
+  built entirely on the missing liquidity and goes with it.**
+- **"Depth is a stock, flow is what binds."** The reasoning is still correct and
+  worth keeping; the arithmetic was applied to the wrong pools. Against real
+  volume the ratio it computes is negligible.
 
-    spend $84    receive $35.37    42.1% efficiency    57.9% lost
-    spend $250   receive $49.11    19.6%               80.4%
-    spend $630   receive $55.71     8.8%               91.2%
+**On liquidity grounds a tokenized-stock payout works.** That is the honest
+finding and it reopens a route this file closed twice.
 
-    to keep 99%, one clip may be at most $0.62
-    to keep 95%,                          $3.22
-    to keep 90%,                          $6.79
+## What actually constrains it, measured on the right contracts this time
 
-## But depth is a stock and the thing that matters is a flow
+The "permissionlessly transferable" finding was also wrong, and wrong the same
+way: **the controls are not on the token, so probing the token found nothing.**
+Every one of the 194 stock tokens is a beacon proxy over
+`0xe10b6f6b275de231345c20d14ab812db62151b00`, and that beacon is where the
+control surface lives.
 
-**This is the correction that mattered**, and the first version of this file did
-not make it. A pool is not a budget that gets spent once. Buying pushes the
-price up, an arbitrageur with a cheaper source sells into it, and both the price
-and the stock-side reserve come back. So a $9.70 pool can pass far more than
-$9.70 through itself, and the question is not how deep it is but **how fast it
-refills**.
+    NVDA    isBlocked(address)         reverts
+    beacon  isBlocked(address)         answers -- false for a fresh address
+    beacon  implementation()           0xb35490d6f9163de4f80d88dc75c3516eb64c5ae2
+    NVDA    paused()                   false
 
-That is measurable, so it was measured -- every `Swap` event on the seven pairs,
-bucketed by day, quote side only and in its own units:
+So one beacon upgrades all 194 tokens at once and answers the blocklist for all
+of them. The implementation carries `adminBurn(address,uint256)`, `pause()`,
+`mint`/`burn`, and `updateMultiplier` -- a live rebasing hook, not decoration,
+since fifteen tokens currently sit at a multiplier other than 1.0 (CRWD at
+4.000000 is a 4:1 split).
 
-    day        d0      d1      d2      d3      d4      d5      d6
-    AMZN     2.71    0.40   18.95   12.34   49.22    0.00    0.00
-    GME      0.81   29.91    0.07    0.00    0.13    0.75    0.71
-    NVDA   488.67   16.26    0.22    5.42    0.00    0.00    0.00
-    total  492.18   46.57   19.24   17.75   49.34    0.75    0.71
+The transfer test in this file was not wrong, it was **narrow**: a fresh address
+is not a blocked address, so it proves transfers are open by default and says
+nothing about whether they can be closed. They can.
 
-    14-day total $683.93    mean $48.85/day    median $12.89/day
+**USDG is the same shape and its powers are hidden better.** It is a Paxos
+proxy whose privileged functions are not in the main dispatch table at all --
+they sit behind a facet router, `facets(bytes4)`:
 
-**The first day is 72% of the fortnight**, which is exactly why one reading is
-not a rate -- and why the $492 that showed up in the first 24-hour window would
-have been a second wrong number reported confidently, had it not been bucketed.
+    facets(pause())            -> 0x58cab81e3d8468a0e90df8cbfacb34535e1de942
+    facets(0xdeadbeef)         -> 0x0000000000000000000000000000000000000000
 
-## The verdict, on the flow rather than on the depth
+The control returning zero is what makes the hit meaningful: the mapping
+discriminates. That facet also carries freeze, unfreeze and
+`wipeFrozenAddress`, which destroys a frozen balance. `paused()` reads false
+today.
 
-$84 is **12% of everything the entire RWA basket has traded in two weeks**, and
-at the median day it is six and a half days of the basket's whole turnover --
-turnover being two-directional, so the one-way buying required is a larger share
-still. A quarterly settlement of $250 to $630 is five to thirteen months of it.
+And the tokens are **chain-locked by construction**: `l1Address()` reverts on
+them where it answers on WETH, the implementation has no `IArbToken` interface,
+and the registry lists exactly one deployment per asset, all on 4663. They
+cannot leave through the canonical bridge. For this design that is survivable,
+since $GLADOS is on 4663 too -- but a miner paid in NVDA holds something whose
+only exits are selling on 4663 or redeeming with Robinhood.
 
-So the route does not work, and the reason is now a defensible one rather than a
-spot check: **not that the pools are shallow, which they can survive, but that
-the flow through them is one to two orders of magnitude below what a settlement
-needs.**
+## The verdict, third time
 
-The number to watch is therefore a rate and not a reserve, which is a better
-trigger than the one this file carried before: **sustained basket throughput
-around $5,000 a day**, at which point a $250 settlement is 5% of daily flow and
-can be clipped in under the 95% line without moving anything. Nothing here is
-within two orders of magnitude of that, and the measurement takes about a minute
-to repeat -- `PairCreated` for the pair set, `Swap` bucketed by day for the flow.
+Liquidity is not the blocker and this file said it was, twice, on measurements
+of the wrong venue. What remains is a real and different objection: **paying
+miners in an asset that a single beacon can pause, blocklist and `adminBurn`,
+and that cannot leave the chain, is handing them an IOU with an off-switch.**
+That is a judgement about counterparty risk rather than a mechanical
+impossibility, and it is the kind of trade this project takes deliberately
+elsewhere -- `payout.md` uses unMineable knowing exactly what it is, and says
+so, because the exposure is bounded to a day.
+
+The measurement to run before anything is built is no longer depth. It is
+whether a real swap of settlement size actually fills at the price the pool
+quotes: **one $10 buy of NVDA with USDG on the v3 500 pool**, which is the same
+argument `payout.md` makes about Across -- a priced route is not a delivered one.
+
+**A method note, since this is the third time.** Every wrong number here came
+from finding one contract that answered and treating it as the population.
+`getPair` on four pairs became "the chain"; seven v2 pairs became "the basket";
+seven selectors reverting became "no permissioning". The fix each time was to
+enumerate rather than sample -- `allPairsLength` was 41,741, the factory list
+was nine, and the control surface was one level up at the beacon. **Ask what
+the denominator is before quoting the numerator.**
 
 ## The legal question was being chased and it does not bind
 
