@@ -42,6 +42,30 @@ A high payout per worker is not an opportunity if the worker is an ASIC. So:
    `src/mine/ev.rs`'s rule, that a field this machine does not know means the
    answer does not exist.
 
+### The 2% nobody quotes, and why it is already in these numbers
+
+Stock yiimp carries `YAAMP_FEES_EXCHANGE = 2`, and it has exactly one use in the
+mining path (`core/backend/markets.php`):
+
+    $coin->price = $market->price * (1 - YAAMP_FEES_EXCHANGE/100);
+
+So every non-BTC coin is *stored* at 2% below what it can actually be sold for,
+and every earning is stamped with that discounted price. It is not a line item
+anywhere and no pool advertises it -- a 2% haircut on the price rather than a
+fee on the payout.
+
+**It is already inside every figure this file reports**, and that is the whole
+reason to write it down here rather than add it to a spreadsheet later.
+`estimate_current` is what the pool *credits*, after selling, so the haircut has
+already been taken by the time the number is published. Adding it again would
+double-count.
+
+The trap is for anybody building a cost model from the pool's fee page: the
+stated fee is 1%, the real deduction is 1% plus a 2% price haircut, and only the
+first is written down. That it lands inside the measurement here is luck rather
+than design -- it is a consequence of reading credited proceeds instead of
+computing expected value, which was chosen for a different reason entirely.
+
 ### The unit convention is derived, so it is checked
 
 zpool documents none of it. Read off the data: `estimate_current` is BTC per
