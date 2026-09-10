@@ -24,6 +24,7 @@ pub mod ev;
 pub mod hash;
 pub mod proto;
 pub mod header;
+pub mod neoscrypt;
 pub mod stratum;
 pub mod u256;
 pub mod work;

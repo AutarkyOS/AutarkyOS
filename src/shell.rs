@@ -7504,6 +7504,10 @@ fn parse_algo<'a>(w: &mut impl Iterator<Item = &'a str>) -> Option<crate::mine::
     match w.next().unwrap_or("") {
         "sha256d" => Some(Algo::Sha256d),
         "blake2s" => Some(Algo::Blake2s),
+        // No parameters, deliberately: N, r and the round count *are* the
+        // profile, so a chain that changed them would be a different proof of
+        // work rather than this one configured differently.
+        "neoscrypt" => Some(Algo::Neoscrypt),
         "yespower" => {
             // Explicit parameters and no per-coin preset table. A preset is a
             // number this tree would be asserting about somebody else's network
@@ -7524,7 +7528,7 @@ fn parse_algo<'a>(w: &mut impl Iterator<Item = &'a str>) -> Option<crate::mine::
             }
         }
         other => {
-            kprintln!("  no such algorithm '{}' -- try sha256d, blake2s or yespower", other);
+            kprintln!("  no such algorithm '{}' -- try sha256d, blake2s, neoscrypt or yespower", other);
             None
         }
     }

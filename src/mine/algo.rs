@@ -29,6 +29,7 @@ use alloc::vec::Vec;
 
 use super::blake2s;
 use super::hash;
+use super::neoscrypt::Neoscrypt;
 use super::yespower::{Version, Yespower};
 
 /// What a hash is waiting on.
@@ -70,6 +71,15 @@ pub enum Algo {
         r: u32,
         pers: Option<Vec<u8>>,
     },
+    /// Feathercoin's, and the one algorithm here with no parameters *and* no
+    /// midstate.
+    ///
+    /// N, r and the round count are not configurable the way yespower's are:
+    /// 128, 2 and 20 are the profile, and a chain that changed them would be
+    /// running a different proof of work rather than this one differently
+    /// configured. So there is nothing to carry on the wire, which is why this
+    /// variant is a bare name where `Yespower` is a structure.
+    Neoscrypt,
     /// RFC 7693 BLAKE2s-256 over the header. Verge's `blake2s` chain and
     /// others.
     ///
@@ -87,6 +97,7 @@ impl Algo {
             Algo::Yespower { v10: true, .. } => "yespower-1.0",
             Algo::Yespower { v10: false, .. } => "yespower-0.5",
             Algo::Blake2s => "blake2s",
+            Algo::Neoscrypt => "neoscrypt",
         }
     }
 
@@ -102,6 +113,11 @@ impl Algo {
             // therefore a shorter hold on the quantum, which is the direction
             // that is safe to be wrong in.
             Algo::Blake2s => 4096,
+            // Between the two by three orders of magnitude at each end. A
+            // NeoScrypt hash is two full SMix passes over 32 KiB, so it lands
+            // nearer yespower than sha256d -- measured on the GPU at 190 kH/s
+            // against sha256d's 630 MH/s, a factor of 3,300.
+            Algo::Neoscrypt => 64,
             // Measured rather than guessed: see `mine bench`. Small because one
             // yespower hash is three orders of magnitude more work than one
             // sha256d, by design.
@@ -128,6 +144,9 @@ impl Algo {
             // A midstate, a header and a digest. Register and L1 territory,
             // which is why these two never bound a device on memory.
             Algo::Sha256d | Algo::Blake2s => 256,
+            // Upstream's `(N + 3) * r * 2 * BLOCK_SIZE` plus the 608 bytes of
+            // FastKDF buffers. Fixed, because the profile is fixed.
+            Algo::Neoscrypt => (128 + 3) * 2 * 2 * 64 + 608,
             Algo::Yespower { v10, n, r, .. } => {
                 let (swidth, sboxes) = if *v10 { (11usize, 3usize) } else { (8, 2) };
                 // S-boxes, then V at 128*r*N, then X, B and the 128-byte
@@ -159,6 +178,10 @@ impl Algo {
             // ARX and integer addition over a working set that fits in
             // registers.
             Algo::Sha256d | Algo::Blake2s => Bound::Arithmetic,
+            // Two SMix passes of 256 dependent random reads each over 32 KiB.
+            // Measured on the GPU by removing SMix: it is 78% of a hash, and
+            // the FastKDF that remains is the other 22%.
+            Algo::Neoscrypt => Bound::Memory,
             // Sequentially dependent random reads over megabytes. The limit is
             // a cache's latency and nothing about the ALUs -- which is what
             // `design/mining.md` means by the budget being L3, and what makes
@@ -182,6 +205,7 @@ impl Algo {
         match self {
             Algo::Sha256d => String::from("sha256d"),
             Algo::Blake2s => String::from("blake2s (RFC 7693)"),
+            Algo::Neoscrypt => String::from("neoscrypt (N=128 r=2, ChaCha+Salsa)"),
             Algo::Yespower { v10, n, r, pers } => {
                 let mut s = String::from(if *v10 { "yespower 1.0 N=" } else { "yespower 0.5 N=" });
                 push_u32(&mut s, *n);
@@ -221,6 +245,7 @@ pub enum Hasher {
     Sha256d(hash::Midstate),
     Blake2s(blake2s::Midstate),
     Yespower(Yespower, Option<Vec<u8>>),
+    Neoscrypt(Neoscrypt),
 }
 
 impl Hasher {
@@ -230,6 +255,7 @@ impl Hasher {
         match algo {
             Algo::Sha256d => Some(Hasher::Sha256d(hash::Midstate::new(header))),
             Algo::Blake2s => Some(Hasher::Blake2s(blake2s::Midstate::new(header))),
+            Algo::Neoscrypt => Some(Hasher::Neoscrypt(Neoscrypt::new())),
             Algo::Yespower { v10, n, r, pers } => {
                 let v = if *v10 { Version::V1_0 } else { Version::V0_5 };
                 Some(Hasher::Yespower(Yespower::new(v, *n, *r)?, pers.clone()))
@@ -244,6 +270,7 @@ impl Hasher {
             Hasher::Sha256d(_) => 0,
             Hasher::Blake2s(_) => 0,
             Hasher::Yespower(y, _) => y.footprint(),
+            Hasher::Neoscrypt(n) => n.footprint(),
         }
     }
 
@@ -258,7 +285,10 @@ impl Hasher {
         match self {
             Hasher::Sha256d(mid) => *mid = hash::Midstate::new(header),
             Hasher::Blake2s(mid) => *mid = blake2s::Midstate::new(header),
-            Hasher::Yespower(..) => {}
+            // Neither depends on the header until `hash` is called, and
+            // rebuilding either would throw away its working set -- 8 MiB for
+            // yespower, 33 KiB for this one -- every time the pool sends work.
+            Hasher::Yespower(..) | Hasher::Neoscrypt(..) => {}
         }
     }
 
@@ -278,6 +308,11 @@ impl Hasher {
                 let mut h = *header;
                 h[76..80].copy_from_slice(&nonce.to_le_bytes());
                 y.hash(&h, pers.as_deref())
+            }
+            Hasher::Neoscrypt(n) => {
+                let mut h = *header;
+                h[76..80].copy_from_slice(&nonce.to_le_bytes());
+                n.hash(&h)
             }
         }
     }

@@ -83,6 +83,8 @@ pub mod mine {
     pub mod header;
     #[path = "../../../src/mine/blake2s.rs"]
     pub mod blake2s;
+    #[path = "../../../src/mine/neoscrypt.rs"]
+    pub mod neoscrypt;
     #[path = "../../../src/mine/yespower.rs"]
     pub mod yespower;
     #[path = "../../../src/mine/algo.rs"]

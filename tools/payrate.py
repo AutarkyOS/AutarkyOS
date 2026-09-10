@@ -94,6 +94,7 @@ OURS = {
     "sha256": (0.63e9, "native", "RTX 3050, cuda/xpu.cu, through the pool"),
     "blake2s": (1.28e9, "native", "RTX 3050, cuda/xpu.cu, through the pool"),
     "heavyhash": (0.383e9, "native", "RTX 3050, cuda/kheavy.cu heavy step -- an upper bound"),
+    "neoscrypt": (0.190e6, "native", "RTX 3050, cuda/neoscrypt.cu, 32768 threads"),
     "yespower": (1368.0, "emulated", "4 kernel slices under QEMU on 4 of 16 threads, reference code"),
 }
 
@@ -149,6 +150,7 @@ FIELD = {
     "neoscrypt":     ("gpu", None, "scrypt variant, GPU territory"),
     "verthash":      ("gpu", 1200, "Vertcoin, anti-ASIC by design, 1.2 GB data file"),
     "blake2s":       ("gpu", None, "what cuda/xpu.cu already computes"),
+    "equihash192":   ("gpu", 3336, "Equihash 192,7 -- a solver, not a hash; see design/equihash.md"),
 
     # --- CPU by construction ---
     "yespower":      ("cpu", None, "memory-hard, cache-resident, CPU-only by design"),
@@ -174,14 +176,18 @@ FIELD = {
     "balloon":       ("cpu", None, "balloon hashing, memory-hard"),
 }
 
-# Which bottleneck each family waits on, mirroring `Algo::bound` in the kernel.
-# Only the ones we can compute need this -- it is what decides whether two of
-# them can share a device productively.
-BOUND = {
-    "sha256": "arithmetic",
-    "blake2s": "arithmetic",
-    "heavyhash": "arithmetic",
-    "yespower": "memory",
+# Which device runs it and which bottleneck it waits on, mirroring
+# `Algo::bound` in the kernel. **Both halves are needed and the first was
+# missing at first**: two memory-bound algorithms contend only if they are on
+# the same silicon, and grouping by bound alone put the GPU's NeoScrypt and the
+# CPU's yespower in one bucket as though they competed. They do not share so
+# much as a cache.
+WHERE = {
+    "sha256": ("gpu", "arithmetic"),
+    "blake2s": ("gpu", "arithmetic"),
+    "heavyhash": ("gpu", "arithmetic"),
+    "neoscrypt": ("gpu", "memory"),
+    "yespower": ("cpu", "memory"),
 }
 
 
@@ -384,23 +390,28 @@ def main():
         for r in open_[:8]:
             print("  %-15s $%-9.4f a worker a day   %s" % (r["algo"], r["per_worker"], r["why"]))
 
-    # **Concurrency pays only across bottlenecks.** Two algorithms on one
-    # device that wait on the same thing simply halve each other, so the total
-    # is fixed and splitting only averages the rates down. Two that wait on
-    # different things can overlap. That is why this groups rather than sums.
+    # **Concurrency pays only across bottlenecks, and only on one device at a
+    # time.** Two algorithms competing for the same resource simply halve each
+    # other, so the total is fixed and splitting averages the rates down; two
+    # waiting on different things can overlap. `(device, bound)` is the pair
+    # that decides it -- the GPU's NeoScrypt and the CPU's yespower are both
+    # memory-bound and share nothing at all.
     if have:
         print()
-        print("what can run at once, by what it waits on:")
+        print("what can run at once, by device and by what it waits on:")
         best = {}
         for r in have:
-            b = BOUND.get(r["algo"], "unknown")
-            if r["ours_usd"] > best.get(b, (0.0, None))[0]:
-                best[b] = (r["ours_usd"], r["algo"])
+            k = WHERE.get(r["algo"], ("?", "unknown"))
+            if r["ours_usd"] > best.get(k, (0.0, None))[0]:
+                best[k] = (r["ours_usd"], r["algo"])
         total = 0.0
-        for b, (usd, algo) in sorted(best.items()):
-            print("  %-12s %-12s $%.6f a day" % (b, algo, usd))
+        for (dev, b), (usd, algo) in sorted(best.items()):
+            print("  %-4s %-11s %-12s $%.6f a day" % (dev, b, algo, usd))
             total += usd
-        print("  %-12s %-12s $%.6f a day" % ("", "together", total))
+        print("  %-4s %-11s %-12s $%.6f a day" % ("", "", "together", total))
+        print()
+        print("  That total is a prediction, not a measurement: nothing has yet run")
+        print("  two of these at once and compared the pair against each alone.")
         print()
         print("against $%.2f a day of electricity assumed: %.0fx underwater."
               % (a.power, a.power / total if total else float("inf")))

@@ -95,6 +95,10 @@ fn parse_coin(spec: &str) -> Result<Coin, String> {
     let algo = match parts.next().unwrap_or("") {
         "sha256d" => Algo::Sha256d,
         "blake2s" => Algo::Blake2s,
+        // No parameters after the name, unlike yespower: N, r and the round
+        // count are the NeoScrypt profile rather than settings, so a chain
+        // varying them would be a different proof of work.
+        "neoscrypt" => Algo::Neoscrypt,
         "yespower" => {
             let v = parts.next().unwrap_or("");
             let n: u32 = parts

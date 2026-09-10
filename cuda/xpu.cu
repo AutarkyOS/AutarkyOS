@@ -46,6 +46,7 @@
 #include "algo.cuh"
 #include "sha256d.cuh"
 #include "blake2s.cuh"
+#include "neoscrypt.cuh"
 
 // The target, most significant word first. Its own symbol rather than the
 // headers' own, because those ship fixed benchmark targets and this one
@@ -101,7 +102,7 @@ __device__ __forceinline__ void blake2s_header_hash(uint32_t nonce, uint32_t out
     for (int i = 0; i < 8; ++i) out[i] = xB2Mid[i] ^ v[i] ^ v[8 + i];
 }
 
-enum XAlgo { X_SHA256D = 0, X_BLAKE2S = 1 };
+enum XAlgo { X_SHA256D = 0, X_BLAKE2S = 1, X_NEOSCRYPT = 2 };
 
 // Nonces per thread. Two, which is what `design/xpu.md` measured: widening the
 // instruction-level parallelism past that bought nothing on this part.
@@ -137,6 +138,31 @@ __global__ void xpu_scan_kernel(uint32_t base, uint32_t *found) {
             atomicMin(found, n0 + j);
         }
     }
+}
+
+// NeoScrypt does not fit the kernel above and cannot be made to.
+//
+// The template scans `NPT` nonces per thread out of registers alone, which is
+// exactly right for a hash whose whole state is a digest. NeoScrypt needs 32
+// KiB of scratchpad *per concurrent hash*, so a thread does one nonce and the
+// launch is bounded by memory rather than by the range asked for.
+//
+// The scratchpad is allocated once, on the first NeoScrypt job, and never
+// freed. Lazily because a device mining only sha256d should not be holding a
+// gigabyte it never touches; once, because allocating per scan would put a
+// `cudaMalloc` inside the hot loop.
+#define NS_MAX_THREADS 32768u
+
+__global__ void xpu_neoscrypt_kernel(uint32_t base, uint32_t *found,
+                                     uint32_t *v, uint8_t *kdf, uint32_t live) {
+    const uint32_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= live) return;
+    uint32_t h[8];
+    neoscrypt_hash_at(base + idx, h, v + (size_t)idx * NS_SCRATCH_WORDS,
+                      kdf + (size_t)idx * NS_KDF_BYTES);
+    // NeoScrypt's digest is already in host word order, like BLAKE2s and
+    // unlike SHA-256d.
+    if (below_target_le(h, xTarget)) atomicMin(found, base + idx);
 }
 
 #define CK(x) do { cudaError_t e_ = (x); if (e_ != cudaSuccess) { \
@@ -204,6 +230,23 @@ static void b2_host_compress(uint32_t h[8], const uint8_t blk[64],
     for (int i = 0; i < 8; ++i) h[i] ^= v[i] ^ v[8 + i];
 }
 
+// Take the NeoScrypt scratchpad, once. Answers non-zero when the card will not
+// give it, which is a refusal the parent can act on rather than a crash.
+static int ns_setup(uint32_t **v, uint8_t **kdf) {
+    if (*v) return 0;
+    const size_t vbytes = (size_t)NS_MAX_THREADS * NS_SCRATCH_WORDS * sizeof(uint32_t);
+    const size_t kbytes = (size_t)NS_MAX_THREADS * NS_KDF_BYTES;
+    if (cudaMalloc(v, vbytes) != cudaSuccess) { *v = NULL; return -1; }
+    if (cudaMalloc(kdf, kbytes) != cudaSuccess) {
+        cudaFree(*v);
+        *v = NULL;
+        return -1;
+    }
+    fprintf(stderr, "[xpu] neoscrypt scratchpad %.0f MiB for %u threads\n",
+            vbytes / 1048576.0, NS_MAX_THREADS);
+    return 0;
+}
+
 static int set_job(int algo, const uint8_t header[80], const uint8_t target_be[32]) {
     uint32_t tgt[8];
     for (int i = 0; i < 8; ++i) tgt[i] = sha_be32(target_be + 4 * i);
@@ -220,6 +263,15 @@ static int set_job(int algo, const uint8_t header[80], const uint8_t target_be[3
         CK(cudaMemcpyToSymbol(cIV, hIV, sizeof hIV));
         CK(cudaMemcpyToSymbol(cMid, mid, sizeof mid));
         CK(cudaMemcpyToSymbol(cTail, tail, sizeof tail));
+        return 0;
+    }
+
+    if (algo == X_NEOSCRYPT) {
+        // Nothing to precompute. FastKDF tiles all eighty bytes across its
+        // buffer before the first PRF call, so there is no invariant prefix to
+        // absorb -- the same property yespower has and the reason neither gets
+        // a midstate.
+        neoscrypt_upload(header);
         return 0;
     }
 
@@ -254,6 +306,8 @@ int main(void) {
     // nothing at all down a pipe, not even its greeting.
     setvbuf(stdout, NULL, _IONBF, 0);
 
+    uint32_t *d_ns_v = NULL;
+    uint8_t *d_ns_kdf = NULL;
     uint32_t *d_found = NULL;
     if (cudaMalloc(&d_found, sizeof(uint32_t)) != cudaSuccess) {
         fprintf(stderr, "cuda: no device\n");
@@ -280,6 +334,7 @@ int main(void) {
             int a;
             if (!strcmp(an, "sha256d")) a = X_SHA256D;
             else if (!strcmp(an, "blake2s")) a = X_BLAKE2S;
+            else if (!strcmp(an, "neoscrypt")) a = X_NEOSCRYPT;
             else { printf("err this device cannot compute %s\n", an); continue; }
 
             uint8_t header[80], target[32];
@@ -304,28 +359,61 @@ int main(void) {
             if (cudaMemcpy(d_found, &none, 4, cudaMemcpyHostToDevice) != cudaSuccess) {
                 printf("err upload\n"); continue;
             }
-            // Rounded down to whole blocks. A partial block would mean the
-            // last threads working nonces outside what was asked for, and a
-            // nonce found outside the range is one the parent cannot account
-            // for.
-            const int threads = 256;
-            uint32_t per_block = (uint32_t)threads * NPT;
-            uint32_t blocks = count / per_block;
-            if (blocks == 0) blocks = 1;
-            uint32_t done = blocks * per_block;
-
-            if (algo == X_SHA256D)
-                xpu_scan_kernel<X_SHA256D><<<blocks, threads>>>(base, d_found);
-            else
-                xpu_scan_kernel<X_BLAKE2S><<<blocks, threads>>>(base, d_found);
-
-            if (cudaDeviceSynchronize() != cudaSuccess) {
-                printf("err launch: %s\n", cudaGetErrorString(cudaGetLastError()));
-                continue;
-            }
+            // **The whole count, in as many launches as it takes.**
+            //
+            // This rounded down to whole blocks and reported what it had
+            // actually done, which the parent did not read -- so a scan of
+            // 1,000 nonces did 512 and the miner advanced its cursor by 1,000,
+            // skipping the difference. Silent, and it grew teeth with
+            // NeoScrypt, whose launch is capped by a gigabyte of scratchpad
+            // rather than by the range: a request for 47,000 nonces can only
+            // put 32,768 in flight, and the other 14,000 would never be
+            // searched at all.
+            //
+            // Looping here rather than reporting a short scan keeps the pipe's
+            // meaning simple -- `scan N` searches N nonces -- and the parent
+            // already sizes N to about a quarter second from a measured rate,
+            // so no single call runs long.
+            uint32_t done = 0;
             uint32_t got = none;
-            if (cudaMemcpy(&got, d_found, 4, cudaMemcpyDeviceToHost) != cudaSuccess) {
-                printf("err readback\n"); continue;
+            while (done < count) {
+                const uint32_t want = count - done;
+                uint32_t here;
+                if (algo == X_NEOSCRYPT) {
+                    if (ns_setup(&d_ns_v, &d_ns_kdf)) {
+                        printf("err no room for a neoscrypt scratchpad\n");
+                        break;
+                    }
+                    const int threads = 64;
+                    here = want < NS_MAX_THREADS ? want : NS_MAX_THREADS;
+                    const uint32_t blocks = (here + threads - 1) / threads;
+                    xpu_neoscrypt_kernel<<<blocks, threads>>>(
+                        base + done, d_found, d_ns_v, d_ns_kdf, here);
+                } else {
+                    const int threads = 256;
+                    const uint32_t per_block = (uint32_t)threads * NPT;
+                    uint32_t blocks = (want + per_block - 1) / per_block;
+                    here = blocks * per_block;
+                    if (algo == X_SHA256D)
+                        xpu_scan_kernel<X_SHA256D><<<blocks, threads>>>(base + done, d_found);
+                    else
+                        xpu_scan_kernel<X_BLAKE2S><<<blocks, threads>>>(base + done, d_found);
+                }
+                if (cudaDeviceSynchronize() != cudaSuccess) {
+                    printf("err launch: %s\n", cudaGetErrorString(cudaGetLastError()));
+                    got = none;
+                    done = count;
+                    break;
+                }
+                done += here;
+                if (cudaMemcpy(&got, d_found, 4, cudaMemcpyDeviceToHost) != cudaSuccess) {
+                    printf("err readback\n");
+                    got = none;
+                    break;
+                }
+                // Stop at the first hit: the parent resumes from that nonce, so
+                // searching past it would be work it is about to ask for again.
+                if (got != none) break;
             }
             if (got != none) printf("found %08x\n", got);
             else printf("none %u\n", done);
@@ -335,5 +423,7 @@ int main(void) {
         printf("err unknown\n");
     }
     cudaFree(d_found);
+    cudaFree(d_ns_v);
+    cudaFree(d_ns_kdf);
     return 0;
 }

@@ -123,6 +123,95 @@ fn init() -> [u32; 8] {
     h
 }
 
+/// The parameter block for a keyed 32-byte digest, folded into `h[0]`.
+///
+/// Same field layout as `init`, with the key length in bits 15..8 -- so a
+/// 32-byte key gives `0x0101_2020`. NeoScrypt's optimised path hard-codes the
+/// result of XORing that into the IV as `0x6B08C647`, which is
+/// `0x6A09_E667 ^ 0x0101_2020`, and that constant is the whole of the evidence
+/// that the keying here is the keying there. A key length left out of the
+/// parameter block is the loudest possible mistake and the quietest possible
+/// symptom: every digest is well-formed and none of them is BLAKE2s.
+fn init_keyed(key_len: usize) -> [u32; 8] {
+    let mut h = IV;
+    h[0] ^= 0x0101_0000 | ((key_len as u32) << 8) | 32;
+    h
+}
+
+fn finish(h: &[u32; 8]) -> [u8; 32] {
+    let mut out = [0u8; 32];
+    for i in 0..8 {
+        out[i * 4..i * 4 + 4].copy_from_slice(&h[i].to_le_bytes());
+    }
+    out
+}
+
+/// Keyed BLAKE2s-256 over an arbitrary message.
+///
+/// RFC 7693 section 2.9: the key is zero-padded to a whole 64-byte block and
+/// **prepended to the message**, so the byte counter starts at 64 rather than
+/// at 0 and a keyed hash is one block longer than the unkeyed hash of the same
+/// bytes. Writing this as "hash the key then the message" -- the obvious
+/// reading, and the one that produces a plausible digest -- gets the counter
+/// wrong on every block and agrees with nobody.
+///
+/// The empty-message case is separate because the key block is then the *last*
+/// block. A loop that always compressed the key block as an interior one would
+/// go on to compress an all-zero final block, which is a different function.
+pub fn keyed(key: &[u8], msg: &[u8]) -> [u8; 32] {
+    let mut h = init_keyed(key.len());
+    let mut t = 0u64;
+
+    if !key.is_empty() {
+        let mut b = [0u8; 64];
+        b[..key.len()].copy_from_slice(key);
+        t = 64;
+        if msg.is_empty() {
+            compress(&mut h, &b, t, true);
+            return finish(&h);
+        }
+        compress(&mut h, &b, t, false);
+    } else if msg.is_empty() {
+        let b = [0u8; 64];
+        compress(&mut h, &b, 0, true);
+        return finish(&h);
+    }
+
+    let mut i = 0;
+    while i + 64 < msg.len() {
+        let mut b = [0u8; 64];
+        b.copy_from_slice(&msg[i..i + 64]);
+        t += 64;
+        compress(&mut h, &b, t, false);
+        i += 64;
+    }
+    let mut b = [0u8; 64];
+    b[..msg.len() - i].copy_from_slice(&msg[i..]);
+    t += (msg.len() - i) as u64;
+    compress(&mut h, &b, t, true);
+    finish(&h)
+}
+
+/// The exact shape NeoScrypt's FastKDF asks for: a 32-byte key over a 64-byte
+/// input, which is two compressions and nothing else.
+///
+/// Specialised rather than left to `keyed` because FastKDF calls it 32 times
+/// per KDF and twice per hash, so this is on the hot path of every nonce. The
+/// lengths are in the type, so there is no padding to compute, no loop to
+/// enter, and no `min` that could be wrong: block one is the key at counter
+/// 64, block two is the input at counter 128 and carries the final flag.
+///
+/// Checked against `keyed` rather than trusted, because a specialised copy of a
+/// general function is exactly the thing that drifts from it.
+pub fn keyed_64(key: &[u8; 32], input: &[u8; 64]) -> [u8; 32] {
+    let mut h = init_keyed(32);
+    let mut b = [0u8; 64];
+    b[..32].copy_from_slice(key);
+    compress(&mut h, &b, 64, false);
+    compress(&mut h, input, 128, true);
+    finish(&h)
+}
+
 /// BLAKE2s-256 of an arbitrary message, unkeyed.
 pub fn hash(msg: &[u8]) -> [u8; 32] {
     let mut h = init();

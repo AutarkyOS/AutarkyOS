@@ -578,6 +578,82 @@ reason `mine sweep` does not: the guest sees four of sixteen threads, so the
 curve bends on cores long before it could bend on cache. It goes in the
 hardware runbook beside the sweep.
 
+## NeoScrypt, which is the fourth algorithm and the first one measured end to end
+
+Three implementations, one oracle, and the oracle came first.
+
+    tools/neoscrypt.py     the reference, transliterated from ghostlander's C
+    cuda/neoscrypt.cu      the RTX 3050, 190 kH/s
+    src/mine/neoscrypt.rs  ring 0, 34,144 bytes of working set
+
+**Upstream ships no test vectors, so the chain is the vector.** Feathercoin
+forked to NeoScrypt at block 432,000, and a block is only on that chain because
+its digest beat the target its own `nbits` declares -- so reproducing one is a
+coincidence at one in `2^256 / target`. Six blocks across the whole NeoScrypt
+era, at odds from 1 in 7e7 to 1 in 8e10. The header assembly is pinned
+separately by a property of the coin: Feathercoin is a Litecoin fork, so its
+*block* hash is SHA-256d while its *proof of work* is NeoScrypt, and the
+explorer's own block hash therefore confirms all eighty bytes before NeoScrypt
+is asked anything.
+
+**The vector earned its place on the first run.** `blkmix`'s output
+permutation is evens-then-odds, which at r=2 is a swap of the middle two
+chunks; the first version read upstream's comment and swapped chunks 1 and 3.
+It returned 32 bytes, deterministically, and one flipped nonce bit moved 133 of
+256 output bits -- textbook avalanche. Every internal claim passed. Only a real
+block said no.
+
+### What the card does with it, and two null results
+
+    full kernel      176.2 ms / 32768 hashes     186 kH/s
+    FastKDF only      38.7 ms                    846 kH/s
+
+So **SMix is 78% of a hash** and a perfect FastKDF is worth 1.28x at most.
+
+Two optimisations were predicted, written, measured and rejected, which is
+worth more than the 190 kH/s figure:
+
+**Interleaving the scratchpad is a 46% loss.** Every memory-bound CUDA kernel
+wants per-thread arrays interleaved so a warp's thirty-two reads of "word i of
+my own array" fall in one cache line. Written, and it measured 105 kH/s against
+194. It cannot help here because the index is *data-dependent per thread* --
+SMix reads `V[64 * (X[48] & 127)]` and `X[48]` is thirty-two different values
+across a warp -- so the reads scatter whatever the layout, and interleaving
+destroys the locality that is available.
+
+**Occupancy is not the bound either.** The kernel uses all 255 registers a
+thread may have, which caps a multiprocessor at 256 threads. Capping registers
+by hand to buy warps back:
+
+    -maxrregcount    64      96     128     168    none
+    kH/s            159     188     188     194     191
+
+Four times the resident warps and 22% of the rate. The machine is waiting on
+something more warps do not hide.
+
+**This is 190 kH/s and a tuned miner does five to ten times that.** The gap is
+known and is not addressed: the scrypt-family technique splits the sixteen
+words of each Salsa or ChaCha block across four cooperating threads and
+exchanges them with warp shuffles. NeoScrypt chains its four chunks serially,
+so the cooperation has to happen inside a block rather than across them, which
+is a rewrite rather than a tuning pass.
+
+### Equihash 192,7 was researched and refused
+
+See `design/equihash.md`, which is kept in full. The short version is that the
+refusal is architectural rather than about effort: everything in `src/mine/`
+answers "given a header and a nonce, what is the digest", and Equihash answers
+"given a header and a nonce, which 400-byte solutions exist, if any". The wire,
+the miner, the pool's validator and `cuda/algo.cuh`'s contract would all have
+to change. Memory is survivable at 3.26 GiB against 3,836 free.
+
+One finding from it belongs here rather than only there, because it is the same
+failure this document keeps recording: **zpool serves one `equihash192` bucket
+spanning four coins with three different BLAKE2b personalisation strings.** A
+solver with one hardcoded prefix is wrong for two of the four, at full speed,
+producing structurally perfect solutions that every pool rejects with no
+diagnostic.
+
 ## Splitting one device across a field, which is mechanism and not policy
 
 A card at half a gigahash is not one coin's worth of hashrate. The question is

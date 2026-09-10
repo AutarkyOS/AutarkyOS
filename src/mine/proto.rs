@@ -191,6 +191,14 @@ fn push_algo(s: &mut String, a: &Algo) {
             write_str(s, "blake2s");
             s.push('}');
         }
+        // A bare name, and that is not the shortcut it looks like. N, r and
+        // the round count *are* the NeoScrypt profile rather than settings, so
+        // there is nothing a pool could vary and nothing a miner could get
+        // wrong -- which is precisely why yespower cannot be sent this way.
+        Algo::Neoscrypt => {
+            write_str(s, "neoscrypt");
+            s.push('}');
+        }
         Algo::Yespower { v10, n, r, pers } => {
             write_str(s, "yespower");
             s.push_str(",\"v10\":");
@@ -382,6 +390,7 @@ fn take_algo(j: &Json) -> Option<Algo> {
     match j.get("name")?.as_str()? {
         "sha256d" => Some(Algo::Sha256d),
         "blake2s" => Some(Algo::Blake2s),
+        "neoscrypt" => Some(Algo::Neoscrypt),
         "yespower" => {
             let v10 = j.get("v10").and_then(|x| x.as_bool())?;
             let n = j.get("n").and_then(|x| x.as_i64())?;
