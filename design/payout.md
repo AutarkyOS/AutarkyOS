@@ -317,6 +317,32 @@ differentiator; only the chain is.
 in LTC cost 0.005% of revenue. Monthly in BTC on a bad day costs 256%. That is
 a factor of fifty thousand between two arrangements of the same mining.
 
+### The withdrawal-fee comparison below is moot: zpool pays it
+
+Kept rather than deleted, because the mistake is the instructive part and it is
+the third time in one day that measuring overturned something reasoned.
+
+zpool's own FAQ, fetched as raw JSON from `/json/faq.json` after the rendered
+page proved to be JS-only:
+
+> **"Will I get charged a fee when I am paid?"**
+> "No, the pool pays the transaction fees."
+
+So the chain's transaction fee never comes out of the payout, and the careful
+table below -- LTC 91x cheaper than BTC, 4,542x on a busy day -- describes a cost
+this operator does not bear. **The only axis that matters is the threshold**,
+and on that the answer changes: **DOGE at 6 days beats LTC at 37**, with nothing
+to offset it.
+
+The general shape of the error: a real, correctly measured quantity that turns
+out not to be *paid by us*. Measuring it was not the mistake; assuming it landed
+on our side of the ledger was.
+
+**And the conversion fee runs backwards from the intuition too.** Auto-exchange
+costs the flat 1%. Being paid in a coin you *did* mine adds a 1% "Direct Earn"
+levy on top. So being paid in something you never mined is the cheap path, which
+is the opposite of what anybody would guess.
+
 ### The threshold, which was the biggest unknown and is now the clearest number
 
 zpool carries an undocumented `minimum_payout` in `/api/currencies` -- 219 coins,
