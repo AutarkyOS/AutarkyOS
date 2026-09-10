@@ -83,6 +83,38 @@ Tolerable here, and not at scale.
 Kryptex is the trustworthy alternative -- **USDC on Polygon**, 1.5 USDC minimum,
 flat 0.5 USDC fee, so 33% at the minimum and 5% if allowed to reach 10.
 
+### NiceHash is out, and the reason is the best cautionary tale here
+
+Worth a paragraph because the failure is not a fee, it is a mechanism that
+destroys the balance, and nothing about it is visible from the fee schedule.
+
+NiceHash has restructured into a Bitcoin-only platform: **ETH is delisted**, the
+order-book exchange is dead -- all 112 markets read `REMOVED`, last trade 2024 --
+and of 79 currencies exactly three are live, BTC plus USDT and USDC **on
+Ethereum and Solana only**. No L2 at any size. Mining pays USDT for exactly one
+of 21 algorithms and it is a Bitcoin-ASIC one.
+
+But the thing that actually kills it is the **60-day rule**. Funds unused for 50
+days are swept, and in NiceHash's own words: *"if the inactive balance is less
+than 20,000 satoshis or 10 USDT/USDC ... it will be deducted as a 60-Day Rule
+Non-Transferable Amount Fee instead."* Below threshold, **the whole balance is
+taken as the fee**.
+
+At $0.07 a day you accrue $3.43 in fifty days. The BTC sweep threshold is
+$15.43 and the USDT one is $10.00. **The balance can never outrun the clock**,
+so the account loses essentially all revenue on a rolling basis. And the
+withdrawal minimum for USDT is *the same 10 units* as the confiscation
+threshold, which is not a coincidence: the documentation says the confiscation
+happens precisely because the balance is below the minimum transfer amount. The
+balance is destroyed at the exact moment it would first become withdrawable.
+
+Full KYC -- ID, proof of address, liveness check, beneficial-owner declaration --
+is required before earning a single satoshi of that.
+
+The general lesson is the one this whole section is about: **a venue's fee table
+is not its cost.** Nothing in NiceHash's fee schedule is unreasonable. The
+dormancy rule, in a different document, takes everything.
+
 ### Two things to check before trusting any of this with money
 
 **Nobody has observed a completed Across fill on 4663.** The SpokePool bytecode
