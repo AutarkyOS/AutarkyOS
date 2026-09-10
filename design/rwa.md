@@ -161,10 +161,39 @@ impossibility, and it is the kind of trade this project takes deliberately
 elsewhere -- `payout.md` uses unMineable knowing exactly what it is, and says
 so, because the exposure is bounded to a day.
 
-The measurement to run before anything is built is no longer depth. It is
-whether a real swap of settlement size actually fills at the price the pool
-quotes: **one $10 buy of NVDA with USDG on the v3 500 pool**, which is the same
-argument `payout.md` makes about Across -- a priced route is not a delivered one.
+### The swap was quoted, at every size that matters
+
+That was the last mechanical unknown, so it was closed rather than left as a
+recommendation. Uniswap's `QuoterV2` on this chain
+(`0x33e885eD0Ec9bF04EcfB19341582aADCb4c8A9E7`, 8,273 bytes) simulates the swap
+against live state, USDG into NVDA on the 500 pool:
+
+    $1     ->   0.004578 NVDA    $218.43/NVDA    +0.000%
+    $10    ->   0.045781 NVDA    $218.43         +0.000%
+    $84    ->   0.384556 NVDA    $218.43         +0.000%
+    $250   ->   1.144512 NVDA    $218.43         +0.000%
+    $630   ->   2.884163 NVDA    $218.43         +0.000%
+    $5,000 ->  22.889561 NVDA    $218.44         +0.003%
+
+The last column is the effective price against a $1 clip, so it is slippage with
+the fee already in both sides. **A quarterly settlement moves the price by
+nothing that can be measured**, and the size at which this design would start to
+care is four orders of magnitude above what it will ever convert.
+
+What remains unrun is an actual filled transaction, which needs funds on the
+chain and is the same caveat `payout.md` records against Across: a quote is not
+a fill. But a quote off the real quoter against live reserves is a much stronger
+position than the priced-route-never-observed one, and nothing about the
+liquidity is in question any more.
+
+**One engineering consequence, because it is easy to miss.**
+`contracts/src/GladosDistributor.sol` talks to `IUniswapV2Pair` directly -- it
+reads `getReserves()` and calls `swap()`, which was the right choice when the
+target was the launchpad's own V2 pair and there was no trustworthy router. None
+of that reaches a V3 pool. Paying in tokenized stock means a second swap path in
+that contract, against `SwapRouter02`
+(`0xCaf681a66D020601342297493863E78C959E5cb2`) or a direct pool swap with the V3
+callback. The distributor is not a few lines from doing this.
 
 **A method note, since this is the third time.** Every wrong number here came
 from finding one contract that answered and treating it as the population.
