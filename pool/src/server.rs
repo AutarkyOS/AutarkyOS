@@ -31,6 +31,7 @@ use std::time::{Duration, Instant};
 use crate::json::Json;
 use crate::mine::proto;
 use crate::mine::stratum::take_line;
+use crate::budget::Budget;
 use crate::pool::{Pool, Verdict};
 use crate::vardiff::VarDiff;
 
@@ -93,6 +94,29 @@ impl Drop for ConnectionSlot {
     fn drop(&mut self) {
         LIVE_CONNECTIONS.fetch_sub(1, Ordering::Relaxed);
     }
+}
+
+/// The pool-wide validation budget, shared by every connection.
+///
+/// **A `Mutex` and not an atomic**, because admitting costs a refill against
+/// the clock, a lookup and a subtraction, and doing that as three atomics
+/// makes an interleaving where two connections both see enough budget and both
+/// spend it -- which is the bound failing exactly when it is under pressure.
+/// It is held for a few hundred nanoseconds and never across a validation.
+static BUDGET: Mutex<Option<Budget>> = Mutex::new(None);
+
+/// Set the share of one core the pool may spend validating. Zero is no limit.
+pub fn set_cpu_percent(percent: f64) {
+    *BUDGET.lock().unwrap() = Some(Budget::new(percent));
+}
+
+/// What the budget has measured, for the operator's report.
+pub fn budget_report() -> Vec<(String, f64, f64)> {
+    BUDGET.lock().unwrap().as_ref().map(|b| b.report()).unwrap_or_default()
+}
+
+pub fn budget_denied() -> u64 {
+    BUDGET.lock().unwrap().as_ref().map(|b| b.denied()).unwrap_or(0)
 }
 
 pub fn serve(addr: &str, pool: Arc<Mutex<Pool>>) -> std::io::Result<()> {
@@ -272,7 +296,53 @@ fn handle(mut stream: TcpStream, pool: Arc<Mutex<Pool>>, peer: &str) -> std::io:
                         continue;
                     }
 
+                    // **The total bound, which the per-connection one is not.**
+                    // `MAX_SUBMITS_PER_SEC` caps this connection; nothing
+                    // capped two hundred and fifty-six of them, and the
+                    // arithmetic that made the per-connection figure look safe
+                    // was never multiplied by `MAX_CONNECTIONS`.
+                    //
+                    // The algorithm is looked up before validating because
+                    // that is what the cost depends on -- a sha256d share is
+                    // 2.4 us on the machine this was deployed to and a
+                    // yespower one is 19,000.
+                    let algo_name = {
+                        let p = pool.lock().unwrap();
+                        p.algo_of_job(&sh.job)
+                    };
+                    let name = algo_name.unwrap_or_else(|| String::from("?"));
+                    let admitted = {
+                        let mut g = BUDGET.lock().unwrap();
+                        match g.as_mut() {
+                            None => true,
+                            Some(b) => b.admit(&name),
+                        }
+                    };
+                    if !admitted {
+                        // Dropped rather than answered, like the rate limit
+                        // above and for the same reason: a reply is a second
+                        // thing to send to somebody the pool is already
+                        // struggling to serve. The miner treats an unanswered
+                        // submit as its own category, which is what it is.
+                        if bad < 4 {
+                            println!("[pool] {worker} share deferred: validation budget spent");
+                        }
+                        continue;
+                    }
+
+                    let began = Instant::now();
                     let verdict = pool.lock().unwrap().submit(&worker, &sh);
+                    // Timed here rather than estimated anywhere, because
+                    // assuming this number is precisely what went wrong: the
+                    // 7.5 ms in the comment above was measured on a different
+                    // machine and the real one is 19 ms.
+                    {
+                        let took = began.elapsed().as_secs_f64() * 1e6;
+                        let mut g = BUDGET.lock().unwrap();
+                        if let Some(b) = g.as_mut() {
+                            b.record(&name, took);
+                        }
+                    }
                     // Accepted shares are the record and are always logged. A
                     // refusal is logged for the first few and then counted,
                     // because at twenty a second one line each fills a journal

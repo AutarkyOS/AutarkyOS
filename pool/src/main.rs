@@ -155,6 +155,7 @@ fn main() {
     let mut ledger: Option<String> = None;
     let mut prices: Option<String> = None;
     let mut window: Option<u64> = None;
+    let mut cpu_percent: f64 = 50.0;
     let mut coins: Vec<Coin> = Vec::new();
     let mut it = args.iter();
     while let Some(a) = it.next() {
@@ -180,6 +181,14 @@ fn main() {
                     std::process::exit(2);
                 }
             },
+            // Percent of **one core**, not of the machine. Zero is no limit.
+            "--cpu-percent" => match it.next().and_then(|v| v.parse::<f64>().ok()) {
+                Some(n) if n.is_finite() && (0.0..=10_000.0).contains(&n) => cpu_percent = n,
+                _ => {
+                    eprintln!("--cpu-percent wants 0..10000 (percent of one core, fractional ok; 0 is no limit)");
+                    std::process::exit(2);
+                }
+            },
             "--window" => match it.next().and_then(|v| v.parse::<u64>().ok()) {
                 Some(w) if w > 0 => window = Some(w),
                 _ => {
@@ -200,6 +209,10 @@ fn main() {
                 println!("  COIN is label:algo:bits[:asset][@host:port,user[,pass]]");
                 println!("  --prices PATH reads what tools/prices.py wrote and says");
                 println!("            whether each coin can be sold at all");
+                println!("  --cpu-percent N caps *total* validation at N% of one core.");
+                println!("            Per-connection limits never bounded the sum: 256");
+                println!("            connections at 20 submits a second of yespower is");
+                println!("            ninety-seven cores. Default 50. 0 is no limit.");
                 println!("  --window N is the payout window, in work. A share credits");
                 println!("            2^bits, so the default 2^32 is one difficulty-1");
                 println!("            share's worth. PPLNS pays a worker its slice of");
@@ -305,6 +318,15 @@ fn main() {
         eprintln!("[pool] --bad-proof: every proof will be deliberately wrong");
         glados_pool::pool::lie_about_proofs();
     }
+    // Before the listener, so the bound exists from the first connection
+    // rather than from whenever a share happens to arrive.
+    server::set_cpu_percent(cpu_percent);
+    if cpu_percent <= 0.0 {
+        eprintln!("[pool] no validation budget: this pool will use whatever the machine has");
+    } else {
+        println!("[pool] validation budget {cpu_percent}% of one core");
+    }
+
     glados_pool::upstream::start_all(Arc::clone(&pool));
     let reporter = Arc::clone(&pool);
     // The share log is the whole product of a non-custodial pool: Layer 1
@@ -327,6 +349,20 @@ fn main() {
                 t.work, t.accepted, t.stale, t.bad, t.duplicate
             );
         }
+        // What the budget has actually measured on *this* machine, and what
+        // it therefore allows. The whole reason it exists is that the figure
+        // in `server.rs`'s comment was measured somewhere else and was out by
+        // 2.5x, so a pool that did not print its own would repeat that.
+        let denied = server::budget_denied();
+        for (algo, us, per_s) in server::budget_report() {
+            println!(
+                "[budget] {algo}  {us:.1} us a share, so {per_s:.0} a second within the cap"
+            );
+        }
+        if denied > 0 {
+            println!("[budget] {denied} share(s) deferred so far; raise --cpu-percent to admit more");
+        }
+
         // **What each worker is actually owed, which the tally does not say.**
         // The tally is all-time; a payout comes from the window. Printing only
         // the first is how an operator ends up paying against the wrong number

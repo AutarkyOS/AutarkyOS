@@ -97,6 +97,7 @@ pub mod mine {
     pub mod ev;
 }
 
+pub mod budget;
 pub mod market;
 pub mod pool;
 pub mod server;

@@ -404,6 +404,18 @@ impl Pool {
         )
     }
 
+    /// Which algorithm a job wants, without validating anything.
+    ///
+    /// The budget needs this *before* the share is checked, because what a
+    /// check costs is a property of the algorithm and the decision is whether
+    /// to pay it at all.
+    pub fn algo_of_job(&self, job: &str) -> Option<String> {
+        self.issued
+            .iter()
+            .find(|(id, _)| id == job)
+            .map(|(_, j)| String::from(j.algo.name()))
+    }
+
     /// Every configured coin's label, in slot order.
     pub fn coin_labels(&self) -> Vec<String> {
         self.coins.iter().map(|c| c.label.clone()).collect()
