@@ -93,6 +93,30 @@ A *local* coin sends no proof and there is a claim that it does not: with no
 chain behind it the coinbase would be a fabrication, and a proof verifying
 against an invented header is worse than none because it looks like evidence.
 
+### The same opacity buys something, and only the cost was written down
+
+Rosenfeld's analysis of pooled reward systems proposes **oblivious shares** as
+the real answer to block withholding: shares a miner cannot recognise as full
+blocks without submitting them. Both withholding attacks need that recognition
+-- sabotage is discarding a block you know you found, and lie-in-wait is
+delaying one while you pile hashrate into the pool holding it -- and he notes
+the idea would need a change to Bitcoin itself.
+
+This protocol approximates it for nothing. The job carries
+`target_with_leading_zeros(bits)`, which is the miner's own VarDiff **share**
+target; `up_target` lives in the pool's `Issued` record and never crosses the
+wire. Combined with the assembled header above, a miner running this protocol
+has neither the network target nor a coinbase to reason about, and cannot tell
+a block from an ordinary share.
+
+**It is obfuscation and not a guarantee, and overselling it would be worse than
+not having it.** A miner that knows which coin it is on can read the network
+target off a block explorer and do the comparison itself. What it changes is
+the cost: withholding stops being free and becomes deliberate. Recorded here
+because this section had the cost of the opaque header and not the compensating
+benefit, and a design note that lists only one side of a trade is how the trade
+gets undone by somebody tidying up.
+
 ## JSON lines, for one reason
 
 Newline-delimited JSON objects, the way Stratum is. Not because it is a good
@@ -552,6 +576,68 @@ introduce one on the way out.
 seconds and returned early on an elapsed zero -- but eight shares inside one
 second is the most extreme flood there is, so the fastest miners, the entire
 reason the file exists, were the one case that never retargeted.
+
+### And a soak found the other end of it: a connection can be too short
+
+VarDiff needs either eight accepted shares or sixty seconds of idle before it
+moves. So **it cannot converge on a connection shorter than sixty seconds**,
+and its state was per connection, so a miner that reconnects often restarted at
+the operator's guess every single time.
+
+Measured, two profiles of the same Python miner against the same pool for the
+same four hours, differing only in how long a connection lasts:
+
+    soak-long   30-minute connections   24 -> 12 -> 10 -> 8 bits, shares credited
+    soak-churn  45-second connections   19 consecutive cycles, 0 shares accepted
+
+Nothing about the churn miner was wrong. It hashed, it was answered, it was
+asked for 24 bits every time and 24 bits is four thousand times more work than
+it could do in a cycle. A flaky link or a phone that sleeps its radio *is* that
+miner, which makes this the device class the pool was built for rather than a
+corner case.
+
+`Pool::converged` remembers where each `(worker, slot)` settled and `hello`
+resumes from there. A worker name is unauthenticated and does not need to be:
+credit is denominated in work, so claiming somebody else's easier start pays
+proportionally less per share and buys nothing, and claiming a harder one only
+hurts the claimant.
+
+### Every bound driven past, and what that turned up
+
+`tools/poolabuse.py` goes past each limit in `server.rs` against a throwaway
+instance on its own port. Driven on the host the pool runs on:
+
+    MAX_BAD              33 answered, then dropped        exact
+    MAX_SUBMITS_PER_SEC  60 offered in 1 ms, 20 answered, connection still open
+    MAX_LINE             131,158 bytes with no newline, stream closed
+    MAX_CONNECTIONS      300 attempted, 256 welcomed, 44 refused, 0 errors
+    budget at 1%         1,540 offered, 323 answered, 0.01 cores
+    budget at 25%        3,620 offered, 1,469 answered, 0.23 cores
+
+Every ceiling held to the share, and a connection turned out to cost one
+thread, one descriptor and 28 KiB -- 258 threads and 8,184 KiB at the ceiling,
+back to 2 and 908 KiB afterwards.
+
+**What the limits could not catch is the thing worth recording.** The tally is
+keyed by `(worker, coin)` and a worker name is whatever a stranger types, so
+sixty seconds of ordinary flooding with a fresh name per connection left 248
+records, 104 KiB resident and 31 KiB of ledger JSON -- which is re-serialised,
+rewritten and published every sixty seconds thereafter. At four connections a
+second that is fourteen thousand records an hour, and **every one of the four
+connection limits held perfectly while it happened.** It is the same shape as
+the hole `budget.rs` was written to close: each bound correct, and the quantity
+they were collectively bounding not bounded at all.
+
+The cap is not a plain ceiling, because a plain ceiling is the same denial of
+service one step later -- the flood simply arrives first and the real miner is
+refused. Room is made by dropping records with **zero credited work**, and
+never one with work in it: work required hashes that met a target, so it cannot
+be manufactured cheaply, which turns the cap into a proof-of-work admission
+rule. A flood of invented names can fill the map and can never displace a miner
+who has done something. Both directions are claims, including the branch where
+the map is genuinely full of paid workers and the pool refuses rather than
+evicting one of them -- a refusal path that has never run is a bound that
+panics the first time it matters.
 
 ## A restart no longer starts from zero
 

@@ -366,6 +366,18 @@ fn main() {
         if denied > 0 {
             println!("[budget] {denied} share(s) deferred so far; raise --cpu-percent to admit more");
         }
+        // Both maps are keyed by a worker name and a worker name is whatever a
+        // stranger types, so both are capped -- and a cap that bites without
+        // saying so is how an operator ends up looking for a miner's record in
+        // the wrong place. Printed only when it is actually biting.
+        if p.untallied() > 0 {
+            println!(
+                "[pool] {} verdict(s) went unrecorded: {} of {} tally slots are held by workers with credited work",
+                p.untallied(),
+                p.tally_len(),
+                glados_pool::pool::MAX_TALLIES
+            );
+        }
 
         // **What each worker is actually owed, which the tally does not say.**
         // The tally is all-time; a payout comes from the window. Printing only

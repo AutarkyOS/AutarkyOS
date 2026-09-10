@@ -222,6 +222,7 @@ fn handle(mut stream: TcpStream, pool: Arc<Mutex<Pool>>, peer: &str) -> std::io:
                     for (slot, v) in vd.iter_mut().enumerate() {
                         if let Some(b) = v.on_idle() {
                             println!("[pool] {worker} slot {slot} eased to {b} bits");
+                            pool.lock().unwrap().remember_bits(&worker, slot, b);
                         }
                     }
                     issue_all(&mut stream, &pool, &vd)?;
@@ -270,9 +271,17 @@ fn handle(mut stream: TcpStream, pool: Arc<Mutex<Pool>>, peer: &str) -> std::io:
                     worker = h.worker.clone();
                     println!("[pool] {peer} hello  worker={} agent={}", h.worker, h.agent);
                     let slots = pool.lock().unwrap().slots();
+                    // `resume_bits` and not `start_bits`: VarDiff cannot
+                    // converge on a connection shorter than its own sixty
+                    // second idle window, so without this a miner that
+                    // reconnects often restarts at the operator's guess every
+                    // time and never retargets at all. See `Pool::converged`
+                    // for the soak that found it.
                     vd = {
                         let p = pool.lock().unwrap();
-                        (0..slots as usize).map(|i| VarDiff::new(p.start_bits(i))).collect()
+                        (0..slots as usize)
+                            .map(|i| VarDiff::new(p.resume_bits(&worker, i)))
+                            .collect()
                     };
                     let w = proto::Welcome {
                         v: proto::VERSION,
@@ -435,6 +444,7 @@ fn handle(mut stream: TcpStream, pool: Arc<Mutex<Pool>>, peer: &str) -> std::io:
                             if let Some(v) = vd.get_mut(slot) {
                                 if let Some(b) = v.on_share() {
                                     println!("[pool] {worker} slot {slot} retargeted to {b} bits");
+                                    pool.lock().unwrap().remember_bits(&worker, slot, b);
                                     // Sent straight away rather than at the next
                                     // job period: a miner that just proved it is
                                     // fast should not spend another thirty

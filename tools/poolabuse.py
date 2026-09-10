@@ -262,6 +262,53 @@ def t_conns(a):
     return 0
 
 
+# --------------------------------------------------------- the tally map
+
+def t_names(a):
+    """Register worker names as fast as one connection is allowed to.
+
+    The flood test cycles a name per *connection*, which is slow. But `hello`
+    may be re-sent on a live connection and it simply overwrites the worker
+    name, and a submit naming a job the pool does not hold answers `Stale` --
+    which is tallied and which **costs no validation at all**, because
+    `Pool::submit` looks the job up before it hashes.
+
+    So this is a write into an unbounded map at the per-connection message
+    rate, buying a permanent record per message, with the validation budget
+    never consulted because nothing is validated. It is the cheapest way in
+    and therefore the one worth measuring.
+    """
+    c = Conn(a.host, a.port, "names-0")
+    c.hello()
+    collect_jobs(c, want=1, timeout=6.0)
+    made = 0
+    t0 = time.time()
+    while made < a.n and time.time() - t0 < a.seconds:
+        for _ in range(20):
+            if made >= a.n:
+                break
+            made += 1
+            c.send({"id": made, "method": "glados.hello",
+                    "params": {"v": 1, "worker": "%s%d" % (a.prefix, made),
+                               "agent": "abuse/1"}})
+            c.send({"id": made, "method": "glados.submit",
+                    "params": {"job": "ffffffff", "nonce": "00000001", "echo": {}}})
+        # Drain so the pool is never blocked writing to us, and stay under the
+        # per-second submit cap.
+        end = time.time() + 1.05
+        while time.time() < end:
+            try:
+                if c.line(timeout=end - time.time()) is None:
+                    break
+            except socket.timeout:
+                break
+    c.close()
+    took = time.time() - t0
+    out({"test": "tally-names", "names_offered": made, "seconds": round(took, 1),
+         "names_per_s": round(made / took, 1)})
+    return 0
+
+
 # ------------------------------------------------------------- the budget
 
 def flood_worker(a, idx, stop, stats):
@@ -274,7 +321,12 @@ def flood_worker(a, idx, stop, stats):
     offered = answered = conns = 0
     while not stop.is_set():
         try:
-            c = Conn(a.host, a.port, "abuse-flood%d" % idx, timeout=10.0)
+            # A fresh worker name per connection is not a stranger test than
+            # a fixed one -- it is a *different* test. The pool tallies by
+            # (worker, coin) and a worker name is unauthenticated, so what this
+            # measures is whether the tally is bounded by anything at all.
+            name = ("abuse-f%d-%d" % (idx, conns + 1)) if a.fresh_names else ("abuse-flood%d" % idx)
+            c = Conn(a.host, a.port, name, timeout=10.0)
             c.hello()
             jobs = collect_jobs(c, want=1, timeout=6.0)
             if not jobs:
@@ -360,12 +412,19 @@ def main():
     p.add_argument("-n", type=int, default=300)
     p.add_argument("--hold", type=float, default=0.0,
                    help="seconds to hold every connection open before closing")
+    p = sub.add_parser("names")
+    p.add_argument("-n", type=int, default=5000)
+    p.add_argument("--seconds", type=float, default=400.0)
+    p.add_argument("--prefix", default="ghost-")
     p = sub.add_parser("flood")
     p.add_argument("--conns", type=int, default=6)
     p.add_argument("--seconds", type=float, default=30.0)
+    p.add_argument("--fresh-names", action="store_true",
+                   help="a new worker name per connection")
     a = ap.parse_args()
     return {"badshares": t_badshares, "ratelimit": t_ratelimit,
-            "bigline": t_bigline, "conns": t_conns, "flood": t_flood}[a.cmd](a)
+            "bigline": t_bigline, "conns": t_conns, "flood": t_flood,
+            "names": t_names}[a.cmd](a)
 
 
 if __name__ == "__main__":

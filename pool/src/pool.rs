@@ -227,6 +227,34 @@ pub struct Contribution {
 /// and the difference comes out of everybody who stayed. Under PPLNS the
 /// window keeps moving whether or not you are in it, so leaving costs you the
 /// window and there is nothing to game.
+///
+/// **That last sentence is true under an assumption this pool does not get to
+/// make, and the assumption is worth naming.** Rosenfeld's analysis of pooled
+/// reward systems (arXiv:1112.4980, §3.3) proves the hopping-proofness of this
+/// *simple* variant only while difficulty and block reward are constant. He
+/// then drops it: a participant's contribution is fixed by the difficulty when
+/// the share was submitted, while the reward it earns is set by the difficulty
+/// when the block is found, so a hopper who knows a retarget is coming joins
+/// before a decrease and leaves before an increase. Small chains retarget
+/// often, and `payrate.py` selects for exactly those.
+///
+/// The hopping-proof form is **unit-PPLNS**, which stores two more things per
+/// share: the value of `p` at submission -- share difficulty over *network*
+/// difficulty -- and the block reward then in force. `Contribution.work` is
+/// `2^bits`, which is the miner's own VarDiff target and says nothing about
+/// the network. So this is not a scheme to swap in; it is blocked on the same
+/// missing number `market.rs` is blocked on, which is the sharpest reason yet
+/// to want it.
+///
+/// **And the window size is a dial, not an optimum.** Rosenfeld again: reward
+/// variance goes as `pB^2/N` and mean time to being paid as `pN/2`, so their
+/// **product is fixed at `(pB)^2/2` whatever N is**. There is no best window;
+/// there is a choice between miners paid smoothly and miners paid soon, and
+/// `--window` being an operator constant is right. What is missing is telling
+/// the operator which end they picked, and that needs `p`, which needs the
+/// network target. At the classic `N = D` the payouts per share are Poisson
+/// with mean one, so **37% of shares are never paid at all** -- a fact a miner
+/// who does not know it reads as the pool cheating.
 pub struct Window {
     /// Oldest first. A `Vec` and not a `VecDeque` because the whole thing is
     /// walked to compute a payout anyway, and the front is popped a handful of
@@ -327,7 +355,62 @@ pub struct Pool {
     /// derived would be worse than asking.
     window_work: u64,
     next_job: u64,
+    /// Where each worker's difficulty had got to, per `(worker, slot)`.
+    ///
+    /// **VarDiff cannot converge on a connection shorter than it.** Its idle
+    /// path fires at `WINDOW_SECS`, sixty seconds, and its share path wants
+    /// eight accepted shares -- so a miner reconnecting every forty-five
+    /// seconds restarts at `start_bits` every time and never retargets at all.
+    /// Found by a soak that deliberately churned: nineteen consecutive
+    /// forty-five-second connections, zero shares accepted, while a
+    /// thirty-minute one on the identical miner eased from 24 bits to 8 and
+    /// was credited normally. Nothing about the miner differed but how long it
+    /// stayed.
+    ///
+    /// A flaky link or a phone is exactly that miner, so this is not a corner
+    /// case -- it is the device class the pool exists to serve.
+    ///
+    /// **A worker name is unauthenticated and it does not need to be.** The
+    /// worst somebody can do by claiming another worker's name is start at a
+    /// difficulty that does not suit them, and credit is denominated in work,
+    /// so an easier start pays proportionally less per share and buys nothing.
+    /// A harder one only hurts the claimant.
+    ///
+    /// Bounded, for the reason `tallies` is: the key is attacker-chosen.
+    converged: HashMap<(String, usize), u32>,
+    /// Where the counters go for a worker the tally has no room for. See
+    /// `tally`. Never read; it exists so the refusal costs nothing and needs
+    /// no second signature.
+    discard: Tally,
+    /// How many verdicts went to `discard`. Printed, because a cap that bites
+    /// silently is a cap nobody knows about.
+    untallied: u64,
 }
+
+/// How many `(worker, slot)` difficulties are remembered across reconnects.
+///
+/// A ceiling rather than an eviction policy: the value is an optimisation, so
+/// losing one costs a miner one convergence and costs the pool nothing, while
+/// the machinery to decide *which* to lose is state of its own on a path that
+/// runs under load. Past this, a reconnecting worker starts where it always
+/// did, which is the behaviour that existed before this map.
+const MAX_REMEMBERED: usize = 4096;
+
+/// How many `(worker, coin)` records the tally will hold.
+///
+/// **The key is a worker name and a worker name is unauthenticated**, so
+/// without a bound this map is a stranger's write primitive against a machine
+/// that is not ours. Measured: sixty seconds of ordinary flooding with a fresh
+/// name per connection left 248 records, 104 KiB of resident memory and 31 KiB
+/// of ledger JSON -- which is then re-serialised and rewritten every sixty
+/// seconds, forever, and published. At four connections a second that is
+/// fourteen thousand records an hour.
+///
+/// Not caught by any of the four connection limits, and it could not be: every
+/// one of them held perfectly while this grew underneath them. It is the same
+/// shape of failure `budget.rs` was written about -- each bound correct, and
+/// the thing they were all bounding not bounded at all.
+pub const MAX_TALLIES: usize = 4096;
 
 /// A window of 2^32, which is the work in one difficulty-1 share.
 ///
@@ -368,7 +451,34 @@ impl Pool {
             windows: HashMap::new(),
             window_work: DEFAULT_WINDOW_WORK,
             next_job: 1,
+            converged: HashMap::new(),
+            discard: Tally::default(),
+            untallied: 0,
         }
+    }
+
+    /// The difficulty a worker should resume at on this slot, falling back to
+    /// the coin's configured start when it has never converged here.
+    pub fn resume_bits(&self, worker: &str, slot: usize) -> u32 {
+        self.converged
+            .get(&(String::from(worker), slot))
+            .copied()
+            .unwrap_or_else(|| self.start_bits(slot))
+    }
+
+    /// Record where a worker's difficulty settled, so its next connection does
+    /// not start over. Silently declines past `MAX_REMEMBERED`.
+    pub fn remember_bits(&mut self, worker: &str, slot: usize, bits: u32) {
+        let key = (String::from(worker), slot);
+        if self.converged.contains_key(&key) || self.converged.len() < MAX_REMEMBERED {
+            self.converged.insert(key, bits);
+        }
+    }
+
+    /// How many difficulties are being remembered. For the operator report and
+    /// for the claim that the map is bounded.
+    pub fn remembered(&self) -> usize {
+        self.converged.len()
     }
 
     /// How much work the payout window holds. Zero is refused rather than
@@ -680,10 +790,46 @@ impl Pool {
         Verdict::Accepted
     }
 
+    /// The record for one worker on one coin, creating it if there is room.
+    ///
+    /// **Room is made by dropping records that are owed nothing, and never by
+    /// dropping one that is.** A record with `work > 0` was paid for in hashes
+    /// that actually met a target, so it cannot be manufactured cheaply and it
+    /// is the only kind a payout ever reads. A record with zero work is a
+    /// stranger's bad and stale shares, which cost nothing to produce in any
+    /// quantity. Evicting the second class to protect the first turns the cap
+    /// from a denial of service into a proof-of-work admission rule: a flood
+    /// of invented names can fill this map and can never crowd out a miner
+    /// who has done something.
+    ///
+    /// A refused verdict goes to `discard` rather than being an `Option` the
+    /// four call sites have to unwrap. It is counted, and the count is printed,
+    /// because the operator's question when a worker is missing from the ledger
+    /// is exactly whether this happened.
     fn tally(&mut self, worker: &str, coin: &str) -> &mut Tally {
-        self.tallies
-            .entry((String::from(worker), String::from(coin)))
-            .or_default()
+        let key = (String::from(worker), String::from(coin));
+        if !self.tallies.contains_key(&key) && self.tallies.len() >= MAX_TALLIES {
+            self.tallies.retain(|_, t| t.work > 0);
+            if self.tallies.len() >= MAX_TALLIES {
+                self.untallied += 1;
+                self.discard = Tally::default();
+                return &mut self.discard;
+            }
+        }
+        self.tallies.entry(key).or_default()
+    }
+
+    /// How many verdicts were dropped because the tally was full of records
+    /// that are owed something. Nonzero means the cap is genuinely binding
+    /// rather than merely present.
+    pub fn untallied(&self) -> u64 {
+        self.untallied
+    }
+
+    /// How many `(worker, coin)` records are held. For the operator report and
+    /// for the claim that the map is bounded.
+    pub fn tally_len(&self) -> usize {
+        self.tallies.len()
     }
 
     /// The share log, which is the whole product of a non-custodial pool and
@@ -1255,6 +1401,101 @@ mod tests {
     /// Equal effort must earn equal credit, whatever difficulty it was at.
     ///
     /// This is the property that pays people fairly, and it is exactly what
+    /// A stranger cycling worker names must not be able to push a miner who
+    /// has actually done work out of the ledger.
+    ///
+    /// This is the claim the cap exists for, and the cap alone does not make
+    /// it true -- a plain ceiling would refuse the *real* miner whenever the
+    /// flood got there first, which is the same denial of service arriving one
+    /// step later. What makes it hold is that eviction only ever takes records
+    /// with zero credited work, and credited work costs hashes that met a
+    /// target.
+    ///
+    /// Driven the wrong way round on purpose: the flood fills the map *first*,
+    /// so the honest worker arrives to a map that is already full. A test that
+    /// registered the miner first would pass on a naive ceiling and prove
+    /// nothing.
+    #[test]
+    fn invented_names_cannot_crowd_out_a_worker_with_credited_work() {
+        let mut p = a_pool();
+        for i in 0..(MAX_TALLIES + 500) {
+            p.tally("flood-{i}".replace("{i}", &i.to_string()).as_str(), "t").bad += 1;
+        }
+        assert!(p.tally_len() <= MAX_TALLIES, "the map is bounded");
+
+        // An accepted share is what "did work" means, and it is the one thing
+        // in this test that cannot be faked cheaply.
+        let t = p.tally("real", "t");
+        t.accepted += 1;
+        t.work += 1 << 20;
+        assert_eq!(p.tally("real", "t").work, 1 << 20, "the record was created");
+
+        // Now flood again, harder than the whole map, and it must still be there.
+        for i in 0..(MAX_TALLIES * 2) {
+            p.tally("later-{i}".replace("{i}", &i.to_string()).as_str(), "t").stale += 1;
+        }
+        assert_eq!(
+            p.tally("real", "t").work,
+            1 << 20,
+            "a worker with credited work survives a flood of invented names"
+        );
+        assert!(p.tally_len() <= MAX_TALLIES, "still bounded after the second flood");
+        // And nothing was refused, which is the interesting half: the cap did
+        // not have to turn anybody away, because everything it dropped was a
+        // record owed nothing. `untallied` is for the case below.
+        assert_eq!(p.untallied(), 0, "eviction found room without refusing anyone");
+    }
+
+    /// The other end of the same rule: when the map really is full of workers
+    /// who are owed something, there is nothing safe to drop and the pool says
+    /// so instead of dropping one of them.
+    ///
+    /// This is the branch that would be dead code if only the flood case were
+    /// tested, and a bound whose refusal path has never run is a bound that
+    /// panics the first time it matters.
+    #[test]
+    fn a_tally_full_of_paid_workers_refuses_rather_than_evicting_one() {
+        let mut p = a_pool();
+        for i in 0..MAX_TALLIES {
+            let t = p.tally("paid-{i}".replace("{i}", &i.to_string()).as_str(), "t");
+            t.accepted += 1;
+            t.work += 1 << 10;
+        }
+        assert_eq!(p.tally_len(), MAX_TALLIES, "full, and every record is owed something");
+
+        p.tally("newcomer", "t").bad += 1;
+        assert_eq!(p.tally_len(), MAX_TALLIES, "nobody was evicted to make room");
+        assert_eq!(p.untallied(), 1, "and the refusal was counted rather than silent");
+        assert_eq!(
+            p.tally("paid-0", "t").work,
+            1 << 10,
+            "the record that would have been evicted is intact"
+        );
+    }
+
+    /// A difficulty is remembered across reconnects, and the map that
+    /// remembers it is bounded by the same argument.
+    #[test]
+    fn a_difficulty_survives_a_reconnect_and_the_map_is_bounded() {
+        let mut p = a_pool();
+        let fresh = p.resume_bits("nobody", 0);
+        assert_eq!(fresh, p.start_bits(0), "an unknown worker starts where it always did");
+
+        p.remember_bits("phone", 0, 11);
+        assert_eq!(p.resume_bits("phone", 0), 11, "and a known one does not start over");
+        assert_eq!(p.resume_bits("phone", 1), p.start_bits(1), "per slot, not per worker");
+
+        for i in 0..(MAX_REMEMBERED + 100) {
+            p.remember_bits("w-{i}".replace("{i}", &i.to_string()).as_str(), 0, 12);
+        }
+        assert!(p.remembered() <= MAX_REMEMBERED, "bounded");
+        // Already present, so it is an update rather than an insertion and the
+        // cap must not refuse it. A cap that refused updates would freeze every
+        // remembered difficulty the moment the map filled.
+        p.remember_bits("phone", 0, 9);
+        assert_eq!(p.resume_bits("phone", 0), 9, "an existing entry is still updated when full");
+    }
+
     /// VarDiff broke about a raw share count: a miner retargeted to 12 bits
     /// finds 256 times as many shares as one at 20 for the same work. Counting
     /// shares would pay it 256 times as much.

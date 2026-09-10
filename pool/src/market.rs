@@ -35,6 +35,22 @@
 //! share on *our* pool worth", which is the question this file is eventually
 //! for and which still wants the arithmetic above.
 //!
+//! ### The network target is not only an expected-value blocker
+//!
+//! Worth stating here because this is where its absence is recorded, and the
+//! second consequence is larger than the first. `Window`'s doc explains it in
+//! full: Rosenfeld proves simple PPLNS hopping-proof only while difficulty is
+//! constant, and the hopping-proof variant stores each share's value of `p` --
+//! share difficulty over *network* difficulty -- rather than raw work. So the
+//! missing number is the difference between the scheme this pool runs and the
+//! one it believes it runs, on chains that retarget often, which is precisely
+//! the class `payrate.py` selects for.
+//!
+//! It is also what would let the window's own variance-against-maturity
+//! tradeoff be printed at startup instead of chosen blind. One absent
+//! quantity, three consequences: no expected value, no hopping proof, and an
+//! operator dial with no units on it.
+//!
 //! ### The refusal is the product
 //!
 //! Naming a coin the price file cannot quote is the whole of what this is for.

@@ -377,6 +377,26 @@ impl Rates {
 /// the point -- a scheduler that also decided what a coin was worth would have
 /// to be rewritten every time the answer changed.
 ///
+/// **What the weights should be, when something does set them.** Soria, Moya
+/// and Mohazab (*Finance Research Letters* 53:103610) model mining as a Tullock
+/// contest and their first-order condition is the ordinary one: buy hash until
+/// marginal revenue equals marginal cost. Where the scarce thing is
+/// device-seconds rather than hashes, that says give the next second to the
+/// coin with the highest marginal revenue per second and equalise marginal
+/// revenue across the coins being run -- which is `payrate.py`'s measured
+/// dollars per day, and needs no learner, because the reward is quoted rather
+/// than unknown.
+///
+/// Their own individual-rationality constraint is worth writing down beside it,
+/// since it is about this machine specifically. Mining happens only while
+/// profit is positive, and at a corner the optimum is zero hash: in their
+/// asymmetric simulation the high-cost miner "chooses the hash value of zero at
+/// the end". This laptop earns $0.07 a day against $0.36 of electricity, so the
+/// model's answer for the whole device is `h* = 0`. A profitability-weighted
+/// `choose` is therefore solving a subproblem whose outer problem has a corner
+/// solution, and that is a fact about the subproblem rather than an objection
+/// to solving it.
+///
 /// Pure, and separate from the loop for that reason: what it does is
 /// arithmetic over a table, and arithmetic is the half that can be checked
 /// without a pool, a socket or a GPU.
