@@ -814,7 +814,35 @@ pub fn engine_refusal() -> alloc::string::String {
     if let Some(what) = agent::doing() {
         return alloc::format!("the model is busy {} -- 'agent stop' cancels it", what);
     }
-    alloc::string::String::from("another task holds the model")
+    // **Ask the holder rather than the flags.** Everything above this line
+    // consults a flag, which is the exact question `with_engine` was changed to
+    // stop asking: "is somebody's *job* running" answers no for any holder that
+    // was never given a flag, and the nightly `godel` trial and `work`'s two
+    // claims are all flagless. So the fallback used to name nobody, and on the
+    // GF63 it did -- `ask` answered "another task holds the model" while
+    // `mind_busy` was false and `agent::doing` was `None`, leaving an operator
+    // with a machine that refused every model command and no way to find out
+    // which task to chase.
+    //
+    // The holder is an id and the id is enough: `snapshot` turns it into the
+    // name the task was spawned with, and a holder whose slot has gone is worth
+    // saying out loud rather than smoothing over.
+    match engine_holder() {
+        Some(id) => match crate::task::snapshot(id) {
+            Some(t) => alloc::format!(
+                "task {} ('{}') holds the model, and neither the mind nor the agent knows about it",
+                id,
+                t.name
+            ),
+            None => alloc::format!(
+                "task {} holds the model and no longer exists -- the claim outlived its holder",
+                id
+            ),
+        },
+        None => alloc::string::String::from(
+            "the model is free; whatever refused did so for another reason",
+        ),
+    }
 }
 
 /// Which task holds the engine, for diagnostics. `None` when it is free.
