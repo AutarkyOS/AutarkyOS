@@ -596,6 +596,10 @@ pub extern "efiapi" fn efi_main(image: Handle, st: *mut SystemTable) -> Status {
     // in a moment ago.
     repair::attempt_all();
 
+    // And the other direction: a repair still applied to a subsystem that has
+    // started passing without it is a workaround that outlived its bug.
+    repair::recheck_persisted();
+
     // Said here rather than only where it happened: by now the fault itself
     // has scrolled past a hundred ok lines, and the line that matters is
     // "this machine is running without X".
@@ -1223,6 +1227,10 @@ fn install_paging(boot: &BootInfo, frames: &mut mem::frame::EarlyFrames) {
 /// captures nothing, so this costs nothing and buys the whole repair loop.
 fn section(name: &'static str, need: boot_report::Need, f: fn()) {
     use cpu::recover::Caught;
+    // Recorded whether it passes or not, because a repair already applied to
+    // this subsystem has to be re-testable: passing with a repair holding it up
+    // and passing because the bug was fixed look the same from anywhere else.
+    boot_report::note_check(name, f);
     match cpu::recover::guarded(f) {
         Caught::Ran => {}
         Caught::Unguarded(_) => {

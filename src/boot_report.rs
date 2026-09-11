@@ -96,6 +96,36 @@ pub fn failures() -> impl Iterator<Item = Failure> {
     slots.iter().filter_map(|s| *s).collect::<alloc::vec::Vec<_>>().into_iter()
 }
 
+/// Every check that ran, whether or not it passed.
+///
+/// **Recorded because a repair has to be re-testable after it has worked.** A
+/// subsystem that is passing *because* a repair is holding it up and one that
+/// is passing because somebody fixed the bug look identical from here, and the
+/// only way to tell them apart is to take the repair away and run the check
+/// again -- which needs the check, which only the failures were keeping.
+static CHECKS: Racy<[Option<(&'static str, fn())>; SLOTS]> = Racy::new([None; SLOTS]);
+
+pub fn note_check(name: &'static str, f: fn()) {
+    let slots = unsafe { CHECKS.get() };
+    for s in slots.iter_mut() {
+        if s.is_none() {
+            *s = Some((name, f));
+            return;
+        }
+    }
+}
+
+/// The check a subsystem passed or failed, so it can be run a second time.
+pub fn check_for(name: &str) -> Option<fn()> {
+    unsafe { CHECKS.get() }.iter().flatten().find(|(n, _)| *n == name).map(|(_, f)| *f)
+}
+
+/// Whether a subsystem failed this boot. A subsystem that is still broken has
+/// nothing to say about whether its repair is still needed.
+pub fn failed(name: &str) -> bool {
+    unsafe { FAILURES.get() }.iter().flatten().any(|f| f.name == name)
+}
+
 /// Note that a repair worked, without forgetting that it was ever broken.
 pub fn mark_repaired(name: &str, action: &'static str) {
     let slots = unsafe { FAILURES.get() };

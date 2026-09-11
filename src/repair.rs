@@ -49,6 +49,15 @@ pub struct Action {
     pub apply: fn() -> bool,
     /// Put it back. Called when the judge did not pass.
     pub revert: fn(),
+    /// Whether writing this down for the next boot means anything.
+    ///
+    /// **`retry` is the reason this field exists.** It applies nothing, so
+    /// persisting it asks the next boot to run a check that boot runs anyway --
+    /// a line in a capped file that can never change an outcome, and one that
+    /// would push a real repair out of the eighth slot. An action worth
+    /// recording is one that leaves the machine in a different state than it
+    /// would otherwise be in.
+    pub persist: bool,
 }
 
 fn retry_apply() -> bool {
@@ -75,6 +84,7 @@ pub static ACTIONS: &[Action] = &[
         offered_for: &[],
         apply: retry_apply,
         revert: nothing,
+        persist: false,
     },
     Action {
         name: "skip-hwp",
@@ -82,6 +92,7 @@ pub static ACTIONS: &[Action] = &[
         offered_for: &["power"],
         apply: skip_hwp_apply,
         revert: skip_hwp_revert,
+        persist: true,
     },
 ];
 
@@ -128,6 +139,17 @@ pub fn in_force() -> impl Iterator<Item = (&'static str, &'static str)> {
 /// with strings read off a FAT partition, which anything that can mount that
 /// partition can edit -- so without it, a text file could aim a power register
 /// knob at the filesystem. The rule that binds a chooser binds a file.
+/// Whether `apply_named` would accept this pair, without applying anything.
+///
+/// Split out so the recording end can ask the applying end rather than
+/// reimplementing its rules -- which is exactly how they came to disagree.
+pub fn would_apply(subsystem: &str, action: &str) -> bool {
+    ACTIONS
+        .iter()
+        .find(|a| a.name == action)
+        .is_some_and(|a| a.offered_for.is_empty() || a.offered_for.contains(&subsystem))
+}
+
 pub fn apply_named(subsystem: &str, action: &str) -> Option<(&'static str, &'static str)> {
     let a = ACTIONS.iter().find(|a| a.name == action)?;
     if !a.offered_for.is_empty() && !a.offered_for.contains(&subsystem) {
@@ -219,7 +241,14 @@ pub fn attempt_all() {
                 // One read back off the disk is already recorded, and appending
                 // it every boot is how an eight-entry file fills with one
                 // entry.
-                if !applied_from_disk(f.name, action) {
+                // Only actions that change something are worth writing down,
+                // and only ones this boot decided for itself -- see `persist`
+                // and `applied_from_disk`.
+                let worth_keeping = ACTIONS
+                    .iter()
+                    .find(|a| a.name == action)
+                    .is_some_and(|a| a.persist);
+                if worth_keeping && !applied_from_disk(f.name, action) {
                     note(&ADOPTED, (f.name, action));
                 }
             }
@@ -337,6 +366,49 @@ pub fn selftest() -> bool {
         "and judging leaves the selftest window exactly as it found it",
     );
 
+    // **The `retry` rule, stated as a property rather than as a row.** An
+    // action that applies nothing cannot change what the next boot does, so
+    // persisting it spends a slot in a capped file on a line with no effect.
+    claim(
+        &mut ok,
+        ACTIONS.iter().any(|a| a.persist) && ACTIONS.iter().any(|a| !a.persist),
+        "the table has both kinds, so the distinction is being exercised",
+    );
+    claim(
+        &mut ok,
+        {
+            let before = crate::dev::power::hwp_skipped();
+            let unchanged = ACTIONS.iter().filter(|a| !a.persist).all(|a| {
+                (a.apply)();
+                let same = crate::dev::power::hwp_skipped() == before;
+                (a.revert)();
+                same
+            });
+            unchanged
+        },
+        "and an action that does not persist is one that changes no knob",
+    );
+
+    // A file may name anything, so `apply_named` is the gate rather than the
+    // caller. Both refusals are the misattribution claim again, arriving by the
+    // route an edited text file would take.
+    claim(
+        &mut ok,
+        apply_named("power", "no-such-action").is_none(),
+        "a repair this kernel does not have is refused however it was asked for",
+    );
+    claim(
+        &mut ok,
+        {
+            let narrow = ACTIONS.iter().find(|a| !a.offered_for.is_empty());
+            match narrow {
+                Some(a) => apply_named("nothing-by-this-name", a.name).is_none(),
+                None => true,
+            }
+        },
+        "and a narrow one aimed at a subsystem it was never offered for",
+    );
+
     // ---- apply and revert --------------------------------------------------
     //
     // Found by name: an index would keep passing while testing whichever row
@@ -382,6 +454,61 @@ fn applied_from_disk(subsystem: &str, action: &str) -> bool {
         .iter()
         .flatten()
         .any(|(s, a)| *a == action && (*s == subsystem || *s == "any"))
+}
+
+/// Report any repair whose subsystem now passes without it.
+///
+/// **The rule this closes: a repair never silently replaces a fix.** A
+/// workaround adopted for a bug somebody has since actually fixed would
+/// otherwise live on the boot volume forever, and from every other vantage
+/// point a subsystem held up by a repair looks exactly like one that is simply
+/// working.
+///
+/// So the repair is taken away, the check is run again, and it is put back
+/// whatever the answer. Put back rather than left off deliberately: this
+/// reports, and withdrawing a repair the machine has been relying on is the
+/// operator's decision, not a side effect of looking.
+///
+/// A subsystem that failed this boot is skipped -- it is still broken, so it
+/// has nothing to say about whether its repair is still needed.
+pub fn recheck_persisted() {
+    use crate::kprintln;
+    for (sub, act) in in_force() {
+        if sub == "any" || crate::boot_report::failed(sub) {
+            continue;
+        }
+        let Some(a) = ACTIONS.iter().find(|a| a.name == act) else {
+            continue;
+        };
+        let Some(check) = crate::boot_report::check_for(sub) else {
+            continue;
+        };
+
+        (a.revert)();
+        let passes = judge(&crate::boot_report::Failure {
+            name: sub,
+            need: crate::boot_report::Need::Optional,
+            why: "re-checked without its repair",
+            rip: 0,
+            retry: check,
+            repaired_by: None,
+        });
+        // Unconditionally, including the path where the check faulted -- the
+        // fault was caught, and a machine left with its repair off because
+        // looking went wrong is worse than one that never looked.
+        (a.apply)();
+
+        if passes {
+            crate::gfx::console::set_color(crate::gfx::console::LTGREEN);
+            kprintln!(
+                "[repair] {} passes without '{}' now, so the repair may have outlived its bug",
+                sub,
+                act
+            );
+            kprintln!("         `repair clear` forgets it; it stays applied until then");
+            crate::gfx::console::set_color(crate::gfx::console::LTGRAY);
+        }
+    }
 }
 
 /// Put every applied repair back, and stop recording.

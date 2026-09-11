@@ -249,8 +249,40 @@ pub fn record(subsystem: &str, action: &str) -> Result<String, String> {
     if subsystem.split_whitespace().count() != 1 || action.split_whitespace().count() != 1 {
         return Err(String::from("a repair is two words, and neither may contain a space"));
     }
-    let esp = super::stage::find_esp()?;
+    // Refused here rather than written and ignored. The hook checks all of
+    // this again when it applies -- so nothing unsafe gets through either way
+    // -- but a line the hook will silently refuse is a line that takes a slot
+    // in a capped file and pushes a real repair out of the eighth one, while
+    // reading back from `repair` as though the machine is protected.
+    //
+    // Found by writing `repair record fmt skip-hwp`, which was accepted.
+    let Some(a) = crate::repair::ACTIONS.iter().find(|a| a.name == action) else {
+        return Err(format!(
+            "'{}' is not a repair this kernel has -- `repair` lists the ones it does",
+            action
+        ));
+    };
+    // `retry` is the one: it applies nothing, so recording it asks the next
+    // boot to do what it does anyway.
+    if !a.persist {
+        return Err(format!(
+            "'{}' applies nothing, so recording it would ask the next boot to do what it does anyway",
+            action
+        ));
+    }
+    // Asked of `repair` rather than reimplemented here. The message is this
+    // module's and the rule is not, which is the whole point -- two copies of
+    // "is this offered" is how these two ends came to disagree.
+    if !crate::repair::would_apply(subsystem, action) {
+        return Err(format!(
+            "'{}' is not offered for {} -- it is offered for {}",
+            action,
+            subsystem,
+            a.offered_for.join(", ")
+        ));
+    }
 
+    let esp = super::stage::find_esp()?;
     let existing = read_through(&esp);
     let want = Entry { subsystem: subsystem.to_string(), action: action.to_string() };
     if existing.contains(&want) {
@@ -373,6 +405,30 @@ pub fn selftest() -> bool {
             parse(s.as_bytes()).len() == MAX_ENTRIES
         },
         "a file longer than the cap is read up to the cap and no further",
+    );
+
+    // **What may be written down is what may be applied.** These two rules
+    // live in different modules, and a recording end that was laxer than the
+    // applying end would fill a capped file with lines the hook refuses --
+    // while `repair` read them back as though the machine were protected. Both
+    // halves are derived from the table, so the pair cannot drift apart.
+    claim(
+        &mut ok,
+        crate::repair::ACTIONS.iter().all(|a| {
+            // Aimed where the row itself says it belongs, so the claim keeps
+            // meaning this as rows are added.
+            let aimed_right = a.offered_for.first().copied().unwrap_or("any");
+            !a.persist || crate::repair::would_apply(aimed_right, a.name)
+        }),
+        "every action that may be recorded is one the hook would then apply",
+    );
+    claim(
+        &mut ok,
+        crate::repair::ACTIONS
+            .iter()
+            .filter(|a| !a.offered_for.is_empty())
+            .all(|a| !crate::repair::would_apply("nothing-by-this-name", a.name)),
+        "and one aimed at the wrong subsystem is refused at both ends",
     );
 
     // Round-tripping is what the withdrawal rests on: a boot that drops the
