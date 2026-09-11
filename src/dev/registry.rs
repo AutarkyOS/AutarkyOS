@@ -469,6 +469,32 @@ pub static TABLE: &[Entry] = &[
         what: "CDC ethernet adapter",
         support: Support::Driver("usb-ecm"),
     },
+    // RNDIS, in both the encodings it is found in. Two rows rather than one
+    // because they are two different interface triples and this table matches
+    // triples; the driver behind them is the same.
+    //
+    // **This is the closest thing to a universal wireless driver there is.**
+    // 802.11 hardware has no common register interface, so a radio needs a
+    // driver per chip; a phone in USB tethering mode presents one of these and
+    // shares the radio it already has.
+    Entry {
+        bus: Bus::Usb,
+        rule: Match::Interface(0xE0, 0x01, 0x03),
+        role: Role::Ethernet,
+        what: "RNDIS network device, as Android tethering presents one",
+        support: Support::Driver("usb-rndis"),
+    },
+    Entry {
+        bus: Bus::Usb,
+        rule: Match::Interface(0x02, 0x02, 0xFF),
+        role: Role::Ethernet,
+        // Named for what it is rather than what it claims: the triple is
+        // CDC/ACM/vendor, which a vendor-specific modem also uses. Nothing in
+        // a descriptor separates them, and the driver finds out by trying --
+        // a modem does not complete an RNDIS INITIALIZE.
+        what: "RNDIS network device, or a vendor-specific modem",
+        support: Support::Driver("usb-rndis"),
+    },
     Entry {
         bus: Bus::Usb,
         rule: Match::Interface(0x03, 0x01, 0x01),

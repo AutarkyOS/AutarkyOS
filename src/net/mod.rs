@@ -354,8 +354,13 @@ pub fn init(ecam: u64, roots: Option<&[u8]>) {
     // driver.
     if driver.is_none() {
         match crate::dev::xhci::probe_net(ecam) {
-            Ok(nic) => driver = Some((Box::new(nic), "usb-ecm")),
-            Err(usb_err) => refused.push(("usb-ecm", alloc::format!("{}", usb_err))),
+            Ok(nic) => {
+                let what = nic.protocol();
+                driver = Some((Box::new(nic), what));
+            }
+            // Named for what was looked for rather than what was found,
+            // because on this arm nothing was.
+            Err(usb_err) => refused.push(("usb-ethernet", alloc::format!("{}", usb_err))),
         }
     }
 
