@@ -3683,11 +3683,26 @@ outcome worth recording as the repair that worked. `skip-hwp` is the GF63 bug
 with a switch in front of it. Most useful repairs turn something off or down;
 so did the Troubleshooter's.
 
-**Nothing chooses with a model yet, deliberately.** The rule is fixed: try each
-offered action in table order, keep the first whose judge passes, revert the
-ones that did not, so whatever is left standing is exactly the one that worked.
-Proving apply/judge/revert somewhere a decode cannot be blamed for is the point
-of doing it in this order.
+**The fixed rule was built first, deliberately**, and it is still the fallback:
+try each offered action in table order, keep the first whose judge passes,
+revert the ones that did not, so whatever is left standing is exactly the one
+that worked. Proving apply/judge/revert somewhere a decode cannot be blamed for
+had to come before a decode was allowed near it.
+
+**The model chooses the order now, and the judge still decides.**
+`author::choose` picks from a grammar built out of the rows offered for *this*
+subsystem, so the answer is an index into a list the kernel built and anything
+else is unreachable rather than unlikely. It falls back to table order on no
+model, a busy engine, or three decodes that will not commit.
+
+It **does not have to be re-derivable**, which is the one place this departs
+from `godel` and reads like a lapse until the reason lands. There a verdict is a
+certificate somebody may want to refute months later, so the search has to be a
+function of the record rather than of a coin. Here the verdict is a live re-run
+of the check that failed: a bad pick costs one apply-and-revert and is then
+refused by the same judge that refuses everything else. So `choose` is left
+sampling at 0.7, where temperature zero is a fixed point a small model wedges
+against.
 
 `offered_for` is narrow on purpose, and `diag repair` is built around that: a
 chooser that could pick a power register knob for a graphics fault is one
@@ -3697,6 +3712,22 @@ written down, so renaming a row cannot leave the suite passing while testing
 something that no longer exists; and the judge claims run against synthetic
 checks belonging to no subsystem, so what they measure is the judge rather than
 a particular repair.
+
+Four more claims are that rule arriving on the other side of the loop.
+`offered` stops the wrong knob being *tried*; these stop the model being *told*
+about a fault other than the one that happened -- the prompt must name the
+subsystem that failed, carry the real symbolicated site, mention no other
+subsystem the table knows about, and offer exactly the rows this subsystem is
+offered. `boot_report::site_of` is one function for that reason: a chooser shown
+less than the operator is guessing about a fault somebody else can see, and one
+shown *different* words makes decisions nobody can check against what was
+printed.
+
+**The transcript says who chose**, because three different things land on index
+zero and they mean different things: `forced` (one option), `table` (the model
+is switched off), `no model`, `undecided` (three decodes that would not commit)
+and `model`. Without that column a boot where the engine was busy reads exactly
+like a boot where the model picked the first row.
 
 `judge` saves and restores the selftest window instead of closing it. It is
 callable from inside a suite -- `diag repair` does exactly that -- and closing
@@ -3777,8 +3808,53 @@ the boot volume records and what actions exist at all; `repair record` and
 applied without touching the file, since undoing a repair for this boot and
 forgetting it forever are different decisions.
 
-**What is not built.** The model still does not choose -- `author::choose` over
-the same table and the same judge is the last piece of the plan.
+**The prompt shape was the whole difference, and it cost a run to find.** The
+first version glossed every row -- `skip-hwp (stop reading the hardware-managed
+performance registers)` -- and came back `no choice among 2 after 0 step(s)`
+three times running. Zero steps means the decode never entered an alternative at
+all: it laid out whitespace until the idle allowance ran out. The prompts that
+work in this tree are one short sentence ending in a question, which is what
+`voter` asks and what `author::choose`'s own note describes. Reshaped, it
+commits. The `about` column is therefore *not* prompt text any more, and says so
+where it is declared.
+
+**And then the measurement, which is the part worth reading.** Six boots with a
+fault injected into `power` that only `skip-hwp` fixes -- three with the table
+in its own order, three with the offered list reversed:
+
+    [retry, skip-hwp]     retry     retry     retry
+    [skip-hwp, retry]     skip-hwp  retry     retry
+
+It picked `retry` **five times in six, wherever `retry` sat**. Reversing the
+list changed the answer once, which is what rules out the obvious reading: this
+is not a model taking whatever is listed first, it is a model preferring a
+*name*, and the name it prefers cannot fix this fault.
+
+The mechanism matters before anybody adds a row. `retry` is one common English
+token; `skip-hwp` is several uncommon pieces. Under a constrained grammar the
+cheapest first-token path wins, so **an action's name carries probability mass
+that has nothing to do with what the action does**. Naming a row is not
+cosmetic here.
+
+So the decode bought nothing on this table: table order tries `retry` first
+too, and six boots of choosing produced exactly what the fixed rule produces,
+for the price of a prefill. What it did not do is any harm -- the machine was
+repaired on all six, because the judge caught the bad pick and the loop moved
+on, which is the whole argument for this arrangement arriving as a measurement
+instead of a claim.
+
+It is left on, and the reason is a caveat rather than optimism: this was
+measured on **SmolLM2-135M**, the checkpoint that fits under QEMU, and not the
+0.6B the machine actually runs. Concluding anything about the shipped model
+from it would be exactly the small-sample extrapolation this file warns about
+elsewhere. `repair model off` is the switch, `repair log` is the transcript, and
+reproducing this on the GF63 is the thing somebody should do before trusting it
+either way.
+
+**What is not built.** No `Probe` is fitted over `/ai/repair/log`. That is the
+point of keeping the transcript -- one line per attempt, symptom and action and
+outcome -- but with zero examples a fitted router has nothing to beat a grammar
+decode with, so it waits until the corpus exists.
 
 **And the end-to-end test no emulator can produce.** Every mechanism above has
 been driven under QEMU with an injected fault, which is not the same as the real
