@@ -3863,11 +3863,36 @@ and the result is a halted machine reporting a register nobody asked for.
 Three conditions, all of them, before any MSR is touched: the vendor is Intel,
 CPUID says the feature exists, and no hypervisor is present. The third is in no
 manual. It is there because an emulator may advertise a capability in CPUID and
-not implement the register behind it, and on real silicon the first two suffice
-while under emulation they are a guess that does not return. **So none of the
-readings can be checked under QEMU**, which reports "vendor intel, hypervisor
-yes" and then declines with its reason. `power force` overrides it and says
-what it is risking.
+not implement the register behind it, and under emulation the first two are a
+guess that does not return. **So none of the readings can be checked under
+QEMU**, which reports "vendor intel, hypervisor yes" and then declines with its
+reason. `power force` overrides it and says what it is risking.
+
+**"On real silicon the first two suffice" is what this used to say, and the
+first boot on the GF63 disproved it.** `power` printed every line down to the
+governor and then took a #GP; the reporter's `rva` disassembled to `rdmsr` with
+`rcx = 0x771`, which is `IA32_HWP_CAPABILITIES`.
+
+CPUID saying HWP exists is not permission to read that register. It is gated
+behind `IA32_PM_ENABLE` bit 0, and this laptop supports HWP and boots with it
+off, so the very first read faulted. The gate asked whether the register
+*exists* where the processor's rule is about whether it is *enabled* -- two
+different questions, and only the first was being asked. `hwp_enabled()` is
+the fourth condition, and it reads the one register in the group that is safe
+on a part advertising HWP, because being the architectural enable is what
+`IA32_PM_ENABLE` is for.
+
+`set_governor` had the same fault by a second route: it called `hwp_range()`
+*before* setting `PM_ENABLE`. Enabling now happens first, which is honest there
+because that function exists to change the policy -- and deliberately does not
+happen in `hwp_range`, since a status command that switched the machine's power
+management on as a side effect of being asked a question would be the worse
+bug.
+
+None of this was reachable under emulation: `allowed` declines under a
+hypervisor before any of it runs, and QEMU reports `hwp no` regardless. **It is
+the first bug in this tree that only bare metal could find**, and the thing that
+found it was the `rva` line the fault reporter prints.
 
 Frequency comes from delivered against reference cycles rather than a register
 claiming one, because a part that changes its clock thousands of times a second
