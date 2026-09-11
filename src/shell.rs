@@ -472,6 +472,14 @@ fn repair_cmd(rest: &str) {
             }
 
             console::set_color(LTGRAY);
+            kprintln!(
+                "  chooser: {}",
+                if crate::repair::model_in_use() {
+                    "the model picks which to try; the re-run decides whether it worked"
+                } else {
+                    "table order (the model is not consulted)"
+                }
+            );
             kprintln!("  offered actions:");
             for a in crate::repair::ACTIONS {
                 let who = if a.offered_for.is_empty() {
@@ -516,7 +524,62 @@ fn repair_cmd(rest: &str) {
             kprintln!("  the boot volume is untouched -- `repair clear` is what forgets them");
         }
 
-        other => kprintln!("  no such verb '{}'; try status, record, clear, off", other),
+        // What was tried and what happened, which is the half of a repair an
+        // operator cannot reconstruct from what is applied. A repair that
+        // worked and one that worked on the third attempt look identical from
+        // `repair` alone, and only one of them says the table is ordered
+        // wrongly.
+        "log" => match crate::sysbox::read_blob("/ai/repair/log")
+            .and_then(|b| alloc::string::String::from_utf8(b).ok())
+        {
+            Some(text) if !text.trim().is_empty() => {
+                console::set_color(YELLOW);
+                kprintln!("repair attempts");
+                console::set_color(WHITE);
+                kprintln!(
+                    "  {:<12} {:<18} {:<12} {:<10} {}",
+                    "subsystem",
+                    "fault",
+                    "action",
+                    "chosen by",
+                    "outcome"
+                );
+                for line in text.lines() {
+                    let mut it = line.split('\t');
+                    let (Some(sub), Some(why), Some(site), Some(act), Some(by), Some(out)) =
+                        (it.next(), it.next(), it.next(), it.next(), it.next(), it.next())
+                    else {
+                        continue;
+                    };
+                    kprintln!("  {:<12} {:<18} {:<12} {:<10} {}", sub, why, act, by, out);
+                    if site != "-" {
+                        console::set_color(LTGRAY);
+                        kprintln!("               {}", site);
+                        console::set_color(WHITE);
+                    }
+                }
+            }
+            _ => kprintln!("  nothing has been attempted on this machine"),
+        },
+
+        // On and off rather than a temperature, because the only question an
+        // operator has here is whether a decode happens at boot at all.
+        "model" => match arg {
+            "on" => {
+                crate::repair::use_model(true);
+                kprintln!("  the model will be asked which repair to try first");
+            }
+            "off" => {
+                crate::repair::use_model(false);
+                kprintln!("  repairs will be tried in table order");
+            }
+            _ => kprintln!("  repair model on|off"),
+        },
+
+        other => kprintln!(
+            "  no such verb '{}'; try status, log, record, clear, off, model",
+            other
+        ),
     }
 }
 

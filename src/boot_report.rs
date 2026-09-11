@@ -161,6 +161,40 @@ pub fn any_vital() -> bool {
 /// Printed at the end of boot rather than only where it happened, because the
 /// line that matters is "this machine is running without X" and by then the
 /// fault itself has scrolled past a hundred `ok` lines.
+/// Where a fault was, as one line of prose, or `None` for a panic.
+///
+/// **The same string reaches the report and the model**, which is the whole
+/// reason it is a function. A chooser shown less than the operator is a chooser
+/// guessing about a fault somebody else can see; a chooser shown *different*
+/// words is one whose decisions cannot be checked against what was printed.
+///
+/// Symbolicated here rather than at record time so a boot where nothing broke
+/// pays nothing for the table.
+pub fn site_of(rip: u64) -> Option<alloc::string::String> {
+    use alloc::format;
+    if rip == 0 {
+        return None;
+    }
+    let base = crate::cpu::idt::IMAGE_BASE.load(core::sync::atomic::Ordering::Relaxed);
+    let size = crate::cpu::idt::IMAGE_SIZE.load(core::sync::atomic::Ordering::Relaxed);
+    Some(
+        match crate::cpu::code::locate(rip, base, size, crate::cpu::code::lookup(rip)) {
+            crate::cpu::code::Where::Image(rva) | crate::cpu::code::Where::Unverified(rva) => {
+                match crate::cpu::code::symbol(rva) {
+                    Some((sym, off)) => format!("in {} +{:#x}", sym, off),
+                    None => format!("at rva {:#x}", rva),
+                }
+            }
+            crate::cpu::code::Where::Generated { tag, off } => {
+                format!("in generated code {:016x} +{:#x}", tag, off)
+            }
+            crate::cpu::code::Where::Elsewhere => {
+                format!("at {:#x}, which is outside the image", rip)
+            }
+        },
+    )
+}
+
 pub fn report() {
     use crate::kprintln;
     let n = count();
@@ -187,24 +221,8 @@ pub fn report() {
         // Where it actually was, which may be nowhere near what is named
         // above. Resolved here rather than at record time so the report costs
         // nothing on a boot where nothing broke.
-        if f.rip != 0 {
-            let base = crate::cpu::idt::IMAGE_BASE.load(core::sync::atomic::Ordering::Relaxed);
-            let size = crate::cpu::idt::IMAGE_SIZE.load(core::sync::atomic::Ordering::Relaxed);
-            match crate::cpu::code::locate(f.rip, base, size, crate::cpu::code::lookup(f.rip)) {
-                crate::cpu::code::Where::Image(rva)
-                | crate::cpu::code::Where::Unverified(rva) => {
-                    match crate::cpu::code::symbol(rva) {
-                        Some((sym, off)) => kprintln!("                 in {} +{:#x}", sym, off),
-                        None => kprintln!("                 at rva {:#x}", rva),
-                    }
-                }
-                crate::cpu::code::Where::Generated { tag, off } => {
-                    kprintln!("                 in generated code {:016x} +{:#x}", tag, off)
-                }
-                crate::cpu::code::Where::Elsewhere => {
-                    kprintln!("                 at {:#x}, which is outside the image", f.rip)
-                }
-            }
+        if let Some(site) = site_of(f.rip) {
+            kprintln!("                 {}", site);
         }
     }
     let over = OVERFLOW.load(core::sync::atomic::Ordering::Relaxed);

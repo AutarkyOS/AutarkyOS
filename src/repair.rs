@@ -24,20 +24,94 @@
 //!
 //! Most useful repairs turn something off or down. So did the Troubleshooter's.
 //!
-//! ### Nothing here chooses with a model
+//! ### The model chooses the order, and the judge decides
 //!
-//! Deliberately. The rule is fixed: try each offered action in table order,
-//! keep the first whose judge passes. Proving the apply/judge/revert loop
-//! somewhere a decode cannot be blamed for is the point of doing it this way
-//! first -- if the loop is wrong, it is wrong somewhere legible. The model
-//! replaces `choose` and nothing else.
+//! `author::choose` picks which repair to try, under a grammar built from the
+//! rows offered for *this* subsystem, so the answer is an index into a list
+//! this kernel built and anything else is unreachable rather than merely
+//! unlikely. Nothing the model emits is executed, parsed as a command, or used
+//! as an argument.
+//!
+//! **And it does not have to be re-derivable**, which is the one place this
+//! departs from `godel` and is worth stating plainly because it looks like a
+//! lapse. There a verdict is a certificate somebody may want to refute months
+//! later, so the search has to be a function of the record rather than of a
+//! coin. Here the verdict is a *live re-run of the check that failed*: a badly
+//! chosen repair costs one apply-and-revert and is then refused by the same
+//! judge that refuses everything else. So `choose` is left sampling at 0.7,
+//! where temperature zero is a fixed point a small model can wedge against --
+//! `author.rs` records what that cost.
+//!
+//! What the model buys is **order**, on a table where the first row is a guess
+//! and the right one may be third. What it cannot buy is a wrong repair
+//! surviving, because it never judges.
+//!
+//! The fixed rule is still there and still the fallback: no model, an engine
+//! somebody else is holding, or three decodes that will not commit, and the
+//! loop walks the table in order exactly as it did. That ordering was built
+//! first on purpose -- the apply, judge and revert loop was proven somewhere a
+//! decode could not be blamed for before a decode was allowed near it.
+//!
+//! ### What the chooser actually does, measured
+//!
+//! Six boots under QEMU with a fault injected into `power` that only
+//! `skip-hwp` fixes, three with the table in its own order and three with the
+//! offered list reversed:
+//!
+//!     [retry, skip-hwp]     retry     retry     retry
+//!     [skip-hwp, retry]     skip-hwp  retry     retry
+//!
+//! **It picked `retry` five times in six, wherever `retry` sat.** Reversing the
+//! list changed the answer once, which is what rules out the obvious
+//! explanation: this is not a model taking whatever is listed first, it is a
+//! model preferring a *name*. And the name it prefers is the one that cannot
+//! fix this fault, so the pick was wrong five times out of six.
+//!
+//! The mechanism is worth knowing before anybody adds a row. `retry` is one
+//! common English token; `skip-hwp` is several uncommon pieces. Under a
+//! constrained grammar the cheapest first-token path wins, so **an action's
+//! name carries probability mass that has nothing to do with what the action
+//! does**. Naming a row well is not cosmetic here.
+//!
+//! On this evidence the decode buys nothing on this table: table order also
+//! tries `retry` first, so six boots of choosing produced what the fixed rule
+//! produces, for the price of a prefill. What it did *not* do is any harm --
+//! the machine was repaired on all six, because the judge caught the bad pick
+//! and the loop moved on. That is this header's argument arriving as a
+//! measurement rather than as a claim.
+//!
+//! It is left on all the same, and the reason is a caveat rather than
+//! optimism: this was measured on SmolLM2-135M, which is the checkpoint that
+//! fits under QEMU and not the one the machine runs. Concluding anything about
+//! the 0.6B from it would be exactly the small-sample extrapolation this
+//! project's notes warn about. `repair model off` is the switch, and the
+//! finding above is what somebody should try to reproduce on real hardware
+//! before trusting it either way.
 
 use crate::boot_report::Failure;
+use alloc::format;
+use alloc::string::String;
 
 pub struct Action {
+    /// What the action is called, and **what the chooser mostly decides on**.
+    ///
+    /// Measured rather than assumed -- see the note at the top of this file. A
+    /// name that tokenises into common English is chosen over one that does
+    /// not, independent of what either row does, so this field is part of the
+    /// prompt's probability mass and not only a label.
     pub name: &'static str,
-    /// One line, for a person reading the log -- and later for the prompt a
-    /// model picks from.
+    /// One line, for a person reading `repair`.
+    ///
+    /// **Deliberately not in the prompt**, and that was measured rather than
+    /// decided. The first version glossed every row -- `skip-hwp (stop reading
+    /// the hardware-managed performance registers)` -- and the decode came back
+    /// `no choice among 2 after 0 step(s)` three times running: zero steps
+    /// means the model never entered an alternative at all, it laid out
+    /// whitespace until the idle allowance ran out. The prompts that work in
+    /// this tree are one short sentence ending in a question, which is what
+    /// `voter` asks and what `author::choose`'s own note about `prompt_for`
+    /// describes. A 135M model reads a paragraph of parentheses as an
+    /// invitation to write more prose.
     pub about: &'static str,
     /// Subsystems this is offered for. Empty means any.
     ///
@@ -200,20 +274,178 @@ pub enum Outcome {
     Unrepaired,
 }
 
+/// How many repairs are tried on one subsystem before the machine gives up.
+///
+/// Three, and the bound is about the *shape* of the evidence rather than about
+/// the cost. A subsystem that has refused three different repairs does not have
+/// a fourth-repair problem; something upstream of all of them is wrong, and
+/// going on would fill the boot log with reverts.
+const MAX_ATTEMPTS: usize = 3;
+
+/// Whether the model is consulted at all. Off falls back to table order.
+static USE_MODEL: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(true);
+
+pub fn use_model(on: bool) {
+    USE_MODEL.store(on, core::sync::atomic::Ordering::Relaxed);
+}
+pub fn model_in_use() -> bool {
+    USE_MODEL.load(core::sync::atomic::Ordering::Relaxed)
+}
+
+/// Three decodes before falling back, for `voter::pick`'s reason.
+///
+/// A constrained decode that will not commit is a small model failing to
+/// commit and never a verdict -- treating one as a verdict is exactly how an
+/// unlucky decode once abandoned a whole night's composition. Bounded at three
+/// because a model that will not commit three times is not unlucky, and an
+/// unbounded retry on a path that runs at boot is a machine that never reaches
+/// the shell.
+const DECODE_TRIES: usize = 3;
+
+/// What the model is told. The operator sees the same words.
+///
+/// It carries the *site* as well as the subsystem, because those answer
+/// different questions -- which check failed, and what actually broke -- and a
+/// chooser shown only the first is being asked to repair a name. It also
+/// carries what has already been tried and failed, so a second round is a
+/// different question rather than the same one asked again.
+fn prompt_for(f: &Failure, remaining: &[&'static Action], tried: &[&'static str]) -> String {
+    let mut p = format!("The {} selftest failed with {}", f.name, f.why);
+    if let Some(site) = crate::boot_report::site_of(f.rip) {
+        p.push(' ');
+        p.push_str(&site);
+    }
+    p.push('.');
+    if !tried.is_empty() {
+        p.push_str(&format!(" {} did not help.", tried.join(" and ")));
+    }
+    p.push_str(&format!(
+        " Repairs: {}. Which is most likely to fix it?",
+        remaining.iter().map(|a| a.name).collect::<alloc::vec::Vec<_>>().join(", ")
+    ));
+    p
+}
+
+/// Which of the remaining repairs to try next.
+///
+/// Answers an index into `remaining`, and **zero is the fixed rule**: the first
+/// row the table offers. Every path that cannot produce a considered answer
+/// lands there rather than on an error, because a machine with a broken
+/// subsystem and no model still deserves its repair attempted.
+fn choose_next(
+    f: &Failure,
+    remaining: &[&'static Action],
+    tried: &[&'static str],
+) -> (usize, &'static str) {
+    // **Who chose is recorded, not inferred.** A model that agrees with table
+    // order and a fallback to table order produce the same sequence of
+    // attempts, so a transcript that does not say which happened cannot answer
+    // the only question worth asking of this feature -- and a boot where the
+    // engine was busy would read as a boot where the model picked the first
+    // row. Three reasons to land on index zero and they mean different things.
+    if remaining.len() == 1 {
+        return (0, "forced");
+    }
+    if !model_in_use() {
+        return (0, "table");
+    }
+    if !crate::ai::engine_ready() {
+        return (0, "no model");
+    }
+    let names: alloc::vec::Vec<&str> = remaining.iter().map(|a| a.name).collect();
+    let prompt = prompt_for(f, remaining, tried);
+    for _ in 0..DECODE_TRIES {
+        if let Some(i) = crate::ai::author::choose(&prompt, &names) {
+            return (i, "model");
+        }
+    }
+    // Said rather than silent. A boot that fell back to table order and a boot
+    // where the model happened to agree with table order are indistinguishable
+    // from the outcome, and only one of them is worth looking into.
+    crate::serial_println!(
+        "[repair] the model would not choose among {} for {}; taking table order",
+        remaining.len(),
+        f.name
+    );
+    (0, "undecided")
+}
+
+/// One line per attempt, in `/ai/repair/log`.
+///
+/// Two reasons, and the second is the durable one. It is the transcript worth
+/// printing when nothing worked -- what was tried and what happened, rather
+/// than a register dump. And it is the corpus a `Probe` could later be fitted
+/// on to replace the decode with the routing layer's answer, which is not worth
+/// fitting until the corpus exists, because with zero examples it has nothing
+/// to beat a grammar decode with.
+///
+/// Written to the namespace, so it is memory until something snapshots. That is
+/// the right level: a repair *decision* is on the ESP because it has to survive
+/// a reboot to mean anything, and the reasoning behind it is worth keeping and
+/// not worth a disk write.
+fn note_attempt(f: &Failure, action: &str, by: &str, outcome: &str) {
+    let line = format!(
+        "{}\t{}\t{}\t{}\t{}\t{}\n",
+        f.name,
+        f.why,
+        crate::boot_report::site_of(f.rip).unwrap_or_else(|| String::from("-")),
+        action,
+        by,
+        outcome
+    );
+    let path = "/ai/repair/log";
+    let mut all = crate::sysbox::read_blob(path)
+        .and_then(|b| String::from_utf8(b).ok())
+        .unwrap_or_default();
+    // Bounded, because this runs every boot on a machine whose fault may be
+    // permanent, and a log nothing trims is a log that eventually is the heap.
+    // Oldest lines go first, since the interesting end of a repair history is
+    // the recent one.
+    while all.len() + line.len() > LOG_BYTES {
+        match all.find('\n') {
+            Some(i) => all = all.split_off(i + 1),
+            None => all.clear(),
+        }
+    }
+    all.push_str(&line);
+    crate::sysbox::write_text(path, &all);
+}
+
+const LOG_BYTES: usize = 8192;
+
 /// Try to repair one failed subsystem.
 ///
 /// **A failed repair is reverted before the next is tried**, so the machine
 /// never accumulates a pile of changes that did not help. Whatever is left
 /// standing at the end is exactly the one that worked, or nothing.
 pub fn attempt(f: &Failure) -> Outcome {
-    for a in offered(f.name) {
+    let mut remaining: alloc::vec::Vec<&'static Action> = offered(f.name).collect();
+    let mut tried: alloc::vec::Vec<&'static str> = alloc::vec::Vec::new();
+
+    for _ in 0..MAX_ATTEMPTS {
+        if remaining.is_empty() {
+            break;
+        }
+        // The index is into `remaining` and came from a grammar built from
+        // `remaining`, so it is in range by construction. Clamped anyway, at
+        // the one line where a chooser's answer becomes a table index -- the
+        // construction is `author::choose`'s to keep and this is the place that
+        // would be wrong if it ever stopped keeping it.
+        let (i, by) = choose_next(f, &remaining, &tried);
+        let a = remaining.remove(i.min(remaining.len() - 1));
+
         if !(a.apply)() {
+            note_attempt(f, a.name, by, "declined to apply");
+            tried.push(a.name);
             continue;
         }
         if judge(f) {
+            note_attempt(f, a.name, by, "the check passes");
             return Outcome::Repaired(a.name);
         }
         (a.revert)();
+        note_attempt(f, a.name, by, "the check still fails");
+        tried.push(a.name);
     }
     Outcome::Unrepaired
 }
@@ -407,6 +639,118 @@ pub fn selftest() -> bool {
             }
         },
         "and a narrow one aimed at a subsystem it was never offered for",
+    );
+
+    // ---- what the chooser is told -----------------------------------------
+    //
+    // **The misattribution claim, on the other side of the loop.** `offered`
+    // stops a power knob being tried on a graphics fault; these stop the model
+    // being *told* about a fault other than the one that happened. Both halves
+    // matter and they fail differently: the first would apply the wrong repair,
+    // the second would apply a defensible repair to a description of somebody
+    // else's problem.
+    //
+    // Every string here is derived from the failure or from the table. A claim
+    // that looked for the word "power" would assert what the table said on the
+    // day it was written.
+    let victim = ACTIONS
+        .iter()
+        .find(|a| !a.offered_for.is_empty())
+        .and_then(|a| a.offered_for.first().copied())
+        .unwrap_or("any");
+    let hurt = crate::boot_report::Failure {
+        name: victim,
+        need: crate::boot_report::Need::Optional,
+        why: "a fault by some name",
+        // A real address in this image, so the site resolves to a real symbol
+        // rather than to a number somebody wrote down.
+        rip: faults as usize as u64,
+        retry: faults,
+        repaired_by: None,
+    };
+    let offers: alloc::vec::Vec<&'static Action> = offered(victim).collect();
+    let p = prompt_for(&hurt, &offers, &[]);
+
+    claim(
+        &mut ok,
+        p.contains(victim) && p.contains(hurt.why),
+        "the prompt names the subsystem that failed and the fault it took",
+    );
+    claim(
+        &mut ok,
+        match crate::boot_report::site_of(hurt.rip) {
+            Some(site) => p.contains(&site),
+            // No symbol table in this build is a fact about the build, not a
+            // failure of the prompt.
+            None => true,
+        },
+        "and where the fault actually was, not only which check was blamed",
+    );
+
+    // The one that would catch a battery fault being described as a graphics
+    // one. Every other subsystem the table knows about must be absent.
+    claim(
+        &mut ok,
+        ACTIONS
+            .iter()
+            .flat_map(|a| a.offered_for.iter())
+            .all(|s| *s == victim || !p.contains(*s)),
+        "and no subsystem other than the one that broke is mentioned at all",
+    );
+    claim(
+        &mut ok,
+        ACTIONS
+            .iter()
+            .all(|a| p.contains(a.name) == offers.iter().any(|o| o.name == a.name)),
+        "the prompt offers exactly the repairs this subsystem is offered, and no others",
+    );
+
+    // A second round is a different question. Without this the model is asked
+    // the same thing twice and has every reason to answer it the same way.
+    let again = prompt_for(&hurt, &offers, &["some-earlier-try"]);
+    claim(
+        &mut ok,
+        again.contains("some-earlier-try") && again != p,
+        "and a second round says what already failed",
+    );
+
+    // ---- falling back ------------------------------------------------------
+    //
+    // The fixed rule is not a legacy path, it is what runs on every machine
+    // with no model -- which under QEMU is most of them.
+    let was = model_in_use();
+    use_model(false);
+    let fixed = choose_next(&hurt, &offers, &[]);
+    use_model(was);
+    claim(
+        &mut ok,
+        fixed == (0, "table"),
+        "with the model off the chooser is the table's first offered row, and says so",
+    );
+    // Three ways to land on index zero, and a transcript that could not tell
+    // them apart would report a busy engine as a model that picked the first
+    // row. The names are distinct because that is the whole use of them.
+    claim(
+        &mut ok,
+        {
+            let one: alloc::vec::Vec<&'static Action> = offers.iter().take(1).copied().collect();
+            choose_next(&hurt, &one, &[]) == (0, "forced")
+        },
+        "and a single offered repair is recorded as forced rather than chosen",
+    );
+
+    // ---- the transcript ----------------------------------------------------
+    //
+    // A machine whose fault is permanent boots and writes these forever, so a
+    // log nothing trims is a log that is eventually the heap.
+    for _ in 0..400 {
+        note_attempt(&hurt, "some-action", "table", "the check still fails");
+    }
+    let grown = crate::sysbox::read_blob("/ai/repair/log").map(|b| b.len()).unwrap_or(0);
+    claim(
+        &mut ok,
+        grown > 0 && grown <= LOG_BYTES,
+        "the attempt log records what was tried and stays bounded doing it",
     );
 
     // ---- apply and revert --------------------------------------------------
