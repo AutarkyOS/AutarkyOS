@@ -73,6 +73,34 @@ try {
     $code = $LASTEXITCODE
     $ErrorActionPreference = $prev
     if ($code -ne 0) { Write-Error "cargo build failed (exit $code)" }
+
+    # **The symbol table has to be regenerated and the image relinked, every
+    # time, and this is not optional.** `src/cpu/symbols.rs` maps addresses to
+    # function names for the fault reporter, and it is generated from the
+    # linker's map of the *previous* link. Change any code and every address
+    # after it moves, so a table one build old names the wrong function --
+    # confidently, with an offset that looks plausible. That is worse than
+    # printing no name at all, which is what this replaced.
+    #
+    # The second link is cheap: only the table changed, and the table is
+    # `.rdata`, which sits after `.text`. Measured: no symbol moves between the
+    # two passes, so one regeneration converges rather than oscillating.
+    $map = Join-Path $root 'target\glados.map'
+    if (Test-Path $map) {
+        $py = Join-Path $root 'tools\venv\Scripts\python.exe'
+        if (-not (Test-Path $py)) { $py = 'python' }
+        $ErrorActionPreference = 'Continue'
+        & $py (Join-Path $root 'tools\symbols.py') $map --emit (Join-Path $root 'src\cpu\symbols.rs')
+        if ($LASTEXITCODE -ne 0) { $ErrorActionPreference = $prev; Write-Error 'symbols.py failed' }
+        if ($Release) { cargo build --release } else { cargo build }
+        $code = $LASTEXITCODE
+        $ErrorActionPreference = $prev
+        if ($code -ne 0) { Write-Error "relink after symbols failed (exit $code)" }
+    } else {
+        # No map means the linker flag is missing, and a stale table would be
+        # shipped silently. Say so rather than deploying names that lie.
+        Write-Warning "no target\glados.map -- fault reports will carry stale function names"
+    }
 } finally {
     Pop-Location
 }

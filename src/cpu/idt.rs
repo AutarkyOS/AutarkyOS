@@ -158,6 +158,27 @@ fn emit(out: &mut dyn FnMut(core::fmt::Arguments), r: &Report) {
     // Relative to the load base it is an offset into the very binary in the
     // build tree, and a disassembly answers which function it is -- but only
     // if it is in the image at all, which this used to print without asking.
+    // **The line that turns a register dump into a sentence.** An rva is
+    // everything the reporter knew until now, and reading one meant a second
+    // computer, the unstripped image and a disassembler -- on a laptop whose
+    // only diagnostic channel is this framebuffer. The first bare-metal boot
+    // cost exactly that for a one-line bug.
+    //
+    // The table is generated from the linker's own map, so it describes this
+    // image and no other. An rva from a screenshot of a *different* build
+    // resolves to whatever now lives at that offset, confidently and wrongly,
+    // which is why the build stamp is printed beside it.
+    fn name(out: &mut dyn FnMut(core::fmt::Arguments), rva: u64) {
+        if let Some((sym, off)) = super::code::symbol(rva) {
+            out(format_args!(
+                "  in    {} +{:#x}   (build {:08x})",
+                sym,
+                off,
+                super::symbols::BUILD_STAMP
+            ));
+        }
+    }
+
     use super::code::Where;
     let base = IMAGE_BASE.load(Ordering::Relaxed);
     let size = IMAGE_SIZE.load(Ordering::Relaxed);
@@ -167,12 +188,14 @@ fn emit(out: &mut dyn FnMut(core::fmt::Arguments), r: &Report) {
         }
         Where::Image(rva) => {
             out(format_args!("  rva   {:#018x}   <-- rip - image base", rva));
+            name(out, rva);
         }
         Where::Unverified(rva) => {
             out(format_args!(
                 "  rva   {:#018x}   <-- rip - image base, extent unknown",
                 rva
             ));
+            name(out, rva);
         }
         Where::Elsewhere => {
             if base != 0 && size != 0 {

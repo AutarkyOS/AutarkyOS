@@ -150,6 +150,43 @@ pub fn locate(rip: u64, base: u64, size: u64, generated: Option<(u64, u64)>) -> 
     Where::Elsewhere
 }
 
+/// The function an image offset falls inside, and how far into it.
+///
+/// **Binary search over a generated table, allocating nothing and taking no
+/// lock**, because the one caller is a fault handler running with interrupts
+/// off on a machine that is about to halt. See `src/cpu/symbols.rs`, which is
+/// emitted by `tools/symbols.py` from the linker's map.
+///
+/// Answers the *nearest preceding* symbol, which is the only thing a table of
+/// entry points can answer. For an rva inside a real function that is the
+/// right answer; for one in padding between functions, or in a compiler-
+/// emitted thunk the map does not name, it is the function before it. The
+/// offset is what distinguishes the two: `+0x13` is inside, `+0x2963` is
+/// almost certainly not.
+pub fn symbol(rva: u64) -> Option<(&'static str, u64)> {
+    let t = super::symbols::SYMBOLS;
+    if t.is_empty() || rva > u32::MAX as u64 {
+        return None;
+    }
+    let want = rva as u32;
+    if want < t[0].0 {
+        return None;
+    }
+    let (mut lo, mut hi) = (0usize, t.len());
+    while lo + 1 < hi {
+        let mid = (lo + hi) / 2;
+        if t[mid].0 <= want { lo = mid } else { hi = mid }
+    }
+    let (at, off, len) = t[lo];
+    let start = off as usize;
+    let end = start + len as usize;
+    let names = super::symbols::NAMES;
+    if end > names.len() {
+        return None;
+    }
+    Some((&names[start..end], (want - at) as u64))
+}
+
 /// A page-aligned buffer that code can be written into and then run.
 ///
 /// Allocation, the barrier and the registration are one object because the
@@ -321,6 +358,58 @@ pub fn selftest() -> bool {
         kprintln!("  {}   {}", if good { "ok " } else { "FAIL" }, what);
         ok &= good;
     };
+
+    // The symbol table is generated, so what is asserted is that this code
+    // indexes it correctly -- not that any particular name is in it, which
+    // would be a claim about the build rather than about the search.
+    {
+        let t = super::symbols::SYMBOLS;
+        claim(!t.is_empty(), "the generated symbol table is not empty");
+
+        let mut sorted = true;
+        let mut inside = true;
+        let names = super::symbols::NAMES;
+        for w in t.windows(2) {
+            if w[0].0 > w[1].0 {
+                sorted = false;
+            }
+        }
+        for e in t.iter() {
+            if e.1 as usize + e.2 as usize > names.len() {
+                inside = false;
+            }
+        }
+        // A table out of order silently answers the wrong function, because a
+        // binary search over it is meaningless.
+        claim(sorted, "it is sorted by address, which the binary search assumes");
+        claim(inside, "and every name lies inside the names blob");
+
+        if let Some(&(rva, off, len)) = t.first() {
+            let want = &names[off as usize..off as usize + len as usize];
+            claim(
+                symbol(rva as u64) == Some((want, 0)),
+                "an exact hit answers that symbol at offset zero",
+            );
+            claim(
+                symbol(rva as u64 + 1) == Some((want, 1)),
+                "and one byte in answers the same symbol, one byte in",
+            );
+            claim(
+                symbol(rva as u64 - 1).is_none() || rva == 0,
+                "below the first symbol there is no answer rather than a wrong one",
+            );
+        }
+        if let Some(&(rva, off, len)) = t.last() {
+            let want = &names[off as usize..off as usize + len as usize];
+            // Past the end the nearest preceding answer is all a table of entry
+            // points can give, and the offset is what says not to trust it.
+            claim(
+                symbol(rva as u64 + 0x1000) == Some((want, 0x1000)),
+                "past the last symbol the answer is the last one, with a large offset",
+            );
+        }
+        claim(symbol(u64::MAX).is_none(), "an rva that cannot be an offset is refused");
+    }
 
     // `locate` decides what a fault reporter prints, so every state it has is
     // asserted here instead of waiting for a fault to disagree.

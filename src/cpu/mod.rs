@@ -5,6 +5,7 @@
 //! Processor state we own: descriptor tables, control registers, I/O ports.
 
 pub mod code;
+pub mod symbols;
 pub mod percpu;
 pub mod recover;
 pub mod gdt;
