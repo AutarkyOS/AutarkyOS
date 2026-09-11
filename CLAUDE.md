@@ -3696,20 +3696,45 @@ revert the ones that did not, so whatever is left standing is exactly the one
 that worked. Proving apply/judge/revert somewhere a decode cannot be blamed for
 had to come before a decode was allowed near it.
 
-**The model chooses the order now, and the judge still decides.**
-`author::choose` picks from a grammar built out of the rows offered for *this*
-subsystem, so the answer is an index into a list the kernel built and anything
-else is unreachable rather than unlikely. It falls back to table order on no
-model, a busy engine, or three decodes that will not commit.
+**The fault's own signature picks the repair, and no model is asked.** A fault
+carries a vector and a symbolicated site, and those two say far more about which
+knob is wrong than any amount of reasoning about names --
+`dev::power::hwp_range +0x13` is not a hint, it is the answer. So `Clue` is
+`Fault(name)` or `SiteContains(part)`, every clue on an action must hold, and
+`skip-hwp` carries the GF63's own: a general protection fault inside
+`dev::power`. Both halves matter -- a *page* fault there is some other bug and
+this knob would not touch it, and a `#GP` outside `dev::power` is not an MSR
+gate problem.
 
-It **does not have to be re-derivable**, which is the one place this departs
-from `godel` and reads like a lapse until the reason lands. There a verdict is a
-certificate somebody may want to refute months later, so the search has to be a
-function of the record rather than of a coin. Here the verdict is a live re-run
-of the check that failed: a bad pick costs one apply-and-revert and is then
-refused by the same judge that refuses everything else. So `choose` is left
-sampling at 0.7, where temperature zero is a fixed point a small model wedges
-against.
+`rank` sorts what is offered into three groups and **drops none of them**:
+matched, then actions asking for nothing, then actions that asked and did not
+get it. The third group is kept because a clue is evidence about what is likely
+and never a proof about what is possible, and discarding would turn a wrong
+guess about a signature into a repair the machine can no longer reach. The judge
+still decides, so the ordering is allowed to be a guess -- being wrong costs an
+apply and a revert, never a bad repair.
+
+**Plain table order was wrong, and this is what made it visible.** `retry` was
+first, and retrying can only ever help a *transient* fault, so on a
+deterministic one the first attempt was guaranteed waste. An action with no
+clues is a fallback now and sinks below anything whose clues held.
+
+`rank` is pure over the failure record, so nine claims assert it with no model,
+no disk and nothing injected -- the `update::decide` discipline, and the reason
+this replaced a decode rather than sitting beside one. Among them: a different
+fault in the same subsystem does not match a signature, the right fault at the
+wrong site does not either, and every vector a clue names is one
+`recover::describe` can actually report. That last is a list rather than a match
+arm now, because renaming a vector would otherwise stop every signature matching
+with no error at all -- a machine quietly repairing itself worse than it used
+to.
+
+**The model is still there and off by default.** `author::choose` over the same
+table, behind `repair model on`, falling back to the ranking on no model, a busy
+engine, or three decodes that will not commit. It is kept rather than deleted
+for the reason the SGD head and the role adapters are kept: the apparatus is
+what lets somebody cheaply re-ask the question on a checkpoint that is not the
+one it was measured on.
 
 `offered_for` is narrow on purpose, and `diag repair` is built around that: a
 chooser that could pick a power register knob for a graphics fault is one
@@ -3850,13 +3875,46 @@ repaired on all six, because the judge caught the bad pick and the loop moved
 on, which is the whole argument for this arrangement arriving as a measurement
 instead of a claim.
 
-It is left on, and the reason is a caveat rather than optimism: this was
-measured on **SmolLM2-135M**, the checkpoint that fits under QEMU, and not the
-0.6B the machine actually runs. Concluding anything about the shipped model
-from it would be exactly the small-sample extrapolation this file warns about
-elsewhere. `repair model off` is the switch, `repair log` is the transcript, and
-reproducing this on the GF63 is the thing somebody should do before trusting it
-either way.
+**And the deterministic rule beats it on the one case there is evidence for.**
+Measured against a fixture reproducing the GF63's shape -- a `#GP` raised inside
+`dev::power` -- the ranking repairs it in **one** attempt where the model took
+two:
+
+    model   retry (wrong) -> skip-hwp    2 attempts
+    rule    skip-hwp                     1 attempt
+
+So the model was switched off rather than deleted. The measurement was on
+SmolLM2-135M, the checkpoint that fits under QEMU and not the 0.6B the machine
+runs, and concluding anything about the shipped model from it would be the
+small-sample extrapolation this file warns about elsewhere. `repair model on` is
+how somebody re-asks, and `repair log` is the transcript.
+
+**Three things the testing turned up, none of them about repairs.**
+
+`tools/symbols.py` **writes nothing without `--emit`.** A whole session's worth
+of "regenerate the symbols" parsed the map, printed a count and left the file
+alone, so the table was stale against every build -- and a convergence check
+comparing a file nothing was writing converged instantly and meant nothing.
+`deploy.ps1` passes `--emit` and was always correct, so this cost testing time
+and never a deploy. Emitting the table changes the layout it describes, so it
+takes two or three passes to reach a fixed point.
+
+**`cpu::code::symbol` can name the wrong function, and the offset is the tell.**
+The table holds public symbols, so anything inlined has no entry and the search
+returns whatever precedes it. A deliberate fault in a small `dev::power` helper
+was reported as `doom::play::dispatch +0x14a2` -- five kilobytes into an
+unrelated function in an unrelated subsystem. Average spacing over 13,817
+symbols is about a hundred bytes, so an offset in the thousands means the real
+function is *absent* rather than enormous. `#[inline(never)]` puts one back in
+the table. Not corrected silently, because the map carries no sizes and there is
+nothing to correct it to.
+
+**QEMU answers zero for a read of an unimplemented MSR instead of raising
+`#GP`.** The first fixture was an `rdmsr` on a reserved register -- the real bug
+-- and it did not fault at all. That is the same emulator gap `dev::power`
+already records as the reason its gate cannot be checked here, arriving one
+level down. The fixture uses a non-canonical address instead, which is `#GP` by
+architecture rather than by model.
 
 **What is not built.** No `Probe` is fitted over `/ai/repair/log`. That is the
 point of keeping the transcript -- one line per attempt, symptom and action and
