@@ -3479,9 +3479,16 @@ a row -- and the tip is the third state between "no label" and "a label on
 every button". A window the bar had no room for now shows as a `+N` chip rather
 than being dropped in silence.
 
-`todo` (shell) and the ToDo window share one list. It is the hand-off
-note for what to test at the GF63, since the machine that builds this is a
-different machine from the one that runs it.
+`todo` (shell) and the ToDo window share one list. It is the hand-off note for
+what to test at the GF63, and this said "the machine that builds this is a
+different machine from the one that runs it", which is false: `Win32_ComputerSystem`
+reports `Thin GF63 12UC`, board `MS-16R8`, so the development host **is** the
+target. The hand-off is real and the reason was wrong. What is true is that the
+two cannot run at once -- `deploy.ps1 -EspDrive S:` writes the external SSD and
+testing means rebooting into it on F11, which takes the editor, the browser and
+this file away with it. So anything you wanted to look up while GLaDOS is
+running has to have been written down first, which is exactly what the list is
+for.
 
 **Apps are `Content::App(Box<dyn DeskApp>)`** (`gfx/mod.rs`): a window whose
 client area belongs to a program. There are ten: Paintbrush (`paint.rs`), Write
