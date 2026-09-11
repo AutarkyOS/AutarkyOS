@@ -275,6 +275,39 @@ pub extern "efiapi" fn efi_main(image: Handle, st: *mut SystemTable) -> Status {
 ");
     }
 
+    // --- repairs this machine decided for itself on an earlier boot ---
+    //
+    // Here because it is the earliest point there is: the ESP is readable, and
+    // every subsystem a repair could be protecting initialises later. A repair
+    // adopted after `power` has already faulted is a repair that arrives one
+    // boot late, which is exactly what persisting it is for.
+    //
+    // Nothing the file says is executed. Two words are resolved against
+    // `repair::ACTIONS`, the row is what runs, and a line naming an action that
+    // does not exist -- or aiming a narrow one at a subsystem it was never
+    // offered for -- gets nothing.
+    let (persisted, repair_note) = update::repairs::at_boot(bs, image);
+    if let Some(line) = &repair_note {
+        serial_println!("glados: {}", line);
+        con_out(st, "glados: ");
+        con_out(st, line);
+        con_out(st, "
+");
+    }
+    for e in &persisted {
+        match repair::apply_named(&e.subsystem, &e.action) {
+            Some((sub, act)) => {
+                repair::note_from_disk(sub, act);
+                serial_println!("glados: repair '{}' for {}", act, sub);
+            }
+            None => serial_println!(
+                "glados: the boot volume asks for '{}' for {}, which is not a repair this kernel has",
+                e.action,
+                e.subsystem
+            ),
+        }
+    }
+
     // Beside the model, and for the same reason. `None` here is not a
     // failure: most machines have no WAD and boot exactly as before.
     let wad = uefi::read_file(bs, image, WAD_PATH);
@@ -568,6 +601,13 @@ pub extern "efiapi" fn efi_main(image: Handle, st: *mut SystemTable) -> Status {
     // "this machine is running without X".
     boot_report::report();
 
+    // The repairs applied at the hook did not stop this boot, which is the
+    // whole of what the trial flag asks. Deliberately here rather than beside
+    // `update::mark_healthy`: that one is bounded by `ExitBootServices` because
+    // it guards a boot image, and this one is not, so it covers the selftests,
+    // storage, the model and the desktop instead of none of them.
+    update::repairs::survived();
+
     gfx::splash::stage("ready");
     gfx::splash::finish();
 
@@ -614,6 +654,11 @@ fn init_storage(acpi: &Option<acpi::Acpi>) -> bool {
             return false;
         }
     }
+
+    // Late on purpose: `repair::attempt_all` decided this before the
+    // controller existed, because the boot summary has to describe the machine
+    // as it now is. This is the first moment there is anywhere to write.
+    repair::persist_adopted();
 
     // The store's location is derived, not remembered: a partition tagged with
     // the GLaDOS type GUID if one exists, otherwise unclaimed space. So

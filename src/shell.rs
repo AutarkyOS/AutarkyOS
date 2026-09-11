@@ -189,7 +189,7 @@ fn find_core(want: &str) -> Option<[u8; 32]> {
 const KNOWN_COMMANDS: &[&str] = &[
     "term", "todo", "paint", "write", "mines", "oracle", "enternet", "net", "dhcp", "mem",
     "mine", "uptime", "tasks", "status", "help", "app", "author", "video", "serial", "log", "snap",
-    "update", "gpu", "abstract", "study", "work", "redqueen",
+    "update", "repair", "gpu", "abstract", "study", "work", "redqueen",
 ];
 
 /// How many steps an authoring run gets.
@@ -426,6 +426,100 @@ pub fn run(boot: &BootInfo, acpi: &Option<Acpi>) -> ! {
 /// Checking, downloading and staging are three different decisions, and an
 /// operator gets to make them one at a time -- with the last one naming what
 /// it is about to overwrite and waiting to be told the digest back.
+/// What this machine has decided about itself, and the operator's undo.
+///
+/// A machine that quietly accumulates repairs is a machine whose boot log
+/// nobody reads any more, which is the failure this project's own notes about
+/// selftest output warn about. So the repairs are a surface: what is applied,
+/// what is written down, and two ways to take one back.
+fn repair_cmd(rest: &str) {
+    use crate::update::repairs;
+
+    let (verb, arg) = match rest.trim().split_once(' ') {
+        Some((v, a)) => (v, a.trim()),
+        None => (rest.trim(), ""),
+    };
+
+    match verb {
+        "" | "status" => {
+            console::set_color(YELLOW);
+            kprintln!("repairs");
+            console::set_color(WHITE);
+
+            let mut any = false;
+            for (sub, act) in crate::repair::in_force() {
+                any = true;
+                kprintln!("  applied   {:<14} {}", sub, act);
+            }
+            if !any {
+                kprintln!("  nothing is applied");
+            }
+
+            // Read back through our own FAT reader rather than remembered,
+            // because what the next boot does is decided by the file and not
+            // by anything this process is holding.
+            match repairs::stored() {
+                Ok(list) if list.is_empty() => {
+                    kprintln!("  the boot volume records none, so the next boot starts clean")
+                }
+                Ok(list) => {
+                    kprintln!("  on the boot volume, applied from the next boot:");
+                    for (i, e) in list.iter().enumerate() {
+                        kprintln!("    {}  {:<14} {}", i, e.subsystem, e.action);
+                    }
+                }
+                Err(e) => kprintln!("  the boot volume cannot be read: {}", e),
+            }
+
+            console::set_color(LTGRAY);
+            kprintln!("  offered actions:");
+            for a in crate::repair::ACTIONS {
+                let who = if a.offered_for.is_empty() {
+                    alloc::string::String::from("any subsystem")
+                } else {
+                    a.offered_for.join(", ")
+                };
+                kprintln!("    {:<12} {}  [{}]", a.name, a.about, who);
+            }
+            console::set_color(WHITE);
+        }
+
+        "record" => {
+            let Some((sub, act)) = arg.split_once(' ') else {
+                kprintln!("  repair record <subsystem> <action>");
+                return;
+            };
+            match repairs::record(sub.trim(), act.trim()) {
+                Ok(line) => kprintln!("  {}", line),
+                Err(e) => kprintln!("  {}", e),
+            }
+        }
+
+        "clear" => {
+            let which = if arg.is_empty() { None } else { arg.parse::<usize>().ok() };
+            if !arg.is_empty() && which.is_none() {
+                kprintln!("  repair clear [n], where n is a number from `repair`");
+                return;
+            }
+            match repairs::clear(which) {
+                Ok(line) => kprintln!("  {}", line),
+                Err(e) => kprintln!("  {}", e),
+            }
+        }
+
+        // Reverting rather than merely refusing to record more: a repair
+        // already applied is holding a subsystem down, and an operator turning
+        // this off almost always means "give me the machine without it".
+        "off" => {
+            let n = crate::repair::revert_all();
+            kprintln!("  {} repair(s) reverted; nothing further is recorded this boot", n);
+            kprintln!("  the boot volume is untouched -- `repair clear` is what forgets them");
+        }
+
+        other => kprintln!("  no such verb '{}'; try status, record, clear, off", other),
+    }
+}
+
 fn update_cmd(rest: &str) {
     use crate::store::sha256;
     use crate::update::{channel, fetch, stage};
@@ -6898,6 +6992,7 @@ fn execute(line: &str, boot: &BootInfo, acpi: &Option<Acpi>, interp: &mut aiksi:
         // does not exist yet, and a command that verified and then did nothing
         // while sounding like it installed something would be worse than no
         // command.
+        "repair" => repair_cmd(rest),
         "update" => update_cmd(rest),
         "words" => {
             console::set_color(YELLOW);

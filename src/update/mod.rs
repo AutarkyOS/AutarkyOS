@@ -24,6 +24,7 @@
 //! then **refuses**. A mechanism that accepts everything until configured is a
 //! mechanism that ships disabled and looks enabled.
 
+pub mod repairs;
 pub mod channel;
 pub mod fetch;
 pub mod manifest;

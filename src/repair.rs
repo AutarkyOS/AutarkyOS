@@ -85,6 +85,65 @@ pub static ACTIONS: &[Action] = &[
     },
 ];
 
+/// What is applied right now, taken from the table rather than from whoever
+/// asked for it.
+///
+/// **Nothing a file says is stored or executed.** `apply_named` resolves two
+/// words to a row and keeps the row's own `&'static str`, which is the same
+/// bargain `author::choose` makes when the model picks one: the chooser names a
+/// row, the kernel owns what the row does. A hand-edited `REPAIRS.TXT` can
+/// therefore ask for a repair that does not exist, and gets nothing.
+static IN_FORCE: crate::sync::Racy<[Option<(&'static str, &'static str)>; 8]> =
+    crate::sync::Racy::new([None; 8]);
+
+/// Adopted this boot and not yet written down. Separate from `IN_FORCE`
+/// because a repair read back off the disk is already recorded, and appending
+/// it again every boot is how a capped file fills up with one entry.
+static ADOPTED: crate::sync::Racy<[Option<(&'static str, &'static str)>; 8]> =
+    crate::sync::Racy::new([None; 8]);
+
+fn note(slots: &crate::sync::Racy<[Option<(&'static str, &'static str)>; 8]>, e: (&'static str, &'static str)) {
+    let a = unsafe { slots.get() };
+    for s in a.iter_mut() {
+        if *s == Some(e) {
+            return;
+        }
+        if s.is_none() {
+            *s = Some(e);
+            return;
+        }
+    }
+}
+
+/// Every repair currently applied, whether it came off the disk or was decided
+/// a moment ago.
+pub fn in_force() -> impl Iterator<Item = (&'static str, &'static str)> {
+    unsafe { IN_FORCE.get() }.iter().flatten().copied()
+}
+
+/// Apply a repair named by two words, refusing anything the table would not
+/// have offered.
+///
+/// **The `offered_for` check is not decoration here.** At boot this is called
+/// with strings read off a FAT partition, which anything that can mount that
+/// partition can edit -- so without it, a text file could aim a power register
+/// knob at the filesystem. The rule that binds a chooser binds a file.
+pub fn apply_named(subsystem: &str, action: &str) -> Option<(&'static str, &'static str)> {
+    let a = ACTIONS.iter().find(|a| a.name == action)?;
+    if !a.offered_for.is_empty() && !a.offered_for.contains(&subsystem) {
+        return None;
+    }
+    // Resolved to the row's own strings, so nothing read off the disk outlives
+    // this function. A universal action carries "any" rather than the name it
+    // was asked about, because that is the truth about what is applied.
+    let sub = a.offered_for.iter().find(|s| **s == subsystem).copied().unwrap_or("any");
+    if !(a.apply)() {
+        return None;
+    }
+    note(&IN_FORCE, (sub, a.name));
+    Some((sub, a.name))
+}
+
 /// Which actions are offered for a subsystem, in table order.
 pub fn offered(subsystem: &str) -> impl Iterator<Item = &'static Action> + '_ {
     ACTIONS
@@ -155,6 +214,14 @@ pub fn attempt_all() {
                 crate::gfx::console::set_color(crate::gfx::console::LTGREEN);
                 kprintln!("  {:<14} repaired by '{}', and the check now passes", f.name, action);
                 crate::boot_report::mark_repaired(f.name, action);
+                note(&IN_FORCE, (f.name, action));
+                // Only what was decided *here* is queued to be written down.
+                // One read back off the disk is already recorded, and appending
+                // it every boot is how an eight-entry file fills with one
+                // entry.
+                if !applied_from_disk(f.name, action) {
+                    note(&ADOPTED, (f.name, action));
+                }
             }
             Outcome::Unrepaired => {
                 crate::gfx::console::set_color(crate::gfx::console::LTRED);
@@ -299,4 +366,72 @@ pub fn selftest() -> bool {
     );
 
     ok
+}
+
+/// Repairs that came off the boot volume this boot, so an adoption that merely
+/// re-derives one is not written down a second time.
+static FROM_DISK: crate::sync::Racy<[Option<(&'static str, &'static str)>; 8]> =
+    crate::sync::Racy::new([None; 8]);
+
+pub fn note_from_disk(subsystem: &'static str, action: &'static str) {
+    note(&FROM_DISK, (subsystem, action));
+}
+
+fn applied_from_disk(subsystem: &str, action: &str) -> bool {
+    unsafe { FROM_DISK.get() }
+        .iter()
+        .flatten()
+        .any(|(s, a)| *a == action && (*s == subsystem || *s == "any"))
+}
+
+/// Put every applied repair back, and stop recording.
+///
+/// Answers how many were reverted. The boot volume is deliberately untouched:
+/// undoing a repair for this boot and forgetting it forever are different
+/// decisions, and an operator investigating whether a repair is still needed
+/// wants the first without committing to the second.
+pub fn revert_all() -> usize {
+    let mut n = 0;
+    for (_, act) in in_force() {
+        if let Some(a) = ACTIONS.iter().find(|a| a.name == act) {
+            (a.revert)();
+            n += 1;
+        }
+    }
+    *unsafe { IN_FORCE.get() } = [None; 8];
+    *unsafe { ADOPTED.get() } = [None; 8];
+    n
+}
+
+/// Write down what was adopted this boot, now that there is a disk to write to.
+///
+/// Deliberately not part of `attempt_all`, which runs before NVMe comes up:
+/// the loop has to decide early so the boot summary is about the machine as it
+/// now is, and the write has to happen late because there is nothing to write
+/// to until the controller answers. Splitting them is cheaper than moving
+/// either.
+///
+/// Failure here is reported and is not a failure of the repair. A machine with
+/// no ESP -- a live ISO, or QEMU's synthetic FAT16 -- still gets the repair for
+/// this boot and rediscovers it on the next one, which is the whole loop
+/// working slightly harder rather than not working.
+pub fn persist_adopted() {
+    use crate::kprintln;
+    let queued: alloc::vec::Vec<_> = unsafe { ADOPTED.get() }.iter().flatten().copied().collect();
+    if queued.is_empty() {
+        return;
+    }
+    for (sub, act) in queued {
+        match crate::update::repairs::record(sub, act) {
+            Ok(line) => {
+                crate::gfx::console::set_color(crate::gfx::console::LTGREEN);
+                kprintln!("[repair] {}", line);
+            }
+            Err(e) => {
+                crate::gfx::console::set_color(crate::gfx::console::LTGRAY);
+                kprintln!("[repair] '{}' for {} holds for this boot only: {}", act, sub, e);
+            }
+        }
+    }
+    crate::gfx::console::set_color(crate::gfx::console::LTGRAY);
 }

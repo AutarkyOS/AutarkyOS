@@ -358,6 +358,9 @@ def main():
     # correctly and silently fails to change anything. This boots a raw FAT32
     # image instead, and the guest's writes stay in it across runs, which is
     # what makes the two-boot apply/prove flow observable.
+    esp_on_nvme = "--esp-on-nvme" in argv
+    if esp_on_nvme:
+        argv.remove("--esp-on-nvme")
     esp_image = None
     if "--esp-image" in argv:
         i = argv.index("--esp-image")
@@ -687,9 +690,17 @@ def main():
         # which is the only way to test that the image tools/mkiso.py produces
         # is actually bootable rather than merely well-formed.
         *(["-cdrom", str(iso)] if iso else
+          [] if esp_on_nvme else
           ["-drive", f"format=raw,file={esp_image}"] if esp_image is not None else
           ["-drive", f"format=raw,file=fat:rw:{esp}"]),
-        "-drive", f"file={ROOT / '.qemu/nvme.img'},if=none,id=nvm0,format=raw",
+        # --esp-on-nvme puts the boot volume on the NVMe controller, which is
+        # where it lives on the GF63: one disk, with the ESP as a partition of
+        # it. The default topology has the ESP on its own drive, so the kernel's
+        # own block layer -- which reads NVMe and nothing else -- cannot see the
+        # volume it booted from, and anything that writes the ESP from a running
+        # machine is untestable. OVMF enumerates NVMe as a boot device, so
+        # nothing else has to change.
+        "-drive", f"file={esp_image if esp_on_nvme else ROOT / '.qemu/nvme.img'},if=none,id=nvm0,format=raw",
         "-device", "nvme,serial=GLADOSQEMU0001,drive=nvm0",
         # A USB controller to develop against. QEMU emulates xHCI faithfully
         # enough to bring up rings and enumerate, which is the whole reason the

@@ -127,6 +127,47 @@ fn put_verified(esp: &Esp, path: &str, data: &[u8]) -> Result<(), String> {
     Ok(())
 }
 
+/// Write one file to the boot volume, verified, over the ranged gate.
+///
+/// Exposed because `repairs` needs exactly this and nothing else about
+/// staging. Keeping the gate here rather than letting a second module claim its
+/// own is the point: there is one place that opens the write window on this
+/// disk, and one place that closes it on every path out.
+pub fn put_one(esp: &Esp, path: &str, data: &[u8]) -> Result<String, String> {
+    if !nvme::unlock_writes(CONFIRM, esp.start_lba, esp.blocks) {
+        return Err(String::from(
+            "the write gate refused the claim -- no NVMe controller, or no such range",
+        ));
+    }
+    let outcome = put_verified(esp, path, data);
+    nvme::lock_writes();
+    outcome?;
+    Ok(format!("wrote {} B to {}", data.len(), path))
+}
+
+/// Remove files that are there, quietly ignoring the ones that are not.
+///
+/// Order is the caller's and it matters: `unstage` and `repairs::clear` both
+/// pass the arming flag first, so an interrupted removal leaves a machine that
+/// does what it already did rather than a half-disarmed one.
+pub fn remove_some(esp: &Esp, paths: &[&str]) -> Result<String, String> {
+    if !nvme::unlock_writes(CONFIRM, esp.start_lba, esp.blocks) {
+        return Err(String::from("the write gate refused the claim"));
+    }
+    let mut gone: Vec<String> = Vec::new();
+    for path in paths {
+        if esp.volume.find(path).is_ok() && fatw::remove(&esp.volume, path).is_ok() {
+            gone.push(String::from(*path));
+        }
+    }
+    nvme::lock_writes();
+
+    if gone.is_empty() {
+        return Ok(String::from("there was nothing to remove"));
+    }
+    Ok(format!("removed {}", gone.join(", ")))
+}
+
 fn write_all(esp: &Esp, image: &[u8], sig: &[u8]) -> Result<(), String> {
     // The flag goes last, and that ordering is the whole crash-safety story:
     // a machine that loses power partway through has a half-written image and
