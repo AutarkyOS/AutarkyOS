@@ -39,6 +39,16 @@ const FLAG: &str = "/GLADOS/UPDATE.FLG";
 /// merely a FAT partition.
 const MARKER: &str = "/EFI/BOOT/BOOTX64.EFI";
 
+/// What makes a boot volume *this* machine's rather than one it can merely see.
+///
+/// A Windows ESP carries the same marker as its fallback path, so the marker
+/// alone matches it perfectly -- and `block::scan` reads NVMe and nothing else,
+/// so a machine booted from the USB stick walks the internal disk here and
+/// finds exactly that. Everything downstream would then read one volume and
+/// write another, since `repairs::at_boot` goes through the firmware, which
+/// reads the medium the image was actually loaded from.
+const PAYLOAD: &str = "/GLADOS";
+
 /// The magic `unlock_writes` wants, so a stray call cannot open the gate.
 const CONFIRM: u64 = 0xD15EA5E;
 
@@ -59,12 +69,34 @@ pub fn find_esp() -> Result<Esp, String> {
     let layout = block::scan().map_err(|e| format!("cannot read the partition table: {:?}", e))?;
 
     let mut saw_fat = false;
+    let mut not_ours: Option<u32> = None;
     for p in layout.partitions.iter() {
         let Ok(v) = fat::Volume::mount(p.start_lba) else {
             continue;
         };
         saw_fat = true;
-        if v.find(MARKER).is_err() {
+        let Ok(marker) = v.find(MARKER) else {
+            continue;
+        };
+        // **Is this the volume we actually booted from?**
+        //
+        // `block::scan` reads NVMe and nothing else, so on a machine booted
+        // from removable media this loop walks the *internal* disk -- and a
+        // Windows ESP carries `\EFI\BOOT\BOOTX64.EFI` as its fallback path,
+        // so it matches the marker perfectly. Everything downstream then reads
+        // one volume and writes another: `repairs::at_boot` goes through the
+        // firmware, which reads the medium the image was loaded from, while
+        // `record` would write here. Split-brain, on somebody else's ESP.
+        //
+        // The payload directory settles it, and comparing sizes does not.
+        // `LoadedImage::ImageSize` is the image *in memory*, sections expanded
+        // and aligned, where a directory entry is the file on disk -- 6,356,992
+        // against 5,119,488 for one build, which is not a mismatch but two
+        // different quantities. A GLaDOS boot volume carries the payload beside
+        // the loader; a Windows ESP does not.
+        let _ = marker;
+        if !v.find(PAYLOAD).map(|e| e.is_dir).unwrap_or(false) {
+            not_ours = Some(p.index);
             continue;
         }
         // Refused with the reason rather than attempted: FAT16 keeps its root
@@ -83,6 +115,17 @@ pub fn find_esp() -> Result<Esp, String> {
             blocks: p.block_count,
             volume: v,
         });
+    }
+
+    // Named rather than folded into "no boot volume", because the two have
+    // completely different fixes and this one is the ordinary consequence of
+    // booting the USB stick: nothing is wrong with the machine, the writable
+    // ESP is simply not on the disk this layer can see.
+    if let Some(idx) = not_ours {
+        return Err(format!(
+            "partition {} is a boot volume carrying no {} directory, so it is somebody else's ESP rather than this machine's -- writing to it would be writing to theirs. Booted from removable media? block::scan reads NVMe and nothing else, so the volume this image came from is not visible from here at all",
+            idx, PAYLOAD
+        ));
     }
 
     Err(String::from(if saw_fat {

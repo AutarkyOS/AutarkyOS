@@ -395,6 +395,21 @@ pub struct LoadedImageProtocol {
     pub parent_handle: Handle,
     pub system_table: *mut SystemTable,
     pub device_handle: Handle,
+    /// **The field whose absence shifted every one below it.**
+    ///
+    /// The spec puts `FilePath` here, between `DeviceHandle` and `Reserved`,
+    /// and it was simply missing -- so `image_base` was reading `LoadOptions`
+    /// and `image_size` was reading `ImageBase`. Both were wrong in ways that
+    /// looked like something else: the base came back null, which sent `main`
+    /// down its probe-for-the-base fallback and therefore worked, and the size
+    /// came back as an address, which made `code::locate`'s "is this rip inside
+    /// the image" bound about two gigabytes wide. That check exists to stop a
+    /// wild jump being reported as a plausible RVA, and at that width it could
+    /// not have stopped one.
+    ///
+    /// Found by a guard that compared the running image's size against a boot
+    /// image on disk and reported it as 2,103,095,296 bytes.
+    pub file_path: *mut c_void,
     reserved: usize,
     pub load_options_size: u32,
     load_options_pad: u32,
