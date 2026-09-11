@@ -2803,7 +2803,7 @@ runner, so **verification is the boot selftests plus driving QEMU.**
 
 At boot the system runs **twenty-six selftest sections**, seven of which are
 now wrapped in `main::section` so an optional one that faults marks itself
-unavailable instead of taking the machine, and `diag` offers **forty-seven
+unavailable instead of taking the machine, and `diag` offers **forty-eight
 named suites** on demand, most of them the same checks (the `aiksi` section covers the capability gate by name and never by
 calling -- half that table pokes memory, drives I/O ports or paints over the
 screen, and a suite that called every row to prove it exists would be
@@ -2885,7 +2885,7 @@ attention path is wired correctly writes real sentences.
 
 **`diag` on its own lists the suites; `diag all` runs them.** A bare `diag`
 prints a table with `-` beside everything that has not run this boot and a
-tally reading `0 passed, 0 failed, 47 not run`, which is easy to read as a
+tally reading `0 passed, 0 failed, 48 not run`, which is easy to read as a
 clean sweep. It is the opposite of one.
 
 **The list and its verdict table are one number now, and were not.** `RESULTS`
@@ -3717,18 +3717,74 @@ A repaired subsystem stays listed, because "was broken and is now repaired" is
 a different fact from "never broke" and an operator is owed both. The header
 counts what is *still* broken.
 
-**What is not built.** Nothing persists: a repair is decided every boot and
-forgotten every boot, so the ESP record (`\GLADOS\REPAIRS.TXT`, read in
-`update::hook` before `ExitBootServices`, self-limiting through the same health
-flag that makes a bad image roll itself back) is the next piece, and
-`author::choose` replacing the fixed rule is the piece after that. There is no
-`repair` verb yet, and nothing reports a subsystem that starts passing *without*
-its repair -- which is how a workaround for a bug somebody has since fixed
-lives forever.
+**A repair survives a reboot**, in `\GLADOS\REPAIRS.TXT` on the ESP -- the
+only durable channel that needs no human, since a namespace write lands in
+memory and reaching NVMe needs `store unlock`, which is a person, once per boot.
+`repairs::at_boot` runs inside `update::hook`, which is the earliest point there
+is: every subsystem a repair could protect initialises later, and a repair
+adopted after `power` has already faulted arrives one boot late.
 
-**And the end-to-end test no emulator can produce.** QEMU reports `hwp no`, so
-the real bug cannot reproduce here: the sequence of the GF63 faulting, being
-repaired by `skip-hwp`, persisting it and booting clean is still owed.
+**Nothing the file says is executed.** Two words are resolved against
+`repair::ACTIONS`, the row is what runs, and `offered_for` is checked on the
+way -- which is not decoration when the strings come off a FAT partition
+anything can edit. That is the same bargain `author::choose` makes: the chooser
+names a row, the kernel owns what the row does.
+
+**The safety property is `update`'s health flag with one change, and the change
+is the interesting part.** That flag is resolved before `ExitBootServices`,
+because the firmware's FAT driver is the only writer of the ESP that exists
+while a *boot image* can still be swapped. Nothing here swaps anything, so the
+constraint does not apply -- and this kernel writes its own ESP afterwards over
+NVMe, which `update stage` has always done. Clearing early would have bought a
+window from the hook to the memory map: long enough to catch a repair that stops
+the model loading, and blind to every repair that faults a subsystem, which is
+the entire population this table can produce. `repairs::survived()` clears it at
+the shell instead, so the window is the whole boot.
+
+A machine that cannot write its ESP therefore withdraws one repair per boot.
+That is the safe direction -- a machine nobody can talk to reverts to
+unmodified -- and it is written down rather than left to be found.
+
+**`--esp-on-nvme` is what made any of this testable.** The harness put the ESP
+on its own drive and the NVMe image on another, so the kernel's own block layer
+-- which reads NVMe and nothing else -- could not see the volume it booted from,
+and `find_esp` correctly answered that no NVMe partition carries
+`BOOTX64.EFI`. The GF63 has one disk with the ESP as a partition of it, and OVMF
+enumerates NVMe as a boot device, so the fix was topology rather than code.
+Driven over six boots on a real FAT32 volume: recorded, applied at the next
+boot, applied again at the one after (so the trial clears), killed at 12 s
+before the shell, **withdrawn automatically** on the boot after that, and clean
+on the boot after that.
+
+**`retry` is deliberately not persistable.** It applies nothing, so recording it
+asks the next boot to run a check that boot runs anyway -- a line in a capped
+file that can never change an outcome and would push a real repair out of the
+eighth slot. `Action::persist` is that distinction and `record` refuses without
+it.
+
+**And a repair never silently replaces a fix.** A subsystem held up by a repair
+and one passing because somebody fixed the bug look identical from everywhere
+else, so `recheck_persisted` takes the repair away, runs the check again,
+reports if it passes, and puts it back whatever the answer -- withdrawing a
+repair the machine has been relying on is the operator's decision, not a side
+effect of looking. That needs the check, which only the *failures* were keeping,
+so `section` registers every check now. QEMU is the honest demonstration, since
+it reports `hwp no` and `power` genuinely does not need the repair there.
+
+The operator's half is the `repair` verb: `repair` says what is applied, what
+the boot volume records and what actions exist at all; `repair record` and
+`repair clear [n]` write one down and take it back; `repair off` reverts what is
+applied without touching the file, since undoing a repair for this boot and
+forgetting it forever are different decisions.
+
+**What is not built.** The model still does not choose -- `author::choose` over
+the same table and the same judge is the last piece of the plan.
+
+**And the end-to-end test no emulator can produce.** Every mechanism above has
+been driven under QEMU with an injected fault, which is not the same as the real
+one: QEMU reports `hwp no`, so the GF63's actual `#GP` cannot reproduce here at
+all. The sequence of that machine faulting, being repaired by `skip-hwp`,
+persisting it and booting clean is still owed, and it needs the laptop.
 
 ### Concurrency
 
