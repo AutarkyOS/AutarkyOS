@@ -477,7 +477,7 @@ fn repair_cmd(rest: &str) {
                 if crate::repair::model_in_use() {
                     "the model picks which to try; the re-run decides whether it worked"
                 } else {
-                    "table order (the model is not consulted)"
+                    "the fault's own signature decides the order (no model asked)"
                 }
             );
             kprintln!("  offered actions:");

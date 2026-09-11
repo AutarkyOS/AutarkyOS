@@ -92,6 +92,23 @@ use crate::boot_report::Failure;
 use alloc::format;
 use alloc::string::String;
 
+/// One condition on a failure record.
+///
+/// **This is the Troubleshooter's actual mechanism**, and it is the thing the
+/// model was measured ignoring: a fault carries a vector and a symbolicated
+/// site, and those two say far more about which knob is wrong than any amount
+/// of reasoning about names. `dev::power::hwp_range +0x13` is not a hint, it is
+/// the answer.
+pub enum Clue {
+    /// The fault `recover` named, spelled exactly as `describe()` spells it,
+    /// which a claim checks rather than trusting.
+    Fault(&'static str),
+    /// The symbolicated site contains this. Matched against the function name
+    /// rather than the subsystem, because `offered_for` already covers the
+    /// subsystem and this is for telling two faults in one subsystem apart.
+    SiteContains(&'static str),
+}
+
 pub struct Action {
     /// What the action is called, and **what the chooser mostly decides on**.
     ///
@@ -123,6 +140,19 @@ pub struct Action {
     pub apply: fn() -> bool,
     /// Put it back. Called when the judge did not pass.
     pub revert: fn(),
+    /// What this repair is *for*, as conditions on the failure.
+    ///
+    /// Every clue must hold. An action with no clues is a **fallback**: it is
+    /// still offered, and it is tried after anything whose clues matched.
+    /// `retry` is the example and the reason the distinction exists -- retrying
+    /// can only ever help a transient fault, so trying it first on a
+    /// deterministic one is a guaranteed wasted attempt, which is exactly what
+    /// plain table order did.
+    ///
+    /// A clue that does not match does not remove an action from the list. It
+    /// sinks it. The judge still decides, so the ordering is allowed to be a
+    /// guess -- being wrong costs an apply and a revert, never a bad repair.
+    pub when: &'static [Clue],
     /// Whether writing this down for the next boot means anything.
     ///
     /// **`retry` is the reason this field exists.** It applies nothing, so
@@ -156,6 +186,8 @@ pub static ACTIONS: &[Action] = &[
         name: "retry",
         about: "run the check again, in case the fault was transient",
         offered_for: &[],
+        // No clues: the fallback, and last by construction.
+        when: &[],
         apply: retry_apply,
         revert: nothing,
         persist: false,
@@ -164,6 +196,16 @@ pub static ACTIONS: &[Action] = &[
         name: "skip-hwp",
         about: "stop reading the hardware-managed performance registers",
         offered_for: &["power"],
+        // **The GF63's own signature.** That machine took a `#GP` at
+        // `dev::power::hwp_range +0x13`, reading `IA32_HWP_CAPABILITIES`
+        // behind a clear `IA32_PM_ENABLE`. Both halves are load-bearing: a
+        // *page* fault in `power` is some other bug entirely and this knob
+        // would not touch it, and a `#GP` somewhere outside `dev::power` is
+        // not an MSR gate problem.
+        when: &[
+            Clue::Fault("general protection fault"),
+            Clue::SiteContains("dev::power"),
+        ],
         apply: skip_hwp_apply,
         revert: skip_hwp_revert,
         persist: true,
@@ -240,6 +282,56 @@ pub fn apply_named(subsystem: &str, action: &str) -> Option<(&'static str, &'sta
     Some((sub, a.name))
 }
 
+/// Whether every clue an action carries holds for this failure.
+///
+/// An action with no clues answers `false` here and is a fallback rather than a
+/// match -- `rank` is what knows the difference, so that "matched nothing" and
+/// "asked for nothing" stay separate facts.
+pub fn matches(f: &Failure, a: &Action) -> bool {
+    !a.when.is_empty()
+        && a.when.iter().all(|c| match c {
+            Clue::Fault(name) => f.why == *name,
+            Clue::SiteContains(part) => crate::boot_report::site_of(f.rip)
+                .map(|s| s.contains(part))
+                .unwrap_or(false),
+        })
+}
+
+/// The order to try repairs in, decided entirely by the failure record.
+///
+/// **Pure, so every case is assertable at boot with no model, no disk and
+/// nothing injected** -- the discipline `update::decide` and
+/// `repairs::decide` already follow, and the reason this replaced a decode
+/// rather than sitting beside one.
+///
+/// Three groups, and nothing is ever dropped:
+///
+/// 1. actions whose clues all hold, in table order
+/// 2. actions asking for nothing, which are the fallbacks
+/// 3. actions that asked for something and did not get it
+///
+/// The third group is kept rather than discarded because a clue is evidence
+/// about what is *likely*, not a proof about what is possible, and the judge is
+/// what actually decides. Discarding would turn a wrong guess about a signature
+/// into a repair the machine can no longer reach.
+pub fn rank(f: &Failure) -> alloc::vec::Vec<&'static Action> {
+    let mut matched = alloc::vec::Vec::new();
+    let mut fallback = alloc::vec::Vec::new();
+    let mut rest = alloc::vec::Vec::new();
+    for a in offered(f.name) {
+        if matches(f, a) {
+            matched.push(a);
+        } else if a.when.is_empty() {
+            fallback.push(a);
+        } else {
+            rest.push(a);
+        }
+    }
+    matched.extend(fallback);
+    matched.extend(rest);
+    matched
+}
+
 /// Which actions are offered for a subsystem, in table order.
 pub fn offered(subsystem: &str) -> impl Iterator<Item = &'static Action> + '_ {
     ACTIONS
@@ -283,7 +375,7 @@ pub enum Outcome {
 const MAX_ATTEMPTS: usize = 3;
 
 /// Whether the model is consulted at all. Off falls back to table order.
-static USE_MODEL: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(true);
+static USE_MODEL: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 
 pub fn use_model(on: bool) {
     USE_MODEL.store(on, core::sync::atomic::Ordering::Relaxed);
@@ -347,7 +439,9 @@ fn choose_next(
         return (0, "forced");
     }
     if !model_in_use() {
-        return (0, "table");
+        // Zero is the ranking's own answer, which is a decision about this
+        // fault rather than a position in a table.
+        return (0, "rule");
     }
     if !crate::ai::engine_ready() {
         return (0, "no model");
@@ -419,7 +513,7 @@ const LOG_BYTES: usize = 8192;
 /// never accumulates a pile of changes that did not help. Whatever is left
 /// standing at the end is exactly the one that worked, or nothing.
 pub fn attempt(f: &Failure) -> Outcome {
-    let mut remaining: alloc::vec::Vec<&'static Action> = offered(f.name).collect();
+    let mut remaining: alloc::vec::Vec<&'static Action> = rank(f);
     let mut tried: alloc::vec::Vec<&'static str> = alloc::vec::Vec::new();
 
     for _ in 0..MAX_ATTEMPTS {
@@ -513,6 +607,19 @@ fn faults() {
     unsafe { core::ptr::read_volatile(0x0 as *const u64) };
 }
 fn passes() {}
+
+/// An address inside a function whose symbol contains `part`, or 0.
+///
+/// Found through the same table the report reads rather than written down, so a
+/// claim built on it is about this image instead of about a number somebody
+/// once measured.
+fn site_rip(part: &str) -> u64 {
+    if part.is_empty() {
+        return 0;
+    }
+    let base = crate::cpu::idt::IMAGE_BASE.load(core::sync::atomic::Ordering::Relaxed);
+    crate::cpu::code::find_symbol(part).map(|rva| base + rva).unwrap_or(0)
+}
 
 pub fn selftest() -> bool {
     let mut ok = true;
@@ -641,6 +748,141 @@ pub fn selftest() -> bool {
         "and a narrow one aimed at a subsystem it was never offered for",
     );
 
+    // ---- the ranking, which is the thing that actually decides order -------
+    //
+    // Pure over the failure record, so all of this runs with no model, no disk
+    // and nothing injected. That is the whole reason it replaced a decode: a
+    // repair loop that needs the model cannot repair the model, and a boot
+    // where the checkpoint will not load is exactly when a repair matters most.
+    //
+    // Every clue is read out of the table. A claim spelling "general protection
+    // fault" in its own text would assert what the table said the day it was
+    // written, and worse, would not notice `recover::describe` renaming a
+    // vector underneath it.
+    let signature = ACTIONS.iter().find(|a| !a.when.is_empty());
+    match signature {
+        None => claim(&mut ok, false, "some action carries a signature to match on"),
+        Some(a) => {
+            let sub = a.offered_for.first().copied().unwrap_or("any");
+
+            // Built from the row's own clues, so it is by construction the
+            // failure this action is for.
+            let mut why = "";
+            let mut site_part = "";
+            for c in a.when {
+                match c {
+                    Clue::Fault(n) => why = n,
+                    Clue::SiteContains(part) => site_part = part,
+                }
+            }
+            // A rip inside the function the clue names, found through the same
+            // symbol table the report uses rather than written down.
+            let hit = crate::boot_report::Failure {
+                name: sub,
+                need: crate::boot_report::Need::Optional,
+                why,
+                rip: site_rip(site_part),
+                retry: passes,
+                repaired_by: None,
+            };
+
+            claim(
+                &mut ok,
+                matches(&hit, a),
+                "an action's own signature matches the failure it describes",
+            );
+            claim(
+                &mut ok,
+                rank(&hit).first().map(|r| r.name) == Some(a.name),
+                "and that puts it first, ahead of anything asking for nothing",
+            );
+
+            // **The claim this whole redesign exists for.** The same subsystem,
+            // a different fault: a register knob must not be reached for
+            // because something else in `power` went wrong. Same shape as the
+            // `offered_for` claims, one level finer.
+            let other = crate::boot_report::Failure {
+                why: if why == "page fault" { "invalid opcode" } else { "page fault" },
+                ..hit
+            };
+            claim(
+                &mut ok,
+                !matches(&other, a),
+                "a different fault in the same subsystem does not match that signature",
+            );
+            claim(
+                &mut ok,
+                rank(&other).first().map(|r| r.name) != Some(a.name),
+                "and is not offered that repair first",
+            );
+
+            // A site somewhere else entirely, with the right vector. Half a
+            // signature is not a signature.
+            let elsewhere = crate::boot_report::Failure { rip: 0, ..hit };
+            claim(
+                &mut ok,
+                !matches(&elsewhere, a),
+                "nor does the right fault at a site the signature does not name",
+            );
+
+            // `retry` is the case that made ordering worth fixing: it can only
+            // help a transient fault, so trying it first on a deterministic one
+            // is a guaranteed wasted attempt -- which is what plain table order
+            // did on every boot.
+            claim(
+                &mut ok,
+                {
+                    let order = rank(&hit);
+                    let clueless = order.iter().position(|r| r.when.is_empty());
+                    let matched = order.iter().position(|r| matches(&hit, r));
+                    match (clueless, matched) {
+                        (Some(c), Some(m)) => m < c,
+                        _ => true,
+                    }
+                },
+                "an action asking for nothing is tried after one whose clues held",
+            );
+        }
+    }
+
+    // Nothing may be dropped. A clue is evidence about what is likely and never
+    // a proof about what is possible, so a wrong guess about a signature must
+    // cost an attempt's ordering and never a repair the machine can reach.
+    claim(
+        &mut ok,
+        {
+            let f = crate::boot_report::Failure {
+                name: ACTIONS
+                    .iter()
+                    .find(|a| !a.offered_for.is_empty())
+                    .and_then(|a| a.offered_for.first().copied())
+                    .unwrap_or("any"),
+                need: crate::boot_report::Need::Optional,
+                why: "nothing that matches any clue",
+                rip: 0,
+                retry: passes,
+                repaired_by: None,
+            };
+            let ranked = rank(&f);
+            let offers = offered(f.name).count();
+            ranked.len() == offers
+                && offered(f.name).all(|a| ranked.iter().any(|r| r.name == a.name))
+        },
+        "ranking reorders what is offered and never drops any of it",
+    );
+
+    // The clues name vectors by the string `recover` prints, so a rename there
+    // would silently stop every signature matching -- with no error, and the
+    // machine merely repairing itself worse.
+    claim(
+        &mut ok,
+        ACTIONS.iter().flat_map(|a| a.when.iter()).all(|c| match c {
+            Clue::Fault(name) => crate::cpu::recover::names().contains(name),
+            Clue::SiteContains(_) => true,
+        }),
+        "every fault a clue names is one `recover` can actually report",
+    );
+
     // ---- what the chooser is told -----------------------------------------
     //
     // **The misattribution claim, on the other side of the loop.** `offered`
@@ -724,8 +966,8 @@ pub fn selftest() -> bool {
     use_model(was);
     claim(
         &mut ok,
-        fixed == (0, "table"),
-        "with the model off the chooser is the table's first offered row, and says so",
+        fixed == (0, "rule"),
+        "with the model off the chooser takes the ranking's answer, and says so",
     );
     // Three ways to land on index zero, and a transcript that could not tell
     // them apart would report a busy engine as a model that picked the first

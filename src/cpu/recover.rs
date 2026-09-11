@@ -332,6 +332,26 @@ pub unsafe fn land(pad: *const u64) -> ! {
     }
 }
 
+/// Every name `describe` can produce.
+///
+/// Exists because `repair`'s clues match on these strings, so renaming a vector
+/// here would silently stop every repair signature matching -- no error, no
+/// fault, just a machine repairing itself worse than it used to. A claim over
+/// this list is what turns that into a failure somebody sees.
+pub fn names() -> &'static [&'static str] {
+    &[
+        "divide error",
+        "bound range exceeded",
+        "invalid opcode",
+        "general protection fault",
+        "page fault",
+        "alignment check",
+        "SIMD floating point",
+        "panicked",
+        "fault",
+    ]
+}
+
 /// What the last recovered fault was.
 pub fn describe() -> &'static str {
     match LAST.load(Ordering::Relaxed) {

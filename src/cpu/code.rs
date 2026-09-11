@@ -167,6 +167,45 @@ pub fn locate(rip: u64, base: u64, size: u64, generated: Option<(u64, u64)>) -> 
 /// emitted thunk the map does not name, it is the function before it. The
 /// offset is what distinguishes the two: `+0x13` is inside, `+0x2963` is
 /// almost certainly not.
+/// The rva of some function whose name contains `part`, if the table has one.
+///
+/// The inverse of `symbol`, and it exists for the selftests rather than for the
+/// fault path: a claim about "a fault inside `dev::power`" needs an address
+/// that really is inside `dev::power` *in this image*, and the alternative is
+/// writing down a number that was true of one build. Linear, because it runs
+/// when somebody types `diag` and never from a handler.
+pub fn find_symbol(part: &str) -> Option<u64> {
+    let names = super::symbols::NAMES;
+    for (at, off, len) in super::symbols::SYMBOLS.iter().copied() {
+        let (start, end) = (off as usize, off as usize + len as usize);
+        if end <= names.len() && names[start..end].contains(part) {
+            return Some(at as u64);
+        }
+    }
+    None
+}
+
+/// The function containing `rva`, and how far into it, or `None`.
+///
+/// **It can name the wrong function, and the offset is the tell.** The table
+/// holds what the linker put in `Publics by Value`, which is every *public*
+/// symbol and not every function: anything inlined, and anything the optimiser
+/// folded into a caller, has no entry. The search returns the greatest symbol
+/// at or below the address, so a fault inside code with no symbol of its own is
+/// reported as a large offset into whatever happens to precede it.
+///
+/// Measured while testing the repair signatures: a deliberate fault in a small
+/// `dev::power` helper was reported as `doom::play::dispatch +0x14a2`, five
+/// kilobytes into an unrelated function in an unrelated subsystem. With 13,817
+/// symbols over the text section the average spacing is about a hundred bytes,
+/// so an offset in the thousands means the real function is absent rather than
+/// enormous. `#[inline(never)]` is what puts a function back in the table when
+/// somebody needs to be able to name it.
+///
+/// Not silently corrected, because there is nothing to correct it *to*: the map
+/// carries addresses and no sizes, so the next entry is the only available end
+/// and the search can never run past it. The offset is the evidence and a
+/// reader has to weigh it.
 pub fn symbol(rva: u64) -> Option<(&'static str, u64)> {
     let t = super::symbols::SYMBOLS;
     if t.is_empty() || rva > u32::MAX as u64 {
