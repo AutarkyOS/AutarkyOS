@@ -464,43 +464,10 @@ fn fault(f: &Frame) -> ! {
     // it is abandoned, which also works when the fault arrived on an interrupt
     // stack as the page-fault vector does.
     if let Some(pad) = super::recover::take(vector) {
-        // Restores **every** general-purpose register, not a set chosen from
-        // a calling convention: `guard` is inlined into its callers, so the
-        // longjmp crosses no ABI boundary and a caller's live value can be
-        // sitting in `rax` or `r9` as easily as in `rbx`.
-        //
-        // `rcx` is the cursor and is therefore restored last, from its own
-        // slot through itself. That leaves nothing to hold the jump target, so
-        // the target is pushed onto the already-restored stack and `ret` takes
-        // it: eight bytes below `rsp`, which nothing owns, written with
-        // interrupts still off because the gate cleared them and `guard` does
-        // not `sti` until it has landed.
-        //
-        // The offsets are asserted against the structure in `recover.rs`.
-        unsafe {
-            core::arch::asm!(
-                "mov rax, [rcx]",
-                "mov rbx, [rcx + 8]",
-                "mov rdx, [rcx + 24]",
-                "mov rsi, [rcx + 32]",
-                "mov rdi, [rcx + 40]",
-                "mov rbp, [rcx + 48]",
-                "mov r8,  [rcx + 56]",
-                "mov r9,  [rcx + 64]",
-                "mov r10, [rcx + 72]",
-                "mov r11, [rcx + 80]",
-                "mov r12, [rcx + 88]",
-                "mov r13, [rcx + 96]",
-                "mov r14, [rcx + 104]",
-                "mov r15, [rcx + 112]",
-                "mov rsp, [rcx + 128]",
-                "push [rcx + 120]",
-                "mov rcx, [rcx + 16]",
-                "ret",
-                in("rcx") pad,
-                options(noreturn),
-            );
-        }
+        // The register list and the reason for it live in `recover::land`,
+        // which the panic handler also uses. Two copies of it is the bet the
+        // stub stride already lost once.
+        unsafe { super::recover::land(pad) }
     }
 
     // A fault taken *while reporting* one used to recurse: the report crashed

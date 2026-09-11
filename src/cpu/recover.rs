@@ -154,6 +154,40 @@ static PADS: crate::sync::Racy<[[Pad; DEPTH]; SLOTS]> =
 /// How many guards each task is currently inside.
 static DEPTHS: crate::sync::Racy<[usize; SLOTS]> = crate::sync::Racy::new([0; SLOTS]);
 
+/// `LAST` when what was caught was a panic rather than a hardware exception.
+/// Outside the vector range so it cannot collide with one.
+const PANIC: u64 = 0xFFFF;
+
+/// Whether a panic should be caught rather than halting the machine.
+///
+/// **Set only around the boot selftests, and cleared immediately after.** A
+/// panic means a Rust invariant was violated, which is a weaker thing to
+/// survive than a hardware exception -- so the window where it is survivable
+/// is one block of code whose whole job is to try things that might not work.
+/// Everywhere else, at every other time, a panic halts exactly as it did.
+static SELFTEST: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// Open or close the window in which a panic is recoverable.
+pub fn selftest_window(on: bool) {
+    SELFTEST.store(on, Ordering::Release);
+}
+
+pub fn in_selftest() -> bool {
+    SELFTEST.load(Ordering::Acquire)
+}
+
+/// The landing pad for a panic, if one is armed and the window is open.
+///
+/// Unlike `take` there is no vector to filter on: a panic is a panic. The
+/// window is the filter, and it is the whole of the restraint here.
+pub fn take_panic() -> Option<*const u64> {
+    if !in_selftest() {
+        return None;
+    }
+    let i = slot()?;
+    take_slot(i, PANIC)
+}
+
 /// Why the last recovered fault happened, for the message a program gets.
 static LAST: AtomicU64 = AtomicU64::new(0);
 static COUNT: AtomicU64 = AtomicU64::new(0);
@@ -218,6 +252,53 @@ fn take_slot(i: usize, why: u64) -> Option<*const u64> {
     Some(&pads[i][top].rax as *const u64)
 }
 
+/// Jump to a landing pad. Never returns.
+///
+/// **One copy of this exists and that is deliberate.** It restores *every*
+/// general-purpose register, not a set chosen from a calling convention:
+/// `guard` is inlined into its callers, so the longjmp crosses no ABI boundary
+/// and a caller's live value can be sitting in `rax` or `r9` as easily as in
+/// `rbx`. It was written out twice for a while -- once in the fault handler and
+/// once for panics -- and two copies of a register list that must not drift is
+/// the same bet `idt.rs` lost over the stub stride.
+///
+/// `rcx` is the cursor and is restored last, from its own slot through itself.
+/// That leaves nothing to hold the jump target, so the target is pushed onto
+/// the already-restored stack and `ret` takes it: eight bytes below `rsp`,
+/// which nothing owns.
+///
+/// The offsets are asserted against `Pad` above.
+///
+/// # Safety
+/// `pad` must be a pointer `take`/`take_panic` answered, and the frame it
+/// belongs to must still be on the stack.
+pub unsafe fn land(pad: *const u64) -> ! {
+    unsafe {
+        core::arch::asm!(
+            "mov rax, [rcx]",
+            "mov rbx, [rcx + 8]",
+            "mov rdx, [rcx + 24]",
+            "mov rsi, [rcx + 32]",
+            "mov rdi, [rcx + 40]",
+            "mov rbp, [rcx + 48]",
+            "mov r8,  [rcx + 56]",
+            "mov r9,  [rcx + 64]",
+            "mov r10, [rcx + 72]",
+            "mov r11, [rcx + 80]",
+            "mov r12, [rcx + 88]",
+            "mov r13, [rcx + 96]",
+            "mov r14, [rcx + 104]",
+            "mov r15, [rcx + 112]",
+            "mov rsp, [rcx + 128]",
+            "push [rcx + 120]",
+            "mov rcx, [rcx + 16]",
+            "ret",
+            in("rcx") pad,
+            options(noreturn),
+        );
+    }
+}
+
 /// What the last recovered fault was.
 pub fn describe() -> &'static str {
     match LAST.load(Ordering::Relaxed) {
@@ -228,6 +309,7 @@ pub fn describe() -> &'static str {
         14 => "page fault",
         17 => "alignment check",
         19 => "SIMD floating point",
+        PANIC => "panicked",
         _ => "fault",
     }
 }
@@ -346,7 +428,23 @@ fn guard_inner<F: FnOnce()>(f: F) -> Result<bool, &'static str> {
         d
     };
 
-    f();
+    // **Called behind an opaque condition, and that is not superstition.**
+    // A closure the optimiser can prove diverges -- one that always panics,
+    // or ends in `unimplemented!()` -- makes everything after this line
+    // unreachable, so it is deleted. Including the landing block below, which
+    // the pad's `rip` points at and which only a longjmp ever reaches. The
+    // compiler cannot see that edge, so it is entitled to remove the target.
+    //
+    // Measured, before this line existed: a guarded closure whose body was a
+    // bare `panic!` landed at rva 0x5e06e8, past the end of `.text`, and took
+    // a #PF at cr2 = 8. The pad was correct and pointed at code that was no
+    // longer there.
+    //
+    // `black_box` on the condition costs one compare and makes the tail
+    // reachable in the compiler's view, which is all that is needed.
+    if core::hint::black_box(true) {
+        f();
+    }
 
     // The normal exit pops. The faulting exit pops inside `take_slot`, so both
     // paths leave the depth where this frame found it.
@@ -372,6 +470,11 @@ fn guard_inner<F: FnOnce()>(f: F) -> Result<bool, &'static str> {
         );
     }
     if faulted != 0 {
+        // The closure was abandoned mid-flight. If it was inside a `kprintln!`
+        // it left the console locked, and the next print -- which is the one
+        // reporting this very fault -- would spin to `PATIENCE` and panic.
+        // A recovered fault must not become a fatal one on the way out.
+        unsafe { crate::gfx::console::release_locks() };
         Err(describe())
     } else {
         Ok(true)
@@ -493,6 +596,45 @@ pub fn selftest() -> bool {
         ),
         "and a caught fault as faulted rather than as a pass",
     );
+
+    // ---- panics, which bypassed every one of the above --------------------
+    //
+    // Hardware exceptions were the only thing recoverable, and an `assert!` is
+    // how a selftest usually fails. So the majority of the cases this whole
+    // mechanism looks like it covers, it did not.
+    claim(
+        &mut ok,
+        !in_selftest() && take_panic().is_none(),
+        "with the window shut, a panic finds no pad and stays fatal",
+    );
+
+    selftest_window(true);
+    // Deliberately a closure that *always* panics, because that is the shape
+    // that broke: the optimiser deletes the landing block when it can prove
+    // the call diverges. `guard_inner` calls behind a `black_box`d condition
+    // to stop it, and this is the claim that the defence is still there.
+    let panicked = guard(|| {
+        panic!("a selftest that asserts its way out");
+    });
+    // Shut immediately. Leaving it open would make every later panic in the
+    // boot recoverable, which is exactly the blanket this is written to avoid.
+    selftest_window(false);
+    claim(&mut ok, panicked.is_err(), "with it open, a panic inside a guard is caught");
+    claim(
+        &mut ok,
+        panicked == Err("panicked"),
+        "and is named a panic rather than borrowing a fault's description",
+    );
+    claim(
+        &mut ok,
+        !in_selftest(),
+        "and the window is shut again afterwards",
+    );
+
+    // The console was locked by the `kprintln!` this suite is made of, and the
+    // claim above printed after the catch -- so the release worked. Said out
+    // loud because the failure would be a hang rather than a wrong answer.
+    claim(&mut ok, true, "and the console survived being abandoned mid-print");
 
     // What is *not* claimed here, said plainly rather than left as a gap.
     //

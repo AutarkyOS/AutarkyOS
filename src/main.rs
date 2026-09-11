@@ -1593,6 +1593,27 @@ fn halt() -> ! {
 
 #[panic_handler]
 fn panic(info: &PanicInfo) -> ! {
+    // **A panic during a boot selftest is survivable; everywhere else it is
+    // not.** A check that asserts its way out has said its subsystem is
+    // broken, which is information rather than a reason to stop the machine --
+    // and an `assert!` is how most selftests fail, so catching only hardware
+    // exceptions would cover far less than it appears to.
+    //
+    // The window is opened around the selftest block and closed immediately
+    // after, so this consults a pad for one stretch of boot and never again. A
+    // panic means a Rust invariant broke, which is a weaker thing to survive
+    // than a #GP, and that narrowness is the whole of what makes it
+    // defensible.
+    //
+    // Serial and not the console, because the console lock may be exactly what
+    // the panicking code was holding; `guard` releases it after landing, which
+    // has not happened yet.
+    if crate::cpu::recover::in_selftest() {
+        serial_println!("\n*** PANIC (inside a selftest, recovering) *** {}", info);
+        if let Some(pad) = crate::cpu::recover::take_panic() {
+            unsafe { crate::cpu::recover::land(pad) }
+        }
+    }
     serial_println!("\n*** PANIC *** {}", info);
     if console::is_ready() {
         // A panic behind a progress bar helps nobody, and on the GF63 the

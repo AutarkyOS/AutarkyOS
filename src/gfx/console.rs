@@ -1075,6 +1075,21 @@ pub fn cols() -> usize {
 
 /// Capture nests per pipeline and is reached from whichever core is running
 /// the shell, so it is behind the same kind of lock for the same reason.
+/// Drop the console's locks, for a task that was longjmped out of one.
+///
+/// **Exactly two locks, named, and that is the whole entitlement.** A selftest
+/// prints as it runs, so the console is the one thing a caught fault is likely
+/// to have been holding. Releasing anything else here would be guessing about
+/// a borrow this function cannot see.
+///
+/// # Safety
+/// Only after a `recover::guard` has caught a fault, when the code that held
+/// these cannot resume.
+pub unsafe fn release_locks() {
+    CAPTURE.force_unlock();
+    CONSOLES.force_unlock();
+}
+
 static CAPTURE: crate::sync::Spin<alloc::vec::Vec<alloc::string::String>> =
     crate::sync::Spin::new(alloc::vec::Vec::new());
 
