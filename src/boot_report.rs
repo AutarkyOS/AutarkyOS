@@ -60,6 +60,16 @@ pub struct Failure {
     /// thing that can say so, and it is resolved to a function name at print
     /// time rather than stored.
     pub rip: u64,
+    /// The check itself, so it can be run again.
+    ///
+    /// **A failure you cannot re-run is a failure you cannot repair**, because
+    /// re-running it is the only judge a repair has. This is why `section`
+    /// takes a `fn()` rather than a closure.
+    pub retry: fn(),
+    /// Set once something fixed it. The subsystem stays listed, because "was
+    /// broken and is now repaired" is a different fact from "never broke" and
+    /// an operator is owed both.
+    pub repaired_by: Option<&'static str>,
 }
 
 const SLOTS: usize = 16;
@@ -67,12 +77,12 @@ const SLOTS: usize = 16;
 static FAILURES: Racy<[Option<Failure>; SLOTS]> = Racy::new([None; SLOTS]);
 static OVERFLOW: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
 
-pub fn record(name: &'static str, need: Need, why: &'static str) {
+pub fn record(name: &'static str, need: Need, why: &'static str, retry: fn()) {
     let rip = crate::cpu::recover::site().unwrap_or(0);
     let slots = unsafe { FAILURES.get() };
     for s in slots.iter_mut() {
         if s.is_none() {
-            *s = Some(Failure { name, need, why, rip });
+            *s = Some(Failure { name, need, why, rip, retry, repaired_by: None });
             return;
         }
     }
@@ -84,6 +94,25 @@ pub fn record(name: &'static str, need: Need, why: &'static str) {
 pub fn failures() -> impl Iterator<Item = Failure> {
     let slots = unsafe { FAILURES.get() };
     slots.iter().filter_map(|s| *s).collect::<alloc::vec::Vec<_>>().into_iter()
+}
+
+/// Note that a repair worked, without forgetting that it was ever broken.
+pub fn mark_repaired(name: &str, action: &'static str) {
+    let slots = unsafe { FAILURES.get() };
+    for s in slots.iter_mut().flatten() {
+        if s.name == name {
+            s.repaired_by = Some(action);
+        }
+    }
+}
+
+/// How many are still broken, which is not how many broke.
+pub fn outstanding() -> usize {
+    unsafe { FAILURES.get() }
+        .iter()
+        .flatten()
+        .filter(|f| f.repaired_by.is_none())
+        .count()
 }
 
 pub fn count() -> usize {
@@ -109,15 +138,20 @@ pub fn report() {
         return;
     }
     crate::gfx::console::set_color(crate::gfx::console::LTRED);
-    kprintln!("\n[boot] {} subsystem(s) did not survive their own selftest:", n);
+    kprintln!(
+        "\n[boot] {} subsystem(s) did not survive their own selftest, {} still broken:",
+        n,
+        outstanding()
+    );
     for f in failures() {
         kprintln!(
             "  {:<14} {}  ({})",
             f.name,
             f.why,
-            match f.need {
-                Need::Vital => "vital",
-                Need::Optional => "optional, so this machine is running without it",
+            match (f.need, f.repaired_by) {
+                (_, Some(a)) => a,
+                (Need::Vital, None) => "vital",
+                (Need::Optional, None) => "optional, so this machine is running without it",
             }
         );
         // Where it actually was, which may be nowhere near what is named

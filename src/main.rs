@@ -17,6 +17,7 @@ extern crate alloc;
 
 mod acpi;
 mod boot_report;
+mod repair;
 mod ai;
 mod app;
 mod cpu;
@@ -556,6 +557,11 @@ pub extern "efiapi" fn efi_main(image: Handle, st: *mut SystemTable) -> Status {
     if ai::engine_ready() && ai::initiative::spawn() {
         kprintln!("  initiative resident -- the machine thinks between your commands");
     }
+
+    // Try to fix what broke, before saying what is missing -- so the summary
+    // reports the state the machine is actually in rather than the one it was
+    // in a moment ago.
+    repair::attempt_all();
 
     // Said here rather than only where it happened: by now the fault itself
     // has scrolled past a hundred ok lines, and the line that matters is
@@ -1167,7 +1173,10 @@ fn install_paging(boot: &BootInfo, frames: &mut mem::frame::EarlyFrames) {
 /// cannot happen here -- `percpu::arm` runs at `init_smp`, one step before the
 /// selftests -- and is matched explicitly so that if the boot order ever
 /// changes, this reads as the open question it is rather than as success.
-fn section(name: &'static str, need: boot_report::Need, f: impl FnOnce()) {
+/// Note the  rather than a closure: a check has to be **re-runnable**,
+/// because re-running it is how a repair is judged. Every section here
+/// captures nothing, so this costs nothing and buys the whole repair loop.
+fn section(name: &'static str, need: boot_report::Need, f: fn()) {
     use cpu::recover::Caught;
     match cpu::recover::guarded(f) {
         Caught::Ran => {}
@@ -1177,7 +1186,7 @@ fn section(name: &'static str, need: boot_report::Need, f: impl FnOnce()) {
             console::set_color(LTGRAY_IDX);
         }
         Caught::Faulted(why) => {
-            boot_report::record(name, need, why);
+            boot_report::record(name, need, why, f);
             console::set_color(LTRED);
             kprintln!(
                 "[selftest] {} {} -- {}",

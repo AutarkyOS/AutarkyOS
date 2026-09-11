@@ -313,8 +313,25 @@ pub fn governor() -> Governor {
 /// **`IA32_PM_ENABLE` is the one HWP register that is safe to read on a part
 /// that advertises HWP**, and everything else in the group is gated behind its
 /// bit 0. It is architectural precisely so software has somewhere to ask.
+/// Set when reading the HWP registers is known to fault on this machine.
+///
+/// **A repair knob, and the shape every one of them should have.** It does not
+/// describe the hardware -- CPUID already does that -- it records a decision
+/// taken after something went wrong, and it makes the subsystem answer "not
+/// available" instead of touching the register again. Default off, so a
+/// machine that never failed behaves exactly as it did.
+static SKIP_HWP: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+pub fn skip_hwp(on: bool) {
+    SKIP_HWP.store(on, Ordering::Relaxed);
+}
+
+pub fn hwp_skipped() -> bool {
+    SKIP_HWP.load(Ordering::Relaxed)
+}
+
 pub fn hwp_enabled() -> bool {
-    if !allowed(CAP_HWP) {
+    if hwp_skipped() || !allowed(CAP_HWP) {
         return false;
     }
     unsafe { cpu::rdmsr(IA32_PM_ENABLE) & 1 != 0 }
