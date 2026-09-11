@@ -7,8 +7,12 @@
 //! here is the thing the machine produced five minutes ago.
 //!
 //! **What is recoverable is bounded and stated.** A fault is caught only while
-//! a task is inside `guard`, which the interpreter and the code generator wrap
-//! their execution in. A fault anywhere else stays fatal, because there is no
+//! a task is inside `guard`. The code generator wraps compiled code in one
+//! (`aiksi::jit`), the page-rights suite faults inside one on purpose, and
+//! `main::section` wraps each boot selftest in one so an optional subsystem
+//! cannot take the machine with it. The tree-walking interpreter does **not**
+//! -- it is bounded by a step budget rather than guarded, and this said
+//! otherwise for a long time. A fault anywhere else stays fatal, because there is no
 //! isolation in this kernel and a fault in the page tables or the allocator has
 //! already corrupted whatever it was going to corrupt. Recovering from that
 //! would produce a machine that keeps running and cannot be trusted, which is

@@ -2801,8 +2801,10 @@ GF63 for a correct reason.
 There is no `cargo test`. This is a `no_std` UEFI binary with no host test
 runner, so **verification is the boot selftests plus driving QEMU.**
 
-At boot the system runs **twenty-six selftest sections**, and `diag` offers
-**forty-two named suites** on demand, most of them the same checks (the `aiksi` section covers the capability gate by name and never by
+At boot the system runs **twenty-six selftest sections**, seven of which are
+now wrapped in `main::section` so an optional one that faults marks itself
+unavailable instead of taking the machine, and `diag` offers **forty-seven
+named suites** on demand, most of them the same checks (the `aiksi` section covers the capability gate by name and never by
 calling -- half that table pokes memory, drives I/O ports or paints over the
 screen, and a suite that called every row to prove it exists would be
 scribbling on the machine to do it), printing `ok` or `FAIL` per line: heap, timer, clock, the namespace's
@@ -2883,7 +2885,7 @@ attention path is wired correctly writes real sentences.
 
 **`diag` on its own lists the suites; `diag all` runs them.** A bare `diag`
 prints a table with `-` beside everything that has not run this boot and a
-tally reading `0 passed, 0 failed, 42 not run`, which is easy to read as a
+tally reading `0 passed, 0 failed, 47 not run`, which is easy to read as a
 clean sweep. It is the opposite of one.
 
 **The list and its verdict table are one number now, and were not.** `RESULTS`
@@ -3256,10 +3258,13 @@ That is exactly why the rest is careful.
   `update::decide` is. Heap-resident generated code is named by tag and
   offset; an rip in neither is said to be in neither.
 
-None of this prevents anything. There is no fault recovery here -- every IDT
-vector but `#BP` is `-> !` -- so a bad jump is still a halted machine. What
-the registry buys is that the one diagnostic which survives says something
-true.
+None of this prevents anything **here**. Faults are recoverable inside
+`cpu::recover::guard` and generated code is usually not called from inside one,
+so a bad jump is still a halted machine. What the registry buys is that the one
+diagnostic which survives says something true -- and that matters more now that
+`boot_report` turns a boot-time halt into a transcript, since a transcript
+naming an offset into an anonymous buffer is a different thing from one naming
+an rva in nothing.
 
 **And it does, verified by faulting on purpose.** `fault code` emits a null
 dereference into an `Exec`, arms it and jumps in. The buffer is deliberately
@@ -3602,6 +3607,128 @@ shadow grid without painting, and `finish()` repaints the whole log. Anything
 that draws during boot must check `splash::active()`, and the fault reporter
 and panic handler call `splash::abandon()` first, because on the GF63 the
 framebuffer is the only diagnostic channel there is.
+
+### Surviving a selftest, and repairing what broke
+
+**The first bare-metal boot on the GF63 died of a thermometer.** A `#GP` in
+`dev::power::hwp_range` -- reading `IA32_HWP_CAPABILITIES`, which is gated
+behind `IA32_PM_ENABLE` and which nothing downstream needs -- halted the
+machine before the shell existed. No storage, no namespace, no model. The only
+positional information on screen was `rva 0xaa013`, which needed a second
+computer and `llvm-objdump` to turn into a function name.
+
+Four pieces answer that, and each is useful without the ones after it.
+
+**Symbolication.** `.cargo/config.toml` passes `/MAP:target/glados.map` --
+`lld-link` takes MSVC flags -- and `tools/symbols.py` turns the map into
+`src/cpu/symbols.rs`: an rva-sorted table and one names blob, 13,559 symbols
+and 546 KB, which takes the image from 4,221 to 4,916 KB. `cpu::code::symbol`
+binary-searches it and allocates nothing, because it is called from a fault
+handler. Two traps paid for: v0 Rust mangling is **length-prefixed**, so a
+greedy regex returns `glados` for everything and it needs a scanner; and the
+build stamp is a content hash of the table rather than the linker timestamp,
+which never converged and named the *previous* link.
+
+`scripts/deploy.ps1` builds, regenerates the table and relinks -- two passes,
+necessarily, since the table describes the image it is then compiled into. The
+stamp is what says whether the one in the binary belongs to it.
+
+**Guards fit to wrap a selftest.** `PADS` is a per-task stack of depth 4, so a
+guard inside a guard no longer disarms the outer one on its *normal* exit.
+`guarded` answers three states rather than two: `Ran`, `Faulted(why)`, and
+`Unguarded`, which means the closure ran with no landing pad and therefore
+**proved nothing** -- treating that as a pass is exactly how a check that never
+protected anything looks like one that passed. `selftest_window(bool)` lets the
+panic handler consult a pad, and only there; everywhere else a panic halts.
+
+Two hazards that are silent, both already paid for. A fault mid-`kprintln!`
+abandons `CAPTURE` and `CONSOLES` held, and `Spin`'s patience limit **panics**
+on the next acquire -- a recovered fault becoming a fatal one -- so the caught
+path calls `console::release_locks()`, which is entitled to exactly those two
+and says so. And **a provably-divergent closure loses its landing pad**: the
+optimiser deletes the unreachable tail, longjmp target included, and the guard
+lands at an rva past `.text`. `guard_inner` calls through
+`if core::hint::black_box(true)`, and the suite's case is a bare `panic!` so it
+asserts the defence rather than working around it.
+
+**Criticality is per subsystem.** `main::section(name, need, f)` wraps a boot
+check; `Need::Vital` halts with a reason, `Need::Optional` records the failure,
+prints one red line and carries on. Seven are wrapped today -- `sysbox`,
+`crypto` and `rng` vital, `power`, `fmt`, `usbhid` and `code` optional.
+
+It takes `fn()` rather than `impl FnOnce()`, and that is the load-bearing
+detail: **a failure you cannot re-run is a failure you cannot repair**, and
+re-running the check is the only judge a repair has.
+
+**The site is recorded, because recovering throws away the only evidence of
+where.** A caught fault is attributed to whatever scope was guarded, which
+answers *which check failed* and not *what broke*. Those differ the moment a
+check calls into something else -- a fault inside the graphics stack reached
+from a power selftest is a power failure by attribution and a graphics one in
+fact. `recover::site()` carries the rip through, `boot_report` symbolicates it
+at print time, and the report prints both. Verified by faulting inside
+`doom::pic` from the `power` section: the report named section `power`, site
+`doom::pic::Art::flat +0x27`.
+
+**The repair loop is the Troubleshooter's bargain**, which was a good one: a
+fixed set of deterministic actions, one applied, and then **checked**. It never
+ran during POST either -- it booted, looked, fixed, and made the fix stick.
+That ordering is forced here anyway, since `ai::init` needs the namespace and
+the selftests run long before either.
+
+`src/repair.rs` is an allowlist, two rows today, which is the honest size of
+the set of knobs that exist rather than a claim the machine can fix anything.
+`retry` earns a row because "it did not happen the second time" is a real
+outcome worth recording as the repair that worked. `skip-hwp` is the GF63 bug
+with a switch in front of it. Most useful repairs turn something off or down;
+so did the Troubleshooter's.
+
+**Nothing chooses with a model yet, deliberately.** The rule is fixed: try each
+offered action in table order, keep the first whose judge passes, revert the
+ones that did not, so whatever is left standing is exactly the one that worked.
+Proving apply/judge/revert somewhere a decode cannot be blamed for is the point
+of doing it in this order.
+
+`offered_for` is narrow on purpose, and `diag repair` is built around that: a
+chooser that could pick a power register knob for a graphics fault is one
+decision away from a second fault in a subsystem nobody was repairing. Both
+halves of that claim are **derived from each row's own list** rather than
+written down, so renaming a row cannot leave the suite passing while testing
+something that no longer exists; and the judge claims run against synthetic
+checks belonging to no subsystem, so what they measure is the judge rather than
+a particular repair.
+
+`judge` saves and restores the selftest window instead of closing it. It is
+callable from inside a suite -- `diag repair` does exactly that -- and closing
+it would silently take panic recovery away from every check after it.
+
+Measured under QEMU, with a fault injected into the `power` section that
+`skip-hwp` genuinely fixes:
+
+    [selftest] power page fault -- this subsystem is unavailable
+    [repair] 1 subsystem(s) to try
+      power          repaired by 'skip-hwp', and the check now passes
+    [boot] 1 subsystem(s) did not survive their own selftest, 0 still broken:
+      power          page fault  (skip-hwp)
+    glados> echo alive
+      alive
+
+A repaired subsystem stays listed, because "was broken and is now repaired" is
+a different fact from "never broke" and an operator is owed both. The header
+counts what is *still* broken.
+
+**What is not built.** Nothing persists: a repair is decided every boot and
+forgotten every boot, so the ESP record (`\GLADOS\REPAIRS.TXT`, read in
+`update::hook` before `ExitBootServices`, self-limiting through the same health
+flag that makes a bad image roll itself back) is the next piece, and
+`author::choose` replacing the fixed rule is the piece after that. There is no
+`repair` verb yet, and nothing reports a subsystem that starts passing *without*
+its repair -- which is how a workaround for a bug somebody has since fixed
+lives forever.
+
+**And the end-to-end test no emulator can produce.** QEMU reports `hwp no`, so
+the real bug cannot reproduce here: the sequence of the GF63 faulting, being
+repaired by `skip-hwp`, persisting it and booting clean is still owed.
 
 ### Concurrency
 

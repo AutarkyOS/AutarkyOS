@@ -7,8 +7,12 @@
 //! address and the instruction pointer, and you are debugging instead of
 //! guessing.
 //!
-//! Every handler here is currently fatal except `#BP`. Once demand paging or
-//! task switching exists, `#PF` will need to become resumable.
+//! Every handler here is fatal except `#BP` **and except inside a guard**.
+//! `super::recover::take` is consulted first for the seven vectors a program
+//! can plausibly raise, and a task holding a landing pad is longjmped back to
+//! it rather than halted; the rip is handed over on the way so the report can
+//! say where it was rather than only which scope it was in. Everything else,
+//! and everything outside a guard, still prints registers and stops.
 //!
 //! Every fault arrives through an assembly stub that pushes all fifteen
 //! general-purpose registers first, so a report says what the machine was
