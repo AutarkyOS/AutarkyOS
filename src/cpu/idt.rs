@@ -463,7 +463,7 @@ fn fault(f: &Frame) -> ! {
     // that was live when the guard was set, so the frame and everything above
     // it is abandoned, which also works when the fault arrived on an interrupt
     // stack as the page-fault vector does.
-    if let Some(pad) = super::recover::take(vector) {
+    if let Some(pad) = super::recover::take(vector, f.rip) {
         // The register list and the reason for it live in `recover::land`,
         // which the panic handler also uses. Two copies of it is the bet the
         // stub stride already lost once.

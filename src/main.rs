@@ -16,6 +16,7 @@
 extern crate alloc;
 
 mod acpi;
+mod boot_report;
 mod ai;
 mod app;
 mod cpu;
@@ -451,7 +452,14 @@ pub extern "efiapi" fn efi_main(image: Handle, st: *mut SystemTable) -> Status {
     init_smp(&acpi);
     init_keyboard(&acpi);
     gfx::splash::stage("self-test");
+    // **The window in which a panicking selftest is survivable**, opened here
+    // and shut on the next line. A check that asserts its way out has said its
+    // subsystem is broken, which is information; a panic anywhere else in this
+    // kernel still halts, which is why the window is two lines wide and not a
+    // policy.
+    cpu::recover::selftest_window(true);
     selftest(&acpi);
+    cpu::recover::selftest_window(false);
 
     // Adopt the current thread of execution as task 0, then give it company.
     gfx::splash::stage("scheduler");
@@ -548,6 +556,11 @@ pub extern "efiapi" fn efi_main(image: Handle, st: *mut SystemTable) -> Status {
     if ai::engine_ready() && ai::initiative::spawn() {
         kprintln!("  initiative resident -- the machine thinks between your commands");
     }
+
+    // Said here rather than only where it happened: by now the fault itself
+    // has scrolled past a hundred ok lines, and the line that matters is
+    // "this machine is running without X".
+    boot_report::report();
 
     gfx::splash::stage("ready");
     gfx::splash::finish();
@@ -1141,6 +1154,54 @@ fn install_paging(boot: &BootInfo, frames: &mut mem::frame::EarlyFrames) {
 }
 
 /// Prove the exception path works while we are still expecting it to.
+/// Run one boot selftest under a guard, and decide what its failure means.
+///
+/// **This is the line between "a thermometer broke" and "the machine is
+/// gone".** Before it, any fault inside any selftest halted the boot before
+/// the shell existed -- which is exactly what a `#GP` in `dev::power` did on
+/// the first bare-metal run, costing storage, the namespace and the model to a
+/// register nobody needs.
+///
+/// `Unguarded` is not treated as a pass and not treated as a failure: it means
+/// the closure ran with no landing pad, so nothing was proven either way. It
+/// cannot happen here -- `percpu::arm` runs at `init_smp`, one step before the
+/// selftests -- and is matched explicitly so that if the boot order ever
+/// changes, this reads as the open question it is rather than as success.
+fn section(name: &'static str, need: boot_report::Need, f: impl FnOnce()) {
+    use cpu::recover::Caught;
+    match cpu::recover::guarded(f) {
+        Caught::Ran => {}
+        Caught::Unguarded(_) => {
+            console::set_color(LTRED);
+            kprintln!("[selftest] {} ran with no landing pad, so it proved nothing", name);
+            console::set_color(LTGRAY_IDX);
+        }
+        Caught::Faulted(why) => {
+            boot_report::record(name, need, why);
+            console::set_color(LTRED);
+            kprintln!(
+                "[selftest] {} {} -- {}",
+                name,
+                why,
+                match need {
+                    boot_report::Need::Vital => "and this machine needs it",
+                    boot_report::Need::Optional => "this subsystem is unavailable",
+                }
+            );
+            console::set_color(LTGRAY_IDX);
+            if need == boot_report::Need::Vital {
+                // Nothing after this line can be trusted, so the honest thing
+                // is to stop here rather than to boot something that will fail
+                // somewhere less legible.
+                boot_report::report();
+                console::set_color(LTRED);
+                kprintln!("\n[boot] {} is vital, so this machine will not continue.", name);
+                halt();
+            }
+        }
+    }
+}
+
 fn selftest(acpi_ref: &Option<acpi::Acpi>) {
     console::set_color(LTGREEN);
     kprintln!("\n[selftest] heap:");
@@ -1271,13 +1332,16 @@ fn selftest(acpi_ref: &Option<acpi::Acpi>) {
     console::set_color(LTGREEN);
     kprintln!("\n[selftest] sysbox namespace:");
     console::set_color(LTGRAY_IDX);
-    sysbox::selftest();
+    section("sysbox", boot_report::Need::Vital, || { sysbox::selftest(); });
 
     // The RFC vectors, at every boot. 25 ms, and it is the only thing standing
     // between a broken field arithmetic and a TLS handshake that fails with
     // nothing to point at -- crypto is the one place where wrong code still
     // produces perfectly plausible output.
-    crypto::selftest();
+    // Vital: a cipher that is quietly wrong produces output that works
+    // perfectly and is not secure, which is the failure `crypto` opens by
+    // warning about. Absent is safer than subtly broken.
+    section("crypto", boot_report::Need::Vital, || { crypto::selftest(); });
 
     // Straight after the ciphers, and deliberately so: the generator is a
     // construction over the ChaCha20 checked one line above, so its claims
@@ -1285,11 +1349,11 @@ fn selftest(acpi_ref: &Option<acpi::Acpi>) {
     console::set_color(LTGREEN);
     kprintln!("\n[selftest] random:");
     console::set_color(LTGRAY_IDX);
-    if !rng::selftest() {
+    section("rng", boot_report::Need::Vital, || if !rng::selftest() {
         console::set_color(LTRED);
         kprintln!("  FAIL -- key material would look fine and be predictable");
         console::set_color(LTGRAY_IDX);
-    }
+    });
 
     if json::selftest() {
         console::set_color(LTGREEN);
@@ -1328,18 +1392,23 @@ fn selftest(acpi_ref: &Option<acpi::Acpi>) {
     // the first time anything here fetches an instruction from the heap. A
     // wrong answer is a halted machine, so it runs early and under QEMU
     // before it ever runs on the GF63.
-    dev::power::probe();
-    kprintln!("
+    // **The one that has actually faulted on real hardware.** Optional by
+    // any reading: nothing downstream needs a temperature, and the first
+    // bare-metal boot lost the entire machine to it.
+    section("power", boot_report::Need::Optional, || {
+        dev::power::probe();
+        kprintln!("
 [power]");
-    dev::power::report();
+        dev::power::report();
+    });
 
     kprintln!("
 [selftest] file formats:");
-    if !fmt::selftest() {
+    section("fmt", boot_report::Need::Optional, || if !fmt::selftest() {
         console::set_color(LTRED);
         kprintln!("[selftest] file type handling is unsound");
         console::set_color(LTGRAY_IDX);
-    }
+    });
 
     kprintln!("
 [selftest] acpi tables:");
@@ -1359,11 +1428,11 @@ fn selftest(acpi_ref: &Option<acpi::Acpi>) {
 
     kprintln!("
 [selftest] usb input:");
-    if !dev::usbhid::selftest() {
+    section("usbhid", boot_report::Need::Optional, || if !dev::usbhid::selftest() {
         console::set_color(LTRED);
         kprintln!("[selftest] a USB keyboard would type the wrong characters");
         console::set_color(LTGRAY_IDX);
-    }
+    });
 
     kprintln!("
 [selftest] text:");
@@ -1400,11 +1469,11 @@ fn selftest(acpi_ref: &Option<acpi::Acpi>) {
 
     kprintln!("
 [selftest] generated code:");
-    if !cpu::code::selftest() {
+    section("code", boot_report::Need::Optional, || if !cpu::code::selftest() {
         console::set_color(LTRED);
         kprintln!("[selftest] the code substrate is not sound -- do not generate any");
         console::set_color(LTGRAY_IDX);
-    }
+    });
 
     // The deliberate null dereference now lives behind the shell's `fault`
     // command. It is fatal by design, so running it during boot would mean the

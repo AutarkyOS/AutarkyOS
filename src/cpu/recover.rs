@@ -185,8 +185,27 @@ pub fn take_panic() -> Option<*const u64> {
         return None;
     }
     let i = slot()?;
-    take_slot(i, PANIC)
+    let pad = take_slot(i, PANIC)?;
+    // A panic has no faulting instruction, and pointing at the last fault's
+    // would be worse than saying nothing.
+    LAST_RIP.store(0, Ordering::Relaxed);
+    Some(pad)
 }
+
+/// Where the last recovered fault happened, as an absolute rip.
+///
+/// **Kept because recovering throws away the only evidence of *where*.** A
+/// caught fault is attributed to whatever scope was guarded, which answers
+/// "which check failed" and not "what broke". Those differ whenever a check
+/// calls into something else: a fault inside the graphics stack, reached from
+/// a power selftest, is a power failure by attribution and a graphics failure
+/// in fact. Without the site there is nothing to tell them apart, and the
+/// report would name the wrong subsystem with total confidence.
+///
+/// Zero when the last recovery was a panic, which has no faulting instruction
+/// in the same sense -- `site()` answers `None` there rather than pointing at
+/// address zero.
+static LAST_RIP: AtomicU64 = AtomicU64::new(0);
 
 /// Why the last recovered fault happened, for the message a program gets.
 static LAST: AtomicU64 = AtomicU64::new(0);
@@ -218,14 +237,24 @@ fn slot() -> Option<usize> {
 ///
 /// The block lives in `PADS`, which is static, so it stays readable after the
 /// landing code has moved `rsp` off the interrupt stack.
-pub fn take(vector: u8) -> Option<*const u64> {
+pub fn take(vector: u8, rip: u64) -> Option<*const u64> {
     // Only the vectors a program can plausibly cause. A machine check or a
     // double fault says the machine is wrong rather than the program.
     if !matches!(vector, 0 | 5 | 6 | 13 | 14 | 17 | 19) {
         return None;
     }
     let i = slot()?;
-    take_slot(i, vector as u64)
+    let pad = take_slot(i, vector as u64)?;
+    LAST_RIP.store(rip, Ordering::Relaxed);
+    Some(pad)
+}
+
+/// Where the last recovered fault was, if it was a fault rather than a panic.
+pub fn site() -> Option<u64> {
+    match LAST_RIP.load(Ordering::Relaxed) {
+        0 => None,
+        r => Some(r),
+    }
 }
 
 /// The innermost armed pad for a task, popped.
