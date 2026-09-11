@@ -134,7 +134,25 @@ const _: () = {
 
 const SLOTS: usize = crate::task::MAX_TASKS;
 
-static PADS: crate::sync::Racy<[Pad; SLOTS]> = crate::sync::Racy::new([EMPTY; SLOTS]);
+/// How deep guards may nest on one task.
+///
+/// **One pad per task was a defect, not a simplification.** The inner guard's
+/// exit cleared `armed`, which disarmed the outer one too, so a `guard` around
+/// anything that itself guards -- `mem::paging::checks` does -- silently
+/// stopped protecting the outer scope. Nothing failed; the protection was
+/// simply gone, which is the shape of bug this module exists to prevent
+/// elsewhere.
+///
+/// Four because the real nesting here is two -- a selftest wrapper around a
+/// check that guards its own deliberate fault -- and a bound that is obviously
+/// enough is better than one that is exactly enough.
+const DEPTH: usize = 4;
+
+static PADS: crate::sync::Racy<[[Pad; DEPTH]; SLOTS]> =
+    crate::sync::Racy::new([[EMPTY; DEPTH]; SLOTS]);
+
+/// How many guards each task is currently inside.
+static DEPTHS: crate::sync::Racy<[usize; SLOTS]> = crate::sync::Racy::new([0; SLOTS]);
 
 /// Why the last recovered fault happened, for the message a program gets.
 static LAST: AtomicU64 = AtomicU64::new(0);
@@ -173,14 +191,31 @@ pub fn take(vector: u8) -> Option<*const u64> {
         return None;
     }
     let i = slot()?;
-    let pads = unsafe { PADS.get() };
-    if pads[i].armed == 0 {
+    take_slot(i, vector as u64)
+}
+
+/// The innermost armed pad for a task, popped.
+///
+/// **Popping rather than only disarming is what makes nesting safe.** A fault
+/// taken while unwinding out of the inner guard now lands in the *outer* one
+/// instead of being fatal, and it still cannot loop, because the depth strictly
+/// decreases on every take and the outermost frame has nowhere left to go.
+fn take_slot(i: usize, why: u64) -> Option<*const u64> {
+    let depths = unsafe { DEPTHS.get() };
+    let d = depths[i];
+    if d == 0 {
         return None;
     }
-    pads[i].armed = 0;
-    LAST.store(vector as u64, Ordering::Relaxed);
+    let top = d - 1;
+    let pads = unsafe { PADS.get() };
+    if pads[i][top].armed == 0 {
+        return None;
+    }
+    pads[i][top].armed = 0;
+    depths[i] = top;
+    LAST.store(why, Ordering::Relaxed);
     COUNT.fetch_add(1, Ordering::Relaxed);
-    Some(&pads[i].rax as *const u64)
+    Some(&pads[i][top].rax as *const u64)
 }
 
 /// What the last recovered fault was.
@@ -208,14 +243,59 @@ pub fn describe() -> &'static str {
 /// closure must not hold a lock, and callers here do not: the interpreter
 /// takes the namespace and the console per operation rather than across a
 /// program.
+/// What `guarded` did, which `guard`'s `Result` cannot express.
+///
+/// **The third case is the one that mattered.** With no per-core storage, or
+/// nested too deep, `guard` ran the closure unprotected and answered `Ok(())`
+/// -- indistinguishable from having run it safely. A caller deciding whether a
+/// subsystem is healthy would read "ran unprotected, and a fault would have
+/// been fatal" as "passed".
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+pub enum Caught {
+    /// Ran under a pad and did not fault.
+    Ran,
+    /// Faulted, and was recovered. The string says what.
+    Faulted(&'static str),
+    /// Ran with no pad, so a fault would have been fatal. Not a pass.
+    Unguarded(&'static str),
+}
+
+/// `guard`, with the three states it actually has.
+#[inline(never)]
+pub fn guarded<F: FnOnce()>(f: F) -> Caught {
+    match guard_inner(f) {
+        Ok(true) => Caught::Ran,
+        Ok(false) => Caught::Unguarded("no landing pad, so this ran unprotected"),
+        Err(e) => Caught::Faulted(e),
+    }
+}
+
+/// The original two-state form, for callers that only need to know it survived.
 #[inline(never)]
 pub fn guard<F: FnOnce()>(f: F) -> Result<(), &'static str> {
+    guard_inner(f).map(|_| ())
+}
+
+/// `Ok(true)` ran guarded, `Ok(false)` ran unguarded, `Err` was recovered.
+#[inline(never)]
+fn guard_inner<F: FnOnce()>(f: F) -> Result<bool, &'static str> {
     let Some(i) = slot() else {
         // No per-core storage yet, so nothing can be attributed and nothing
         // can be recovered. Run it plainly rather than pretending.
         f();
-        return Ok(());
+        return Ok(false);
     };
+
+    // Deeper than the stack goes. Running unguarded is the honest answer and
+    // is reported as such; refusing to run would turn a depth limit into a
+    // behaviour change.
+    {
+        let depths = unsafe { DEPTHS.get() };
+        if depths[i] >= DEPTH {
+            f();
+            return Ok(false);
+        }
+    }
 
     // Read as one block rather than fifteen `asm!`s, so nothing the compiler
     // emits between them can move a register the block claims to have read.
@@ -252,21 +332,29 @@ pub fn guard<F: FnOnce()>(f: F) -> Result<(), &'static str> {
         );
     }
 
-    {
+    let d = {
+        let depths = unsafe { DEPTHS.get() };
+        let d = depths[i];
         let pads = unsafe { PADS.get() };
-        pads[i] = Pad {
+        pads[i][d] = Pad {
             rax: r[0], rbx: r[1], rcx: r[2], rdx: r[3], rsi: r[4], rdi: r[5],
             rbp: r[6], r8: r[7], r9: r[8], r10: r[9], r11: r[10], r12: r[11],
             r13: r[12], r14: r[13], r15: r[14], rip: r[15], rsp: r[16],
             armed: 1,
         };
-    }
+        depths[i] = d + 1;
+        d
+    };
 
     f();
 
+    // The normal exit pops. The faulting exit pops inside `take_slot`, so both
+    // paths leave the depth where this frame found it.
     {
+        let depths = unsafe { DEPTHS.get() };
+        depths[i] = d;
         let pads = unsafe { PADS.get() };
-        pads[i].armed = 0;
+        pads[i][d].armed = 0;
     }
     // Jumped over on the normal path. A recovered fault lands on `3:` with
     // every register and the stack restored, and falls into the same tail.
@@ -286,7 +374,7 @@ pub fn guard<F: FnOnce()>(f: F) -> Result<(), &'static str> {
     if faulted != 0 {
         Err(describe())
     } else {
-        Ok(())
+        Ok(true)
     }
 }
 
@@ -338,6 +426,73 @@ pub fn selftest() -> bool {
         after = 42;
     });
     claim(&mut ok, r.is_ok() && after == 42, "the machine keeps running after catching one");
+
+    // ---- nesting, which was broken and silently so ------------------------
+    //
+    // **The bug this pair exists to catch.** One pad per task meant the inner
+    // guard's *normal exit* cleared the arm, so an outer guard around anything
+    // that itself guards stopped protecting anything at all. Nothing failed
+    // and nothing printed; the protection was simply gone.
+    //
+    // Note what happens if the fix is wrong: the fault below is not caught,
+    // and the machine halts here rather than printing FAIL. That is the honest
+    // shape for this claim -- there is no way to ask "was I protected" except
+    // by needing it.
+    let mut inner_ran = false;
+    let outer = guard(|| {
+        let _ = guard(|| {
+            inner_ran = true;
+        });
+        // The inner guard has exited normally. If its exit disarmed this one,
+        // the machine stops on the next line.
+        unsafe {
+            core::ptr::read_volatile(0x0 as *const u64);
+        }
+    });
+    claim(&mut ok, inner_ran, "a guard nested inside a guard runs");
+    claim(
+        &mut ok,
+        outer.is_err(),
+        "and the outer one still catches a fault after the inner one exited",
+    );
+
+    // A fault in the inner guard is caught by the inner guard, and the outer
+    // one is left armed for its own.
+    let mut inner_caught = false;
+    let outer = guard(|| {
+        inner_caught = guard(|| unsafe {
+            core::ptr::read_volatile(0x0 as *const u64);
+        })
+        .is_err();
+        unsafe {
+            core::ptr::read_volatile(0x0 as *const u64);
+        }
+    });
+    claim(&mut ok, inner_caught, "a fault in the inner guard is caught there");
+    claim(&mut ok, outer.is_err(), "and the outer one catches its own afterwards");
+
+    // The depth is where it started, or every guarded call leaks a slot and
+    // the fifth one runs unprotected.
+    claim(
+        &mut ok,
+        slot().map(|i| unsafe { DEPTHS.get() }[i] == 0).unwrap_or(false),
+        "and the nesting depth is back to zero",
+    );
+
+    // `guarded` distinguishes the case `guard` could not: ran unprotected.
+    claim(
+        &mut ok,
+        guarded(|| {}) == Caught::Ran,
+        "guarded reports a clean run as having been guarded",
+    );
+    claim(
+        &mut ok,
+        matches!(
+            guarded(|| unsafe { core::ptr::read_volatile(0x0 as *const u64); }),
+            Caught::Faulted(_)
+        ),
+        "and a caught fault as faulted rather than as a pass",
+    );
 
     // What is *not* claimed here, said plainly rather than left as a gap.
     //
