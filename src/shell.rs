@@ -8030,6 +8030,17 @@ fn mine_cmd(rest: &str) {
                     client::spawned_slices(),
                     MAX_SLICES
                 );
+                // Where the ceiling comes from, because it is not the obvious
+                // place. It is the task table and never the core count: every
+                // application processor adopts an idle task and no slot is ever
+                // reclaimed, so a machine with *more* cores has *fewer* slices
+                // available, which is exactly backwards from what anybody
+                // typing this expects.
+                kprintln!(
+                    "  {} task slot(s) of {}, and every core holds one -- that is what caps a slice",
+                    crate::task::count(),
+                    crate::task::MAX_TASKS
+                );
                 // **The other ceiling, and the one nobody could see.** Slices
                 // run at once, so their working sets are resident at once, and
                 // a memory-bound algorithm is built to exceed a core's private
@@ -8077,7 +8088,26 @@ fn mine_cmd(rest: &str) {
             let mut w = arg.split_whitespace();
             let max: u32 = w.next().and_then(|x| x.parse().ok()).unwrap_or(MAX_SLICES as u32);
             let ms: u64 = w.next().and_then(|x| x.parse().ok()).unwrap_or(5000);
+            // **Said rather than clamped in silence.** `mine sweep 16` on a
+            // sixteen-thread machine is an entirely reasonable thing to type,
+            // and it used to answer with a four-point curve and nothing saying
+            // why -- which reads as a machine that ignored you, or worse, as a
+            // curve that flattened at four because of contention. The ceiling
+            // is a task-table fact rather than a hardware one and it is worth
+            // one line to say so, for the reason `godel` refuses to clamp a
+            // stored bar: a number quietly moved to the nearest legal one is a
+            // number nobody can check against what they asked for.
+            let asked = max;
             let max = max.clamp(1, MAX_SLICES as u32);
+            if asked > max {
+                console::set_color(LTGRAY);
+                kprintln!(
+                    "  {} asked for, {} is the ceiling -- `mine slices` says what sets it",
+                    asked,
+                    max
+                );
+                console::set_color(WHITE);
+            }
             if ms < 2000 {
                 kprintln!("  under two seconds a slice barely starts; not a measurement");
                 return;
