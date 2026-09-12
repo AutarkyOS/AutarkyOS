@@ -498,10 +498,17 @@ pub fn why() -> &'static str {
 pub fn report() {
     use crate::kprintln;
     let c = caps();
+    // Named rather than merely reported present. "hypervisor yes" is enough to
+    // justify declining an MSR and useless in a bug report from somebody whose
+    // install story is "boot it in a VM", where which one is the first question
+    // anybody asks.
     kprintln!(
         "  vendor {}   hypervisor {}",
         if c & CAP_INTEL != 0 { "intel" } else { "other" },
-        if c & CAP_VIRTUAL != 0 { "yes" } else { "no" }
+        match crate::cpu::hypervisor_name() {
+            Some(n) => n,
+            None => alloc::string::String::from("no"),
+        }
     );
     kprintln!(
         "  dts {}  package {}  hwp {}  aperf {}  turbo {}",

@@ -693,6 +693,130 @@ pub fn drivers_for(role: Role) -> Vec<&'static str> {
 /// The report a person actually wants when something does not work. It is
 /// deliberately a separate function rather than a filter at the call site,
 /// because this is the question the registry exists to answer.
+/// Which machine this is, as the *devices* say rather than as CPUID says.
+///
+/// **CPUID cannot answer this and the measurement is why.** Leaf `0x40000000`
+/// carries a twelve-byte vendor string, and under QEMU accelerated by WHPX this
+/// kernel read `56 4d 77 61 72 65 56 4d 77 61 72 65` -- `VMwareVMware`,
+/// exactly. That is QEMU's `vmware-cpuid-freq`, on by default, which borrows
+/// VMware's own CPUID convention for the leaf that reports TSC and APIC
+/// frequency and takes the signature with it. So a kernel that named its
+/// hypervisor from CPUID would tell every QEMU user they were running on
+/// VMware, confidently and in writing.
+///
+/// Emulated hardware does not have that problem. A hypervisor has to put PCI
+/// devices in front of a guest and those carry the vendor's own id, which is
+/// not a courtesy string it chose to emit -- it is what the driver has to match
+/// to work at all. `80EE` is VirtualBox's, `15AD` is VMware's, and QEMU's
+/// devices come from Red Hat's `1B36` and `1AF4` plus the Bochs display at
+/// `1234:1111`.
+///
+/// Still evidence rather than proof: a hypervisor can be configured to present
+/// somebody else's devices, and one that presents none of these answers
+/// `Unrecognised` rather than a guess.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Platform {
+    /// No hypervisor bit. Real hardware, or one hiding well enough that
+    /// nothing here can tell and nothing here should pretend to.
+    Bare,
+    Qemu,
+    VMware,
+    VirtualBox,
+    HyperV,
+    /// A hypervisor is present and none of its devices are ones we know.
+    Unrecognised,
+}
+
+impl Platform {
+    pub fn name(self) -> &'static str {
+        match self {
+            Platform::Bare => "bare metal",
+            Platform::Qemu => "QEMU",
+            Platform::VMware => "VMware",
+            Platform::VirtualBox => "VirtualBox",
+            Platform::HyperV => "Hyper-V",
+            Platform::Unrecognised => "a hypervisor this kernel does not recognise",
+        }
+    }
+}
+
+pub fn platform() -> Platform {
+    if crate::cpu::hypervisor().is_none() {
+        return Platform::Bare;
+    }
+    platform_of(nodes())
+}
+
+/// The same answer over a list somebody hands in.
+///
+/// Split out so VirtualBox and VMware are testable on a machine that is
+/// neither, which is the whole difficulty with this feature: the two guests
+/// most people will use are the two nobody here can boot. `mem::fixed` asserts
+/// its arithmetic against a synthetic memory map for the same reason, and
+/// `diag devices` already checks every row against synthetic idents rather than
+/// against the bus underneath.
+pub fn platform_of(list: &[Node]) -> Platform {
+    // Order is by how unambiguous the id is. VirtualBox and VMware own their
+    // vendor numbers outright; QEMU's are Red Hat's and a Bochs display that
+    // several emulators have borrowed, so they are checked last.
+    let mut qemu = false;
+    for n in list {
+        match (n.id.vendor, n.id.device) {
+            (0x80EE, _) => return Platform::VirtualBox,
+            (0x15AD, _) => return Platform::VMware,
+            (0x1414, _) => return Platform::HyperV,
+            (0x1B36, _) | (0x1AF4, _) | (0x1234, 0x1111) => qemu = true,
+            _ => {}
+        }
+    }
+    if qemu {
+        return Platform::Qemu;
+    }
+    Platform::Unrecognised
+}
+
+/// What this guest needs changed before GLaDOS is much use on it.
+///
+/// Derived from what was enumerated rather than from a table per hypervisor,
+/// because the question is never "which VM is this" but "is the thing this
+/// kernel requires actually present". A VirtualBox configured with an NVMe
+/// controller needs nothing said; a QEMU without one needs the same sentence
+/// VMware does.
+pub fn vm_advice() -> Vec<&'static str> {
+    if platform() == Platform::Bare {
+        return Vec::new();
+    }
+    advice_for(nodes())
+}
+
+/// The same, over a list somebody hands in. See `platform_of`.
+pub fn advice_for(list: &[Node]) -> Vec<&'static str> {
+    let mut out: Vec<&'static str> = Vec::new();
+    let has_nvme = list.iter().any(|n| n.id.class == 0x01 && n.id.subclass == 0x08);
+    let has_ahci = list.iter().any(|n| n.id.class == 0x01 && n.id.subclass == 0x06);
+    if !has_nvme {
+        // The single most likely reason a guest boots to a shell with nothing
+        // behind it. Both VirtualBox and VMware default to SATA.
+        out.push(
+            "no NVMe controller -- set the guest's disk controller to NVMe;              there is no AHCI driver here, so a SATA disk is a disk this kernel cannot see",
+        );
+        if has_ahci {
+            out.push("(a SATA controller in AHCI mode is present and is exactly what cannot be driven)");
+        }
+    }
+    // Asked of the same table a driver is chosen from, so a row added for a
+    // new NIC silences this line without anybody remembering to.
+    let has_eth = list
+        .iter()
+        .any(|n| n.entry.map(|e| e.support.driver().is_some() && e.role == Role::Ethernet).unwrap_or(false));
+    if !has_eth {
+        out.push(
+            "no ethernet this kernel drives -- choose an Intel PRO/1000 (e1000) or e1000e adapter",
+        );
+    }
+    out
+}
+
 pub fn gaps() -> Vec<(&'static Node, &'static str)> {
     nodes()
         .iter()
@@ -734,6 +858,29 @@ pub fn report() {
     }
     let all = nodes();
     kprintln!("  {} device(s)", all.len());
+
+    // Which machine this is, and what it needs changed. First, because a guest
+    // whose disk controller is wrong has nothing else worth reading here -- and
+    // because the install story for this kernel is about to be "boot it in a
+    // VM", which makes this the line most readers are looking for.
+    let p = platform();
+    if p != Platform::Bare {
+        crate::gfx::console::set_color(crate::gfx::console::YELLOW);
+        // Both are printed when they disagree, and they do: QEMU reports
+        // `VMwareVMware` at CPUID leaf 0x40000000. Naming only one of them
+        // would be picking which of two true readings to hide.
+        match crate::cpu::hypervisor_name() {
+            Some(cpuid) if cpuid != p.name() => {
+                kprintln!("  running on {} (its devices say so; CPUID says '{}')", p.name(), cpuid)
+            }
+            _ => kprintln!("  running on {}", p.name()),
+        }
+        for line in vm_advice() {
+            crate::gfx::console::set_color(crate::gfx::console::LTRED);
+            kprintln!("  {}", line);
+        }
+        crate::gfx::console::set_color(crate::gfx::console::LTGRAY);
+    }
     for n in all {
         let (tag, driver) = match n.entry {
             Some(e) => (e.support.tag(), e.support.driver().unwrap_or("-")),
@@ -767,6 +914,29 @@ pub fn report() {
 /// the machine under it would pass here and fail on the next laptop, which is
 /// the exact failure this module exists to stop. The rules are arithmetic and
 /// the arithmetic is the same everywhere.
+/// A synthetic node for the VM claims, carrying only what they read.
+///
+/// Built here rather than taken off the bus, for the reason every other claim
+/// in this file is: a check written against the machine underneath passes on
+/// this one and says nothing about the next.
+fn fake(vendor: u16, device: u16, class: u8, subclass: u8) -> Node {
+    Node {
+        id: Ident { bus: Bus::Pci, vendor, device, class, subclass, prog_if: 0 },
+        at: Where::Pci(crate::dev::pci::Device {
+            bus: 0,
+            dev: 0,
+            func: 0,
+            vendor,
+            device,
+            class,
+            subclass,
+            prog_if: 0,
+            header_type: 0,
+        }),
+        entry: None,
+    }
+}
+
 pub fn checks() -> Vec<(&'static str, bool)> {
     let mut out = Vec::new();
 
@@ -896,6 +1066,63 @@ pub fn checks() -> Vec<(&'static str, bool)> {
                     || !overlap(&a.rule, &b.rule)
             })
         }),
+    ));
+
+    // ---- which guest this is, and what it needs changed --------------------
+    //
+    // **VirtualBox and VMware are the two guests most people will use and the
+    // two nobody here can boot**, so every one of these runs against a
+    // synthetic device list. That is the same bargain `mem::fixed` makes with
+    // its memory map: a claim about the machine underneath would pass here and
+    // tell you nothing about the one you are trying to support.
+    out.push((
+        "VirtualBox is named by its own vendor id",
+        platform_of(&[fake(0x80EE, 0xBEEF, 0x03, 0x00)]) == Platform::VirtualBox,
+    ));
+    out.push((
+        "VMware is named by its own vendor id",
+        platform_of(&[fake(0x15AD, 0x0405, 0x03, 0x00)]) == Platform::VMware,
+    ));
+    out.push((
+        "and QEMU by the devices Red Hat ships it with",
+        platform_of(&[fake(0x1B36, 0x0010, 0x01, 0x08)]) == Platform::Qemu
+            && platform_of(&[fake(0x1234, 0x1111, 0x03, 0x00)]) == Platform::Qemu,
+    ));
+    // The one that matters, because CPUID says `VMwareVMware` under QEMU: a
+    // guest carrying both signatures is named by the unambiguous one.
+    out.push((
+        "a guest showing VMware's id beside QEMU's is VMware, not QEMU",
+        platform_of(&[fake(0x1234, 0x1111, 0x03, 0x00), fake(0x15AD, 0x0405, 0x03, 0x00)])
+            == Platform::VMware,
+    ));
+    out.push((
+        "a hypervisor whose devices are all strangers is not guessed at",
+        platform_of(&[fake(0xDEAD, 0x0001, 0x03, 0x00)]) == Platform::Unrecognised,
+    ));
+
+    // The advice, which is the half a person actually acts on. Both of the
+    // default configurations are wrong in the same way and it is worth saying
+    // so in those words: VirtualBox and VMware both default to SATA.
+    let sata_only = [fake(0x15AD, 0x07E0, 0x01, 0x06)];
+    out.push((
+        "a guest with only a SATA controller is told to switch it to NVMe",
+        advice_for(&sata_only).iter().any(|l| l.contains("NVMe")),
+    ));
+    out.push((
+        "and told that the SATA controller it has is the one that cannot be driven",
+        advice_for(&sata_only).iter().any(|l| l.contains("AHCI")),
+    ));
+    out.push((
+        "a guest that already has NVMe is told nothing about disks",
+        !advice_for(&[fake(0x1B36, 0x0010, 0x01, 0x08)])
+            .iter()
+            .any(|l| l.contains("NVMe")),
+    ));
+    // Derived from the driver table rather than from a list of vendor ids, so
+    // adding a NIC row silences this without anybody remembering to.
+    out.push((
+        "a guest with no drivable ethernet is told which adapter to pick",
+        advice_for(&sata_only).iter().any(|l| l.contains("e1000")),
     ));
 
     out

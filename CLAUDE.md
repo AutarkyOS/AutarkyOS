@@ -4472,7 +4472,8 @@ list -- is answered by `Partial`, and by the registry never claiming a device
 works, only that a row describes it. Both copies are gone and `hardware()`
 reads the registry.
 
-`diag devices` is 14 claims over 34 rows. Two of them are about the table
+`diag devices` is 23 claims over 36 rows, nine of which are about which
+*hypervisor* this is. Two of them are about the table
 rather than about any device, and they are the ones worth knowing: **every row
 is reachable** by some device, because a rule that cannot win against the rest
 of the table is documentation pretending to be code, and **no two rows of equal

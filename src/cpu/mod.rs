@@ -280,6 +280,78 @@ pub fn last_level_cache() -> Option<usize> {
     }
 }
 
+/// What the hypervisor calls itself, or `None` on bare metal.
+///
+/// **The bit says whether, this says which**, and until now only the bit was
+/// read. `dev::power` has consulted CPUID.1:ECX[31] since it was written, which
+/// is enough to decline an MSR and not enough to tell a QEMU from a VirtualBox
+/// -- so every report from a guest said "hypervisor yes" and left the reader to
+/// ask which one, on a project whose whole install story is about to be "boot
+/// it in a VM".
+///
+/// Leaf `0x40000000` is the convention every hypervisor follows: `eax` is the
+/// highest leaf in the hypervisor range and `ebx:ecx:edx` are twelve bytes of
+/// vendor string. It is **only meaningful when the present bit is set** -- on
+/// bare metal `0x40000000` is above the supported range and the processor
+/// answers with the highest basic leaf instead, which would read as a vendor
+/// string made of whatever that leaf happens to contain.
+///
+/// The string is what the hypervisor chose to say about itself. It can be
+/// configured, and on some it can be hidden entirely, so this is evidence and
+/// never proof -- which is exactly the standing this tree already gives the
+/// present bit it sits beside.
+pub fn hypervisor() -> Option<[u8; 12]> {
+    if cpuid(1, 0)[2] & (1 << 31) == 0 {
+        return None;
+    }
+    let r = cpuid(0x4000_0000, 0);
+    let mut v = [0u8; 12];
+    v[0..4].copy_from_slice(&r[1].to_le_bytes());
+    v[4..8].copy_from_slice(&r[2].to_le_bytes());
+    v[8..12].copy_from_slice(&r[3].to_le_bytes());
+    Some(v)
+}
+
+/// The hypervisor's own name, matched against the strings in the field.
+///
+/// Answers the raw string when nothing matches rather than "unknown", because
+/// a twelve-byte name nobody here recognises is the single most useful thing a
+/// bug report from an unfamiliar setup can carry.
+pub fn hypervisor_name() -> Option<alloc::string::String> {
+    use alloc::string::{String, ToString};
+    let v = hypervisor()?;
+    // Spelled exactly as each one reports it. QEMU answers `TCGTCGTCGTCG` only
+    // when it is interpreting; accelerated by KVM it answers `KVMKVMKVM` and
+    // accelerated by WHPX it answers as Hyper-V, because in both cases the
+    // thing the guest is actually running on is the accelerator rather than
+    // QEMU. So this names the *hypervisor* and not the program that launched
+    // it, which is the honest answer and is not always the one somebody
+    // expects to read.
+    let known: &[(&[u8], &str)] = &[
+        (b"KVMKVMKVM   ", "KVM (QEMU accelerated)"),
+        (b"TCGTCGTCGTCG", "QEMU, interpreting (TCG)"),
+        (b"Microsoft Hv", "Hyper-V or WHPX"),
+        (b"VMwareVMware", "VMware"),
+        (b"VBoxVBoxVBox", "VirtualBox"),
+        (b"XenVMMXenVMM", "Xen"),
+        (b"prl hyperv  ", "Parallels"),
+        (b"bhyve bhyve ", "bhyve"),
+        (b"ACRNACRNACRN", "ACRN"),
+    ];
+    for (sig, name) in known {
+        if v.starts_with(sig) || &v[..] == *sig {
+            return Some(name.to_string());
+        }
+    }
+    let mut raw = String::new();
+    for b in v {
+        if b.is_ascii_graphic() || b == b' ' {
+            raw.push(b as char);
+        }
+    }
+    Some(raw)
+}
+
 pub fn cpuid(leaf: u32, sub: u32) -> [u32; 4] {
     let eax: u32;
     let ebx_slot: u64;
