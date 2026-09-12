@@ -68,10 +68,20 @@ Works, and verified:
 | Updates | Signed staged images swapped before `ExitBootServices`, with rollback |
 | SMP | Per-core GDT/TSS/APIC, a real spinlock, shared heap and console, tasks that migrate |
 | Accounting | Every allocation billed to the task that made it, with peak and outstanding |
-| Mining | Midstate-cached SHA-256d with an honest scoreboard |
+| Mining | SHA-256d, yespower, NeoScrypt and BLAKE2s in ring 0 against upstream's own vectors; four coins at once on parallel slices, standing down for the model |
+| Pool | Stratum V1 upstream, one downstream connection carrying several coins, shares validated by recomputation, PPLNS on a ledger that survives a restart |
+| Self-repair | A failing boot check marks its subsystem unavailable instead of halting; a repair is chosen by the fault's own signature, judged by re-running the check, and survives a reboot -- withdrawing itself if it prevents one |
+| Faults | Reports name the function, from a 13,817-symbol table built out of the linker map |
+| Guests | Names the hypervisor from its PCI ids and says what it has configured wrongly |
 
 Does not work yet:
 
+- **SATA.** There is no AHCI driver, so a machine whose disk is SATA reaches a
+  shell with no store, no snapshots and nowhere to save. It is the largest hole
+  in the device table and entirely tractable -- AHCI is published and needs no
+  firmware. It matters most in a virtual machine, because **VirtualBox and
+  VMware both default to SATA**; set the controller to NVMe and the guest will
+  tell you if you forgot.
 - **Wireless.** The built-in card is CNVi, so the MAC lives in the PCH and the
   M.2 module is only a radio, reachable through an undocumented signed-firmware
   protocol. The WPA2 supplicant is complete and checked against IEEE 802.11i
@@ -420,6 +430,83 @@ cargo build --release
 ```
 
 The artifact is `target/x86_64-unknown-uefi/release/glados.efi`.
+
+### Booting it in a virtual machine
+
+Download the ISO from [releases](https://github.com/IlumCI/sanctum/releases)
+and give the guest these four settings. Three of them are the difference
+between a working machine and a shell with nothing behind it.
+
+| setting | value | why |
+|---|---|---|
+| Firmware | **UEFI**, not BIOS | This kernel *is* a UEFI application. There is no BIOS path and never will be -- UEFI already hands over long mode, CPL 0 and an identity map, which is why there is no bootloader here at all. |
+| Disk controller | **NVMe** | There is no AHCI driver. A SATA disk is a disk this kernel cannot see, so the store, snapshots and anywhere to save all quietly do not exist. **VirtualBox and VMware both default to SATA.** |
+| Memory | **4 GB** or more | The weights are read whole into a pool before `ExitBootServices`. A 0.6B checkpoint is about 600 MB and the 2B is 1.9 GB. |
+| Network | **Intel PRO/1000** (e1000) or e1000e | Those are the two the `e1000` driver claims. Anything else is listed as present and undriven. |
+
+Two or more cores is worth it: `diag mt` and `diag migrate` are false
+statements about a single-core machine and correctly fail there.
+
+**The guest tells you when one of these is wrong.** `devices` names the
+hypervisor from the PCI ids it can see and then says what needs changing:
+
+```
+glados> devices
+  running on VirtualBox
+  no NVMe controller -- set the guest's disk controller to NVMe; there is no
+  AHCI driver here, so a SATA disk is a disk this kernel cannot see
+  (a SATA controller in AHCI mode is present and is exactly what cannot be driven)
+```
+
+It names the machine from devices rather than from CPUID, and the reason is
+worth knowing if you are comparing notes: **QEMU reports itself as
+`VMwareVMware` at CPUID leaf `0x40000000`**. That is its `vmware-cpuid-freq`
+property, on by default, which borrows VMware's convention for the leaf that
+reports TSC and APIC frequency. Both readings are printed when they disagree.
+
+#### QEMU
+
+```bash
+qemu-system-x86_64 \
+  -machine q35 -cpu max -smp 4 -m 4G \
+  -drive if=pflash,format=raw,readonly=on,file=/usr/share/OVMF/OVMF_CODE.fd \
+  -drive if=pflash,format=raw,file=OVMF_VARS.fd \
+  -cdrom glados-1.3.6.iso \
+  -drive file=store.img,if=none,id=d0,format=raw \
+  -device nvme,serial=glados,drive=d0 \
+  -netdev user,id=n0 -device e1000,netdev=n0
+```
+
+`OVMF_VARS.fd` must be a **writable copy**, not the system one. Create the
+store with `qemu-img create -f raw store.img 8G`; without it the machine boots
+and has nowhere to keep anything. On Windows, `-accel whpx` is about 160 times
+faster than the interpreter; on Linux use `-accel kvm`.
+
+#### VirtualBox
+
+- **System → Motherboard →** tick *Enable EFI (special OSes only)*
+- **Storage →** remove the SATA controller, *Add Controller* → **NVMe**, then attach the ISO and a new disk to it
+- **Network → Adapter 1 → Advanced → Adapter Type:** *Intel PRO/1000 MT Desktop*
+- **System → Processor:** 2 or more
+
+#### VMware
+
+In the `.vmx`, or through the GUI equivalents:
+
+```
+firmware = "efi"
+nvme0.present = "TRUE"
+ethernet0.virtualDev = "e1000e"
+memsize = "4096"
+numvcpus = "4"
+```
+
+**None of this has been booted in VirtualBox or VMware.** The device
+identification and the advice above are asserted against synthetic device lists
+in `diag devices` -- nine claims covering both vendors -- and the settings are
+derived from what the kernel requires rather than from a run somebody did. If
+one of them is wrong, the guest will say which subsystem it is missing, and
+that report is worth more than this table.
 
 ### Running under QEMU
 
