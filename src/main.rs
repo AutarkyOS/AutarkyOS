@@ -746,6 +746,27 @@ fn clock_task() {
             // counter in the corner of a splash is the tell that something is
             // drawing behind the curtain.
             if let (Some(fb), false) = (gfx::primary(), gfx::splash::active()) {
+                // **The pointer is pumped from here, not only from a
+                // generation.** `pump_cursor` had exactly one caller, inside
+                // `generate`, so it answered the freeze during `ask` and no
+                // other. Every long foreground command has the same shape --
+                // `mine sweep` waits whole seconds per point on the shell task,
+                // and the shell's idle loop is the only thing that reads the
+                // mouse -- so on the GF63 a sweep froze the pointer for half an
+                // hour with the uptime still counting beside it. That is the
+                // same symptom `pump_cursor` documents, arriving by a command
+                // nobody had added a call to.
+                //
+                // Here rather than in the sweep, because a list of long
+                // commands that remember to pump is the stale-call-site failure
+                // `with_engine` records: correct the day it is written and
+                // wrong the next time somebody adds a command. This task wakes
+                // on its own quantum whatever the shell is doing, which is
+                // precisely what the moving clock proved.
+                //
+                // Still motion only -- `pump_cursor` dispatches no presses, so
+                // nothing here can re-enter the desktop or the engine.
+                gfx::desk::pump_cursor();
                 // Short, because the taskbar reserves a fixed well for it and
                 // every character of that well is a character the task buttons
                 // do not get. The switch counter moved to `tasks`, which is
