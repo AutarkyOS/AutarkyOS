@@ -58,6 +58,36 @@ pub enum Value {
     /// and a wrapped numerator is a confidently wrong exact answer, which is
     /// worse than no answer at all.
     Rat(i64, i64),
+    /// A physical quantity: an exact magnitude, and what it is a quantity *of*.
+    ///
+    /// **This project has already been bitten by a missing unit.** `acpi`
+    /// records it: `_BIF` element zero says whether a battery reports in
+    /// milliwatts or milliamps, machines differ, and "a capacity in mAh over a
+    /// rate in mW gives a number that looks like a time and is wrong by the
+    /// battery's voltage". A number that looks like a time is the whole
+    /// failure mode -- nothing errors, nothing is out of range, and the answer
+    /// is simply about something else.
+    ///
+    /// So the dimension travels *in the value* and is checked where the
+    /// arithmetic happens, rather than living in a variable name that only a
+    /// reader enforces. Adding metres to seconds is an error here, and
+    /// dividing amp-seconds by watts does not answer a time.
+    ///
+    /// Seven exponents, one per SI base dimension, in the order `DIM_NAMES`
+    /// gives: m, kg, s, A, K, mol, cd. Multiplying adds them and dividing
+    /// subtracts them, which is the whole of dimensional analysis.
+    ///
+    /// Two invariants, both established by `quantity`:
+    ///
+    ///   * the magnitude is a reduced fraction with a positive denominator,
+    ///     exactly as `Rat` is -- a quantity is a number with a label, and the
+    ///     number half obeys the same rules.
+    ///   * **the dimension is never all zeros.** A dimensionless quantity is a
+    ///     number, so it comes back as `Int` or `Rat`. Without that rule
+    ///     `6 m / 2 m` is a `Qty` that renders as `3` and compares unequal to
+    ///     `3`, which is the same trap `Rat` avoids by never holding a
+    ///     denominator of one.
+    Qty(i64, i64, Dim),
     Str(String),
     /// A sequence, and the only compound value there is.
     ///
@@ -108,6 +138,7 @@ impl Value {
         match self {
             Value::Int(_) => "int",
             Value::Rat(..) => "rat",
+            Value::Qty(..) => "qty",
             Value::Str(_) => "str",
             Value::List(_) => "list",
             Value::Rec(n, _) => n,
@@ -123,6 +154,9 @@ impl Value {
             // it comes back an `Int`. A `Rat` with a zero numerator cannot be
             // constructed.
             Value::Rat(..) => true,
+            // A quantity is a number with a label. Zero of something is still
+            // zero, so the magnitude decides and the label does not.
+            Value::Qty(n, ..) => *n != 0,
             Value::Str(s) => !s.is_empty(),
             Value::List(v) => !v.is_empty(),
             // A record always exists, and one with no fields cannot be
@@ -143,6 +177,13 @@ impl Value {
                 "expected a whole number, found {}/{} -- use floor, ceil or round",
                 n, d
             )),
+            // A quantity is not a whole number however round its magnitude
+            // is: 3 metres is not 3. Stripping the unit has to be asked for,
+            // which is what `mag` is.
+            Value::Qty(_, _, k) => Err(format!(
+                "expected a plain number, found a quantity in {} -- use mag to drop the unit",
+                render_dim(k)
+            )),
             Value::Str(_) => Err("expected a number, found a string".to_string()),
             Value::List(_) => Err("expected a number, found a list".to_string()),
             Value::Rec(n, _) => Err(format!("expected a number, found a {}", n)),
@@ -162,7 +203,7 @@ impl Value {
     /// Is this a number at all? Used to decide whether an operation is
     /// arithmetic before either side has been coerced.
     pub fn is_num(&self) -> bool {
-        matches!(self, Value::Int(_) | Value::Rat(_, _))
+        matches!(self, Value::Int(_) | Value::Rat(_, _) | Value::Qty(..))
     }
 
     /// The only way a `Rat` is built. Establishes all three invariants.
@@ -263,6 +304,159 @@ pub fn rat_binary(op: &str, a: (i64, i64), b: (i64, i64)) -> Result<Value, Strin
     }
 }
 
+// --- dimensions -------------------------------------------------------------
+
+/// Exponents of the seven SI base dimensions, in `DIM_NAMES` order.
+pub type Dim = [i8; 7];
+
+pub const DIMLESS: Dim = [0; 7];
+
+/// The base dimensions. Everything else is a product of these.
+pub const DIM_NAMES: [&str; 7] = ["m", "kg", "s", "A", "K", "mol", "cd"];
+
+/// Units that are not base but are worth being able to write.
+///
+/// A table rather than a feature of the parser, because every row is already
+/// expressible in base dimensions -- all it buys is writing `W` where
+/// `kg*m^2/s^3` is meant. Adding a row adds a name for something that could
+/// already be said, which is why the list can stay short without limiting
+/// anything.
+const DERIVED: &[(&str, Dim)] = &[
+    //          m  kg   s   A   K mol  cd
+    ("N", [1, 1, -2, 0, 0, 0, 0]),
+    ("J", [2, 1, -2, 0, 0, 0, 0]),
+    ("W", [2, 1, -3, 0, 0, 0, 0]),
+    ("Pa", [-1, 1, -2, 0, 0, 0, 0]),
+    ("Hz", [0, 0, -1, 0, 0, 0, 0]),
+    ("C", [0, 0, 1, 1, 0, 0, 0]),
+    ("V", [2, 1, -3, -1, 0, 0, 0]),
+    ("Ohm", [2, 1, -3, -2, 0, 0, 0]),
+];
+
+fn unit_dim(name: &str) -> Option<Dim> {
+    for (i, n) in DIM_NAMES.iter().enumerate() {
+        if *n == name {
+            let mut d = DIMLESS;
+            d[i] = 1;
+            return Some(d);
+        }
+    }
+    DERIVED.iter().find(|(n, _)| *n == name).map(|(_, d)| *d)
+}
+
+/// Read a unit written the way it is spoken: `m`, `m/s^2`, `kg*m/s^2`, `1/s`.
+///
+/// One solidus at most, and everything after it is divided. `a/b/c` is refused
+/// rather than guessed at -- it means `a/(b*c)` to a physicist and `(a/b)/c`
+/// to a parser, and those agree here but would not for a reader.
+pub fn parse_dim(spec: &str) -> Result<Dim, String> {
+    let mut acc = [0i32; 7];
+    let halves: Vec<&str> = spec.split('/').collect();
+    if halves.len() > 2 {
+        return Err("a unit has at most one '/'".to_string());
+    }
+    for (half_i, half) in halves.iter().enumerate() {
+        let sign: i32 = if half_i == 0 { 1 } else { -1 };
+        for factor in half.split('*') {
+            let f = factor.trim();
+            // `1` is how a reciprocal is written -- `1/s` -- and an empty
+            // piece is what a trailing separator leaves.
+            if f.is_empty() || f == "1" {
+                continue;
+            }
+            let (name, exp) = match f.split_once('^') {
+                Some((n, e)) => (
+                    n,
+                    e.parse::<i32>()
+                        .map_err(|_| format!("'{}' is not an exponent", e))?,
+                ),
+                None => (f, 1),
+            };
+            let base = unit_dim(name).ok_or_else(|| format!("no unit '{}'", name))?;
+            for k in 0..7 {
+                acc[k] += base[k] as i32 * exp * sign;
+            }
+        }
+    }
+    // Accumulated in `i32` and narrowed once, so a spec that overflows says so
+    // rather than wrapping into a dimension nobody wrote.
+    let mut out = DIMLESS;
+    for k in 0..7 {
+        if acc[k] < i8::MIN as i32 || acc[k] > i8::MAX as i32 {
+            return Err(format!("the exponent of {} is out of range", DIM_NAMES[k]));
+        }
+        out[k] = acc[k] as i8;
+    }
+    Ok(out)
+}
+
+/// A dimension, written back the way it would be read.
+pub fn render_dim(d: &Dim) -> String {
+    let (mut num, mut den): (Vec<String>, Vec<String>) = (Vec::new(), Vec::new());
+    for (i, e) in d.iter().enumerate() {
+        if *e == 0 {
+            continue;
+        }
+        let a = e.unsigned_abs();
+        let part = if a == 1 {
+            String::from(DIM_NAMES[i])
+        } else {
+            format!("{}^{}", DIM_NAMES[i], a)
+        };
+        if *e > 0 {
+            num.push(part);
+        } else {
+            den.push(part);
+        }
+    }
+    let mut s = if num.is_empty() {
+        String::from("1")
+    } else {
+        num.join("*")
+    };
+    if !den.is_empty() {
+        s.push('/');
+        s.push_str(&den.join("*"));
+    }
+    s
+}
+
+/// Combine two dimensions: `sign` 1 to multiply, -1 to divide.
+fn dim_combine(a: Dim, b: Dim, sign: i32) -> Result<Dim, String> {
+    let mut out = DIMLESS;
+    for k in 0..7 {
+        let v = a[k] as i32 + b[k] as i32 * sign;
+        if v < i8::MIN as i32 || v > i8::MAX as i32 {
+            return Err(format!("the exponent of {} is out of range", DIM_NAMES[k]));
+        }
+        out[k] = v as i8;
+    }
+    Ok(out)
+}
+
+/// The only way a `Qty` is built. Collapses to a plain number when the
+/// dimension cancels, which is what makes `6 m / 2 m` equal to `3`.
+pub fn quantity(n: i64, d: i64, dim: Dim) -> Result<Value, String> {
+    let base = Value::rational(n, d)?;
+    if dim == DIMLESS {
+        return Ok(base);
+    }
+    let (n, d) = base.as_rat()?;
+    Ok(Value::Qty(n, d, dim))
+}
+
+/// Any number as (numerator, denominator, dimension). A plain number is
+/// dimensionless, which is what makes `3 m * 2` work and `3 m + 2` not.
+fn as_qty(v: &Value) -> Result<(i64, i64, Dim), String> {
+    match v {
+        Value::Qty(n, d, k) => Ok((*n, *d, *k)),
+        _ => {
+            let (n, d) = v.as_rat()?;
+            Ok((n, d, DIMLESS))
+        }
+    }
+}
+
 impl Value {
 
     pub fn render(&self) -> String {
@@ -272,6 +466,16 @@ impl Value {
             // denominator of one is impossible here by construction, so this
             // never renders `3/1` for something `Int` would render as `3`.
             Value::Rat(n, d) => format!("{}/{}", n, d),
+            // Magnitude then unit, the way it is spoken and written: `5 m`,
+            // `1/3 m`, `9 m/s^2`. A denominator of one is dropped, so a whole
+            // magnitude reads as one.
+            Value::Qty(n, d, k) => {
+                if *d == 1 {
+                    format!("{} {}", n, render_dim(k))
+                } else {
+                    format!("{}/{} {}", n, d, render_dim(k))
+                }
+            }
             Value::Str(s) => s.clone(),
             // `Host{name: "x", port: 80}`, which is how it was written apart
             // from the type name leading instead of calling. Legible in a
@@ -724,6 +928,12 @@ pub const BUILTINS: &[(&str, Touch, usize, usize)] = &[
     ("floor", Touch::Pure, 1, 1),
     ("ceil", Touch::Pure, 1, 1),
     ("round", Touch::Pure, 1, 1),
+    // Physical quantities. `qty` is the only way a unit is attached, so a
+    // dimension is something a program states rather than something it hopes
+    // a variable name carries.
+    ("qty", Touch::Pure, 2, 2),
+    ("unit", Touch::Pure, 1, 1),
+    ("mag", Touch::Pure, 1, 1),
 
     // --- lists, beyond building one ----------------------------------------
     ("sort", Touch::Pure, 1, 1),
@@ -1584,6 +1794,76 @@ impl Interp {
         }
         if op == BinOp::Ne {
             return Ok(Value::Int(if a != b { 1 } else { 0 }));
+        }
+
+        // Dimensioned arithmetic, and it goes **before** the exact-fraction
+        // branch below rather than after: a quantity meeting a fraction would
+        // otherwise be routed through `rat_binary`, which knows nothing about
+        // dimensions and would quietly answer a bare number.
+        //
+        // This is where a unit error becomes an error. Adding metres to
+        // seconds is refused by name, and dividing amp-seconds by watts
+        // answers something that is not a time -- which is the `acpi` battery
+        // bug, caught by construction instead of by somebody noticing that a
+        // plausible number was about the wrong thing.
+        if a.is_num() && b.is_num() && (matches!(a, Value::Qty(..)) || matches!(b, Value::Qty(..))) {
+            let (an, ad, ak) = as_qty(&a)?;
+            let (bn, bd, bk) = as_qty(&b)?;
+            let mismatch = |what: &str| {
+                Err(format!(
+                    "cannot {} {} and {}",
+                    what,
+                    render_dim(&ak),
+                    render_dim(&bk)
+                ))
+            };
+            return match op {
+                // A plain number is dimensionless, so `3 m + 2` is refused by
+                // the same rule that refuses `3 m + 2 s`. That is the point:
+                // there is no quantity a bare number may be added to.
+                BinOp::Add | BinOp::Sub => {
+                    if ak != bk {
+                        return mismatch(if op == BinOp::Add { "add" } else { "subtract" });
+                    }
+                    let m = rat_binary(
+                        if op == BinOp::Add { "+" } else { "-" },
+                        (an, ad),
+                        (bn, bd),
+                    )?;
+                    let (n, d) = m.as_rat()?;
+                    quantity(n, d, ak)
+                }
+                BinOp::Mul => {
+                    let k = dim_combine(ak, bk, 1)?;
+                    let m = rat_binary("*", (an, ad), (bn, bd))?;
+                    let (n, d) = m.as_rat()?;
+                    quantity(n, d, k)
+                }
+                BinOp::Div => {
+                    let k = dim_combine(ak, bk, -1)?;
+                    let m = rat_binary("/", (an, ad), (bn, bd))?;
+                    let (n, d) = m.as_rat()?;
+                    quantity(n, d, k)
+                }
+                // Ordering two quantities of different kinds is not a
+                // comparison that has an answer, so it is refused rather than
+                // decided on the magnitudes.
+                BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge => {
+                    if ak != bk {
+                        return mismatch("compare");
+                    }
+                    let l = an as i128 * bd as i128;
+                    let r = bn as i128 * ad as i128;
+                    let t = match op {
+                        BinOp::Lt => l < r,
+                        BinOp::Le => l <= r,
+                        BinOp::Gt => l > r,
+                        _ => l >= r,
+                    };
+                    Ok(Value::Int(t as i64))
+                }
+                _ => Err("that operator wants plain numbers".to_string()),
+            };
         }
 
         // Exact arithmetic, the moment either side is a fraction.

@@ -296,6 +296,41 @@ pub fn call(it: &mut Interp, name: &str, args: &[Value]) -> Result<Value, String
                 q
             }))
         }
+        // A magnitude and what it is a quantity of. The unit is written the
+        // way it is spoken -- `m`, `m/s^2`, `kg*m/s^2` -- and a name the table
+        // does not know is refused rather than ignored, because a typo that
+        // silently produced a dimensionless number would defeat the entire
+        // point of carrying one.
+        "qty" => {
+            let (n, d) = args[0].as_rat()?;
+            let dim = super::eval::parse_dim(&text(args, 1))?;
+            super::eval::quantity(n, d, dim)
+        }
+        // What it is a quantity of, as text. A plain number answers `1`, which
+        // is what dimensionless is called and is the same thing `render_dim`
+        // prints inside a quantity.
+        "unit" => {
+            let d = match &args[0] {
+                Value::Qty(_, _, k) => *k,
+                _ => super::eval::DIMLESS,
+            };
+            Ok(Value::Str(super::eval::render_dim(&d)))
+        }
+        // The magnitude with the unit dropped. Deliberately explicit: `as_int`
+        // refuses a quantity outright, so the only way to get a bare number
+        // out of one is to say that is what you meant.
+        // Matched on the variant rather than taken through `as_rat`, which
+        // refuses a quantity on purpose. If it did not, every builtin taking a
+        // number would strip units silently -- `floor(qty(7, "m"))` would
+        // answer 7 and the unit would be gone with nothing said. Those refuse
+        // instead, and name this as the way to ask.
+        "mag" => match &args[0] {
+            Value::Qty(n, d, _) => Value::rational(*n, *d),
+            other => {
+                let (n, d) = other.as_rat()?;
+                Value::rational(n, d)
+            }
+        },
         // Integer square root, by the same Newton iteration `gfx` uses for
         // circles. Kept integer even now that fractions exist, because the
         // square root of most fractions is irrational and cannot be one --

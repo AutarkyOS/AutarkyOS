@@ -618,6 +618,83 @@ pub fn selftest() -> bool {
         return false;
     }
 
+    // --- quantities, and the unit error that is now an error --------------
+    //
+    // `acpi` records what a missing unit cost: "a capacity in mAh over a rate
+    // in mW gives a number that looks like a time and is wrong by the
+    // battery's voltage". Nothing errors in that failure, nothing is out of
+    // range, and the answer is simply about something else. These are that
+    // failure caught at the operation.
+    if !text("qty(5, \"m\")", "5 m") || !text("qty(rat(1,3), \"m\")", "1/3 m") {
+        return false;
+    }
+    // Multiplying adds exponents and dividing subtracts them, which is the
+    // whole of dimensional analysis.
+    if !text("qty(10, \"m\") / qty(2, \"s\")", "5 m/s")
+        || !text("qty(3, \"m\") * qty(4, \"s\")", "12 m*s")
+        || !text("qty(1, \"m\") / qty(1, \"s^2\")", "1 m/s^2")
+    {
+        return false;
+    }
+    // **A dimension that cancels leaves a number.** Same rule as a `Rat` never
+    // holding a denominator of one: without it `6 m / 2 m` is a quantity that
+    // renders as `3` and compares unequal to `3`.
+    if !int("qty(6, \"m\") / qty(2, \"m\")", 3) || !int("qty(6,\"m\") / qty(2,\"m\") == 3", 1) {
+        return false;
+    }
+    // Adding metres to seconds is the error this exists for. So is adding a
+    // bare number to a quantity -- dimensionless is a dimension, and there is
+    // no quantity a plain number may be added to.
+    if run("qty(3, \"m\") + qty(4, \"s\")").is_some() {
+        return false;
+    }
+    if run("qty(3, \"m\") + 2").is_some() {
+        return false;
+    }
+    // ...and the same units add fine, which is what makes the refusal a check
+    // rather than a blanket.
+    if !text("qty(3, \"m\") + qty(4, \"m\")", "7 m") {
+        return false;
+    }
+    // Ordering two different kinds has no answer, so it is refused rather than
+    // decided on the magnitudes -- 3 seconds is not less than 4 metres.
+    if run("qty(3, \"s\") < qty(4, \"m\")").is_some() {
+        return false;
+    }
+    if !int("qty(3, \"m\") < qty(4, \"m\")", 1) {
+        return false;
+    }
+    // Derived names are a table of things already expressible, so a watt and
+    // its base spelling are the same dimension and compare equal.
+    if !int("qty(1, \"W\") == qty(1, \"kg*m^2/s^3\")", 1) {
+        return false;
+    }
+    // **The battery bug, as a claim.** Charge over power is not a time, and
+    // energy over power is. A unit-free version of this answers a plausible
+    // number in both cases and nobody finds out.
+    if !text("qty(2, \"J\") / qty(1, \"W\")", "2 s") {
+        return false;
+    }
+    // Charge over power is `s^4*A/m^2*kg` -- not a time, and not anything with
+    // a name. Worked out by hand rather than copied from a run, because a
+    // claim that records whatever the code printed asserts nothing.
+    if !text("qty(2, \"A*s\") / qty(1, \"W\")", "2 s^4*A/m^2*kg") {
+        return false;
+    }
+    // A unit the table does not know is refused rather than ignored: a typo
+    // that quietly produced a dimensionless number would defeat the point.
+    if run("qty(1, \"furlong\")").is_some() {
+        return false;
+    }
+    // Dropping the unit has to be asked for. Every builtin that wants a plain
+    // number refuses a quantity, and names `mag` when it does.
+    if !int("mag(qty(7, \"m\"))", 7) || !text("unit(qty(1, \"m/s\"))", "m/s") {
+        return false;
+    }
+    if run("floor(qty(7, \"m\"))").is_some() {
+        return false;
+    }
+
     // --- records ----------------------------------------------------------
     //
     // A declaration, a constructor, a field read, a field write, and the
