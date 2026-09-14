@@ -110,6 +110,33 @@ fn blocks_for(bytes: u64) -> u64 {
 }
 
 /// A page-aligned scratch buffer sized to whole blocks.
+///
+/// **It is never freed, and here is what that costs, measured rather than
+/// estimated.** `alloc_dma` is `alloc_zeroed` with no matching `dealloc`, and
+/// every `put`, `get`, `commit`, `format` and `mount` comes through here. The
+/// request is `rounded + 4096`, so a blob of 512 bytes or fewer takes 4,608
+/// bytes of heap permanently.
+///
+/// Under QEMU, a fresh boot snapshotted twice with `autosnap off`:
+///
+///     snap 1   812 block(s)   heap 22,260,592 -> 25,773,456   +3,512,864
+///     snap 2     1 block(s)   heap 25,773,456 -> 25,786,992      +13,536
+///
+/// Marginal cost `(3,512,864 - 13,536) / 811` = **4,315 bytes of heap per
+/// block written**, against 512 bytes of data. Slightly under the 4,608 floor
+/// because blobs spanning several blocks amortise the spare page.
+///
+/// What that buys before it hurts: roughly 440,000 blocks in one session
+/// against the ~1.9 GiB this machine reports free, and `Written` memoises so
+/// an unchanged subtree is never re-put. A reboot clears it. So bulk import is
+/// affordable and *repeated* import in one session is not, which is the
+/// opposite of what anybody would assume.
+///
+/// The fix, when it is worth the risk of touching this path: every caller uses
+/// its buffer inside one short scope and none of them escapes, so one static
+/// scratch grown on demand would serve them all -- single core, one store, and
+/// `put`/`get` are not reentrant. Not done here, because this is the most
+/// dangerous code in the building and the leak is survivable at present sizes.
 fn dma(bytes: usize) -> Result<&'static mut [u8], Error> {
     let rounded = (blocks_for(bytes as u64) as usize).max(1) * bs() as usize;
     let p = nvme::alloc_dma(rounded + 4096).ok_or(Error::NoDevice)?;
