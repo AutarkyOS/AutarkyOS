@@ -258,6 +258,11 @@ fn seed_lib(sb: &mut Sysbox) {
         &path_of("/lib/prob.ai&xi"),
         Node::Blob(crate::aiksi::LIB_PROB.as_bytes().to_vec()),
     );
+    let _ = tree::put(
+        &mut sb.root,
+        &path_of("/lib/geom.ai&xi"),
+        Node::Blob(crate::aiksi::LIB_GEOM.as_bytes().to_vec()),
+    );
 }
 
 fn seed_tools(sb: &mut Sysbox) {

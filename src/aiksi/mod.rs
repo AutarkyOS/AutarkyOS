@@ -31,6 +31,9 @@ use alloc::string::String;
 /// mounted a store still has to have one.
 pub const LIB_PROB: &str = include_str!("lib/prob.ai&xi");
 
+/// Plane geometry over exact coordinates, seeded beside it.
+pub const LIB_GEOM: &str = include_str!("lib/geom.ai&xi");
+
 /// Lex, parse and evaluate one line, returning the value of its last expression.
 pub fn eval_line(interp: &mut Interp, src: &str) -> Result<Value, String> {
     let toks = lex::lex(src)?;
@@ -211,6 +214,93 @@ pub fn lib_selftest() -> bool {
         lt("get(ordered(list(rat(2,3), rat(1,2))), 0)", "1/2"),
     );
     check("a percentage is for reading, and rounds", li("pct(rat(1,4))", 25));
+
+    // --- geometry, over exact coordinates ---------------------------------
+    fn geo(expr: &str) -> Option<Value> {
+        let mut it = Interp::new();
+        eval_line(&mut it, &alloc::format!("use \"/lib/geom\" {}", expr)).ok()
+    }
+    fn gi(expr: &str, want: i64) -> bool {
+        matches!(geo(expr), Some(Value::Int(v)) if v == want)
+    }
+    fn gt(expr: &str, want: &str) -> bool {
+        matches!(geo(expr), Some(v) if v.render() == want)
+    }
+
+    const SQ: &str = "list(Pt(0,0), Pt(2,0), Pt(2,2), Pt(0,2))";
+    const TRI: &str = "list(Pt(0,0), Pt(1,0), Pt(0,1))";
+
+    check(
+        "a second library imports, and declares a record type of its own",
+        geo("Pt(1, 2).x").is_some(),
+    );
+    // The first thing anybody asks a geometry library, and the one whole-number
+    // arithmetic answers 0 to.
+    check(
+        "the unit triangle has area 1/2, which integer division calls 0",
+        gt(&alloc::format!("area({})", TRI), "1/2"),
+    );
+    check(
+        "and a square's area is whole, so it comes back whole",
+        gi(&alloc::format!("area({})", SQ), 4),
+    );
+    // Twice the area is a whole number whenever the coordinates are, which is
+    // what lets a caller read a winding direction without touching a fraction.
+    check(
+        "the sign of the doubled area is the winding direction",
+        gi(&alloc::format!("area2({})", SQ), 8)
+            && gi("clockwise(list(Pt(0,0), Pt(0,2), Pt(2,2), Pt(2,0)))", 1)
+            && gi(&alloc::format!("clockwise({})", SQ), 0),
+    );
+    check(
+        "the orientation predicate, which every decision below is",
+        gi("collinear(Pt(0,0), Pt(1,1), Pt(2,2))", 1)
+            && gi("side(Pt(0,0), Pt(1,0), Pt(0,1))", 1)
+            && gi("side(Pt(0,0), Pt(1,0), Pt(0,-1))", -1),
+    );
+    // Two lines with whole endpoints meet at a rational point, and 2/3 has no
+    // exact binary representation at all -- so this is a point floating point
+    // cannot put on either line.
+    check(
+        "lines meet exactly, at a point no float can hold",
+        gt("meet(Pt(0,0), Pt(1,1), Pt(0,1), Pt(2,0))", "Pt{x: 2/3, y: 2/3}"),
+    );
+    check(
+        "parallel lines answer nothing rather than a sentinel point",
+        matches!(geo("meet(Pt(0,0), Pt(1,1), Pt(0,1), Pt(1,2))"), Some(Value::Nil)),
+    );
+    check(
+        "the centroid of an area, which is not the mean of the corners",
+        gt(&alloc::format!("centroid({})", SQ), "Pt{x: 1, y: 1}"),
+    );
+    check(
+        "a midpoint is a fraction when the endpoints are odd apart",
+        gt("mid(Pt(0,0), Pt(1,1))", "Pt{x: 1/2, y: 1/2}"),
+    );
+    check("squared distance, exactly", gi("dist2(Pt(0,0), Pt(3,4))", 25));
+    check(
+        "inside and outside, decided by the comparison and not by rounding",
+        gi(&alloc::format!("inside({}, Pt(1,1))", SQ), 1)
+            && gi(&alloc::format!("inside({}, Pt(3,1))", SQ), 0),
+    );
+    // The hull is the algorithm that most wants exactness: every decision it
+    // makes is a sign of `cross`, and a rounded sign builds a "hull" that is
+    // not convex. An interior point and a point sitting on an edge must both
+    // come off, and a hull is its corners.
+    check(
+        "a convex hull drops an interior point",
+        gi(&alloc::format!("len(hull(push({}, Pt(1,1))))", SQ), 4),
+    );
+    check(
+        "and drops a point lying on an edge, because a hull is its corners",
+        gi("len(hull(list(Pt(0,0), Pt(1,0), Pt(2,0), Pt(2,2), Pt(0,2))))", 4),
+    );
+    // Coordinates may themselves be fractions, which is the case a library
+    // built on whole numbers cannot take at all.
+    check(
+        "the coordinates may be fractions to begin with",
+        gt("area(list(Pt(0,0), Pt(rat(1,2),0), Pt(0,rat(1,2))))", "1/8"),
+    );
 
     ok
 }
