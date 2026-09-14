@@ -426,6 +426,60 @@ pub fn selftest() -> bool {
         }
     }
 
+    // --- what a name costs the decoder to say --------------------------
+    //
+    // Against a vocabulary written here rather than a loaded one, so these
+    // run on a machine with no model: what is being checked is the measure
+    // itself, and a claim that needed a checkpoint could only ever report
+    // whatever that checkpoint happened to tokenize.
+    //
+    // " ls" is one token and `fsck` is spelled a letter at a time, which is
+    // `retry` against `skip-hwp` in miniature -- the asymmetry `repair`
+    // measured, reproduced somewhere it can be asserted.
+    {
+        let vocab: [&[u8]; 9] = [b" ls", b"l", b"f", b"s", b"c", b"k", b"\n", b" ", b"zz"];
+        let alphabet = Alphabet::from_pieces(vocab.iter().copied());
+        let g = Grammar::new(["ls", "fsck"].into_iter());
+        let c = super::constrain::costs(&g, &alphabet);
+
+        ok &= check(
+            "a one-token name and a spelled-out one are told apart",
+            c[0].body_one_token && !c[1].body_one_token,
+        );
+        // Two and five rather than one and four: the terminator is a step
+        // every alternative pays, so it cannot bias one against another, and
+        // a measure that dropped it would understate every name equally.
+        ok &= check(
+            "the cost counts the terminator that every alternative pays",
+            c[0].min_tokens == Some(2) && c[1].min_tokens == Some(5),
+        );
+        // Byte-level BPE packs the leading space into the word. Take " ls"
+        // away and `ls` has to be spelled `l`,`s`, which is the difference
+        // between a name the decoder says in one sample and one it does not.
+        // Getting this wrong overstates every name by exactly one token.
+        let thin = Alphabet::from_pieces(vocab.iter().skip(1).copied());
+        let c2 = super::constrain::costs(&g, &thin);
+        ok &= check(
+            "a leading space is part of the word, not a token before it",
+            c2[0].min_tokens == Some(3) && !c2[0].body_one_token,
+        );
+        // Unreachable has to be distinguishable from cheap. Answering 0, or
+        // any number, would make a name the decoder can never finish read as
+        // the easiest one in the table.
+        let g2 = Grammar::new(["qq"].into_iter());
+        ok &= check(
+            "a name no token path spells is unreachable and not cheap",
+            super::constrain::costs(&g2, &alphabet)[0].min_tokens.is_none(),
+        );
+        // The first-step count is what mass can flow toward a name on the
+        // opening sample. `ls` is reachable through " ls" and "l"; `fsck`
+        // only through "f".
+        ok &= check(
+            "the opening sample admits more ways into 'ls' than into 'fsck'",
+            c[0].first_step == 2 && c[1].first_step == 1,
+        );
+    }
+
     let _ = tokenizer::BOS;
     let _ = WHITE;
     ok
@@ -1514,6 +1568,90 @@ pub fn route_report(task: &str, trust: Trust) {
 /// Prints the two numbers the whole design rests on: how often the cores agree,
 /// and how much more often they are right when they do. If that gap ever
 /// closes, the gate is worthless and should be deleted rather than trusted.
+/// What each applet name costs the decoder to say, over the live vocabulary.
+///
+/// `repair` measured that a model under a constrained grammar picked `retry`
+/// five times in six wherever it sat in the list, because `retry` is one
+/// common token and `skip-hwp` is several uncommon pieces. The applet grammar
+/// is the same machinery over more rows, and nobody had asked whether the same
+/// asymmetry is in it. This asks.
+///
+/// **It reports availability and never behaviour.** Every column is a property
+/// of (name, vocabulary) with no forward pass anywhere, so a spread here says
+/// the bias is *possible*, not that it happens. Whether cheap names are
+/// actually over-picked is a paired measurement against `route`, which does
+/// not read a name at all and therefore cannot have this bias -- and that is
+/// the interesting comparison, because `prompt_for`'s own doc already records
+/// the probe beating the decode and attributes it to comprehension alone.
+pub fn grammar_report() {
+    let (grammar, names) = grammar_for(Trust::Full);
+    let Some(costs) = with_alphabet(|a| super::constrain::costs(&grammar, a)) else {
+        kprintln!("  no model loaded, so there is no vocabulary to measure against");
+        return;
+    };
+
+    let vocab = with_alphabet(|a| a.len()).unwrap_or(0);
+    kprintln!("  {} name(s) against a {} entry vocabulary", names.len(), vocab);
+    kprintln!("  {:<10} {:>5} {:>6} {:>6}", "name", "min", "oneTok", "first");
+
+    let mut one_token = 0usize;
+    let (mut lo, mut hi) = (usize::MAX, 0usize);
+    let mut unreachable = 0usize;
+    for c in &costs {
+        let name = names.get(c.alt).copied().unwrap_or("?");
+        let min = match c.min_tokens {
+            Some(n) => {
+                lo = lo.min(n);
+                hi = hi.max(n);
+                alloc::format!("{}", n)
+            }
+            None => {
+                unreachable += 1;
+                String::from("-")
+            }
+        };
+        if c.body_one_token {
+            one_token += 1;
+        }
+        kprintln!(
+            "  {:<10} {:>5} {:>6} {:>6}",
+            name,
+            min,
+            if c.body_one_token { "yes" } else { "no" },
+            c.first_step
+        );
+    }
+
+    if lo == usize::MAX {
+        kprintln!("  nothing in this grammar is reachable at all");
+        return;
+    }
+    kprintln!(
+        "  {} of {} spelled by one token; cheapest {} step(s), dearest {}",
+        one_token,
+        costs.len(),
+        lo,
+        hi
+    );
+    if unreachable > 0 {
+        kprintln!("  {} name(s) no token path spells -- the decoder cannot finish them", unreachable);
+    }
+    // The spread is the whole finding, so it is stated rather than left for a
+    // reader to compute. A table where every name costs the same carries no
+    // bias of this kind and that is a result worth printing plainly.
+    if lo == hi && one_token == costs.len() {
+        kprintln!("  no spread: every name is one token, so this bias cannot arise here");
+    } else {
+        kprintln!("  the {} dearest name(s) cost a step the rest do not", costs.len() - one_token);
+    }
+    // `first` rises with name length because a longer name has more of its own
+    // prefixes in the vocabulary, so it is branching rather than ease. Said
+    // here because the column sits next to two that do mean what they look
+    // like, and a reader who took all three the same way would conclude
+    // `remember` is the cheapest name in the table.
+    kprintln!("  'first' counts prefixes, so it tracks length -- not how easily a name is reached");
+}
+
 pub fn gate_report() {
     console::set_color(YELLOW);
     kprintln!("[gate]");

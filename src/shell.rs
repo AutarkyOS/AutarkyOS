@@ -189,7 +189,7 @@ fn find_core(want: &str) -> Option<[u8; 32]> {
 const KNOWN_COMMANDS: &[&str] = &[
     "term", "todo", "paint", "write", "mines", "oracle", "enternet", "net", "dhcp", "mem",
     "mine", "uptime", "tasks", "status", "help", "app", "author", "video", "serial", "log", "snap",
-    "update", "repair", "gpu", "abstract", "study", "work", "redqueen",
+    "update", "repair", "gpu", "abstract", "study", "work", "redqueen", "grammar",
 ];
 
 /// How many steps an authoring run gets.
@@ -2649,6 +2649,7 @@ fn execute(line: &str, boot: &BootInfo, acpi: &Option<Acpi>, interp: &mut aiksi:
             crate::ai::window_report();
         }
         "gate" => crate::ai::harness::gate_report(),
+        "grammar" => crate::ai::harness::grammar_report(),
         "search" => crate::ai::harness::search_report(),
         "probe" => crate::ai::harness::probe_features(),
         "feature" => {
