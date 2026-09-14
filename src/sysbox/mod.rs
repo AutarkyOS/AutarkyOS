@@ -153,6 +153,7 @@ pub fn init() {
           type 'sysbox' for the applet list.\n".to_vec()));
     let _ = tree::put(&mut sb.root, &path_of("/tmp/.keep"), Node::Blob(Vec::new()));
     let _ = tree::put(&mut sb.root, &path_of("/ai/.keep"), Node::Blob(Vec::new()));
+    seed_lib(&mut sb);
     seed_tools(&mut sb);
     seed_apps(&mut sb);
     unsafe {
@@ -247,6 +248,18 @@ fn rows() {\n\
 }\n".to_vec()));
 }
 
+/// The shared library at `/lib`, which `Interp::import` will admit to a
+/// sandboxed program where it admits nothing else outside that program's own
+/// subtree. Seeded rather than left empty: an import path with nothing in it
+/// is a jail around an empty room.
+fn seed_lib(sb: &mut Sysbox) {
+    let _ = tree::put(
+        &mut sb.root,
+        &path_of("/lib/prob.ai&xi"),
+        Node::Blob(crate::aiksi::LIB_PROB.as_bytes().to_vec()),
+    );
+}
+
 fn seed_tools(sb: &mut Sysbox) {
     let _ = tree::put(&mut sb.root, &path_of("/ai/tools/hello.ai&xi"), Node::Blob(
         b"// says hello; the smallest working skill\n\
@@ -304,6 +317,13 @@ pub fn restore_latest() {
                 if children("/ai/tools").is_empty() {
                     seed_tools(s);
                     seed_apps(s);
+                }
+                // Asked separately, because a snapshot predating the library
+                // has tools and no /lib -- and a restore that put the tools
+                // back while leaving the import path empty would break every
+                // stored program that depends on one.
+                if children("/lib").is_empty() {
+                    seed_lib(s);
                 }
             });
             console::set_color(LTGREEN);

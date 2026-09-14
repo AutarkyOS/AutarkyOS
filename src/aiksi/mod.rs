@@ -18,6 +18,19 @@ pub use eval::{Interp, Value};
 
 use alloc::string::String;
 
+/// The standard library, compiled in and seeded into `/lib` at boot.
+///
+/// A real file rather than a byte-string literal, because it is *source*: it
+/// gets read, diffed and edited like the Rust beside it, and escaping a
+/// hundred lines of Aiksi into `b"...\n\"` would make it none of those. The
+/// seeded tools in `sysbox` predate this and are one line each, which is why
+/// they get away with it.
+///
+/// Compiled in for the reason the routing corpus is: `/lib` is where a stored
+/// program's dependencies are allowed to live, so a machine that has never
+/// mounted a store still has to have one.
+pub const LIB_PROB: &str = include_str!("lib/prob.ai&xi");
+
 /// Lex, parse and evaluate one line, returning the value of its last expression.
 pub fn eval_line(interp: &mut Interp, src: &str) -> Result<Value, String> {
     let toks = lex::lex(src)?;
@@ -111,6 +124,95 @@ pub fn bench() {
             kprintln!("    {}   {} us", name, us);
         }
     }
+}
+
+/// The standard library, checked by importing it and running it.
+///
+/// Not by reading it. `/lib/prob` is Aiksi source compiled into the image, so
+/// the only thing that establishes it works is the interpreter executing it
+/// against answers known from outside -- C(5,3) is 10 whatever this machine
+/// thinks, and five fair tosses landing three heads is 5/16.
+///
+/// This is also the first thing that exercises `use` on a path that is not the
+/// caller's own, and the first consumer of exact fractions outside their own
+/// claims.
+pub fn lib_selftest() -> bool {
+    use crate::gfx::console::{self, LTGRAY, LTGREEN, LTRED};
+    let mut ok = true;
+    let mut check = |what: &str, pass: bool| {
+        console::set_color(if pass { LTGREEN } else { LTRED });
+        crate::kprintln!("  {}  {}", if pass { "ok  " } else { "FAIL" }, what);
+        console::set_color(LTGRAY);
+        ok &= pass;
+    };
+
+    fn lib(expr: &str) -> Option<Value> {
+        let mut it = Interp::new();
+        eval_line(&mut it, &alloc::format!("use \"/lib/prob\" {}", expr)).ok()
+    }
+    fn li(expr: &str, want: i64) -> bool {
+        matches!(lib(expr), Some(Value::Int(v)) if v == want)
+    }
+    fn lt(expr: &str, want: &str) -> bool {
+        matches!(lib(expr), Some(v) if v.render() == want)
+    }
+
+    check(
+        "the library imports at all, from a path the caller does not own",
+        lib("fact(5)").is_some(),
+    );
+    check("factorial, and a refusal past what fits", li("fact(5)", 120) && li("fact(21)", -1));
+
+    // The point of the multiplicative forms. 50! is not a number this machine
+    // holds, so neither of these is computable through a factorial at all --
+    // they are the argument for not writing one.
+    check(
+        "permutations past the point a factorial overflows",
+        li("perm(50, 3)", 117_600),
+    );
+    check(
+        "C(50,25) exactly, which n!/(k!(n-k)!) could not reach",
+        li("comb(50, 25)", 126_410_606_437_752),
+    );
+    check(
+        "combinations at the edges, and outside them",
+        li("comb(5, 3)", 10) && li("comb(5, 0)", 1) && li("comb(5, 6)", 0),
+    );
+
+    // The claim the exact numbers exist for. A float would answer 0.3125 and
+    // then not compare equal to itself after a few more operations.
+    check(
+        "five fair tosses landing three heads is 5/16, exactly",
+        lt("binom(5, 3, 1, 2)", "5/16"),
+    );
+    // Every outcome, summed, is one. Nothing but exact arithmetic makes that
+    // true -- in floating point it is 0.9999999999999999 or 1.0000000000000002
+    // depending on the order, and neither is 1.
+    check(
+        "the whole distribution sums to exactly 1",
+        li("atleast(5, 0, 1, 2)", 1) && li("atleast(6, 0, 1, 3)", 1),
+    );
+    check(
+        "sampling without replacement: two of two aces from four cards",
+        lt("hyper(4, 2, 2, 2)", "1/6"),
+    );
+
+    check("an exact mean, which is a fraction", lt("mean(list(1, 2))", "3/2"));
+    check(
+        "an even-length median is the mean of the middle two",
+        lt("median(list(1, 2, 3, 4))", "5/2") && li("median(list(1, 2, 3))", 2),
+    );
+    check("variance over three points", lt("variance(list(1, 2, 3))", "2/3"));
+
+    // `sort` would put 2/3 before 1/2, because structurally a numerator of 2
+    // precedes one of 1. This is why the library carries its own ordering.
+    check(
+        "fractions order by value and not by their spelling",
+        lt("get(ordered(list(rat(2,3), rat(1,2))), 0)", "1/2"),
+    );
+    check("a percentage is for reading, and rounds", li("pct(rat(1,4))", 25));
+
+    ok
 }
 
 /// Programs run end to end, and compared against what they should produce.

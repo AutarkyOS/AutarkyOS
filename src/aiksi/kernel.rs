@@ -222,10 +222,22 @@ pub fn call(it: &mut Interp, name: &str, args: &[Value]) -> Result<Value, String
         // Exact fractions. `rat(n)` is n over one, which is an `Int`; the
         // two-argument form is the only way a fraction is built, and it
         // reduces on the way in so `rat(2,4)` and `rat(1,2)` are one value.
+        // `rat(a, b)` is **exact division**, not merely a fraction built from
+        // two whole numbers, and the difference is what makes it usable inside
+        // a library. A running total that has already become a fraction still
+        // has to be divisible by a count -- `mean` over a list of fractions is
+        // the ordinary case, not the exotic one -- and a `rat` that only took
+        // integers would force every caller to multiply by a reciprocal
+        // instead, which is the same operation written less clearly.
+        //
+        // `rat(a)` is a with nothing done to it, which is what makes it read
+        // as "as a number" at a call site.
         "rat" => {
-            let n = int(args, 0)?;
-            let d = if args.len() > 1 { int(args, 1)? } else { 1 };
-            Value::rational(n, d)
+            let a = args[0].as_rat()?;
+            if args.len() < 2 {
+                return Value::rational(a.0, a.1);
+            }
+            super::eval::rat_binary("/", a, args[1].as_rat()?)
         }
         // A whole number is itself over one, so these answer for both kinds
         // rather than refusing an `Int` -- a caller that has to ask which it
