@@ -29,15 +29,6 @@ fn cross(o, a, b) {
   return (a.x - o.x) * (b.y - o.y) - (a.y - o.y) * (b.x - o.x)
 }
 
-// Absolute value that works for a fraction as well as a whole number.
-//
-// The `abs` builtin takes a whole number and refuses a fraction, which is
-// right for it -- and wrong here, where a coordinate may be either.
-fn absv(x) {
-  if (x < 0) { return 0 - x }
-  return x
-}
-
 fn collinear(a, b, c): int {
   return cross(a, b, c) == 0
 }
@@ -77,8 +68,12 @@ fn area2(poly) {
 // (0,0) (1,0) (0,1) has area 1/2, and in whole-number arithmetic that is 0.
 // A library that answered 0 for the area of a triangle would be wrong in the
 // first thing anybody asked it.
+// `abs` refused a fraction when this was written, so there was a hand-written
+// `absv` here with `0 - x` inside it -- unary minus went through `as_int` too.
+// Both were gaps in the language papered over by a library, which is how a gap
+// survives. Both are fixed, and this is what is left.
 fn area(poly) {
-  return rat(absv(area2(poly)), 2)
+  return rat(abs(area2(poly)), 2)
 }
 
 fn clockwise(poly): int {

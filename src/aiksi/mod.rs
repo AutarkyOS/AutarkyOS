@@ -850,6 +850,64 @@ pub fn selftest() -> bool {
         return false;
     }
 
+    // --- the four operators that had never met the tower ------------------
+    //
+    // Each of these went through `as_int`, which refuses a fraction, a
+    // quantity and an approximation by design -- so the three kinds the tower
+    // exists for could not be negated, compared, or raised to a power. The
+    // libraries were the evidence: `/lib/geom` carried a hand-written `absv`
+    // with `0 - x` inside it, and `/lib/prob` a hand-written selection sort,
+    // both working around the language rather than using it. A gap a library
+    // papers over is a gap that survives.
+    if !text("-rat(1,2)", "-1/2") || !text("-qty(5, \"m\")", "-5 m") {
+        return false;
+    }
+    if !text("-real(2)", "~-2") || !int("-3", -3) {
+        return false;
+    }
+    if !text("abs(rat(-1,2))", "1/2") || !text("abs(qty(-5, \"m\"))", "5 m") {
+        return false;
+    }
+    // `min` answers the value rather than a whole number, so a third really is
+    // a third. It reads the same ordering `<` does, which is the point: a
+    // `min` that disagreed with `<` would be two answers to one question.
+    if !text("min(rat(1,2), rat(1,3))", "1/3") || !text("max(rat(1,2), rat(1,3))", "1/2") {
+        return false;
+    }
+    if !text("clamp(rat(5,2), 0, 2)", "2") || !text("min(qty(3, \"m\"), qty(4, \"m\"))", "3 m") {
+        return false;
+    }
+    // Comparing two quantities of different kinds has no answer, so `min`
+    // refuses it exactly as `<` does rather than deciding on the magnitudes.
+    if run("min(qty(3, \"m\"), qty(4, \"s\"))").is_some() {
+        return false;
+    }
+    // A whole base with a non-negative exponent is untouched, saturation and
+    // the clamp at 62 included -- the `pow(3, 1000)` claim above still reads
+    // `i64::MAX`, so nothing written before this moved.
+    //
+    // **A negative exponent used to answer 1, for every base.** Not a wrong
+    // answer to the question -- an answer to no question. It is the reciprocal
+    // now, which is exact for a fraction and inverts a dimension with it.
+    if !text("pow(2, -1)", "1/2") || !text("pow(rat(1,2), 3)", "1/8") {
+        return false;
+    }
+    if !text("pow(qty(2, \"m\"), 3)", "8 m^3") || !text("pow(qty(2, \"s\"), -1)", "1/2 1/s") {
+        return false;
+    }
+    if !text("pow(qty(3, \"m\"), 0)", "1") || !text("pow(real(2), -2)", "~0.25") {
+        return false;
+    }
+    // `sort` tested "is this a number" with `as_int`, so a list of fractions
+    // fell through to comparing *renderings* -- where "19/2" sorts before "9"
+    // and the list comes back wrong while looking sorted.
+    if !text("get(sort(list(rat(19,2), 9)), 0)", "9") {
+        return false;
+    }
+    if !text("get(sort(list(rat(2,3), rat(1,2))), 0)", "1/2") {
+        return false;
+    }
+
     // --- records ----------------------------------------------------------
     //
     // A declaration, a constructor, a field read, a field write, and the

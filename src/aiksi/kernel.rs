@@ -221,11 +221,38 @@ pub fn call(it: &mut Interp, name: &str, args: &[Value]) -> Result<Value, String
         // nobody reading.
         "abs" => match &args[0] {
             Value::Approx(x) => Ok(Value::Approx(if *x < 0.0 { -*x } else { *x })),
+            // A fraction and a quantity both have an absolute value and
+            // neither could say so: this went through `as_int`, which refuses
+            // both. `/lib/geom` carries an `absv` for exactly that reason.
+            Value::Rat(n, d) => Value::rational(n.saturating_abs(), *d),
+            // A unit is not a sign, so it survives: `abs(qty(-5, "m"))` is 5 m.
+            Value::Qty(n, d, k) => super::eval::quantity(n.saturating_abs(), *d, *k),
             _ => Ok(Value::Int(int(args, 0)?.saturating_abs())),
         },
-        "min" => Ok(Value::Int(int(args, 0)?.min(int(args, 1)?))),
-        "max" => Ok(Value::Int(int(args, 0)?.max(int(args, 1)?))),
-        "clamp" => Ok(Value::Int(int(args, 0)?.clamp(int(args, 1)?, int(args, 2)?))),
+        // Ordered by value rather than by whole number, so these agree with
+        // `<`. All three went through `as_int`, which refuses a fraction, a
+        // quantity and an approximation -- so the three kinds the numeric
+        // tower exists for could not be handled by the three builtins whose
+        // whole job is comparing. They answer the *value*, not an `Int`, so
+        // `min(rat(1,2), rat(1,3))` is a third and not an error.
+        "min" => {
+            let (a, b) = (&args[0], &args[1]);
+            Ok(if super::eval::num_cmp(b, a)?.is_lt() { b.clone() } else { a.clone() })
+        }
+        "max" => {
+            let (a, b) = (&args[0], &args[1]);
+            Ok(if super::eval::num_cmp(b, a)?.is_gt() { b.clone() } else { a.clone() })
+        }
+        "clamp" => {
+            let (x, lo, hi) = (&args[0], &args[1], &args[2]);
+            if super::eval::num_cmp(x, lo)?.is_lt() {
+                return Ok(lo.clone());
+            }
+            if super::eval::num_cmp(x, hi)?.is_gt() {
+                return Ok(hi.clone());
+            }
+            Ok(x.clone())
+        }
         // Exact fractions. `rat(n)` is n over one, which is an `Int`; the
         // two-argument form is the only way a fraction is built, and it
         // reduces on the way in so `rat(2,4)` and `rat(1,2)` are one value.
@@ -397,14 +424,10 @@ pub fn call(it: &mut Interp, name: &str, args: &[Value]) -> Result<Value, String
             let n = int(args, 0)?;
             Ok(Value::Int(if n <= 0 { 0 } else { isqrt(n as u64) as i64 }))
         }
-        "pow" => {
-            let (b, e) = (int(args, 0)?, int(args, 1)?);
-            let mut acc: i64 = 1;
-            for _ in 0..e.clamp(0, 62) {
-                acc = acc.saturating_mul(b);
-            }
-            Ok(Value::Int(acc))
-        }
+        // The exponent is whole whatever the base is, which is the one thing
+        // this cannot generalise: a fractional power is irrational for almost
+        // every base and there is no exact value to answer with.
+        "pow" => super::eval::num_pow(&args[0], int(args, 1)?),
 
         // --- lists -----------------------------------------------------
         "sort" => match &args[0] {
@@ -414,9 +437,19 @@ pub fn call(it: &mut Interp, name: &str, args: &[Value]) -> Result<Value, String
                 // of mixed kinds sorts stably rather than refusing: a program
                 // sorting rows it read from a file should not have to prove
                 // they are homogeneous first.
-                out.sort_by(|a, b| match (a.as_int(), b.as_int()) {
-                    (Ok(x), Ok(y)) => x.cmp(&y),
-                    _ => a.render().cmp(&b.render()),
+                // `as_int` was the test for "is this a number", and it is
+                // false for every fraction -- so a list of them fell through
+                // to the rendering, where "19/2" sorts before "9" and the
+                // list comes back wrong while looking sorted. `num_cmp` is
+                // the same ordering `<` answers, so a sorted list and a
+                // comparison cannot now disagree about it.
+                out.sort_by(|a, b| {
+                    if a.is_num() && b.is_num() {
+                        if let Ok(o) = super::eval::num_cmp(a, b) {
+                            return o;
+                        }
+                    }
+                    a.render().cmp(&b.render())
                 });
                 Ok(Value::List(out))
             }

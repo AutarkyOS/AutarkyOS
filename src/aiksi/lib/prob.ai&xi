@@ -141,36 +141,18 @@ fn mean(xs) {
   return rat(total(xs), n)
 }
 
-// Ascending order, by selection, using the language's own `<`.
+// Ascending order, by value.
 //
-// Deliberately not the `sort` builtin. That orders values structurally, and a
-// fraction's structure is a numerator beside a denominator -- so 2/3 would
-// sort below 1/2 on the numerator alone and the list would come back wrong
-// while looking sorted. `<` is the exact cross-multiplied comparison, which is
-// the one that means what it says about a number.
+// This was a hand-written selection sort, and the note on it said why: `sort`
+// tested "is this a number" with `as_int`, which is false for every fraction,
+// so a list of them fell through to comparing *renderings* -- where "19/2"
+// sorts before "9" and 2/3 sorts below 1/2. The builtin reads the same
+// ordering `<` does now, so the workaround came out and this is what is left.
 //
-// Selection rather than insertion because lists here are values: `set` answers
-// a new list, so an insertion sort would build one per element. This builds
-// one per swap and needs no `insert`, which the language does not have.
+// Kept as a name rather than deleted: it says what it sorts by, where `sort`
+// alone leaves a reader to wonder whether a list of fractions is safe.
 fn ordered(xs) {
-  out = xs
-  n = len(out)
-  i = 0
-  while (i < n) {
-    m = i
-    j = i + 1
-    while (j < n) {
-      if (get(out, j) < get(out, m)) { m = j }
-      j = j + 1
-    }
-    if (m != i) {
-      t = get(out, i)
-      out = set(out, i, get(out, m))
-      out = set(out, m, t)
-    }
-    i = i + 1
-  }
-  return out
+  return sort(xs)
 }
 
 // The middle value, or the exact mean of the middle two.

@@ -505,6 +505,106 @@ pub fn approximate(v: &Value) -> Result<f32, String> {
     }
 }
 
+/// One ordering for every rung of the tower.
+///
+/// Dispatch is `binary`'s -- quantity, then approximation, then fraction,
+/// then whole number -- because an ordering that took a different route would
+/// be a second answer to a question with one. Cross-multiplied in `i128`:
+/// both denominators are positive by invariant, so the inequality keeps its
+/// direction and there is no sign analysis to get wrong. A 128-bit
+/// *comparison* is a subtract and is safe; it is division and modulo that do
+/// not return on this target, which `rat_binary` records.
+///
+/// **`min`, `max`, `clamp` and `sort` read this; `<` in `binary` does its own
+/// cross-multiply inline.** They agree everywhere except NaN, deliberately:
+/// `<` answers what IEEE says, which is false in both directions, and a
+/// sorting comparator that answered neither would be inconsistent and could
+/// make `sort` misbehave. Here NaN orders equal, so `min` hands back its left
+/// argument -- an arbitrary answer, but the same one every time. Change one
+/// of the two and read the other.
+pub fn num_cmp(a: &Value, b: &Value) -> Result<core::cmp::Ordering, String> {
+    if matches!(a, Value::Qty(..)) || matches!(b, Value::Qty(..)) {
+        let (an, ad, ak) = as_qty(a)?;
+        let (bn, bd, bk) = as_qty(b)?;
+        if ak != bk {
+            return Err(format!(
+                "cannot compare {} and {}",
+                render_dim(&ak),
+                render_dim(&bk)
+            ));
+        }
+        return Ok((an as i128 * bd as i128).cmp(&(bn as i128 * ad as i128)));
+    }
+    if matches!(a, Value::Approx(_)) || matches!(b, Value::Approx(_)) {
+        let (x, y) = (approximate(a)?, approximate(b)?);
+        return Ok(x.partial_cmp(&y).unwrap_or(core::cmp::Ordering::Equal));
+    }
+    let (an, ad) = a.as_rat()?;
+    let (bn, bd) = b.as_rat()?;
+    Ok((an as i128 * bd as i128).cmp(&(bn as i128 * ad as i128)))
+}
+
+/// A number raised to a whole power, up the tower.
+///
+/// The exponent stays whole because a fractional one is irrational for almost
+/// every base -- there is no `Rat` that is the square root of two -- so
+/// admitting one would mean approximating without being asked. `real` and the
+/// transcendentals are the door to that, and they say so in the rendering.
+///
+/// **A negative exponent is the reciprocal, and previously was nothing at
+/// all.** The old implementation clamped the exponent to `0..62`, so
+/// `pow(2, -1)` answered 1 -- not a wrong answer to the question, an answer to
+/// no question. Nothing in the tree passed one, which is why it survived.
+///
+/// A quantity carries its dimension through: `pow(qty(2, "m"), 3)` is 8 m^3,
+/// and a negative power inverts the dimension with the magnitude, so a
+/// reciprocal second really is a hertz.
+pub fn num_pow(base: &Value, e: i64) -> Result<Value, String> {
+    // A whole base and a non-negative power answer exactly what they answered
+    // before this existed, saturation and the clamp at 62 included. Every
+    // program, core and stored candidate written earlier still means what it
+    // meant, which is the same bargain `rat` and `qty` made.
+    if let Value::Int(b) = base {
+        if e >= 0 {
+            let mut acc: i64 = 1;
+            for _ in 0..e.clamp(0, 62) {
+                acc = acc.saturating_mul(*b);
+            }
+            return Ok(Value::Int(acc));
+        }
+    }
+    if let Value::Approx(x) = base {
+        let mut acc = 1.0f32;
+        for _ in 0..e.unsigned_abs().min(4096) {
+            acc *= *x;
+        }
+        return Ok(Value::Approx(if e < 0 { 1.0 / acc } else { acc }));
+    }
+    let (n, d, k) = as_qty(base)?;
+    // Reciprocate once, so the loop below is the same either way. Zero has no
+    // reciprocal and saying so is better than an infinity this type cannot
+    // hold -- the same reason the exact path refuses a division by zero where
+    // the approximate path is allowed to answer `~inf`.
+    let (n, d, k) = if e < 0 {
+        if n == 0 {
+            return Err("division by zero".to_string());
+        }
+        (d, n, dim_combine(DIMLESS, k, -1)?)
+    } else {
+        (n, d, k)
+    };
+    let mut acc = (1i64, 1i64);
+    let mut dim = DIMLESS;
+    // Exact, so an overflow is an error rather than a saturation. A saturated
+    // exact answer is a confidently wrong one, which is the whole objection
+    // `rat_binary` makes.
+    for _ in 0..e.unsigned_abs().min(4096) {
+        acc = rat_binary("*", acc, (n, d))?.as_rat()?;
+        dim = dim_combine(dim, k, 1)?;
+    }
+    quantity(acc.0, acc.1, dim)
+}
+
 /// An approximate value, written so it cannot be mistaken for an exact one.
 ///
 /// The `~` is the point. Six places because `f32` carries about seven
@@ -1738,7 +1838,24 @@ impl Interp {
             Expr::Unary(op, inner) => {
                 let v = self.expr(inner)?;
                 match op {
-                    UnOp::Neg => Ok(Value::Int(v.as_int()?.wrapping_neg())),
+                    // Up the tower rather than through `as_int`, which
+                    // refuses everything but a whole number. That refusal is
+                    // why `/lib/geom` carries its own `absv` and writes
+                    // `0 - x`: unary minus was the one operator that never
+                    // learned about fractions, and a library working around a
+                    // gap in the language is how the gap survives.
+                    //
+                    // `rational` refuses to build a numerator of `i64::MIN`,
+                    // so no `Rat` or `Qty` holds one and the negation here
+                    // cannot overflow.
+                    UnOp::Neg => match &v {
+                        Value::Rat(n, d) => Value::rational(-*n, *d),
+                        // A sign belongs to the magnitude. A negative length
+                        // is still a length, so the dimension is carried.
+                        Value::Qty(n, d, k) => quantity(-*n, *d, *k),
+                        Value::Approx(x) => Ok(Value::Approx(-*x)),
+                        _ => Ok(Value::Int(v.as_int()?.wrapping_neg())),
+                    },
                     UnOp::Not => Ok(Value::Int(if v.truthy() { 0 } else { 1 })),
                     UnOp::BitNot => Ok(Value::Int(!v.as_int()?)),
                 }
