@@ -14,6 +14,7 @@ pub mod initiative;
 pub mod train;
 pub mod deliberate;
 pub mod corpus;
+pub mod forest;
 pub mod futures;
 pub mod glance;
 pub mod godel;

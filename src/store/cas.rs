@@ -122,15 +122,21 @@ fn blocks_for(bytes: u64) -> u64 {
 ///     snap 1   812 block(s)   heap 22,260,592 -> 25,773,456   +3,512,864
 ///     snap 2     1 block(s)   heap 25,773,456 -> 25,786,992      +13,536
 ///
-/// Marginal cost `(3,512,864 - 13,536) / 811` = **4,315 bytes of heap per
-/// block written**, against 512 bytes of data. Slightly under the 4,608 floor
-/// because blobs spanning several blocks amortise the spare page.
+/// **The cost is per blob, not per block**, and the first version of this note
+/// said per block because the blobs it measured were one block each. A second
+/// measurement settled it: importing 8,913 forest nodes averaging 865 bytes
+/// wrote 21,425 blocks for `heap 30,199,328 -> 82,328,560`, which is 2,433
+/// bytes per *block* against the 4,315 above -- half, because a two-block blob
+/// pays one spare page rather than two. Per blob the two agree: about
+/// `4096 + ceil(size / 512) * 512`, which is exactly what the line below asks
+/// for. A figure in the wrong unit generalises in the wrong direction, and
+/// this one would have over-predicted a large corpus by a factor of two.
 ///
-/// What that buys before it hurts: roughly 440,000 blocks in one session
-/// against the ~1.9 GiB this machine reports free, and `Written` memoises so
-/// an unchanged subtree is never re-put. A reboot clears it. So bulk import is
-/// affordable and *repeated* import in one session is not, which is the
-/// opposite of what anybody would assume.
+/// What that buys before it hurts: a full forest import plus its snapshot took
+/// the heap to 82 MiB of the ~1.9 GiB this machine reports, and `Written`
+/// memoises so an unchanged subtree is never re-put. A reboot clears it. So
+/// bulk import is affordable and *repeated* import in one session is not,
+/// which is the opposite of what anybody would assume.
 ///
 /// The fix, when it is worth the risk of touching this path: every caller uses
 /// its buffer inside one short scope and none of them escapes, so one static

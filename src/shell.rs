@@ -190,6 +190,7 @@ const KNOWN_COMMANDS: &[&str] = &[
     "term", "todo", "paint", "write", "mines", "oracle", "enternet", "net", "dhcp", "mem",
     "mine", "uptime", "tasks", "status", "help", "app", "author", "video", "serial", "log", "snap",
     "update", "repair", "gpu", "abstract", "study", "work", "redqueen", "grammar",
+    "forest",
 ];
 
 /// How many steps an authoring run gets.
@@ -2650,6 +2651,7 @@ fn execute(line: &str, boot: &BootInfo, acpi: &Option<Acpi>, interp: &mut aiksi:
         }
         "gate" => crate::ai::harness::gate_report(),
         "grammar" => crate::ai::harness::grammar_report(),
+        "forest" => crate::ai::forest::command(rest),
         "search" => crate::ai::harness::search_report(),
         "probe" => crate::ai::harness::probe_features(),
         "feature" => {
