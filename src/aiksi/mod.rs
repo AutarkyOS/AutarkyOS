@@ -34,6 +34,51 @@ pub const LIB_PROB: &str = include_str!("lib/prob.ai&xi");
 /// Plane geometry over exact coordinates, seeded beside it.
 pub const LIB_GEOM: &str = include_str!("lib/geom.ai&xi");
 
+/// Linear algebra: Gaussian elimination that cannot lie about a pivot.
+pub const LIB_MAT: &str = include_str!("lib/mat.ai&xi");
+
+/// Number theory, and modular arithmetic with no 128-bit divide anywhere.
+pub const LIB_NUM: &str = include_str!("lib/num.ai&xi");
+
+/// Polynomials, including the two operations whole numbers cannot express.
+pub const LIB_POLY: &str = include_str!("lib/poly.ai&xi");
+
+/// Physics in quantities that carry their units.
+pub const LIB_PHYS: &str = include_str!("lib/phys.ai&xi");
+
+/// Every library, as (path, source).
+///
+/// One list, so seeding `/lib` and checking what is in it cannot disagree
+/// about what exists. Adding a library is adding a row here; forgetting to
+/// seed one stops being a thing that can happen separately.
+pub const LIBS: &[(&str, &str)] = &[
+    ("/lib/prob.ai&xi", LIB_PROB),
+    ("/lib/geom.ai&xi", LIB_GEOM),
+    ("/lib/mat.ai&xi", LIB_MAT),
+    ("/lib/num.ai&xi", LIB_NUM),
+    ("/lib/poly.ai&xi", LIB_POLY),
+    ("/lib/phys.ai&xi", LIB_PHYS),
+];
+
+/// Every `fn name(` a library source declares, in order.
+///
+/// Scanned rather than parsed, which is the bargain `fmt::outline` makes and
+/// for the same reason: there is nothing here a parser would be more right
+/// about, since a declaration is `fn`, a space, a name and an open paren at
+/// the start of a line, and a comment cannot match because it starts with a
+/// slash.
+pub fn declared_names(src: &str) -> alloc::vec::Vec<&str> {
+    let mut out = alloc::vec::Vec::new();
+    for line in src.lines() {
+        if let Some(rest) = line.trim_start().strip_prefix("fn ") {
+            if let Some(q) = rest.find('(') {
+                out.push(rest[..q].trim());
+            }
+        }
+    }
+    out
+}
+
 /// Lex, parse and evaluate one line, returning the value of its last expression.
 pub fn eval_line(interp: &mut Interp, src: &str) -> Result<Value, String> {
     let toks = lex::lex(src)?;
@@ -300,6 +345,285 @@ pub fn lib_selftest() -> bool {
     check(
         "the coordinates may be fractions to begin with",
         gt("area(list(Pt(0,0), Pt(rat(1,2),0), Pt(0,rat(1,2))))", "1/8"),
+    );
+
+    // --- the libraries as a set, which reading one cannot check -----------
+    //
+    // `use` is textual inclusion, and a user function **shadows a builtin**
+    // deliberately -- `eval` says a program defining `rect` means its own
+    // `rect`. So a library declaring `trim` silently takes the string builtin
+    // away from every program that imports it, for a name with nothing to do
+    // with text. And two libraries declaring one name means whichever was
+    // imported second wins, with no message at all.
+    //
+    // Both of these were live while `/lib/poly` was being written: it had a
+    // `trim` and an `area`, and this is what found them.
+    {
+        let mut shadow = "";
+        let mut dupe = "";
+        let mut unparsed = "";
+        let mut seen: alloc::vec::Vec<&str> = alloc::vec::Vec::new();
+        for (path, src) in LIBS {
+            for n in declared_names(src) {
+                if eval::touch_of(n).is_some() && shadow.is_empty() {
+                    shadow = n;
+                }
+                if seen.contains(&n) && dupe.is_empty() {
+                    dupe = n;
+                }
+                seen.push(n);
+            }
+            let stem = &path[..path.len() - 6];
+            let mut it = Interp::new();
+            if eval_line(&mut it, &alloc::format!("use \"{}\" 1", stem)).is_err()
+                && unparsed.is_empty()
+            {
+                unparsed = path;
+            }
+        }
+        check(
+            &alloc::format!("all {} librar(ies) import and run their top level", LIBS.len()),
+            unparsed.is_empty(),
+        );
+        check(
+            &alloc::format!(
+                "{} function(s), none shadowing a builtin ({})",
+                seen.len(),
+                if shadow.is_empty() { "none" } else { shadow }
+            ),
+            shadow.is_empty(),
+        );
+        check(
+            &alloc::format!(
+                "and no two libraries declare one name ({})",
+                if dupe.is_empty() { "none" } else { dupe }
+            ),
+            dupe.is_empty(),
+        );
+    }
+
+    fn lib_of(which: &str, expr: &str) -> Option<Value> {
+        let mut it = Interp::new();
+        eval_line(&mut it, &alloc::format!("use \"{}\" {}", which, expr)).ok()
+    }
+    fn vi(which: &str, expr: &str, want: i64) -> bool {
+        matches!(lib_of(which, expr), Some(Value::Int(v)) if v == want)
+    }
+    fn vt(which: &str, expr: &str, want: &str) -> bool {
+        matches!(lib_of(which, expr), Some(v) if v.render() == want)
+    }
+
+    // --- linear algebra ---------------------------------------------------
+    const M: &str = "/lib/mat";
+
+    check("a third library imports, and builds an identity", vt(M, "ident(2)", "[[1, 0], [0, 1]]"));
+    // Elimination goes through fractions to get there, so a denominator that
+    // reduces to one is the evidence the arithmetic never left exactness --
+    // `-3` rather than `-3/1` is the canonical-form rule doing the checking.
+    check(
+        "a whole matrix has a whole determinant, and the rendering is the proof",
+        vi(M, "det(list(list(1,2,3), list(4,5,6), list(7,8,10)))", -3),
+    );
+    check("a row swap flips its sign", vi(M, "det(list(list(0,1), list(1,0)))", -1));
+    check("the 3x3 Hilbert determinant is exactly 1/2160", vt(M, "det(hilb(3))", "1/2160"));
+    // The demonstration. The inverse of a Hilbert matrix is a matrix of whole
+    // numbers, and no floating-point library recovers them -- at 3x3 double
+    // precision is already out by 1e-12 and single by far more.
+    check(
+        "and its inverse is whole numbers, which no float recovers",
+        vt(M, "inv(hilb(3))", "[[9, -36, 30], [-36, 192, -180], [30, -180, 180]]"),
+    );
+    check(
+        "A times A inverse is exactly the identity, on the matrix built to break that",
+        vi(M, "mul(inv(hilb(3)), hilb(3)) == ident(3)", 1),
+    );
+    // Substituted back rather than compared against a number typed here, which
+    // is the `hull` bargain: the check does not depend on the checker having
+    // done the arithmetic correctly by hand.
+    check(
+        "a 4x4 Hilbert solve, verified by putting the answer back in",
+        vi(M, "mv(hilb(4), solve(hilb(4), list(1,2,3,4))) == list(1,2,3,4)", 1),
+    );
+    check(
+        "a singular matrix has determinant exactly zero, and solve answers nothing",
+        vi(M, "det(list(list(1,2), list(2,4)))", 0)
+            && vi(M, "rank(list(list(1,2), list(2,4)))", 1)
+            && matches!(
+                lib_of(M, "solve(list(list(1,2), list(2,4)), list(1,2))"),
+                Some(Value::Nil)
+            ),
+    );
+    check(
+        "a shape mismatch answers nothing rather than a product",
+        matches!(lib_of(M, "mul(ident(2), ident(3))"), Some(Value::Nil)),
+    );
+    check(
+        "matrix times vector, which is the shape a layer is",
+        vt(M, "mv(list(list(1,2), list(3,4)), list(5,6))", "[17, 39]"),
+    );
+    // `/lib/geom` refused to write `dist` at all, because the length of (1,1)
+    // is not a rational. The tower grew a rung for it, and the `~` is the
+    // warning the documentation used to have to carry.
+    check(
+        "a length is approximate and says so, which /lib/geom declined to answer",
+        vt(M, "dist(list(0,0), list(1,1))", "~1.414214"),
+    );
+    check(
+        "the pivot test is an ordering, since != calls an approximate zero nonzero",
+        vi(M, "nz(real(0))", 0) && vi(M, "real(0) != 0", 1) && vi(M, "nz(real(1))", 1),
+    );
+
+    // --- number theory ----------------------------------------------------
+    const N: &str = "/lib/num";
+
+    check("gcd and lcm", vi(N, "gcd(1071, 462)", 21) && vi(N, "lcm(4, 6)", 12));
+    check(
+        "Bezout's coefficients really do reconstruct the gcd",
+        vi(N, "egcd(240, 46).g", 2) && vi(N, "egcd(240, 46).x * 240 + egcd(240, 46).y * 46", 2),
+    );
+    check(
+        "a residue is never negative, where % follows the dividend",
+        vi(N, "md(-7, 3)", 2) && vi(N, "-7 % 3", -1),
+    );
+    check(
+        "an inverse mod m, and the honest refusal when there is none",
+        vi(N, "modinv(3, 11)", 4) && vi(N, "modinv(2, 4)", -1),
+    );
+    // The whole reason `mulmod` exists, and the second half is what it would
+    // have answered without it -- this machine cannot divide a 128-bit
+    // integer, so the usual widening is unavailable rather than merely slow.
+    check(
+        "a modular multiply whose product overflows 64 bits, with no 128-bit divide",
+        vi(N, "mulmod(3999999999, 3999999999, 4000000000)", 1)
+            && vi(N, "3999999999 * 3999999999 % 4000000000 != 1", 1),
+    );
+    check(
+        "561 is composite, which a Fermat test calls prime",
+        vi(N, "isprime(561)", 0) && vi(N, "isprime(2147483647)", 1),
+    );
+    check(
+        "2^61 - 1 is prime, decided through that multiply rather than a coin flip",
+        vi(N, "isprime(2305843009213693951)", 1),
+    );
+    check("factorisation, with repeats", vt(N, "factor(360)", "[2, 2, 2, 3, 3, 5]"));
+    check(
+        "divisors, totient and the sieve",
+        vi(N, "len(divisors(36))", 9) && vi(N, "totient(36)", 12) && vi(N, "len(primes(100))", 25),
+    );
+    check(
+        "the Chinese remainder theorem, including the pair with no solution",
+        vi(N, "crt(2, 3, 3, 5)", 8) && vi(N, "crt(1, 2, 2, 4)", -1),
+    );
+    check(
+        "digits, in any base",
+        vi(N, "dsum(9875, 10)", 29) && vi(N, "palin(1221, 10)", 1) && vi(N, "palin(9, 2)", 1),
+    );
+
+    // --- polynomials ------------------------------------------------------
+    const P: &str = "/lib/poly";
+
+    // Not an approximation of the answer: a different polynomial. In whole
+    // numbers `x^2 * (1/2)` is `x^2 * 0`.
+    check(
+        "the integral of x is x^2/2, which whole numbers render as nothing",
+        vt(P, "integ(list(0, 1))", "[0, 0, 1/2]"),
+    );
+    check("and a definite integral is exact", vi(P, "defint(list(0, 0, 1), 0, 3)", 9));
+    check("the derivative", vt(P, "deriv(list(5, 3, 2))", "[3, 4]"));
+    // The loop terminates because the leading term cancels *exactly*. In
+    // floating point it becomes 1e-17, the degree never falls, and the
+    // division runs until something else stops it.
+    check(
+        "long division, exact enough that the degree actually falls",
+        vt(P, "pdiv(list(-1, 0, 1), list(-1, 1)).q", "[1, 1]")
+            && vt(P, "pdiv(list(-1, 0, 1), list(-1, 1)).r", "[0]"),
+    );
+    check(
+        "and a quotient that only exists in fractions",
+        vt(P, "pdiv(list(1, 0, 1), list(0, 2)).q", "[0, 1/2]"),
+    );
+    check("a polynomial gcd, monic", vt(P, "pgcd(list(-1, 0, 1), list(1, -2, 1))", "[-1, 1]"));
+    check(
+        "every rational root of (x-1)(x-2)(x-3)",
+        vt(P, "roots(list(-6, 11, -6, 1))", "[1, 2, 3]"),
+    );
+    check(
+        "a root that is not whole, by the rational root theorem",
+        vt(P, "roots(list(1, -3, 2))", "[1/2, 1]"),
+    );
+    // Empty is the complete answer rather than a failure to find anything:
+    // x^2 - 2 has two real roots and neither is rational.
+    check(
+        "x^2 - 2 has no rational root, and an empty list says exactly that",
+        vt(P, "roots(list(-2, 0, 1))", "[]"),
+    );
+    check(
+        "rational coefficients are cleared first, so the theorem still applies",
+        vt(P, "roots(list(rat(1,2), rat(-3,2), 1))", "[1/2, 1]"),
+    );
+    check(
+        "Lagrange interpolation through three points, exactly",
+        vt(P, "interp(list(0, 1, 2), list(1, 3, 7))", "[1, 1, 1]"),
+    );
+    check(
+        "evaluating at an approximation carries the tilde out with it",
+        vt(P, "ev(list(1, 1, 1), real(2))", "~7"),
+    );
+    check(
+        "a library importing another library, which nothing had done before",
+        vi(P, "gcd(12, 18)", 6),
+    );
+
+    // --- physics ----------------------------------------------------------
+    const H: &str = "/lib/phys";
+
+    check(
+        "the speed of light, exact by definition",
+        vi(H, "mag(c())", 299792458) && vt(H, "unit(c())", "m/s"),
+    );
+    // Checkable twice over: against a textbook, and against its own
+    // dimensions. The second needs nobody to have read the formula.
+    check(
+        "kinetic energy comes out in joules, by dimension rather than by name",
+        vi(H, "unit(ke(qty(2, \"kg\"), qty(3, \"m/s\"))) == unit(qty(1, \"J\"))", 1)
+            && vi(H, "mag(ke(qty(2, \"kg\"), qty(3, \"m/s\")))", 9),
+    );
+    check(
+        "gravitation comes out in newtons, which is not obvious by inspection",
+        vi(H, "unit(grav(qty(1, \"kg\"), qty(1, \"kg\"), qty(1, \"m\"))) == unit(qty(1, \"N\"))", 1),
+    );
+    check(
+        "the ideal gas law comes out in pascals",
+        vi(H, "unit(gas_p(qty(1, \"mol\"), qty(300, \"K\"), qty(1, \"m^3\"))) == unit(qty(1, \"Pa\"))", 1),
+    );
+    // The ACPI battery bug in one line: charge over power is not a time, and
+    // the dimension says so without anybody having to notice.
+    check(
+        "amp-seconds over watts is not a time, which is the battery bug by construction",
+        vi(H, "unit(qty(2000, \"A*s\") / qty(10, \"W\")) != unit(qty(1, \"s\"))", 1),
+    );
+    check(
+        "adding a mass to a time is refused rather than answered",
+        lib_of(H, "qty(1, \"kg\") + qty(1, \"s\")").is_none(),
+    );
+    check(
+        "Ohm's law, and an absolute temperature from a Celsius one",
+        vt(H, "ohm_i(qty(12, \"V\"), qty(4, \"Ohm\"))", "3 A") && vt(H, "celsius(25)", "5963/20 K"),
+    );
+    // Both halves at once: a wrong unit fails and a magnitude that is not a
+    // perfect square fails, because the candidate is squared and compared.
+    check(
+        "the root of a quantity, settled by squaring it back",
+        vt(H, "qsqrt(qty(9, \"m^2/s^2\"), \"m/s\")", "3 m/s")
+            && matches!(lib_of(H, "qsqrt(qty(2, \"m^2\"), \"m\")"), Some(Value::Nil))
+            && matches!(lib_of(H, "qsqrt(qty(9, \"m^2/s^2\"), \"m\")"), Some(Value::Nil)),
+    );
+    // The range limit, as a failure rather than as a paragraph. `h` needs a
+    // denominator of 10^42 and an `i64` stops at about 10^18.
+    check(
+        "Planck's constant does not fit, and says so rather than rounding",
+        lib_of(H, "si(662607015, -42, \"m^2*kg/s\")").is_none()
+            && vi(H, "si(299792458, 0, \"m/s\") == c()", 1),
     );
 
     // --- how approximate the approximations are ---------------------------

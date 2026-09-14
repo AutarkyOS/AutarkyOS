@@ -253,16 +253,12 @@ fn rows() {\n\
 /// subtree. Seeded rather than left empty: an import path with nothing in it
 /// is a jail around an empty room.
 fn seed_lib(sb: &mut Sysbox) {
-    let _ = tree::put(
-        &mut sb.root,
-        &path_of("/lib/prob.ai&xi"),
-        Node::Blob(crate::aiksi::LIB_PROB.as_bytes().to_vec()),
-    );
-    let _ = tree::put(
-        &mut sb.root,
-        &path_of("/lib/geom.ai&xi"),
-        Node::Blob(crate::aiksi::LIB_GEOM.as_bytes().to_vec()),
-    );
+    // Every row of `aiksi::LIBS`, rather than a call per library. One list
+    // means adding a library and forgetting to seed it is not a thing that can
+    // happen, and the boot check that walks `/lib` walks the same list.
+    for (path, src) in crate::aiksi::LIBS {
+        let _ = tree::put(&mut sb.root, &path_of(path), Node::Blob(src.as_bytes().to_vec()));
+    }
 }
 
 fn seed_tools(sb: &mut Sysbox) {

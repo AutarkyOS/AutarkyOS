@@ -1,0 +1,170 @@
+// Physics, in quantities that carry their units.
+//
+//   use "/lib/phys"
+//
+// Every function here takes and answers a `qty`, so a unit error is an
+// **error** rather than a plausible number. `ke(qty(2, "kg"), qty(3, "s"))` is
+// refused by name, because `kg * s^2` is not an energy -- and that refusal
+// happens in the arithmetic rather than in a check somebody remembered to
+// write. That is the whole reason this library exists, and it is the same
+// class of bug the ACPI battery code hit for real: milliamp-hours divided by
+// watts gives a number that looks like a time and is not one.
+//
+// A formula here is therefore checkable twice over: against a textbook, and
+// against its own dimensions. `unit(ke(...))` is `m^2*kg/s^2`, which is a
+// joule whether or not the arithmetic is right.
+//
+// ### The range, which is a real limit and is stated rather than found
+//
+// A magnitude is an exact fraction of two `i64`s, so it spans about 10^-18 to
+// 10^18 and no further. Human-scale physics fits with room. Atomic-scale
+// physics does not, and the constants that cannot be held are named below
+// rather than approximated into something that looks exact:
+//
+//   fits      c, g, G, R, atmosphere, astronomical unit, light year
+//   does not  h (6.6e-34), k_B (1.4e-23), N_A (6.0e23), e (1.6e-19),
+//             the electron and proton masses, the permittivity of free space
+//
+// `h` needs a denominator of 10^42 and there is no honest way to write that
+// here: the nearest whole fraction that fits is not Planck's constant, it is
+// a different number that would then be used as though it were. `si` below
+// builds one of these if you want to try, and **fails loudly** with
+// "numerator overflowed" rather than answering.
+//
+// There is a consolation and it is a real one. `R` is the gas constant and
+// `R = N_A * k_B` exactly, so everything molar -- the ideal gas law, molar
+// heat capacity, the whole of the chemistry a person does with a balance and
+// a thermometer -- is reachable at full precision. What is out of range is
+// the per-particle view, which is the view that needs the constants that do
+// not fit.
+//
+// ### Everything is a function, including the constants
+//
+// Deliberately: a top level of nothing but declarations is what
+// `Interp::prepare` requires to run a program's top level once and copy the
+// result. A single top-level assignment here would make every program that
+// imports this file non-preparable, which is a cost paid somewhere else
+// entirely for a spelling that saves two characters.
+
+// --- constants ----------------------------------------------------------
+
+// The speed of light, **exact by definition** since 1983: the metre is
+// defined from it, so this is not a measurement that could be refined.
+fn c() { return qty(299792458, "m/s") }
+
+// Standard gravity, also exact by definition. Not the local value anywhere;
+// the agreed conventional one, used to define the kilogram-force.
+fn g() { return qty(rat(196133, 20000), "m/s^2") }
+
+// The molar gas constant, exact since the 2019 redefinition made both N_A and
+// k_B exact. 8.31446261815324 J/(mol*K), written as the fraction it is.
+fn R() { return qty(rat(831446261815324, 100000000000000), "m^2*kg/s^2*mol*K") }
+
+// Newton's constant. **The one measured number here**, and the least
+// precisely known constant in physics -- about five significant figures,
+// where everything else above is exact. 6.67430e-11.
+fn G() { return qty(rat(667430, 10000000000000000), "m^3/kg*s^2") }
+
+// One standard atmosphere, exact by definition.
+fn atm() { return qty(101325, "Pa") }
+
+// The ice point, for converting a Celsius temperature to an absolute one.
+fn T0() { return qty(rat(27315, 100), "K") }
+
+fn celsius(t) { return qty(t, "K") + T0() }
+
+// The astronomical unit and the light year, both exact by definition -- the
+// second being the first multiplied out over a Julian year.
+fn au() { return qty(149597870700, "m") }
+fn ly() { return qty(9460730472580800, "m") }
+
+fn minute() { return qty(60, "s") }
+fn hour() { return qty(3600, "s") }
+fn day() { return qty(86400, "s") }
+fn year() { return qty(31557600, "s") }
+
+// A quantity written the way a constant is printed: m * 10^e of some unit.
+//
+// The failure is the feature. `si(662607015, -42, "m^2*kg/s")` is Planck's
+// constant and this machine cannot hold it, so the call **errors** where a
+// library that quietly rounded would hand back something usable and wrong.
+fn si(m: int, e: int, u) {
+  return qty(m * pow(10, e), u)
+}
+
+// --- mechanics ----------------------------------------------------------
+
+fn speed(d, t) { return d / t }
+fn accel(dv, t) { return dv / t }
+fn force(m, a) { return m * a }
+fn mom(m, v) { return m * v }
+fn work(f, d) { return f * d }
+fn pwr(w, t) { return w / t }
+
+// Kinetic energy, one half m v squared. The half is `rat(1, 2)` and not
+// `/ 2`: a mass of 1 kg divided by 2 in whole-number arithmetic is 0 kg.
+fn ke(m, v) { return rat(1, 2) * m * v * v }
+
+fn pe(m, h) { return m * g() * h }
+
+fn dens(m, v) { return m / v }
+fn pres(f, a) { return f / a }
+
+// Newton's law of gravitation. Worth one claim on its own, because the
+// dimension of `G * kg * kg / m^2` coming out as a newton is not obvious by
+// inspection and is exactly what a unit system is for.
+fn grav(m1, m2, r) { return G() * m1 * m2 / (r * r) }
+
+// --- electricity --------------------------------------------------------
+
+fn ohm_v(i, r) { return i * r }
+fn ohm_i(v, r) { return v / r }
+fn ohm_r(v, i) { return v / i }
+fn pelec(v, i) { return v * i }
+
+// --- gases --------------------------------------------------------------
+
+// The ideal gas law, solved for each variable in turn. Four functions rather
+// than one with a flag, because each is a formula somebody looks up and the
+// dimensions of each are a separate claim.
+fn gas_p(n, t, v) { return n * R() * t / v }
+fn gas_v(n, t, p) { return n * R() * t / p }
+fn gas_n(p, v, t) { return p * v / (R() * t) }
+fn gas_t(p, v, n) { return p * v / (n * R()) }
+
+// Moles from a mass and a molar mass. No table of elements here: one would be
+// a hundred lines of data that `tools/` should generate rather than a person
+// type, and nothing has asked for it yet.
+fn moles(mass, molar) { return mass / molar }
+
+// --- the square root of a quantity --------------------------------------
+
+// The root of a quantity, with the expected unit supplied by the caller.
+//
+// **The unit is asserted rather than derived, and it has to be.** A dimension
+// is seven whole exponents, so the root of `m/s` would need exponents of a
+// half and there is nowhere to put them; and even where the exponents are
+// even, an approximate magnitude cannot carry a unit at all -- `real` refuses
+// a quantity by name.
+//
+// So this works exactly when the answer is exactly representable, and says so
+// by **checking**: the candidate is squared and compared against the input,
+// which settles both halves at once. A wrong unit fails. A magnitude that is
+// not a perfect square fails. Nothing approximate is ever returned wearing a
+// unit it did not earn.
+//
+//     qsqrt(qty(9, "m^2/s^2"), "m/s")   ->  3 m/s
+//     qsqrt(qty(2, "m^2"), "m")         ->  nothing
+fn qsqrt(x, u) {
+  m = mag(x)
+  r = qty(rat(sqrt(num(m)), sqrt(den(m))), u)
+  if (r * r == x) { return r }
+  return
+}
+
+// Escape velocity, which is the reason `qsqrt` exists: sqrt(2GM/r) has
+// dimension m/s, and both the dimension and the magnitude have to come out
+// whole for an exact answer. Nothing when they do not, which is most of the
+// time -- so this is honest about being a special case rather than a general
+// formula.
+fn escape(m, r, u) { return qsqrt(2 * G() * m / r, u) }

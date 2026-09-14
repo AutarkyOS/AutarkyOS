@@ -1,0 +1,346 @@
+// Polynomials over exact numbers.
+//
+//   use "/lib/poly"
+//
+// A polynomial is a list of coefficients, **constant first**, so `get(p, i)`
+// is the coefficient of x^i and the list index is the exponent. Ascending
+// rather than the way they are written on paper, because every algorithm here
+// indexes by degree and none of them reads left to right.
+//
+// This is the first file in `/lib` that imports another one. It needs `lcm`
+// and `divisors` from `/lib/num` for the rational root theorem, and a second
+// copy of either would be a second thing to keep right.
+//
+// **Two operations here are impossible in whole numbers and ordinary in
+// fractions**, which is the whole argument for the library sitting on top of
+// the exact tower rather than beside it:
+//
+//   `integ`   the integral of x is x^2/2, and in integer arithmetic that is
+//             x^2 * 0. Not an approximation of the answer -- the wrong answer.
+//   `pdiv`    long division needs the leading coefficient of the divisor to
+//             divide exactly, which it almost never does.
+//
+// And one is impossible in floating point. `pdiv` terminates because the
+// leading term of the remainder cancels **exactly**, so `ptrim` sees a real
+// zero and the degree genuinely falls. In floating point that term is 1e-17
+// instead, the degree never falls, and the loop runs until something stops it.
+// Every exact algorithm below has the same shape: a decision that is only a
+// decision because the arithmetic does not lie.
+//
+// What is absent, and for the reason `/lib/mat` refuses eigenvalues: `roots`
+// answers the **rational** roots and says nothing about the others, because
+// x^2 - 2 has two real roots and neither is a number this library can hold.
+
+use "/lib/num"
+
+// A quotient and a remainder, since the language has one return.
+rec Div { q, r }
+
+// --- shape --------------------------------------------------------------
+
+// Trailing zeros off, keeping at least one coefficient so a polynomial is
+// never an empty list. The zero polynomial is `[0]`.
+//
+// Named `ptrim` and not `trim` because **a user function shadows a builtin**,
+// deliberately and by design -- `eval` says a program defining `rect` means
+// its own `rect`. So a library declaring `trim` would take the string builtin
+// away from every program that imported it, silently, for a name that has
+// nothing to do with text. Every public name in `/lib` is checked against
+// `BUILTINS` at boot for exactly that.
+fn ptrim(p) {
+  n = len(p)
+  while (n > 1 && get(p, n - 1) == 0) { n = n - 1 }
+  if (n == 0) { return list(0) }
+  return slice(p, 0, n)
+}
+
+// The degree, with the zero polynomial at -1.
+//
+// -1 rather than 0, because the degree of the zero polynomial is genuinely
+// not zero -- a constant has degree 0 and zero is not a constant in the sense
+// that matters to `pdiv`, which must refuse it as a divisor. Conventionally it
+// is minus infinity; -1 is the nearest thing an `int` has and every comparison
+// below only needs it to be less than every real degree.
+fn deg(p): int {
+  t = ptrim(p)
+  if (len(t) == 1 && get(t, 0) == 0) { return -1 }
+  return len(t) - 1
+}
+
+// Horner's rule, which is the evaluation and not merely an optimisation of
+// it: n multiplies instead of n^2, and with exact coefficients it is also the
+// form that keeps the intermediates smallest.
+//
+// Works at any x the tower holds. `ev(p, real(2))` answers an approximation
+// and says so, which is how a caller gets a decimal without the polynomial
+// having stopped being exact.
+fn ev(p, x) {
+  s = 0
+  i = len(p) - 1
+  while (i >= 0) {
+    s = s * x + get(p, i)
+    i = i - 1
+  }
+  return s
+}
+
+// --- arithmetic ---------------------------------------------------------
+
+fn padd(a, b) {
+  n = max(len(a), len(b))
+  out = list()
+  i = 0
+  while (i < n) {
+    v = 0
+    if (i < len(a)) { v = v + get(a, i) }
+    if (i < len(b)) { v = v + get(b, i) }
+    out = push(out, v)
+    i = i + 1
+  }
+  return ptrim(out)
+}
+
+fn psub(a, b) {
+  n = max(len(a), len(b))
+  out = list()
+  i = 0
+  while (i < n) {
+    v = 0
+    if (i < len(a)) { v = v + get(a, i) }
+    if (i < len(b)) { v = v - get(b, i) }
+    out = push(out, v)
+    i = i + 1
+  }
+  return ptrim(out)
+}
+
+fn pscale(p, k) {
+  out = list()
+  i = 0
+  while (i < len(p)) {
+    out = push(out, get(p, i) * k)
+    i = i + 1
+  }
+  return ptrim(out)
+}
+
+fn pmul(a, b) {
+  out = list()
+  n = len(a) + len(b) - 1
+  i = 0
+  while (i < n) {
+    out = push(out, 0)
+    i = i + 1
+  }
+  i = 0
+  while (i < len(a)) {
+    j = 0
+    while (j < len(b)) {
+      out = set(out, i + j, get(out, i + j) + get(a, i) * get(b, j))
+      j = j + 1
+    }
+    i = i + 1
+  }
+  return ptrim(out)
+}
+
+// Long division: a = q*b + r with deg(r) < deg(b). Nothing when b is zero.
+//
+// The loop terminates because the subtraction cancels the leading term
+// **exactly**, so `ptrim` sees a zero that is a zero and the degree falls by at
+// least one every pass. See the header: this is the loop that does not
+// terminate in floating point.
+fn pdiv(a, b) {
+  bb = ptrim(b)
+  db = deg(bb)
+  if (db < 0) { return }
+  r = ptrim(a)
+  q = list()
+  k = deg(r) - db
+  i = 0
+  while (i <= k) {
+    q = push(q, 0)
+    i = i + 1
+  }
+  if (len(q) == 0) { q = list(0) }
+  lb = get(bb, db)
+  while (deg(r) >= db) {
+    dr = deg(r)
+    c = rat(get(r, dr), lb)
+    q = set(q, dr - db, c)
+    i = 0
+    while (i <= db) {
+      r = set(r, dr - db + i, get(r, dr - db + i) - c * get(bb, i))
+      i = i + 1
+    }
+    r = ptrim(r)
+  }
+  return Div(ptrim(q), r)
+}
+
+// Leading coefficient 1. The normal form a gcd is reported in, since a
+// polynomial gcd is only defined up to a constant multiple and without this
+// `pgcd(2x+2, 4x+4)` could answer either of them.
+fn monic(p) {
+  t = ptrim(p)
+  d = deg(t)
+  if (d < 0) { return t }
+  l = get(t, d)
+  out = list()
+  i = 0
+  while (i <= d) {
+    out = push(out, rat(get(t, i), l))
+    i = i + 1
+  }
+  return out
+}
+
+// The greatest common divisor, monic, by Euclid on polynomials.
+//
+// Coefficients grow -- each remainder is built from fractions of the previous
+// pair, and nothing here clears denominators between steps. For the degrees a
+// person types that is fine; a serious implementation would use the subresultant
+// algorithm for the same reason `/lib/mat` names Bareiss.
+fn pgcd(a, b) {
+  x = ptrim(a)
+  y = ptrim(b)
+  while (deg(y) >= 0) {
+    d = pdiv(x, y)
+    x = y
+    y = d.r
+  }
+  return monic(x)
+}
+
+// --- calculus -----------------------------------------------------------
+
+fn deriv(p) {
+  if (len(p) <= 1) { return list(0) }
+  out = list()
+  i = 1
+  while (i < len(p)) {
+    out = push(out, get(p, i) * i)
+    i = i + 1
+  }
+  return ptrim(out)
+}
+
+// The antiderivative with constant term zero.
+//
+// `rat(c, i+1)` is exact division. In whole-number arithmetic the integral of
+// x would be `x^2 * (1/2)` = `x^2 * 0`, which is not an approximation of the
+// answer but a different polynomial.
+fn integ(p) {
+  out = list(0)
+  i = 0
+  while (i < len(p)) {
+    out = push(out, rat(get(p, i), i + 1))
+    i = i + 1
+  }
+  return ptrim(out)
+}
+
+// The definite integral from a to b, exactly.
+//
+// Not `area`: `/lib/geom` already has one, `use` is textual inclusion, and
+// whichever file was imported second would silently win.
+fn defint(p, a, b) {
+  f = integ(p)
+  return ev(f, b) - ev(f, a)
+}
+
+// --- roots --------------------------------------------------------------
+
+// The same polynomial with whole-number coefficients, scaled by the lcm of the
+// denominators. A root is unchanged by scaling, which is what makes the
+// rational root theorem reachable from rational input.
+fn pwhole(p) {
+  l = 1
+  i = 0
+  while (i < len(p)) {
+    l = lcm(l, den(get(p, i)))
+    i = i + 1
+  }
+  return pscale(p, l)
+}
+
+// Distinct values from a sorted list.
+fn uniq(xs) {
+  out = list()
+  i = 0
+  while (i < len(xs)) {
+    if (i == 0 || get(xs, i) != get(xs, i - 1)) { out = push(out, get(xs, i)) }
+    i = i + 1
+  }
+  return out
+}
+
+// Every **rational** root, ascending and without repeats.
+//
+// The rational root theorem: with whole coefficients, any rational root p/q in
+// lowest terms has p dividing the constant term and q dividing the leading
+// one. So the candidate set is finite, small, and computed rather than
+// searched -- and each candidate is settled by evaluating the polynomial,
+// which is exact, so there is no tolerance deciding whether something is a
+// root.
+//
+// **It says nothing about the irrational roots and cannot.** `roots(list(-2,
+// 0, 1))` is empty because x^2 - 2 has no rational root, which is a true and
+// complete answer to the question asked and not a failure to find anything.
+// Multiplicity is not reported either: a double root appears once.
+//
+// A zero constant term is a root at zero, divided out first so the theorem
+// has a nonzero constant to work with.
+fn roots(p) {
+  out = list()
+  q = ptrim(pwhole(p))
+  if (deg(q) < 1) { return out }
+  while (get(q, 0) == 0 && deg(q) >= 1) {
+    out = push(out, 0)
+    q = slice(q, 1, len(q) - 1)
+  }
+  if (deg(q) < 1) { return uniq(sort(out)) }
+  n = deg(q)
+  ps = divisors(abs(get(q, 0)))
+  qs = divisors(abs(get(q, n)))
+  i = 0
+  while (i < len(ps)) {
+    j = 0
+    while (j < len(qs)) {
+      c = rat(get(ps, i), get(qs, j))
+      if (ev(q, c) == 0) { out = push(out, c) }
+      if (ev(q, -c) == 0) { out = push(out, -c) }
+      j = j + 1
+    }
+    i = i + 1
+  }
+  return uniq(sort(out))
+}
+
+// The polynomial of least degree through the given points, exactly.
+//
+// Lagrange rather than Newton, because the divided differences Newton needs
+// are the same fractions in a different order and the basis form is the one a
+// reader can check term by term. Distinct x values are the caller's job: two
+// points sharing an x make a denominator zero, which is refused by name
+// rather than answered.
+fn interp(xs, ys) {
+  n = len(xs)
+  out = list(0)
+  i = 0
+  while (i < n) {
+    b = list(1)
+    d = 1
+    j = 0
+    while (j < n) {
+      if (j != i) {
+        b = pmul(b, list(-get(xs, j), 1))
+        d = d * (get(xs, i) - get(xs, j))
+      }
+      j = j + 1
+    }
+    out = padd(out, pscale(b, rat(get(ys, i), d)))
+    i = i + 1
+  }
+  return ptrim(out)
+}

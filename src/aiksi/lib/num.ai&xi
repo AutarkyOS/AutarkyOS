@@ -1,0 +1,376 @@
+// Number theory: the whole numbers, and what can be said about them exactly.
+//
+//   use "/lib/num"
+//
+// Everything here is a whole number in and a whole number out, which makes it
+// the one library in `/lib` that needs no part of the numeric tower -- and the
+// one whose answers are checkable against a table anybody has. 561 is a
+// Carmichael number, 2^61 - 1 is prime, phi(36) is 12. A library that gets
+// those wrong is wrong in a way a reader can see.
+//
+// **The hard constraint here is that this machine cannot divide a 128-bit
+// integer.** `rat_binary` records why: the build uses the stock precompiled
+// `x86_64-unknown-uefi` target, `__udivti3` and `__umodti3` link but do not
+// return, and a single `u128 %` stopped boot dead with no fault and no output.
+// That is normally invisible, and it is squarely in the way here, because
+// modular multiplication is exactly the operation that wants a 128-bit
+// intermediate: `a * b mod m` overflows a 64-bit product as soon as `m` is
+// larger than about three billion.
+//
+// So `mulmod` does it without one, and the two halves of that are worth
+// reading before changing anything below -- every modular function here rests
+// on it.
+//
+// Refusals answer -1, which is `find`'s convention and `/lib/prob`'s. Every
+// function that uses it returns a non-negative value for admissible input, so
+// -1 cannot be mistaken for an answer.
+
+// The Bezout triple: g = gcd(a, b) = a*x + b*y.
+rec Bez { g, x, y }
+
+// --- the basics ---------------------------------------------------------
+
+// A remainder that is never negative.
+//
+// `%` follows the dividend's sign, as it does in Rust and C -- so `-7 % 3` is
+// -1 and not 2. Both are defensible and only one of them is a residue, and
+// every modular function below would be subtly wrong on negative input
+// without this.
+fn md(a: int, m: int): int {
+  r = a % m
+  if (r < 0) { r = r + m }
+  return r
+}
+
+fn gcd(a: int, b: int): int {
+  if (a < 0) { a = -a }
+  if (b < 0) { b = -b }
+  while (b != 0) {
+    t = a % b
+    a = b
+    b = t
+  }
+  return a
+}
+
+// The least common multiple, dividing *before* multiplying.
+//
+// `a * b / g` overflows for inputs whose lcm fits perfectly well; `a / g * b`
+// is the same value and does not, because `g` divides `a` exactly.
+fn lcm(a: int, b: int): int {
+  if (a == 0 || b == 0) { return 0 }
+  g = gcd(a, b)
+  if (a < 0) { a = -a }
+  if (b < 0) { b = -b }
+  return a / g * b
+}
+
+// Extended Euclid, iteratively. The gcd is normalised positive, and x and y
+// are carried along with the same operations, so the identity holds however
+// the signs came in.
+fn egcd(a: int, b: int) {
+  g0 = a
+  g1 = b
+  x0 = 1
+  x1 = 0
+  y0 = 0
+  y1 = 1
+  while (g1 != 0) {
+    q = g0 / g1
+    w = g0 - q * g1
+    g0 = g1
+    g1 = w
+    w = x0 - q * x1
+    x0 = x1
+    x1 = w
+    w = y0 - q * y1
+    y0 = y1
+    y1 = w
+  }
+  if (g0 < 0) { return Bez(-g0, -x0, -y0) }
+  return Bez(g0, x0, y0)
+}
+
+// --- modular arithmetic -------------------------------------------------
+
+// a * b mod m, with no 128-bit intermediate anywhere.
+//
+// Two paths, and the fast one covers almost every real call. Below
+// 3037000500 -- just over the square root of 2^63 -- the product of two
+// residues fits a 64-bit integer, so it is one multiply and one remainder.
+//
+// Above that it is the Russian peasant method: double and add, taking the
+// remainder at every step so nothing ever exceeds 2m. It costs one iteration
+// per bit of b, which is about sixty multiplies' worth of work for one
+// multiply, and it is what makes `isprime` correct on numbers where the
+// obvious implementation silently wraps.
+//
+// **The bound is 2^62 and it is a refusal rather than a hope.** Both `r + a`
+// and `a + a` reach up to 2m, so a modulus at or above 2^62 would overflow
+// the very additions that exist to avoid overflowing the multiply. That is
+// the one sliver of the positive range this cannot serve, and answering -1 is
+// better than answering a wrapped value that looks like a residue.
+fn mulmod(a: int, b: int, m: int): int {
+  if (m <= 0 || m >= 4611686018427387904) { return -1 }
+  a = md(a, m)
+  b = md(b, m)
+  if (m < 3037000500) { return a * b % m }
+  r = 0
+  while (b > 0) {
+    if (b % 2 == 1) { r = (r + a) % m }
+    a = (a + a) % m
+    b = b / 2
+  }
+  return r
+}
+
+// b^e mod m, by squaring. A negative exponent is the inverse raised to the
+// positive one, which is the only thing it can mean and is refused when the
+// inverse does not exist.
+fn modpow(b: int, e: int, m: int): int {
+  if (m <= 1) { return 0 }
+  if (e < 0) {
+    b = modinv(b, m)
+    if (b < 0) { return -1 }
+    e = -e
+  }
+  r = 1
+  b = md(b, m)
+  while (e > 0) {
+    if (e % 2 == 1) { r = mulmod(r, b, m) }
+    b = mulmod(b, b, m)
+    e = e / 2
+  }
+  return r
+}
+
+// The inverse of a mod m, or -1 when there is none.
+//
+// An inverse exists exactly when a and m are coprime, so the refusal is a
+// fact about the arithmetic rather than a limit of this implementation --
+// which is why it is worth distinguishing from an error. 2 has no inverse mod
+// 4 on any machine ever built.
+fn modinv(a: int, m: int): int {
+  if (m <= 0) { return -1 }
+  e = egcd(md(a, m), m)
+  if (e.g != 1) { return -1 }
+  return md(e.x, m)
+}
+
+// The Chinese remainder theorem for two congruences: the smallest
+// non-negative x with x = a (mod m) and x = b (mod n).
+//
+// The moduli need not be coprime. When they are not there is a solution only
+// if a and b already agree modulo their gcd, and -1 says so -- which is the
+// case a version assuming coprimality answers confidently and wrongly.
+fn crt(a: int, m: int, b: int, n: int): int {
+  if (m <= 0 || n <= 0) { return -1 }
+  e = egcd(m, n)
+  g = e.g
+  d = b - a
+  if (d % g != 0) { return -1 }
+  l = m / g * n
+  t = md(d / g * e.x, n / g)
+  return md(a + m * t, l)
+}
+
+// --- primes -------------------------------------------------------------
+
+// Deterministic Miller-Rabin.
+//
+// The first twelve primes as witnesses is enough to decide every number below
+// 3.3 * 10^24, which is the whole of the 64-bit range and then some -- so this
+// is a *proof* rather than a probable-prime test, and there is no error
+// parameter to get wrong. A smaller witness set would do for smaller inputs
+// (four suffice below 3.2 * 10^9), and the saving is not worth a table of
+// thresholds that has to be right.
+//
+// It rests on `mulmod` entirely: with the obvious `a * b % m` this reports
+// composites as prime the moment the modulus passes three billion, which is
+// the failure that looks like a working primality test.
+fn isprime(n: int): int {
+  if (n < 2) { return 0 }
+  ws = list(2, 3, 5, 7, 11, 13, 17, 19, 23, 29, 31, 37)
+  i = 0
+  while (i < len(ws)) {
+    p = get(ws, i)
+    if (n == p) { return 1 }
+    if (n % p == 0) { return 0 }
+    i = i + 1
+  }
+  d = n - 1
+  s = 0
+  while (d % 2 == 0) {
+    d = d / 2
+    s = s + 1
+  }
+  i = 0
+  while (i < len(ws)) {
+    x = modpow(get(ws, i), d, n)
+    if (x != 1 && x != n - 1) {
+      k = 1
+      seen = 0
+      while (k < s) {
+        x = mulmod(x, x, n)
+        // No `break` in this language, so the counter is the exit.
+        if (x == n - 1) {
+          seen = 1
+          k = s
+        } else {
+          k = k + 1
+        }
+      }
+      if (seen == 0) { return 0 }
+    }
+    i = i + 1
+  }
+  return 1
+}
+
+fn nextprime(n: int): int {
+  if (n < 2) { return 2 }
+  n = n + 1
+  if (n % 2 == 0) { n = n + 1 }
+  while (isprime(n) == 0) { n = n + 2 }
+  return n
+}
+
+// Every prime up to n, by sieve.
+//
+// Capped at 20000, and the reason is the language rather than the algorithm.
+// Lists are **values** here, so `set` answers a new list: the sieve is linear
+// in steps and quadratic in copying, which is invisible at a thousand and
+// expensive at a million. For one number, `isprime` is the right question;
+// for a range, this is, up to the cap.
+fn primes(n: int) {
+  out = list()
+  if (n < 2) { return out }
+  if (n > 20000) { return out }
+  f = list()
+  i = 0
+  while (i <= n) {
+    f = push(f, 1)
+    i = i + 1
+  }
+  p = 2
+  while (p * p <= n) {
+    if (get(f, p) == 1) {
+      q = p * p
+      while (q <= n) {
+        f = set(f, q, 0)
+        q = q + p
+      }
+    }
+    p = p + 1
+  }
+  i = 2
+  while (i <= n) {
+    if (get(f, i) == 1) { out = push(out, i) }
+    i = i + 1
+  }
+  return out
+}
+
+// The prime factors, ascending, with repeats: factor(360) is
+// [2, 2, 2, 3, 3, 5].
+//
+// Repeats rather than exponent pairs, because the flat list is what `totient`
+// and `divisors` both want to walk and a caller who wants exponents can count
+// runs. Trial division on the odd numbers, so the work is about sqrt(n)/2
+// iterations -- comfortable to 10^10, slow past 10^12, and there is no
+// Pollard rho here because nothing has needed one.
+fn factor(n: int) {
+  out = list()
+  if (n < 0) { n = -n }
+  if (n < 2) { return out }
+  while (n % 2 == 0) {
+    out = push(out, 2)
+    n = n / 2
+  }
+  d = 3
+  while (d * d <= n) {
+    while (n % d == 0) {
+      out = push(out, d)
+      n = n / d
+    }
+    d = d + 2
+  }
+  if (n > 1) { out = push(out, n) }
+  return out
+}
+
+// Every divisor of n, ascending, found in pairs about the square root.
+fn divisors(n: int) {
+  out = list()
+  if (n < 1) { return out }
+  d = 1
+  while (d * d <= n) {
+    if (n % d == 0) {
+      out = push(out, d)
+      if (d != n / d) { out = push(out, n / d) }
+    }
+    d = d + 1
+  }
+  return sort(out)
+}
+
+// Euler's totient: how many of 1..n are coprime to n.
+//
+// From the distinct prime factors, dividing before multiplying so a large n
+// with a large prime factor does not overflow on the way to an answer that
+// fits.
+fn totient(n: int): int {
+  if (n < 1) { return 0 }
+  r = n
+  fs = factor(n)
+  last = 0
+  i = 0
+  while (i < len(fs)) {
+    p = get(fs, i)
+    if (p != last) {
+      r = r / p * (p - 1)
+      last = p
+    }
+    i = i + 1
+  }
+  return r
+}
+
+// --- digits -------------------------------------------------------------
+
+// The digits of n in the given base, most significant first.
+fn digits(n: int, b: int) {
+  out = list()
+  if (b < 2) { return out }
+  if (n < 0) { n = -n }
+  if (n == 0) { return list(0) }
+  while (n > 0) {
+    out = push(out, n % b)
+    n = n / b
+  }
+  return reverse(out)
+}
+
+fn dsum(n: int, b: int): int {
+  ds = digits(n, b)
+  s = 0
+  i = 0
+  while (i < len(ds)) {
+    s = s + get(ds, i)
+    i = i + 1
+  }
+  return s
+}
+
+// Is n the same read backwards, in this base?
+fn palin(n: int, b: int): int {
+  ds = digits(n, b)
+  i = 0
+  j = len(ds) - 1
+  while (i < j) {
+    if (get(ds, i) != get(ds, j)) { return 0 }
+    i = i + 1
+    j = j - 1
+  }
+  return 1
+}
