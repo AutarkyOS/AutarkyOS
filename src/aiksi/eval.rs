@@ -88,6 +88,37 @@ pub enum Value {
     ///     `3`, which is the same trap `Rat` avoids by never holding a
     ///     denominator of one.
     Qty(i64, i64, Dim),
+    /// A number that is **not** exact, and says so.
+    ///
+    /// Everything else in this tower is exact by construction: an `Int` is a
+    /// whole number, a `Rat` is a ratio of two, a `Qty` is one of those with a
+    /// dimension. None of them can hold the square root of two, the sine of
+    /// anything interesting, or a logarithm -- those are irrational, and a type
+    /// that quietly rounded one would make every value downstream of it a
+    /// number nobody could tell from an exact one.
+    ///
+    /// So approximation is a **different type**, and that is the whole design:
+    /// the moment an answer stops being exact, the value it is carried in says
+    /// so, and it goes on saying so through every operation afterwards.
+    /// `render` puts a `~` in front of it, so a transcript, a ledger line or a
+    /// forest node's `method` shows at a glance which numbers in it are
+    /// trustworthy and which are close.
+    ///
+    /// **There is no literal for one.** The lexer has no float, deliberately
+    /// -- `lex.rs` records that a `.` is unambiguously field access precisely
+    /// because no number contains one -- so an approximate value cannot be
+    /// *written*, only produced by asking for one (`real`) or by an operation
+    /// that has no exact answer. Exactness is the default and inexactness is
+    /// opt-in, which is the same bargain `rat` makes for division.
+    ///
+    /// `f32` and not `f64`, and the reason is verification rather than taste:
+    /// `tensor.rs` is what implements these functions, it is `f32` throughout
+    /// because the model's forward pass is, and adding an `f64` path would
+    /// mean writing a second set of transcendentals that nothing checks. See
+    /// the accuracy figures in `lib_selftest` -- `sqrtf` is one hardware
+    /// instruction and exact, and the rest are series whose stated target is
+    /// "a 1e-6 error in a logit changes nothing".
+    Approx(f32),
     Str(String),
     /// A sequence, and the only compound value there is.
     ///
@@ -139,6 +170,7 @@ impl Value {
             Value::Int(_) => "int",
             Value::Rat(..) => "rat",
             Value::Qty(..) => "qty",
+            Value::Approx(_) => "approx",
             Value::Str(_) => "str",
             Value::List(_) => "list",
             Value::Rec(n, _) => n,
@@ -157,6 +189,10 @@ impl Value {
             // A quantity is a number with a label. Zero of something is still
             // zero, so the magnitude decides and the label does not.
             Value::Qty(n, ..) => *n != 0,
+            // NaN is not zero and is not a number either; treating it as false
+            // would make a computation that went wrong look like one that
+            // answered nothing.
+            Value::Approx(v) => *v != 0.0,
             Value::Str(s) => !s.is_empty(),
             Value::List(v) => !v.is_empty(),
             // A record always exists, and one with no fields cannot be
@@ -184,6 +220,13 @@ impl Value {
                 "expected a plain number, found a quantity in {} -- use mag to drop the unit",
                 render_dim(k)
             )),
+            // Approximate, so there is no whole number it *is*. Rounding has
+            // three answers and the language does not pick one silently, which
+            // is the same refusal `Rat` gets.
+            Value::Approx(_) => Err(
+                "expected a whole number, found an approximate one -- use floor, ceil or round"
+                    .to_string(),
+            ),
             Value::Str(_) => Err("expected a number, found a string".to_string()),
             Value::List(_) => Err("expected a number, found a list".to_string()),
             Value::Rec(n, _) => Err(format!("expected a number, found a {}", n)),
@@ -203,7 +246,7 @@ impl Value {
     /// Is this a number at all? Used to decide whether an operation is
     /// arithmetic before either side has been coerced.
     pub fn is_num(&self) -> bool {
-        matches!(self, Value::Int(_) | Value::Rat(_, _) | Value::Qty(..))
+        matches!(self, Value::Int(_) | Value::Rat(_, _) | Value::Qty(..) | Value::Approx(_))
     }
 
     /// The only way a `Rat` is built. Establishes all three invariants.
@@ -445,6 +488,50 @@ pub fn quantity(n: i64, d: i64, dim: Dim) -> Result<Value, String> {
     Ok(Value::Qty(n, d, dim))
 }
 
+/// Any number as an `f32`, for the operations that have no exact answer.
+///
+/// A quantity refuses rather than dropping its unit, because a dimension that
+/// disappeared into a sine is exactly the error the type exists to catch.
+pub fn approximate(v: &Value) -> Result<f32, String> {
+    match v {
+        Value::Approx(x) => Ok(*x),
+        Value::Int(n) => Ok(*n as f32),
+        Value::Rat(n, d) => Ok(*n as f32 / *d as f32),
+        Value::Qty(_, _, k) => Err(format!(
+            "an approximation has no dimension, and this is in {} -- use mag first",
+            render_dim(k)
+        )),
+        other => Err(format!("expected a number, found {}", other.type_name())),
+    }
+}
+
+/// An approximate value, written so it cannot be mistaken for an exact one.
+///
+/// The `~` is the point. Six places because `f32` carries about seven
+/// significant digits and printing more would be inventing them; trailing
+/// zeros come off so a whole-valued approximation reads as `~3` rather than
+/// `~3.000000` while still saying it is approximate.
+pub fn render_approx(v: f32) -> String {
+    if v.is_nan() {
+        return String::from("~nan");
+    }
+    if v.is_infinite() {
+        return String::from(if v > 0.0 { "~inf" } else { "~-inf" });
+    }
+    let mut s = format!("{:.6}", v);
+    if s.contains('.') {
+        while s.ends_with('0') {
+            s.pop();
+        }
+        if s.ends_with('.') {
+            s.pop();
+        }
+    }
+    let mut out = String::from("~");
+    out.push_str(&s);
+    out
+}
+
 /// Any number as (numerator, denominator, dimension). A plain number is
 /// dimensionless, which is what makes `3 m * 2` work and `3 m + 2` not.
 fn as_qty(v: &Value) -> Result<(i64, i64, Dim), String> {
@@ -476,6 +563,7 @@ impl Value {
                     format!("{}/{} {}", n, d, render_dim(k))
                 }
             }
+            Value::Approx(v) => render_approx(*v),
             Value::Str(s) => s.clone(),
             // `Host{name: "x", port: 80}`, which is how it was written apart
             // from the type name leading instead of calling. Legible in a
@@ -934,6 +1022,18 @@ pub const BUILTINS: &[(&str, Touch, usize, usize)] = &[
     ("qty", Touch::Pure, 2, 2),
     ("unit", Touch::Pure, 1, 1),
     ("mag", Touch::Pure, 1, 1),
+    // Approximation, opt-in. `real` is the one door into it, exactly as `rat`
+    // is the one door into exact division -- so a program that never calls it
+    // never holds an inexact number, and one that does can be read.
+    //
+    // The transcendentals answer approximate values because their answers are
+    // irrational: there is no `Rat` that is the sine of anything but zero.
+    ("real", Touch::Pure, 1, 1),
+    ("exp", Touch::Pure, 1, 1),
+    ("ln", Touch::Pure, 1, 1),
+    ("sin", Touch::Pure, 1, 1),
+    ("cos", Touch::Pure, 1, 1),
+    ("pi", Touch::Pure, 0, 0),
 
     // --- lists, beyond building one ----------------------------------------
     ("sort", Touch::Pure, 1, 1),
@@ -1863,6 +1963,35 @@ impl Interp {
                     Ok(Value::Int(t as i64))
                 }
                 _ => Err("that operator wants plain numbers".to_string()),
+            };
+        }
+
+        // Approximation is contagious, and it has to be. An exact value meeting
+        // an approximate one cannot produce an exact answer, so the result says
+        // it is approximate -- which is the whole reason the type exists. It
+        // comes *after* the dimensioned branch, so a quantity meeting an
+        // approximation is refused there by name rather than silently losing
+        // its unit into an `f32`.
+        if a.is_num() && b.is_num() && (matches!(a, Value::Approx(_)) || matches!(b, Value::Approx(_)))
+        {
+            let x = approximate(&a)?;
+            let y = approximate(&b)?;
+            return match op {
+                BinOp::Add => Ok(Value::Approx(x + y)),
+                BinOp::Sub => Ok(Value::Approx(x - y)),
+                BinOp::Mul => Ok(Value::Approx(x * y)),
+                // No division-by-zero refusal here, deliberately: IEEE answers
+                // an infinity, `render` prints `~inf`, and that is a true
+                // statement about what happened. The exact path refuses
+                // instead because there an infinity is not representable at
+                // all, so there is nothing honest to hand back.
+                BinOp::Div => Ok(Value::Approx(x / y)),
+                BinOp::Lt => Ok(Value::Int((x < y) as i64)),
+                BinOp::Le => Ok(Value::Int((x <= y) as i64)),
+                BinOp::Gt => Ok(Value::Int((x > y) as i64)),
+                BinOp::Ge => Ok(Value::Int((x >= y) as i64)),
+                BinOp::Rem => Err("remainder wants whole numbers".to_string()),
+                _ => Err("that operator wants whole numbers".to_string()),
             };
         }
 

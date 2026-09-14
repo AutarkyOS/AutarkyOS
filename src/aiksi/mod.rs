@@ -302,6 +302,92 @@ pub fn lib_selftest() -> bool {
         gt("area(list(Pt(0,0), Pt(rat(1,2),0), Pt(0,rat(1,2))))", "1/8"),
     );
 
+    // --- how approximate the approximations are ---------------------------
+    //
+    // `tensor.rs` says of itself that these are "accurate enough for
+    // inference, where a 1e-6 error in a logit changes nothing". That is a
+    // statement about a use rather than about digits, and it is now the
+    // language's `exp`, `ln`, `sin` and `cos` -- so what it means gets
+    // measured and printed rather than quoted.
+    //
+    // Identities rather than a table of constants: a round trip and a
+    // Pythagorean sum are checkable without a reference implementation, which
+    // is the only kind of check this machine can make about itself.
+    {
+        use crate::ai::tensor;
+
+        let mut worst_trip = 0.0f32;
+        let mut k = 1;
+        while k <= 16 {
+            let x = k as f32 * 0.5;
+            let back = tensor::lnf(tensor::expf(x));
+            let e = ((back - x) / x).abs();
+            if e > worst_trip {
+                worst_trip = e;
+            }
+            k += 1;
+        }
+
+        let mut worst_pyth = 0.0f32;
+        let mut j = 0;
+        while j < 32 {
+            let x = j as f32 * 0.25;
+            let s = tensor::sinf(x);
+            let c = tensor::cosf(x);
+            let e = (s * s + c * c - 1.0).abs();
+            if e > worst_pyth {
+                worst_pyth = e;
+            }
+            j += 1;
+        }
+
+        // Hardware, and therefore exact where the answer is representable.
+        // Worth separating from the series above, because a reader told "the
+        // maths is approximate" would otherwise assume this is too.
+        let sqrt_exact = tensor::sqrtf(4.0) == 2.0
+            && tensor::sqrtf(144.0) == 12.0
+            && tensor::sqrtf(1.0) == 1.0;
+
+        check(
+            &alloc::format!(
+                "ln(exp(x)) returns x to {:.1e} relative, over 0.5..8",
+                worst_trip
+            ),
+            worst_trip < 1.0e-4,
+        );
+        // **The header's 1e-6 is about `expf`, not about `sinf`, and this is
+        // the first thing to measure the difference.** Round-tripping through
+        // exp and ln holds to 2.1e-6; the Pythagorean identity is off by
+        // 3.1e-4, three hundred times looser.
+        //
+        // The arithmetic explains it rather than merely recording it. `sinf`
+        // is a Taylor series truncated after x^7, so the first dropped term is
+        // x^9/9!, and at the fold boundary x = pi/2 that is 1.5708^9 / 362880
+        // = 1.6e-4. Two of those, squared and summed, is the 3e-4 measured.
+        //
+        // And the tree already knew, without anyone joining it up: the claim
+        // at `ai/mod.rs:143` checks `sinf(pi/2)` against a tolerance of
+        // **1e-4**, which is the real figure, while the module header beside
+        // it says 1e-6. The bound here is 1e-3 so it sits above the measured
+        // value with room, and the printed number is the thing to read.
+        //
+        // Worth knowing beyond this language: `model.rs:971` builds the RoPE
+        // tables with these, so the model's positional encoding carries that
+        // error too. That is within the "enough for inference" target it was
+        // written for, and it is not 1e-6.
+        check(
+            &alloc::format!(
+                "sin^2 + cos^2 is 1 to {:.1e} -- the series, not the 1e-6 the header claims",
+                worst_pyth
+            ),
+            worst_pyth < 1.0e-3,
+        );
+        check(
+            "sqrt is one hardware instruction, so a perfect square is exact",
+            sqrt_exact,
+        );
+    }
+
     ok
 }
 
@@ -692,6 +778,75 @@ pub fn selftest() -> bool {
         return false;
     }
     if run("floor(qty(7, \"m\"))").is_some() {
+        return false;
+    }
+
+    // --- approximation, which says it is one ------------------------------
+    //
+    // The tower is exact everywhere else, so the only honest way to hold the
+    // square root of two is a type that admits what it is. `~` is in the
+    // rendering for that reason: a transcript, a ledger line or a forest
+    // node's method shows which of its numbers are trustworthy.
+    if !text("real(2)", "~2") || !text("pi()", "~3.141593") {
+        return false;
+    }
+    // **Inexactness is opt-in, exactly as exact division was.** `sqrt(2)` is
+    // still the integer root and still 1, so every program written before this
+    // answers what it answered; the irrational one is asked for by name.
+    if !int("sqrt(2)", 1) || !int("sqrt(144)", 12) {
+        return false;
+    }
+    if !text("sqrt(real(2))", "~1.414214") {
+        return false;
+    }
+    // There is no way to *write* one. The lexer has no float -- which is what
+    // keeps `.` unambiguously field access -- so an approximate value can only
+    // be produced by asking, never typed.
+    if run("3.7").is_some() {
+        return false;
+    }
+    // Contagious, because an exact value meeting an approximate one cannot
+    // produce an exact answer.
+    if !text("real(1) + 1", "~2") || !text("1 + real(1)", "~2") || !text("rat(1,2) * real(2)", "~1") {
+        return false;
+    }
+    // **An approximation is never equal to an exact number, because it is not
+    // one.** That reads as strict and is the useful behaviour: the right way
+    // to test a float is a tolerance, and making `==` answer true here would
+    // let a program compare two approximations and believe the result.
+    // Ordering still crosses, so a bound is asked the ordinary way.
+    if !int("real(2) == 2", 0) {
+        return false;
+    }
+    if !int("real(2) < 3", 1) || !int("real(2) > 1", 1) {
+        return false;
+    }
+    // And the demonstration that it really is inexact: a root squared does not
+    // come back. `1.9999999` is the f32 answer, and it is not 2.
+    if !text("sqrt(real(2)) * sqrt(real(2))", "~2") {
+        return false;
+    }
+    if !int("sqrt(real(2)) * sqrt(real(2)) < 2", 1) {
+        return false;
+    }
+    // A dimension must not disappear into a sine. An approximation has no
+    // unit, so mixing is refused rather than silently dropping one.
+    if run("qty(2, \"m\") * real(3)").is_some() {
+        return false;
+    }
+    // Rounding is the honest exit from the type: it is the operation that
+    // turns an inexact number into an exact whole one.
+    if !int("floor(real(rat(37,10)))", 3) || !int("ceil(real(rat(37,10)))", 4)
+        || !int("round(real(rat(37,10)))", 4)
+    {
+        return false;
+    }
+    if !int("round(real(rat(-37,10)))", -4) || !int("floor(real(rat(-37,10)))", -4) {
+        return false;
+    }
+    // And everything that wants a whole number still refuses one, naming the
+    // way to ask.
+    if run("repeat(\"x\", real(2))").is_some() {
         return false;
     }
 

@@ -215,7 +215,14 @@ pub fn call(it: &mut Interp, name: &str, args: &[Value]) -> Result<Value, String
         }
 
         // --- numbers ---------------------------------------------------
-        "abs" => Ok(Value::Int(int(args, 0)?.saturating_abs())),
+        // Both kinds in one arm, because this one sits above the guarded
+        // arms further down and a guard added there would never be reached --
+        // the compiler said so, which is the warning `shell::execute` records
+        // nobody reading.
+        "abs" => match &args[0] {
+            Value::Approx(x) => Ok(Value::Approx(if *x < 0.0 { -*x } else { *x })),
+            _ => Ok(Value::Int(int(args, 0)?.saturating_abs())),
+        },
         "min" => Ok(Value::Int(int(args, 0)?.min(int(args, 1)?))),
         "max" => Ok(Value::Int(int(args, 0)?.max(int(args, 1)?))),
         "clamp" => Ok(Value::Int(int(args, 0)?.clamp(int(args, 1)?, int(args, 2)?))),
@@ -255,6 +262,23 @@ pub fn call(it: &mut Interp, name: &str, args: &[Value]) -> Result<Value, String
         // invariant, so `div_euclid` is the floor and the remainder is in
         // `0..d`, which is what lets the other two be stated as offsets from
         // it rather than as separate arithmetic.
+        // Guarded arms first. A guarded arm placed *after* the bare one it
+        // guards is unreachable, which this tree has already paid for once in
+        // `shell::execute` and which the compiler only mentions in a warning.
+        //
+        // These are where an approximation stops being one: rounding is the
+        // operation that turns an inexact number into an exact whole one, so
+        // it is the honest exit from the type rather than a way around it.
+        "floor" if matches!(args[0], Value::Approx(_)) => Ok(Value::Int(
+            crate::ai::tensor::floorf(super::eval::approximate(&args[0])?) as i64,
+        )),
+        "ceil" if matches!(args[0], Value::Approx(_)) => {
+            let x = super::eval::approximate(&args[0])?;
+            Ok(Value::Int(-(crate::ai::tensor::floorf(-x) as i64)))
+        }
+        "round" if matches!(args[0], Value::Approx(_)) => Ok(Value::Int(
+            crate::ai::tensor::roundf(super::eval::approximate(&args[0])?) as i64,
+        )),
         "floor" => {
             let (n, d) = args[0].as_rat()?;
             Ok(Value::Int(n.div_euclid(d)))
@@ -331,11 +355,44 @@ pub fn call(it: &mut Interp, name: &str, args: &[Value]) -> Result<Value, String
                 Value::rational(n, d)
             }
         },
+        // --- approximation, opt-in ------------------------------------
+        //
+        // Every one of these answers `Approx`, and that is the contract: they
+        // are the operations with no exact answer, so the value they hand back
+        // says it is inexact and goes on saying so.
+        //
+        // The implementations are `ai::tensor`'s, and not a second set written
+        // here. That module is `f32` because the model's forward pass is, it
+        // is the code the model's own correctness already depends on, and a
+        // parallel `f64` tower would be numerics nothing in this tree checks.
+        // What it is *not* is general-purpose: its own header says these are
+        // "accurate enough for inference, where a 1e-6 error in a logit
+        // changes nothing". `diag lib` measures what that means in digits
+        // rather than repeating the sentence.
+        "real" => Ok(Value::Approx(super::eval::approximate(&args[0])?)),
+        "exp" => Ok(Value::Approx(crate::ai::tensor::expf(
+            super::eval::approximate(&args[0])?,
+        ))),
+        "ln" => Ok(Value::Approx(crate::ai::tensor::lnf(
+            super::eval::approximate(&args[0])?,
+        ))),
+        "sin" => Ok(Value::Approx(crate::ai::tensor::sinf(
+            super::eval::approximate(&args[0])?,
+        ))),
+        "cos" => Ok(Value::Approx(crate::ai::tensor::cosf(
+            super::eval::approximate(&args[0])?,
+        ))),
+        // Not a literal, because there is no float literal to write it as --
+        // which is the property that keeps `.` unambiguously field access.
+        "pi" => Ok(Value::Approx(core::f32::consts::PI)),
         // Integer square root, by the same Newton iteration `gfx` uses for
-        // circles. Kept integer even now that fractions exist, because the
-        // square root of most fractions is irrational and cannot be one --
-        // `sqrt` answering an approximation would be the one inexact thing in
-        // an exact numeric tower, silently.
+        // circles, **and still integer for a whole number**. Changing that
+        // would alter what every program written before this answered, so
+        // `sqrt(2)` is still 1 and `sqrt(real(2))` is the irrational one.
+        // Inexactness is opt-in here exactly as it is everywhere else.
+        "sqrt" if matches!(args[0], Value::Approx(_)) => Ok(Value::Approx(
+            crate::ai::tensor::sqrtf(super::eval::approximate(&args[0])?),
+        )),
         "sqrt" => {
             let n = int(args, 0)?;
             Ok(Value::Int(if n <= 0 { 0 } else { isqrt(n as u64) as i64 }))
