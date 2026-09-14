@@ -294,6 +294,138 @@ pub fn selftest() -> bool {
         return false;
     }
 
+    // --- exact fractions --------------------------------------------------
+    //
+    // The claim that earns its place is `rat(1,3) * 3 == 1`. A float cannot
+    // make that true, and every domain worth adding -- physics, statistics,
+    // competition mathematics -- is written in numbers that have to survive
+    // being divided and multiplied back. It is also what keeps `differ`'s
+    // no-tolerance rule intact: exact values compare exactly.
+    if !int("rat(1,3) * 3", 1) {
+        return false;
+    }
+    // Reduced on the way in, so one number has one value. Without this
+    // `rat(2,4) == rat(1,2)` is false and two programs computing the same
+    // answer disagree about it.
+    if !text("rat(2,4)", "1/2") || !int("rat(2,4) == rat(1,2)", 1) {
+        return false;
+    }
+    // A denominator of one is an `Int`, never a `Rat`. `int` here is the
+    // check: it matches the variant, so a `3/1` would fail it while
+    // rendering identically.
+    if !int("rat(3,1)", 3) || !int("rat(6,3)", 2) {
+        return false;
+    }
+    // The sign lives in the numerator, so a negative has one spelling.
+    if !text("rat(1,-2)", "-1/2") || !int("rat(-1,2) == rat(1,-2)", 1) {
+        return false;
+    }
+    // **Integer division is untouched.** This is the whole compatibility
+    // argument: every core, seeded tool and generated candidate written
+    // before fractions existed still means what it meant, because two `Int`s
+    // never reach the exact path. Exactness starts at `rat` and propagates.
+    if !int("10/3", 3) || !int("7/2", 3) {
+        return false;
+    }
+    // And propagates once it has started.
+    if !text("rat(1,3) + rat(1,3)", "2/3") || !text("1 + rat(1,2)", "3/2") {
+        return false;
+    }
+    // Cross-multiplied, so a comparison does not go through a division that
+    // would round before the answer.
+    if !int("rat(1,3) < rat(1,2)", 1) || !int("rat(2,3) > rat(1,2)", 1) {
+        return false;
+    }
+    // The three roundings disagree, which is exactly why `as_int` refuses to
+    // pick one silently. -7/2 is -3.5: down, up, and half away from zero.
+    if !int("floor(rat(-7,2))", -4) || !int("ceil(rat(-7,2))", -3)
+        || !int("round(rat(-7,2))", -4) || !int("round(rat(7,2))", 4)
+    {
+        return false;
+    }
+    if !int("num(rat(3,4))", 3) || !int("den(rat(3,4))", 4) || !int("den(5)", 1) {
+        return false;
+    }
+    // Refusals. A zero denominator is not a number, and an exact answer that
+    // does not fit is an error rather than a wrapped one -- a confidently
+    // wrong exact value is worse than none, which is the trade exactness
+    // makes and the reason the arithmetic is checked.
+    if run("rat(1,0)").is_some() {
+        return false;
+    }
+    if run("rat(1,4000000000) * rat(1,4000000000)").is_some() {
+        return false;
+    }
+    // A fraction is not a whole number and will not pretend to be one.
+    if run("repeat(\"x\", rat(1,2))").is_some() {
+        return false;
+    }
+
+    // --- arithmetic that would stop the machine ---------------------------
+    //
+    // Every one of these is legal to *write* and, unguarded, is either a
+    // hardware fault or a silently wrong answer. In a kernel with no process
+    // isolation and every IDT vector but `#BP` fatal, the first kind halts the
+    // machine -- so a program a model wrote, or a corpus supplied, must not be
+    // able to reach one.
+    //
+    // The guards were already here and had never been checked, which is the
+    // same objection `differ` makes about its own suite: a defence nobody has
+    // watched refuse anything is indistinguishable from an absent one.
+    //
+    // `i64::MIN` is built rather than written, because the literal
+    // 9223372036854775808 does not fit an `i64` and the lexer would have to
+    // read it before the unary minus could apply.
+    const MIN: &str = "(0 - 9223372036854775807 - 1)";
+
+    // `idiv` raises `#DE` on `i64::MIN / -1` -- the quotient has no
+    // representation. On this machine that is a fatal fault, not an exception
+    // somebody catches.
+    if !int(&alloc::format!("{} / -1", MIN), i64::MIN) {
+        return false;
+    }
+    if !int(&alloc::format!("{} % -1", MIN), 0) {
+        return false;
+    }
+    // A shift wider than the type is undefined in C and masked by the
+    // hardware; either way the answer is not what was written. Masked here,
+    // deliberately and consistently, rather than faulting.
+    if !int("1 << 64", 1) || !int("1 << 65", 2) || !int("1 << -1", i64::MIN) {
+        return false;
+    }
+    // `abs` of the most negative number is not representable either.
+    if !int(&alloc::format!("abs({})", MIN), i64::MAX) {
+        return false;
+    }
+    // Saturating rather than wrapping, so a big power is a big number and
+    // never a small negative one.
+    //
+    // Base 3 rather than 2, and that is the claim working rather than a
+    // detail: the exponent is clamped to 62, so `pow(2, 1000)` reaches 2^62 =
+    // 4.6e18 and never saturates at all. Written with 2 this would have passed
+    // or failed for a reason that has nothing to do with saturation.
+    if !int("pow(3, 1000)", i64::MAX) || !int("pow(2, 10)", 1024) {
+        return false;
+    }
+    // Rounding the most negative number must not overflow on the way.
+    if !int(&alloc::format!("floor({})", MIN), i64::MIN)
+        || !int(&alloc::format!("ceil({})", MIN), i64::MIN)
+        || !int(&alloc::format!("round({})", MIN), i64::MIN)
+    {
+        return false;
+    }
+    // Division and remainder by zero are errors, not faults.
+    if run("1 / 0").is_some() || run("1 % 0").is_some() {
+        return false;
+    }
+    // And the exact path refuses rather than wrapping, which is the one place
+    // this language does *not* wrap. An `Int` is a machine word and wrapping
+    // is what a hash wants; a `Rat` is a number, and a wrapped numerator is a
+    // confidently wrong exact answer.
+    if run(&alloc::format!("rat(1, 3) * {}", MIN)).is_some() {
+        return false;
+    }
+
     // --- records ----------------------------------------------------------
     //
     // A declaration, a constructor, a field read, a field write, and the

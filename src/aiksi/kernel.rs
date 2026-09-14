@@ -219,9 +219,76 @@ pub fn call(it: &mut Interp, name: &str, args: &[Value]) -> Result<Value, String
         "min" => Ok(Value::Int(int(args, 0)?.min(int(args, 1)?))),
         "max" => Ok(Value::Int(int(args, 0)?.max(int(args, 1)?))),
         "clamp" => Ok(Value::Int(int(args, 0)?.clamp(int(args, 1)?, int(args, 2)?))),
+        // Exact fractions. `rat(n)` is n over one, which is an `Int`; the
+        // two-argument form is the only way a fraction is built, and it
+        // reduces on the way in so `rat(2,4)` and `rat(1,2)` are one value.
+        "rat" => {
+            let n = int(args, 0)?;
+            let d = if args.len() > 1 { int(args, 1)? } else { 1 };
+            Value::rational(n, d)
+        }
+        // A whole number is itself over one, so these answer for both kinds
+        // rather than refusing an `Int` -- a caller that has to ask which it
+        // holds before asking for a numerator has been given two types where
+        // the maths has one.
+        "num" => Ok(Value::Int(args[0].as_rat()?.0)),
+        "den" => Ok(Value::Int(args[0].as_rat()?.1)),
+        // Rounding is where a fraction becomes a whole number, and the three
+        // of them disagree -- which is exactly why `as_int` refuses to pick
+        // one silently. `-7/2` is -4, -3 and -4 respectively.
+        // All three are built from `div_euclid`/`rem_euclid` on `i64` and
+        // never from negation or a widened intermediate. `-n` has no answer
+        // for `i64::MIN`, and 128-bit division does not return on this target
+        // at all -- see `eval::rat_binary`. The denominator is positive by
+        // invariant, so `div_euclid` is the floor and the remainder is in
+        // `0..d`, which is what lets the other two be stated as offsets from
+        // it rather than as separate arithmetic.
+        "floor" => {
+            let (n, d) = args[0].as_rat()?;
+            Ok(Value::Int(n.div_euclid(d)))
+        }
+        "ceil" => {
+            let (n, d) = args[0].as_rat()?;
+            let q = n.div_euclid(d);
+            let up = n.rem_euclid(d) != 0;
+            Ok(Value::Int(if up {
+                q.checked_add(1).ok_or("number too large to round")?
+            } else {
+                q
+            }))
+        }
+        // Half away from zero, the convention a person means by "round" and
+        // the one competition answers are written in. Computed on doubled
+        // numerators so it needs no division that could round the wrong way
+        // first.
+        // Half away from zero, which is what a person means by "round" and
+        // what a competition answer is written in.
+        //
+        // Stated as an offset from the floor, and the comparison is `r` against
+        // `d - r` rather than `2r` against `d`, because doubling a remainder
+        // near `i64::MAX` overflows while the difference cannot -- `r` is in
+        // `0..d` by `rem_euclid`, so `d - r` is positive and fits.
+        //
+        // The two directions differ at exactly the half, and that is the whole
+        // of "away from zero": 7/2 goes up to 4, -7/2 goes down to -4, and the
+        // floor is 3 and -4 respectively. So a positive takes the step when
+        // the halves are equal and a negative does not.
+        "round" => {
+            let (n, d) = args[0].as_rat()?;
+            let q = n.div_euclid(d);
+            let r = n.rem_euclid(d);
+            let up = if n >= 0 { r >= d - r } else { r > d - r };
+            Ok(Value::Int(if up {
+                q.checked_add(1).ok_or("number too large to round")?
+            } else {
+                q
+            }))
+        }
         // Integer square root, by the same Newton iteration `gfx` uses for
-        // circles. There are no floats in this language and adding them for
-        // one builtin would change every arithmetic path.
+        // circles. Kept integer even now that fractions exist, because the
+        // square root of most fractions is irrational and cannot be one --
+        // `sqrt` answering an approximation would be the one inexact thing in
+        // an exact numeric tower, silently.
         "sqrt" => {
             let n = int(args, 0)?;
             Ok(Value::Int(if n <= 0 { 0 } else { isqrt(n as u64) as i64 }))

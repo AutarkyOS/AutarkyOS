@@ -24,6 +24,40 @@ use alloc::vec::Vec;
 #[derive(Clone, Debug, PartialEq)]
 pub enum Value {
     Int(i64),
+    /// An exact rational: numerator, denominator.
+    ///
+    /// `kernel.rs` said for a long time that "there are no floats in this
+    /// language and adding them for one builtin would change every arithmetic
+    /// path", which was the right judgement for one integer `sqrt` and the
+    /// wrong one for physics, statistics or competition mathematics -- none of
+    /// which can be written with integers at all.
+    ///
+    /// **Exact rather than floating, because the answer to a maths problem is
+    /// a number and not an approximation to one.** A third is a third here; it
+    /// does not become 0.333... and it does not stop comparing equal to
+    /// itself. That also keeps `differ`'s rule intact, which requires two
+    /// routes to agree *bit for bit with no tolerance* -- a float would have
+    /// forced a tolerance, and its own doc says a tolerance hides the bug
+    /// worth finding.
+    ///
+    /// Three invariants, all established by `rational` and relied on
+    /// everywhere else:
+    ///
+    ///   * `den > 0` -- the sign lives in the numerator, so there is one
+    ///     spelling of a negative value rather than two.
+    ///   * reduced -- `2/4` and `1/2` are the same number and must be the
+    ///     same *value*, or two programs computing the same answer disagree.
+    ///   * **`den != 1`** -- an integer is an `Int` and never a `Rat`. This is
+    ///     the one that makes the rest safe: without it `3` and `3/1` render
+    ///     differently, hash differently, and compare unequal while being the
+    ///     same number.
+    ///
+    /// Arithmetic goes through `i128` and is checked back into `i64`, so an
+    /// overflow is an error rather than a wrap. That is deliberate and it is
+    /// the cost of exactness: repeated exact arithmetic grows denominators,
+    /// and a wrapped numerator is a confidently wrong exact answer, which is
+    /// worse than no answer at all.
+    Rat(i64, i64),
     Str(String),
     /// A sequence, and the only compound value there is.
     ///
@@ -73,6 +107,7 @@ impl Value {
     pub fn type_name(&self) -> &str {
         match self {
             Value::Int(_) => "int",
+            Value::Rat(..) => "rat",
             Value::Str(_) => "str",
             Value::List(_) => "list",
             Value::Rec(n, _) => n,
@@ -83,6 +118,11 @@ impl Value {
     pub fn truthy(&self) -> bool {
         match self {
             Value::Int(v) => *v != 0,
+            // Never zero, and that is a property rather than an assumption:
+            // `rational(0, d)` reduces to `0/1`, whose denominator is one, so
+            // it comes back an `Int`. A `Rat` with a zero numerator cannot be
+            // constructed.
+            Value::Rat(..) => true,
             Value::Str(s) => !s.is_empty(),
             Value::List(v) => !v.is_empty(),
             // A record always exists, and one with no fields cannot be
@@ -95,6 +135,14 @@ impl Value {
     pub fn as_int(&self) -> Result<i64, String> {
         match self {
             Value::Int(v) => Ok(*v),
+            // Never silently truncated. A caller wanting 3 from 7/2 has to say
+            // which way it rounds, because the two answers differ and the
+            // language has no business choosing. `floor`, `ceil` and `round`
+            // are the ways to ask.
+            Value::Rat(n, d) => Err(format!(
+                "expected a whole number, found {}/{} -- use floor, ceil or round",
+                n, d
+            )),
             Value::Str(_) => Err("expected a number, found a string".to_string()),
             Value::List(_) => Err("expected a number, found a list".to_string()),
             Value::Rec(n, _) => Err(format!("expected a number, found a {}", n)),
@@ -102,9 +150,128 @@ impl Value {
         }
     }
 
+    /// Any number as a fraction. An `Int` is itself over one.
+    pub fn as_rat(&self) -> Result<(i64, i64), String> {
+        match self {
+            Value::Int(v) => Ok((*v, 1)),
+            Value::Rat(n, d) => Ok((*n, *d)),
+            other => other.as_int().map(|v| (v, 1)),
+        }
+    }
+
+    /// Is this a number at all? Used to decide whether an operation is
+    /// arithmetic before either side has been coerced.
+    pub fn is_num(&self) -> bool {
+        matches!(self, Value::Int(_) | Value::Rat(_, _))
+    }
+
+    /// The only way a `Rat` is built. Establishes all three invariants.
+    ///
+    /// Returns an `Int` whenever the denominator reduces to one, which is what
+    /// keeps a whole number from having two spellings.
+    pub fn rational(n: i64, d: i64) -> Result<Value, String> {
+        if d == 0 {
+            return Err("division by zero".to_string());
+        }
+        // `i64::MIN` has no positive counterpart, so negating it to move the
+        // sign out of the denominator overflows. Refusing is the honest answer
+        // and the alternative is a value whose sign is silently wrong.
+        if n == i64::MIN || d == i64::MIN {
+            return Err("number too large to reduce".to_string());
+        }
+        let (mut n, mut d) = if d < 0 { (-n, -d) } else { (n, d) };
+        let g = gcd(n.unsigned_abs(), d.unsigned_abs()) as i64;
+        if g > 1 {
+            n /= g;
+            d /= g;
+        }
+        Ok(if d == 1 { Value::Int(n) } else { Value::Rat(n, d) })
+    }
+}
+
+fn gcd(mut a: u64, mut b: u64) -> u64 {
+    while b != 0 {
+        let t = a % b;
+        a = b;
+        b = t;
+    }
+    a.max(1)
+}
+
+/// Exact arithmetic on two fractions, entirely in `i64`.
+///
+/// **128-bit division and modulo hang this kernel, and nothing else in the
+/// tree had ever used them -- so this is where it was found.** `.cargo/config`
+/// records that the build uses the stock precompiled `x86_64-unknown-uefi`
+/// target because `-Zbuild-std` needs a host linker this machine does not
+/// have, and `compiler_builtins` is therefore whatever that target ships.
+/// `__multi3` is fine -- an `i128` multiply is inline, and a comparison is a
+/// subtract -- but `__udivti3` and `__umodti3` do not return. A single
+/// `u128 % u128` in a gcd loop was enough to stop boot dead with no fault, no
+/// panic and no output, three sections before the shell.
+///
+/// So the obvious implementation -- widen to `i128`, multiply, reduce, narrow
+/// back -- is unavailable, and what replaces it is better anyway.
+/// **Cross-reduction before multiplying** keeps every intermediate inside
+/// `i64` for exactly the cases a wider one would have rescued: `a/b * c/d`
+/// divides out `gcd(a, d)` and `gcd(c, b)` first, and addition uses the lcm of
+/// the denominators rather than their product. That is strictly less likely to
+/// overflow than the naive widened version, not more.
+///
+/// Overflow is an error rather than a wrap. Exactness is the whole point of
+/// this type, and a wrapped numerator is a confidently wrong exact answer.
+pub fn rat_binary(op: &str, a: (i64, i64), b: (i64, i64)) -> Result<Value, String> {
+    let (an, ad) = a;
+    let (bn, bd) = b;
+    match op {
+        "+" | "-" => {
+            let bn = if op == "-" {
+                bn.checked_neg().ok_or("numerator overflowed")?
+            } else {
+                bn
+            };
+            // The common denominator is the lcm, `ad * (bd/g)`, and not the
+            // product. For `1/6 + 1/10` that is 30 rather than 60, and the
+            // difference is the whole margin on a long exact calculation.
+            let g = gcd(ad.unsigned_abs(), bd.unsigned_abs()) as i64;
+            let l = an.checked_mul(bd / g).ok_or("numerator overflowed")?;
+            let r = bn.checked_mul(ad / g).ok_or("numerator overflowed")?;
+            let n = l.checked_add(r).ok_or("numerator overflowed")?;
+            let d = ad.checked_mul(bd / g).ok_or("denominator overflowed")?;
+            Value::rational(n, d)
+        }
+        "*" | "/" => {
+            // Dividing is multiplying by the reciprocal, and the zero check
+            // has to happen before the flip rather than after -- afterwards it
+            // is a denominator of zero that `rational` would report as the
+            // wrong thing.
+            let (bn, bd) = if op == "/" {
+                if bn == 0 {
+                    return Err("division by zero".to_string());
+                }
+                (bd, bn)
+            } else {
+                (bn, bd)
+            };
+            let g1 = gcd(an.unsigned_abs(), bd.unsigned_abs()) as i64;
+            let g2 = gcd(bn.unsigned_abs(), ad.unsigned_abs()) as i64;
+            let n = (an / g1).checked_mul(bn / g2).ok_or("numerator overflowed")?;
+            let d = (ad / g2).checked_mul(bd / g1).ok_or("denominator overflowed")?;
+            Value::rational(n, d)
+        }
+        _ => Err(format!("{} is not exact arithmetic", op)),
+    }
+}
+
+impl Value {
+
     pub fn render(&self) -> String {
         match self {
             Value::Int(v) => format!("{}", v),
+            // `n/d`, which is how it was written and how it reads back. A
+            // denominator of one is impossible here by construction, so this
+            // never renders `3/1` for something `Int` would render as `3`.
+            Value::Rat(n, d) => format!("{}/{}", n, d),
             Value::Str(s) => s.clone(),
             // `Host{name: "x", port: 80}`, which is how it was written apart
             // from the type name leading instead of calling. Legible in a
@@ -543,6 +710,20 @@ pub const BUILTINS: &[(&str, Touch, usize, usize)] = &[
     ("clamp", Touch::Pure, 3, 3),
     ("sqrt", Touch::Pure, 1, 1),
     ("pow", Touch::Pure, 2, 2),
+    // Exact fractions. `rat` is the only way one is made, so exactness is
+    // opt-in at a named point and every program written before them still
+    // means what it meant -- `10/3` is still 3.
+    //
+    // Short common words on purpose. `grammar` measured that 19 of 23 applet
+    // names are a single token, and `repair` measured a model preferring
+    // `retry` over `skip-hwp` five times in six on token cost alone. A maths
+    // library the model cannot cheaply spell is one it will not reach for.
+    ("rat", Touch::Pure, 1, 2),
+    ("num", Touch::Pure, 1, 1),
+    ("den", Touch::Pure, 1, 1),
+    ("floor", Touch::Pure, 1, 1),
+    ("ceil", Touch::Pure, 1, 1),
+    ("round", Touch::Pure, 1, 1),
 
     // --- lists, beyond building one ----------------------------------------
     ("sort", Touch::Pure, 1, 1),
@@ -1403,6 +1584,45 @@ impl Interp {
         }
         if op == BinOp::Ne {
             return Ok(Value::Int(if a != b { 1 } else { 0 }));
+        }
+
+        // Exact arithmetic, the moment either side is a fraction.
+        //
+        // `Eq` and `Ne` are already answered above by comparing the values
+        // themselves, which is only correct because `rational` guarantees one
+        // spelling per number -- reduced, positive denominator, never over
+        // one. Without those invariants `2/4 == 1/2` would be false.
+        //
+        // An `Int` meeting a `Rat` promotes; two `Int`s never reach here, so
+        // `10/3` is still 3 and every program, core and generated candidate
+        // written before fractions existed means exactly what it meant.
+        // Exactness is opt-in at the point the first fraction is made, and
+        // propagates from there.
+        if a.is_num() && b.is_num() && (matches!(a, Value::Rat(..)) || matches!(b, Value::Rat(..))) {
+            let (an, ad) = a.as_rat()?;
+            let (bn, bd) = b.as_rat()?;
+            return match op {
+                BinOp::Add => rat_binary("+", (an, ad), (bn, bd)),
+                BinOp::Sub => rat_binary("-", (an, ad), (bn, bd)),
+                BinOp::Mul => rat_binary("*", (an, ad), (bn, bd)),
+                BinOp::Div => rat_binary("/", (an, ad), (bn, bd)),
+                // Cross-multiplied in `i128`. Both denominators are positive
+                // by invariant, so the inequality keeps its direction and
+                // there is no case analysis on sign to get wrong.
+                BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge => {
+                    let l = an as i128 * bd as i128;
+                    let r = bn as i128 * ad as i128;
+                    let t = match op {
+                        BinOp::Lt => l < r,
+                        BinOp::Le => l <= r,
+                        BinOp::Gt => l > r,
+                        _ => l >= r,
+                    };
+                    Ok(Value::Int(t as i64))
+                }
+                BinOp::Rem => Err("remainder wants whole numbers".to_string()),
+                _ => Err("that operator wants whole numbers".to_string()),
+            };
         }
 
         let x = a.as_int()?;
