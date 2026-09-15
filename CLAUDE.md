@@ -2803,7 +2803,7 @@ runner, so **verification is the boot selftests plus driving QEMU.**
 
 At boot the system runs **twenty-six selftest sections**, seven of which are
 now wrapped in `main::section` so an optional one that faults marks itself
-unavailable instead of taking the machine, and `diag` offers **forty-eight
+unavailable instead of taking the machine, and `diag` offers **fifty-eight
 named suites** on demand, most of them the same checks (the `aiksi` section covers the capability gate by name and never by
 calling -- half that table pokes memory, drives I/O ports or paints over the
 screen, and a suite that called every row to prove it exists would be
@@ -4588,15 +4588,81 @@ radio. `net/wifi.rs` identifies hardware and refuses to pretend; `hardware()`
 projects `dev::registry` down to the network parts, so the naming lives in one
 table rather than two, and boot prints it.
 
-For the USB dongle, everything above the transport is finished and checked at
-boot: `net/ieee80211.rs` builds probe requests and parses beacons,
-`dev/rtl8188eu.rs::desc` builds and reads the TX and RX descriptors, and
-`net/wpa2.rs` runs the handshake. `bring_up` applies all four initialisation
-tables including the radio, over the serial interface the radio actually needs.
-What is missing is the transport in between: LLT, the FIFO boundary that gates
-the MAC TX/RX enables, channel selection, efuse, firmware, and handing a
-descriptor to a bulk endpoint. None of the chip-facing half can be exercised
-here, since QEMU has no model of the part.
+### Wireless: a seam, a shared layer, and no drivers
+
+**`net::iface::Nic` is Ethernet-shaped, and that was the finding that decided
+the architecture.** `transmit(&[u8])` takes an Ethernet frame, which suits a
+FullMAC part whose firmware hides 802.11 -- and `dev::registry` names six
+wireless families, nearly every one of them SoftMAC. On those the radio moves
+*802.11* frames and the **host** does association, sequencing and crypto. So
+the generalisation is not a driver; it is a seam one layer down, plus
+everything above it written once:
+
+```
+      net::iface::Nic        ethernet frames, TCP/IP above
+            ^
+   +--------+--------+
+ net::mlme          a FullMAC part plugs in here, because
+ net::softmac       its firmware already did all of this
+      |
+ dev::radio::Radio  <- the seam: 802.11 frames in and out
+      ^
+ rtl8188eu, ath9k, mt76, ...
+```
+
+| | |
+|---|---|
+| `dev/radio.rs` | the seam -- name, caps, mac, start/stop, channel, tx, rx -- and the channel plan, which is the same for every part in the world and used to live in one driver |
+| `net/softmac.rs` | Ethernet over 802.11: SNAP, the four address layouts, sequence numbers, CCMP when the chip does not |
+| `net/mlme.rs` | the station state machine: scan, authenticate, associate, four-way, install keys |
+| `net/ccmp.rs` | the link cipher: AAD masks, packet numbers, replay |
+| `crypto/ccm.rs` | AES-CCM, against RFC 3610 packet vector 1 |
+| `net/wpa2.rs` | the handshake, **both** halves |
+
+A driver's whole obligation is `impl Radio` and one call to
+`net::attach_radio`, which makes it `wlan0`. It **refuses a FullMAC part**:
+`Caps::softmac` is how a chip says its firmware ran the MLME, and such a part
+implements `Nic` directly like the wired card. `Nic::wireless()` answers
+`Option<&mut dyn Wlan>` with a default of `None`, so there is one driver and
+one handle to it; the shell's `wifi scan | join | leave` goes through that.
+
+**All of it is asserted at boot with nothing plugged in** -- `diag radio`,
+`softmac`, `ccmp`, `ccm`, `mlme` -- against a `Loopback` radio and a fake
+access point that authenticates, associates and runs the authenticator's half
+of the four-way handshake. The whole path scan to encrypted data runs in a
+loop with no delay, because `Station::poll(now_ms)` **takes the clock as an
+argument**: every state is a deadline, so a machine reading its own clock could
+only be tested by waiting.
+
+Four things that cost a run each and are silent when wrong:
+
+- **The association response and message 1 arrive in one batch**, and the
+  supplicant that reads message 1 does not exist until the response has been
+  read. Acting on frames in arrival order drops message 1 of every handshake --
+  and what that looks like is a network that scans, authenticates, associates,
+  returns an AID, and then times out with nothing visibly wrong. `poll` drains,
+  handles management, *then* feeds EAPOL.
+- **The key goes in after message 4**, never before. Installing earlier stops
+  the link accepting the plaintext EAPOL the handshake is made of.
+- **`Supplicant::on_frame` had never been executed** before `wpa2::Authenticator`
+  existed. The PMK was checked against Annex H.4 and the PTK against its own
+  symmetry; the state machine that installs a key had no frames to be fed.
+- **`aes::key_wrap` was missing**, so `key_unwrap` had only itself and one
+  vector. The counter is xored into A after encryption and before decryption,
+  which is the one asymmetry in RFC 3394 and the only place the two directions
+  can silently disagree.
+
+Owed, and written at the top of `ccmp.rs` rather than only here: an IEEE
+802.11-2016 Annex J CCMP vector. The cipher is checked against RFC 3610; the
+*framing* is structural and round-trip only.
+
+For the rtl8188eu dongle specifically, `desc` builds and reads the TX and RX
+descriptors and `bring_up` applies all four initialisation tables including the
+radio. What is missing is the transport: LLT, the FIFO boundary that gates the
+MAC TX/RX enables, channel selection, efuse, firmware, and handing a descriptor
+to a bulk endpoint -- and then `impl Radio` over it. None of the chip-facing
+half can be exercised here, since QEMU models no wireless part at all. `ath9k`
+is named in the registry as the tractable one: SoftMAC, and no firmware blob.
 
 ### Crypto (`src/crypto/`)
 
