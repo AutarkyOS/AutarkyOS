@@ -5127,15 +5127,16 @@ what a person types. 198 queries, same candidates and same nodes throughout:
 
     method               L r@1   L r@5   L MRR     S r@1   S r@5   S MRR
     mean pool             0.5%    1.0%  0.0098      8.0%   16.1%  0.1097
-    idf pool              5.5%    9.5%  0.0799     30.8%   44.4%  0.3757
-    terms b=0.00         81.8%   91.4%  0.8594     45.9%   63.1%  0.5440
-    terms b=0.25         83.8%   94.4%  0.8841     47.9%   65.6%  0.5636
-    terms b=0.50         87.8%   94.4%  0.9095     47.9%   67.1%  0.5681   <- ships
-    terms b=0.75         86.3%   93.4%  0.8955     46.4%   66.1%  0.5588
-    bm25 k=1.2 b=0.50    79.2%   90.9%  0.8464     42.4%   62.1%  0.5109
-    bm25 k=1.2 b=0.75    81.8%   92.9%  0.8652     42.4%   62.1%  0.5140
-    mix a=0.10           81.8%   92.4%  0.8683     47.4%   66.1%  0.5622
-    mix a=0.50           44.9%   54.0%  0.4947     46.9%   61.1%  0.5384
+    idf pool              4.5%   11.1%  0.0766     34.3%   43.4%  0.3893
+    terms b=0.25 idf     86.3%   93.9%  0.8968     48.4%   66.1%  0.5660
+    terms b=0.50 idf     89.3%   94.4%  0.9166     48.9%   65.6%  0.5722
+    terms b=0.75 idf     87.3%   93.4%  0.9039     46.4%   64.1%  0.5529
+    terms b=0.25 idf^2   90.9%   93.4%  0.9245     52.0%   71.7%  0.6016
+    terms b=0.50 idf^2   91.9%   93.9%  0.9310     52.5%   72.2%  0.6080   <- ships
+    terms b=0.75 idf^2   91.4%   93.9%  0.9275     50.5%   68.6%  0.5957
+    bm25 k=1.2 b=0.50    80.3%   89.3%  0.8529     43.9%   61.1%  0.5157
+    mix a=0.10           90.4%   93.9%  0.9242     52.5%   72.2%  0.6095
+    mix a=0.30           71.2%   80.3%  0.7551     51.0%   71.2%  0.5944
 
 **Two named gaps closed, one of them with a negative result.**
 
@@ -5191,11 +5192,35 @@ is one command that prints every rung. The subject router still uses embeddings
 and improved for free when the pooling did, from 28.6% to **34.7%** top-1 against
 6.2% chance.
 
-What this does *not* fix: the four entries returned for "what is the derivative
-of a polynomial" are all polynomial questions, and the one specifically about
-differentiating one is not first. Both candidate explanations were tested --
-term frequency and query length -- and neither was it, so the cause is still
-open and is now the *only* thing open rather than one of three.
+### `forest why`, and the two causes it found
+
+The entry about *differentiating* a polynomial was not first, and two guesses
+had already been wrong about it. `forest why <question>` prints what the scorer
+actually saw: every query token with its document frequency and weight, then
+each top result with its length, its length charge, and which tokens it matched
+for how much. Both remaining causes fell out of one run.
+
+**A tokenisation boundary.** A byte-level BPE spells `what` mid-sentence as
+`' what'` and at the start of a string as `'what'` -- different ids. So the
+first word of every query and every indexed document was a *different token*
+from the same word anywhere else, and therefore rare: `'what'` measured a
+document frequency of **2** and an IDF of **7.9968**, against `' derivative'`
+at 8.4022. A stopword worth as much as the rarest content word in nine thousand
+nodes, and a question about roulette outranking one about derivatives for
+starting with it. `lex::prep` puts a space in front on **both sides**; `' what'`
+is df 74 and IDF 4.78, and the sweep moved 87.8% to 89.3%.
+
+**Linear IDF does not suppress a stopword *set*.** With that fixed, a node
+matching `what is the of a` and no content word at all still came first: its
+matched mass was 9.56 against 12.20 for the node holding the only `derivative`
+in the corpus, close enough for the length charge to overturn -- 0.876 against
+1.177. Squared, the same five sum to 28.6 against 75.4. That is the weighting a
+tf-idf cosine uses, it says rarity counts more than linearly, and it moved
+89.3% to **91.9%** long and 48.9% to **52.5%** short with r@5 going 65.6% to
+72.2%.
+
+The derivative entry now ranks **first**, paying the highest length charge in
+the list, and no stopword-only match survives in the top five.
 
 ### Budgeted retrieval
 

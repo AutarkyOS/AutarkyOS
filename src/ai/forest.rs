@@ -462,7 +462,7 @@ pub fn embed() {
         let docs: Vec<Vec<usize>> = ix
             .heads
             .iter()
-            .map(|h| e.tok.encode(&crate::ai::route::queryable(h), false, false))
+            .map(|h| crate::ai::lex::tokens(&e.tok, &crate::ai::route::queryable(h)))
             .collect();
         let lex = crate::ai::lex::Lex::build(e.tok.vocab_size(), &docs);
         let vecs: Vec<Vec<f32>> =
@@ -717,7 +717,7 @@ pub fn bench(sample: usize) {
         let docs: Vec<Vec<usize>> = ix
             .heads
             .iter()
-            .map(|h| e.tok.encode(&crate::ai::route::queryable(h), false, false))
+            .map(|h| crate::ai::lex::tokens(&e.tok, &crate::ai::route::queryable(h)))
             .collect();
         let lex = crate::ai::lex::Lex::build(e.tok.vocab_size(), &docs);
         let idfv: Vec<Vec<f32>> =
@@ -782,23 +782,24 @@ pub fn bench(sample: usize) {
     // all, and a grid that only had those two rows reported the discount as
     // having no effect. The row that had actually won came back missing.
     enum M {
-        /// Presence, then a length charge on the sum.
-        Terms(f32),
+        /// Presence, then a length charge on the sum. The flag is whether a
+        /// term's weight is its IDF or its IDF squared.
+        Terms(f32, bool),
         /// Saturating term frequency, with the charge inside it.
         Bm25(f32, f32),
         /// The best `Terms` row, mixed with the embedding.
         Mix(f32),
     }
     let grid = alloc::vec![
-        M::Terms(0.00),
-        M::Terms(0.25),
-        M::Terms(0.50),
-        M::Terms(0.75),
+        M::Terms(0.25, false),
+        M::Terms(0.50, false),
+        M::Terms(0.75, false),
+        M::Terms(0.25, true),
+        M::Terms(0.50, true),
+        M::Terms(0.75, true),
         M::Bm25(1.2, 0.50),
-        M::Bm25(1.2, 0.75),
         M::Mix(0.10),
         M::Mix(0.30),
-        M::Mix(0.50),
     ];
     let rows = 2 + grid.len();
 
@@ -825,6 +826,7 @@ pub fn bench(sample: usize) {
     let mut si = alloc::vec![0.0f32; n];
     let mut sl = alloc::vec![0.0f32; n];
     let mut raw = alloc::vec![0.0f32; n];
+    let mut raw2 = alloc::vec![0.0f32; n];
     let mut best = alloc::vec![0.0f32; n];
     let mut r1 = [alloc::vec![0usize; rows], alloc::vec![0usize; rows]];
     let mut r5 = [alloc::vec![0usize; rows], alloc::vec![0usize; rows]];
@@ -834,7 +836,7 @@ pub fn bench(sample: usize) {
         for (truth, full) in &queries {
             let q = if set == 0 { full.clone() } else { shorten(full) };
             let pooled = crate::ai::with_engine(|e| {
-                let ids = e.tok.encode(&q, false, false);
+                let ids = crate::ai::lex::tokens(&e.tok, &q);
                 let mut m = crate::ai::vocab::pool_text(&e.model, &e.tok, &q);
                 crate::ai::lex::normalise(&mut m);
                 (ids.clone(), m, crate::ai::lex::pool_ids(&e.model, &ids, &lex))
@@ -864,13 +866,17 @@ pub fn bench(sample: usize) {
             tally(1, &si);
             // The postings walk once, reused by every `Terms` row, so what
             // differs between them is the charge and nothing else.
-            let tot = lex.score_raw(&ids, &mut raw);
+            let tot1 = lex.score_raw_p(&ids, &mut raw, false);
+            let tot2 = lex.score_raw_p(&ids, &mut raw2, true);
             for (k, m) in grid.iter().enumerate() {
                 match m {
-                    M::Terms(b) => {
-                        sl.copy_from_slice(&raw);
+                    M::Terms(b, sq) => {
+                        let (src, tot) = if *sq { (&raw2, tot2) } else { (&raw, tot1) };
+                        sl.copy_from_slice(src);
                         lex.finish(&mut sl, tot, *b);
-                        if (*b - crate::ai::lex::LEN_B).abs() < 1.0e-6 {
+                        if (*b - crate::ai::lex::LEN_B).abs() < 1.0e-6
+                            && *sq == crate::ai::lex::IDF_SQUARED
+                        {
                             best.copy_from_slice(&sl);
                         }
                     }
@@ -903,7 +909,9 @@ pub fn bench(sample: usize) {
             0 => alloc::format!("{:<18}", "mean pool"),
             1 => alloc::format!("{:<18}", "idf pool"),
             k => match grid[k - 2] {
-                M::Terms(b) => alloc::format!("terms b={:<10.2}", b),
+                M::Terms(b, sq) => {
+                    alloc::format!("terms b={:.2} idf{:<5}", b, if sq { "^2" } else { "" })
+                }
                 M::Bm25(k1, b) => alloc::format!("bm25 k={:.1} b={:<7.2}", k1, b),
                 M::Mix(a) => alloc::format!("mix a={:<12.2}", a),
             },
@@ -938,11 +946,142 @@ pub fn bench(sample: usize) {
         );
     }
     kprintln!(
-        "  shipping the terms family at b={:.2}; chance at r@1 is 1 in {}",
+        "  shipping terms b={:.2} idf{}; chance at r@1 is 1 in {}",
         crate::ai::lex::LEN_B,
+        if crate::ai::lex::IDF_SQUARED { "^2" } else { "" },
         n
     );
     kprintln!("  swept in {} ms", us / 1000);
+}
+
+/// Why a question ranked the entries it did, token by token.
+///
+/// **Built because two guesses had already been wrong.** The entry about
+/// differentiating a polynomial was not first and the two obvious explanations
+/// -- term frequency and query length -- were both measured and neither was it.
+/// Guessing a third time would have been worse than the first two; this prints
+/// what the scorer actually saw.
+pub fn why(q: &str, show: usize) {
+    let _claim = match crate::ai::claim_engine() {
+        Some(c) => c,
+        None => {
+            kprintln!("  {}", crate::ai::engine_refusal());
+            return;
+        }
+    };
+    let lex = match crate::ai::recall::load_lex() {
+        Some(l) => l,
+        None => {
+            kprintln!("  no postings -- 'forest embed' writes them");
+            return;
+        }
+    };
+    let ids = match crate::ai::with_engine(|e| crate::ai::lex::tokens(&e.tok, q)) {
+        Some(v) => v,
+        None => return,
+    };
+
+    // The query as the scorer sees it: which tokens, spelled how, worth what.
+    // A token printed with its bytes is the only way to see that `polynomial`
+    // and `polynomials` are two different things to an index that never stems.
+    let mut uniq: Vec<usize> = Vec::new();
+    for t in &ids {
+        if !uniq.contains(t) {
+            uniq.push(*t);
+        }
+    }
+    kprintln!("  {} token(s), {} distinct", ids.len(), uniq.len());
+    let mut total = 0.0f32;
+    for t in &uniq {
+        let idf = lex.idf(*t);
+        total += idf;
+        let text = crate::ai::with_engine(|e| {
+            alloc::string::String::from_utf8_lossy(e.tok.token_bytes(*t)).into_owned()
+        })
+        .unwrap_or_default();
+        kprintln!(
+            "    {:>6}  df {:>5}  idf {:>7.4}  '{}'",
+            t,
+            lex.df.get(*t).copied().unwrap_or(0),
+            idf,
+            text
+        );
+    }
+    kprintln!("  query idf mass {:.4}", total);
+
+    let n = match crate::ai::recall::with_nodes(|nodes| nodes.len()) {
+        Some(v) => v,
+        None => {
+            kprintln!("  no node vectors -- 'forest embed' writes them");
+            return;
+        }
+    };
+    let mut sc = alloc::vec![0.0f32; n];
+    lex.score(&ids, &mut sc);
+    let mut order: Vec<usize> = (0..n).collect();
+    order.sort_by(|a, b| {
+        sc[*b].partial_cmp(&sc[*a]).unwrap_or(core::cmp::Ordering::Equal).then(a.cmp(b))
+    });
+
+    let paths = crate::ai::recall::with_nodes(|nodes| nodes.paths.clone()).unwrap_or_default();
+    kprintln!("  rank  score   len  charge   path");
+    for (r, i) in order.iter().take(show).enumerate() {
+        let short = paths[*i].strip_prefix(ROOT).unwrap_or(&paths[*i]);
+        kprintln!(
+            "  {:>4}  {:.4}  {:>4}  {:.4}   {}",
+            r + 1,
+            sc[*i],
+            lex.len.get(*i).copied().unwrap_or(0),
+            lex.charge(*i, crate::ai::lex::LEN_B),
+            short
+        );
+        let mut hit = alloc::string::String::new();
+        for t in &uniq {
+            if lex.contains(*t, *i as u32) {
+                if !hit.is_empty() {
+                    hit.push(' ');
+                }
+                let text = crate::ai::with_engine(|e| {
+                    alloc::string::String::from_utf8_lossy(e.tok.token_bytes(*t)).into_owned()
+                })
+                .unwrap_or_default();
+                hit.push_str(&alloc::format!("{}({:.2})", text.trim(), lex.idf(*t)));
+            }
+        }
+        kprintln!("        matched: {}", hit);
+    }
+
+    // Where the documents carrying the *rarest* thing asked for actually
+    // landed. If the question's most distinctive word is in a hundred nodes and
+    // none of them is near the top, the ranking is not failing to find them --
+    // it is finding them and then putting something else first.
+    let rarest = uniq.iter().copied().fold((0usize, -1.0f32), |acc, t| {
+        let v = lex.idf(t);
+        if v > acc.1 {
+            (t, v)
+        } else {
+            acc
+        }
+    });
+    let text = crate::ai::with_engine(|e| {
+        alloc::string::String::from_utf8_lossy(e.tok.token_bytes(rarest.0)).into_owned()
+    })
+    .unwrap_or_default();
+    let holders = lex.posting(rarest.0).len();
+    let mut bestrank = usize::MAX;
+    for (r, i) in order.iter().enumerate() {
+        if lex.contains(rarest.0, *i as u32) {
+            bestrank = r + 1;
+            break;
+        }
+    }
+    kprintln!(
+        "  rarest asked: '{}' idf {:.4}, in {} node(s); best of them ranks {}",
+        text.trim(),
+        rarest.1,
+        holders,
+        if bestrank == usize::MAX { 0 } else { bestrank }
+    );
 }
 
 /// How many candidates are offered to the fill.
@@ -992,7 +1131,7 @@ pub fn recall_query(q: &str, budget: usize, subjects: usize) {
     // The query, tokenised once: the same ids drive the term match and the
     // pooled vector, so the two channels cannot disagree about what was asked.
     let asked = crate::ai::with_engine(|e| {
-        let ids = e.tok.encode(q, false, false);
+        let ids = crate::ai::lex::tokens(&e.tok, q);
         let v = crate::ai::lex::pool_ids(&e.model, &ids, &lex);
         (ids, v)
     });
@@ -1225,6 +1364,21 @@ pub fn command(rest: &str) {
         },
         "index" => index_report(),
         "embed" => embed(),
+        "why" => {
+            let rest = rest.strip_prefix("why").unwrap_or("").trim();
+            let (show, q) = match rest.split_once(' ') {
+                Some((h, t)) => match h.parse::<usize>() {
+                    Ok(k) => (k, t.trim()),
+                    Err(_) => (8, rest),
+                },
+                None => (8, rest),
+            };
+            if q.is_empty() {
+                kprintln!("  usage: forest why [n] <question>");
+            } else {
+                why(q, show);
+            }
+        }
         "bench" => {
             let k = w.next().and_then(|v| v.parse::<usize>().ok()).unwrap_or(200);
             bench(k);
@@ -1280,6 +1434,7 @@ pub fn command(rest: &str) {
             kprintln!("  forest body <path>  one node, read off the disk and not the namespace");
             kprintln!("  forest embed        build the branch table, store it, and score it");
             kprintln!("  forest bench [n]    known-item retrieval, one method per row");
+            kprintln!("  forest why [n] <q>  which tokens scored what, and for whom");
             kprintln!("  forest route <q>    which branches a question belongs in");
             kprintln!("  forest recall [n] [k] <q>  what fits in n tokens; k subjects, 0 for all");
         }

@@ -65,6 +65,13 @@ pub struct Lex {
     pub tf: Vec<u8>,
 }
 
+/// Whether a term's weight is its IDF or its IDF squared.
+///
+/// Set from the sweep in `forest bench`, and the reason it exists at all is in
+/// `Lex::weight`: five stopwords carried more of a query's linear IDF mass than
+/// the single rarest word in nine thousand nodes.
+pub const IDF_SQUARED: bool = true;
+
 /// How fast term frequency saturates. BM25's `k1`.
 ///
 /// The second occurrence of a word says much less than the first and the
@@ -136,6 +143,11 @@ impl Lex {
     /// Query tokens are deduplicated first: a word said twice is not twice the
     /// evidence, and without this a repeated term quietly doubles its own
     /// weight against every other.
+    /// Whether rarity counts quadratically. Chosen by `forest bench`.
+    pub fn squared() -> bool {
+        IDF_SQUARED
+    }
+
     /// What ships, with the constants `forest bench` chose.
     ///
     /// The `Terms` family: presence, then a length charge on the sum. **Not
@@ -145,7 +157,7 @@ impl Lex {
     /// term repetition, not about BM25, and the grid keeps both so the day the
     /// corpus changes the answer is one command away.
     pub fn score(&self, query: &[usize], out: &mut [f32]) {
-        let total = self.score_raw(query, out);
+        let total = self.score_raw_p(query, out, IDF_SQUARED);
         self.finish(out, total, LEN_B);
     }
 
@@ -154,7 +166,34 @@ impl Lex {
     /// Split from the normalisation so a sweep over `b` pays for the postings
     /// walk once. Recomputing it per `b` would put the walk into the difference
     /// between the rows, which is the thing being compared.
+    /// A term's weight: its IDF, or its IDF squared.
+    ///
+    /// **Squaring is not a tweak, it is the difference between two scorings.**
+    /// Linear IDF asks what share of the query's information a document
+    /// accounts for, and five stopwords carry more of that share than one rare
+    /// word: measured here, `what is the of a` summed to 9.56 against 12.20 for
+    /// a document holding the only occurrence of `derivative` in nine thousand
+    /// nodes -- close enough that a length charge overturned it, and a node
+    /// matching no content word at all came first.
+    ///
+    /// Squared, the same five sum to 28.6 against 75.4. It is the weighting a
+    /// tf-idf cosine uses, where the query and the document are both IDF-scaled
+    /// and the score is their inner product, and it says that rarity should
+    /// count more than linearly. `forest bench` decides which.
+    pub fn weight(&self, t: usize, sq: bool) -> f32 {
+        let v = self.idf(t);
+        if sq {
+            v * v
+        } else {
+            v
+        }
+    }
+
     pub fn score_raw(&self, query: &[usize], out: &mut [f32]) -> f32 {
+        self.score_raw_p(query, out, false)
+    }
+
+    pub fn score_raw_p(&self, query: &[usize], out: &mut [f32], sq: bool) -> f32 {
         for v in out.iter_mut() {
             *v = 0.0;
         }
@@ -165,7 +204,7 @@ impl Lex {
                 continue;
             }
             seen.push(*t);
-            let w = self.idf(*t);
+            let w = self.weight(*t, sq);
             total += w;
             for n in self.posting(*t) {
                 if let Some(s) = out.get_mut(*n as usize) {
@@ -247,6 +286,22 @@ impl Lex {
     /// has to reach one to check that occurrences were counted.
     pub fn range_of(&self, t: usize) -> (usize, usize) {
         self.range(t).unwrap_or((0, 0))
+    }
+
+    /// Is this document in this token's posting list?
+    ///
+    /// Binary search, which is only correct because `build` walks the documents
+    /// in order and therefore writes each posting ascending. Stated because a
+    /// build that ever stopped doing that would make this quietly wrong rather
+    /// than slow.
+    pub fn contains(&self, t: usize, n: u32) -> bool {
+        self.posting(t).binary_search(&n).is_ok()
+    }
+
+    /// The length charge this document pays at the shipped `b`.
+    pub fn charge(&self, n: usize, b: f32) -> f32 {
+        let l = *self.len.get(n).unwrap_or(&1) as f32;
+        1.0 - b + b * (l / self.avg_len())
     }
 
     fn range(&self, t: usize) -> Option<(usize, usize)> {
@@ -382,6 +437,36 @@ impl Lex {
     }
 }
 
+/// Text with a leading space, so its first word tokenises like a word.
+///
+/// **This is a real bug wearing a one-line fix, and it took an instrument to
+/// see.** A byte-level BPE tokeniser spells `what` mid-sentence as `' what'`
+/// and at the start of a string as `'what'` -- two different ids. So the first
+/// word of every query and of every indexed document was a *different token*
+/// from the same word anywhere else, and therefore rare, and therefore scored
+/// by IDF as one of the most informative terms in the corpus.
+///
+/// Measured on this forest before the fix: `'what'` had a document frequency of
+/// **2** and an IDF of **7.9968**, against `' derivative'` at 8.4022 -- a
+/// stopword worth as much as the rarest content word in nine thousand nodes.
+/// A question about roulette outranked one about differentiating a polynomial
+/// on the strength of starting with the same word.
+///
+/// Applied on **both sides or neither**, which is the rule this file keeps
+/// running into: indexing with the space and querying without it would swap
+/// which side carries the phantom token rather than removing it.
+pub fn prep(text: &str) -> alloc::string::String {
+    let mut out = alloc::string::String::with_capacity(text.len() + 1);
+    out.push(' ');
+    out.push_str(text.trim_start());
+    out
+}
+
+/// Tokenise for indexing or for asking, which must be the same thing.
+pub fn tokens(tok: &crate::ai::tokenizer::Tokenizer, text: &str) -> Vec<usize> {
+    tok.encode(&prep(text), false, false)
+}
+
 /// Pool a piece of text into one vector, weighted by how much each token says.
 ///
 /// Replaces `vocab::pool`'s straight mean. Each row is scaled to unit length
@@ -394,7 +479,7 @@ pub fn pool(
     text: &str,
     lex: &Lex,
 ) -> Vec<f32> {
-    let ids = tok.encode(text, false, false);
+    let ids = tokens(tok, text);
     pool_ids(model, &ids, lex)
 }
 
@@ -602,6 +687,14 @@ pub fn selftest() -> bool {
         Lex::decode(&enc[..enc.len() - 1]).is_none()
             && Lex::decode(&extra).is_none()
             && Lex::decode(b"GLADOSZZ____________").is_none(),
+    );
+
+    check(
+        "a leading space is added where there is none and not doubled where there is",
+        prep("what is") == " what is"
+            && prep(" already") == " already"
+            && prep("  two") == " two"
+            && prep("") == " ",
     );
 
     let mut v = alloc::vec![3.0f32, 4.0];
