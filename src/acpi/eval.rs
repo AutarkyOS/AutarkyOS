@@ -1084,7 +1084,7 @@ impl<'a> Interp<'a> {
     /// One direct child by name. Not `resolve`, which searches upward: an
     /// ancestor's `_ADR` is a different device's address and finding it would
     /// silently attribute a region to the wrong part.
-    fn child(&self, n: usize, seg: [u8; 4]) -> Option<usize> {
+    pub fn child(&self, n: usize, seg: [u8; 4]) -> Option<usize> {
         self.ns
             .node(n)
             .children
@@ -1107,6 +1107,22 @@ impl<'a> Interp<'a> {
     /// guarding this laptop's power resources could not be evaluated, and 90
     /// of its 92 power resources did not exist.
     fn pci_config_base(&mut self, scope: usize) -> Result<u64, Fault> {
+        let ecam = crate::acpi::parsed().and_then(|a| a.mcfg).ok_or(Fault::Region(SPACE_PCI_CONFIG))?;
+        let (bus, dev, func) = self.pci_location(scope)?;
+        Ok(ecam
+            + ((bus as u64) << 20)
+            + ((dev as u64) << 15)
+            + ((func as u64) << 12))
+    }
+
+    /// Which bus, device and function a namespace node describes.
+    ///
+    /// The same walk `pci_config_base` needs, answered as the three numbers
+    /// everything else speaks in -- so that a caller holding a PCI address can
+    /// go the other way and ask which node describes it. That is how the GPU's
+    /// ACPI device is found without writing `\_SB.PC00.PEG1.PEGP` down
+    /// anywhere: this laptop's path is not the next laptop's.
+    pub fn pci_location(&mut self, scope: usize) -> Result<(u8, u8, u8), Fault> {
         let ecam = crate::acpi::parsed().and_then(|a| a.mcfg).ok_or(Fault::Region(SPACE_PCI_CONFIG))?;
         // Innermost first, plus the host bridge's base bus number if it
         // declares one. `_BBN` is usually zero and is usually absent, and a
@@ -1147,7 +1163,7 @@ impl<'a> Interp<'a> {
                 bus = ((v >> 8) & 0xFF) as u64;
             }
         }
-        Ok(ecam + (bus << 20) + (dev << 15) + (func << 12))
+        Ok((bus as u8, dev as u8, func as u8))
     }
 
     /// A region's base and length, for a report that wants to show them.

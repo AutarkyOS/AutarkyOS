@@ -1775,7 +1775,184 @@ fn abstract_cmd(rest: &str) {
 /// register read needs and which firmware has normally set already. Nothing
 /// here powers a device on, resets one, or grants it DMA. Those are all
 /// separate acts and they should stay separate ones.
-fn gpu_cmd(acpi: &Option<Acpi>) {
+/// Wake the discrete GPU, or say what waking it would involve.
+///
+/// **Two verbs, because one of them runs the vendor's code with writes on.**
+/// `gpu wake` reads `_PR0` and lists what it would call; `gpu wake now` calls
+/// it. The split is the `update stage` idiom: the dangerous form is a separate
+/// thing to type, and the safe one shows exactly what the dangerous one will
+/// do rather than describing it.
+/// `00:01.0`, the way everybody writes a PCI address.
+fn parse_bdf(t: &str) -> Option<(u8, u8, u8)> {
+    let (bus, rest) = t.split_once(':')?;
+    let (dev, func) = rest.split_once('.')?;
+    Some((
+        u8::from_str_radix(bus.trim(), 16).ok()?,
+        u8::from_str_radix(dev.trim(), 16).ok()?,
+        u8::from_str_radix(func.trim(), 16).ok()?,
+    ))
+}
+
+fn gpu_wake(acpi: &Option<Acpi>, act: bool, named: Option<(u8, u8, u8)>) {
+    let Some(a) = acpi else {
+        console::set_color(LTRED);
+        kprintln!("  ACPI was not parsed, so there is no namespace to ask");
+        console::set_color(WHITE);
+        return;
+    };
+    let Some(ecam) = a.mcfg else {
+        console::set_color(LTRED);
+        kprintln!("  no MCFG table, so no ECAM and no PCI addresses to match against");
+        console::set_color(WHITE);
+        return;
+    };
+
+    console::set_color(YELLOW);
+    kprintln!("[gpu wake]");
+    console::set_color(WHITE);
+
+    // Named beats found. A machine with two discrete parts has two answers
+    // and only the operator knows which one is meant -- and naming one is
+    // also how this gets exercised on a machine whose own bus has neither.
+    let at = match named.or_else(|| crate::gpu::target(ecam)) {
+        Some(v) => v,
+        None => {
+            kprintln!("  no discrete GPU on the bus, and no bridge forwarding an empty one");
+            kprintln!("  -- so there is nothing here that is merely asleep");
+            kprintln!("  'gpu wake <bus>:<dev>.<func>' names one anyway");
+            return;
+        }
+    };
+    kprintln!("  looking at {:02x}:{:02x}.{}", at.0, at.1, at.2);
+
+    let Some(plan) = crate::gpu::plan(a, at) else {
+        console::set_color(YELLOW);
+        kprintln!("  no ACPI device describes that address");
+        console::set_color(LTGRAY);
+        kprintln!("  the firmware's own tables are where the power control is, and on");
+        kprintln!("  this laptop most of them are SSDTs -- 'acpi load <t> +' stacks one");
+        kprintln!("  onto the namespace, and tools/acpidump.ps1 dumps the set.");
+        console::set_color(WHITE);
+        return;
+    };
+
+    kprintln!("  device     {}", plan.device);
+    if plan.resources.is_empty() {
+        console::set_color(YELLOW);
+        kprintln!("  no _PR0, so this device declares no power resources");
+        console::set_color(LTGRAY);
+        kprintln!("  that is a fact about the tables loaded, not about the machine:");
+        kprintln!("  a table that is not in the namespace cannot contribute one.");
+        console::set_color(WHITE);
+        return;
+    }
+    kprintln!(
+        "  _PR0       {} resource(s), {} with an _ON",
+        plan.resources.len(),
+        plan.with_on
+    );
+    for r in plan.resources.iter() {
+        kprintln!("             {}", r);
+    }
+    if plan.has_ps0 {
+        kprintln!("  and then   {}._PS0", plan.device);
+    }
+
+    if !act {
+        console::set_color(LTGRAY);
+        kprintln!("  nothing was called. 'gpu wake now' runs it.");
+        console::set_color(WHITE);
+        return;
+    }
+
+    // A dumped table computes addresses for the machine it came from. Under
+    // QEMU this laptop's `PEG1.PXCS` resolves to physical 0x8000, which here
+    // is the SMP trampoline -- so executing its `_ON` would write over the
+    // code that starts the other cores. Reading a foreign table is the point
+    // of `acpi load`; acting on one is never.
+    if crate::acpi::namespace_is_foreign() {
+        console::set_color(LTRED);
+        kprintln!("  this namespace is a dump, so nothing ran");
+        console::set_color(LTGRAY);
+        kprintln!("  its addresses belong to the machine the tables came from. Reboot");
+        kprintln!("  to get this machine's own tables back, then ask again.");
+        console::set_color(WHITE);
+        return;
+    }
+
+    // The gate that already exists, and this is exactly what it is for: `_ON`
+    // writes to operation regions, and on this machine those reach the
+    // embedded controller as well as the PCI fabric.
+    if !crate::acpi::eval::writes_allowed() {
+        console::set_color(LTRED);
+        kprintln!("  region writes are locked, so nothing ran");
+        console::set_color(LTGRAY);
+        kprintln!("  'acpi unlock' first. _ON is the firmware's own code and it writes");
+        kprintln!("  hardware; the lock is there so that is a decision and not a side");
+        kprintln!("  effect of asking a question.");
+        console::set_color(WHITE);
+        return;
+    }
+
+    kprintln!("  running:");
+    let steps = crate::gpu::wake(a, at);
+    for st in steps.iter() {
+        console::set_color(if st.ok { LTGREEN } else { LTRED });
+        kprintln!("    {}  {:<34} {}", if st.ok { "ok  " } else { "FAIL" }, st.what, st.why);
+        console::set_color(WHITE);
+    }
+    if steps.is_empty() {
+        kprintln!("    nothing to call");
+        return;
+    }
+
+    // The only answer that settles it. Everything above can succeed and the
+    // device still not be there.
+    match crate::gpu::answers(ecam, at) {
+        Some(v) => {
+            console::set_color(LTGREEN);
+            kprintln!(
+                "  {:02x}:{:02x}.{} answers {:04x}:{:04x}",
+                at.0, at.1, at.2, v & 0xffff, v >> 16
+            );
+            console::set_color(LTGRAY);
+            kprintln!("  'gpu' now reads its registers; 'pci' lists it.");
+            console::set_color(WHITE);
+        }
+        None => {
+            console::set_color(YELLOW);
+            kprintln!("  {:02x}:{:02x}.{} still does not answer config space", at.0, at.1, at.2);
+            console::set_color(LTGRAY);
+            kprintln!("  the methods ran; the device did not come back. A link that has");
+            kprintln!("  to be retrained is the next thing to look at -- PEG1 carries");
+            kprintln!("  L23E and L23R for exactly that.");
+            console::set_color(WHITE);
+        }
+    }
+}
+
+fn gpu_cmd(acpi: &Option<Acpi>, rest: &str) {
+    match rest {
+        "wake" => return gpu_wake(acpi, false, None),
+        "wake now" => return gpu_wake(acpi, true, None),
+        t if t.starts_with("wake now ") => {
+            return match parse_bdf(t[9..].trim()) {
+                Some(at) => gpu_wake(acpi, true, Some(at)),
+                None => kprintln!("  not a PCI address: {}", t[9..].trim()),
+            }
+        }
+        t if t.starts_with("wake ") => {
+            return match parse_bdf(t[5..].trim()) {
+                Some(at) => gpu_wake(acpi, false, Some(at)),
+                None => kprintln!("  not a PCI address: {}", t[5..].trim()),
+            }
+        }
+        "" => {}
+        other => {
+            kprintln!("  usage: gpu | gpu wake | gpu wake now   (got '{}')", other);
+            return;
+        }
+    }
     let Some(ecam) = acpi.as_ref().and_then(|a| a.mcfg) else {
         console::set_color(LTRED);
         kprintln!("  no MCFG table, so no ECAM base and no PCIe enumeration at all");
@@ -4048,7 +4225,7 @@ fn execute(line: &str, boot: &BootInfo, acpi: &Option<Acpi>, interp: &mut aiksi:
                 console::set_color(WHITE);
             }
         },
-        "gpu" => gpu_cmd(acpi),
+        "gpu" => gpu_cmd(acpi, rest.trim()),
         "abstract" => abstract_cmd(rest),
         "study" => study_cmd(rest),
         "work" => work_cmd(rest),

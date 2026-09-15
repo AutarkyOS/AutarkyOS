@@ -563,6 +563,22 @@ pub struct NsSummary {
 /// more says so rather than being silently cut off.
 const MAX_ROUNDS: usize = 8;
 
+/// Is the namespace somebody else's firmware rather than this machine's?
+///
+/// **A table dumped from another machine computes addresses for that machine.**
+/// Reading one here is the whole point of `acpi load` and costs nothing. Acting
+/// on one does not: `GPCB` answers 0 under QEMU, so this laptop's
+/// `PEG1.PXCS` resolves to physical 0x8000 -- which in *this* kernel is the
+/// SMP trampoline. A method that writes its registers would be writing over
+/// the code that starts the other cores.
+///
+/// So anything that executes firmware with writes enabled asks this first.
+pub fn namespace_is_foreign() -> bool {
+    unsafe { *FOREIGN.get() }
+}
+
+static FOREIGN: crate::sync::Racy<bool> = crate::sync::Racy::new(false);
+
 /// Decide the conditionals the walk recorded, and walk the branches taken.
 ///
 /// **Separate from the walk because neither half can do the other's work.**
@@ -738,7 +754,12 @@ pub fn load_namespace(a: &Acpi) -> NsSummary {
     settle(&mut ns, pending, &mut sum);
     sum.redefinitions = ns.redefinitions;
     *NAMESPACE.lock() = Some(ns);
-    unsafe { *SUMMARY.get() = Some(sum) };
+    unsafe {
+        *SUMMARY.get() = Some(sum);
+        // Built from the tables this machine's firmware published, so the
+        // addresses in it are this machine's.
+        *FOREIGN.get() = false;
+    }
     sum
 }
 
@@ -1351,8 +1372,15 @@ pub fn load_report(path: &str, extend: bool) {
     // silently stopped describing the running machine would be a good way to
     // read a battery that is not there.
     *NAMESPACE.lock() = Some(ns);
-    unsafe { *SUMMARY.get() = Some(sum) };
+    unsafe {
+        *SUMMARY.get() = Some(sum);
+        *FOREIGN.get() = true;
+    }
     crate::kprintln!("  this is now the namespace 'acpi ns' and 'acpi eval' address");
+    crate::console::set_color(crate::gfx::console::YELLOW);
+    crate::kprintln!("  it is a dump, so its addresses are the machine it came from's --");
+    crate::kprintln!("  read it freely; nothing will execute it with writes enabled.");
+    crate::console::set_color(crate::gfx::console::LTGRAY);
 }
 
 // --- turning the machine off --------------------------------------------
