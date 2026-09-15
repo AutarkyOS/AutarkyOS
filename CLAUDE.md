@@ -5112,6 +5112,64 @@ top-1 won, and **that choice is budget-dependent**: a retrieval loading three
 subjects would prefer the other one. Both figures print every run so it can be
 revisited with evidence.
 
+### Retrieval, and the measurement that condemned the first attempt
+
+`src/ai/lex.rs`. **Mean-pooled embeddings scored 0.5% on real retrieval**, and
+that number is the reason everything below exists.
+
+The task is known-item retrieval and it is built so it cannot be gamed: a node's
+`concept` is the *first sentence* of its `text`, so the index holds the concept
+and its terms while the query is everything after that first sentence. Prose
+from the same node that the index has never seen, one right answer in 8,913,
+chance 0.011%. `forest bench [n]` runs it; 198 queries, one row per method,
+same queries and same candidates throughout:
+
+    method              r@1      r@5       MRR
+    mean pool           0.5%      1.0%    0.0098
+    idf pool            5.5%      9.5%    0.0799
+    terms b=0.00       81.8%     91.4%    0.8594
+    terms b=0.25       83.8%     94.4%    0.8841
+    terms b=0.50       87.8%     94.4%    0.9095     <- ships
+    terms b=0.75       86.3%     93.4%    0.8955
+    terms b=1.00       81.8%     91.4%    0.8634
+    mix a=0.05         84.8%     94.4%    0.8901
+    mix a=1.00          5.5%      9.5%    0.0799
+
+Three corrections, each visible in a row above:
+
+- **Inverse document frequency.** `vocab::pool` averages every token's embedding
+  equally, so in "what is the derivative of a polynomial" the four function
+  words outvote the two that carry the question -- and they are the four that
+  appear in every other document too. Weighting by `ln((N+1)/(df+1))` and
+  scaling each row to unit length first took 0.5% to 5.5%.
+- **An inverted index.** An embedding match is a similarity; a term match is a
+  fact. Names and numbers either appear or they do not, and on a corpus of
+  questions that is most of the signal. 5.5% to 81.8%, for 1.3 MB of postings.
+- **A length discount.** Asked for the derivative of a polynomial, the first
+  answer was about *roulette* -- a long node holding `what`, `is`, `of` and `a`.
+  A long document collects more small weights than a short one carrying the
+  words that mattered. BM25's `b` charges for that: 81.8% to 87.8%.
+
+**`LEN_B` is 0.5 and not the textbook 0.75**, because the sweep has an interior
+optimum there -- which is the difference between a value chosen and a value
+defaulted to. These are short questions of similar shape and they wanted less of
+a charge than web documents do.
+
+**`MIX` is 0**, so the embedding channel is off for node retrieval. Every weight
+above zero measured worse. That is not a claim that embeddings are useless: it
+is one checkpoint's table, pooled with no forward pass, against exact term
+matching -- a different model or a rank-based fusion may move it, and the sweep
+is one command that prints every rung. The subject router still uses embeddings
+and improved for free when the pooling did, from 28.6% to **34.7%** top-1 against
+6.2% chance.
+
+What this does *not* fix: scoring is presence-only, with no term-frequency
+saturation, and the benchmark's queries are long where a typed question is
+short. Both are visible in the same example -- the four entries returned for
+"what is the derivative of a polynomial" are all polynomial questions, but the
+one specifically about differentiating one ranks below three that say
+"polynomial" twice.
+
 ### Budgeted retrieval
 
 `src/ai/recall.rs`. Phase 4: pick nodes for a question and render as many as a

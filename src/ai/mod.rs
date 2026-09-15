@@ -26,6 +26,7 @@ pub mod harness;
 pub mod model;
 pub mod probe;
 pub mod problem;
+pub mod lex;
 pub mod recall;
 pub mod redqueen;
 pub mod route;

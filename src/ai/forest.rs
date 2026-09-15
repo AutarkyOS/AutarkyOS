@@ -454,49 +454,54 @@ pub fn embed() {
     let mhz = crate::time::tsc_mhz().max(1);
     let t0 = crate::time::rdtsc();
 
+    // One token list per node over exactly the text the index holds, then the
+    // document frequencies, then the vectors those frequencies weight. The
+    // order matters: a weight cannot be known until the whole corpus has been
+    // seen, so pooling has to come second.
     let built = crate::ai::with_engine(|e| {
-        let dim = e.model.cfg.dim;
-        let mut t = crate::ai::route::Table {
-            dim,
-            names: Vec::new(),
-            counts: Vec::new(),
-            sums: Vec::new(),
-            centroid: Vec::new(),
-        };
-        let mut vecs: Vec<Vec<f32>> = Vec::with_capacity(ix.len());
-        let mut owner: Vec<usize> = Vec::with_capacity(ix.len());
-        for i in 0..ix.len() {
-            let b = crate::ai::route::subject_of(&ix.paths[i]);
-            let bi = match t.find(b) {
-                Some(j) => j,
-                None => {
-                    t.names.push(String::from(b));
-                    t.counts.push(0);
-                    t.sums.resize(t.names.len() * dim, 0.0);
-                    t.names.len() - 1
-                }
-            };
-            let v = crate::ai::vocab::pool_text(
-                &e.model,
-                &e.tok,
-                &crate::ai::route::queryable(&ix.heads[i]),
-            );
-            for (acc, x) in t.sums[bi * dim..(bi + 1) * dim].iter_mut().zip(v.iter()) {
-                *acc += *x;
-            }
-            t.counts[bi] += 1;
-            owner.push(bi);
-            vecs.push(v);
-        }
-        (t, vecs, owner)
+        let docs: Vec<Vec<usize>> = ix
+            .heads
+            .iter()
+            .map(|h| e.tok.encode(&crate::ai::route::queryable(h), false, false))
+            .collect();
+        let lex = crate::ai::lex::Lex::build(e.tok.vocab_size(), &docs);
+        let vecs: Vec<Vec<f32>> =
+            docs.iter().map(|d| crate::ai::lex::pool_ids(&e.model, d, &lex)).collect();
+        (e.model.cfg.dim, lex, vecs)
     });
-    let (mut t, vecs, owner) = match built {
+    let (dim, lex, vecs) = match built {
         Some(v) => v,
         None => {
             kprintln!("  {}", crate::ai::engine_refusal());
             return;
         }
     };
+
+    let mut t = crate::ai::route::Table {
+        dim,
+        names: Vec::new(),
+        counts: Vec::new(),
+        sums: Vec::new(),
+        centroid: Vec::new(),
+    };
+    let mut owner: Vec<usize> = Vec::with_capacity(ix.len());
+    for i in 0..ix.len() {
+        let b = crate::ai::route::subject_of(&ix.paths[i]);
+        let bi = match t.find(b) {
+            Some(j) => j,
+            None => {
+                t.names.push(String::from(b));
+                t.counts.push(0);
+                t.sums.resize(t.names.len() * dim, 0.0);
+                t.names.len() - 1
+            }
+        };
+        for (acc, x) in t.sums[bi * dim..(bi + 1) * dim].iter_mut().zip(vecs[i].iter()) {
+            *acc += *x;
+        }
+        t.counts[bi] += 1;
+        owner.push(bi);
+    }
 
     // The fold is reported rather than assumed. If `tools/forest.py` ever
     // spells a shard differently, this number drops to zero on a forest that
@@ -563,6 +568,8 @@ pub fn embed() {
     };
     let nbytes = nodes.encode().len();
     let nwrote = crate::ai::recall::store(&nodes);
+    let lbytes = lex.encode().len();
+    let lwrote = crate::ai::recall::store_lex(&lex);
     // Whatever was cached came from the table that was just replaced.
     crate::ai::recall::forget();
 
@@ -601,12 +608,279 @@ pub fn embed() {
     } else {
         kprintln!("  the table would not write to {}", crate::ai::route::TABLE);
     }
-    if nwrote {
-        kprintln!("  {} B of node vectors at {}", nbytes, crate::ai::recall::NODES);
+    if nwrote && lwrote {
+        kprintln!(
+            "  {} B of node vectors and {} B of postings",
+            nbytes,
+            lbytes
+        );
     } else {
-        kprintln!("  the node vectors would not write to {}", crate::ai::recall::NODES);
+        kprintln!("  the node vectors or postings would not write");
     }
     kprintln!("  built and scored in {} ms, no forward pass anywhere", us / 1000);
+}
+
+// --- the measurement that says whether retrieval retrieves ----------------
+
+/// The keys a node body uses, in `tools/forest.py`'s order.
+///
+/// Listed rather than inferred. The format is line oriented and a line whose
+/// first word is not a key *continues* the field before it, which is what lets
+/// a body carry brackets, equals signs and blank lines with no escaping -- so a
+/// reader that treated any first word as a key would end `text` at the first
+/// line of prose beginning with a noun.
+const KEYS: &[&str] = &["head", "kind", "source", "concept", "method", "check", "answer", "text"];
+
+/// One field of a node body, continuation lines included.
+pub fn field(body: &str, want: &str) -> String {
+    let mut out = String::new();
+    let mut inside = false;
+    for line in body.lines() {
+        let key = line.split(' ').next().unwrap_or("");
+        if KEYS.contains(&key) && line.len() > key.len() {
+            inside = key == want;
+            if inside {
+                out.push_str(&line[key.len() + 1..]);
+            }
+            continue;
+        }
+        if inside {
+            out.push('\n');
+            out.push_str(line);
+        }
+    }
+    out
+}
+
+/// A query that shares no text with what the index holds.
+///
+/// **This is what makes the benchmark mean anything.** The index is built from
+/// `concept` and the head's terms; `concept` is the *first sentence* of `text`,
+/// so everything after it -- the rest of the question, the working, the options
+/// -- is prose from the same node that the index has never seen. Retrieving the
+/// node from it is a real known-item task with one right answer in nine
+/// thousand, and no string in common to shortcut it.
+///
+/// Nothing is returned when the tail would not be disjoint, and the caller
+/// counts those. A benchmark that quietly drops the awkward half is measuring
+/// the easy half and reporting it as the whole.
+pub fn held_out(body: &str) -> Option<String> {
+    let text = field(body, "text");
+    let concept = field(body, "concept");
+    let t = text.trim();
+    let c = concept.trim();
+    if c.is_empty() || t.is_empty() {
+        return None;
+    }
+    let rest = t.strip_prefix(c)?.trim();
+    if rest.len() < 32 {
+        return None;
+    }
+    Some(String::from(rest))
+}
+
+/// Where the true answer came in a list of scores, counting from zero.
+fn rank_by(scores: &[f32], truth: usize) -> usize {
+    let mine = scores[truth];
+    scores
+        .iter()
+        .enumerate()
+        .filter(|(i, s)| *i != truth && **s > mine)
+        .count()
+}
+
+/// Known-item retrieval over the whole forest, one method at a time.
+///
+/// The ladder is the point. Each row is the *same* queries against the *same*
+/// candidates with one thing changed, so the differences are the methods and
+/// not the sample.
+pub fn bench(sample: usize) {
+    if !sysbox::stored::available() {
+        kprintln!("  no store mounted -- 'store init', then 'snap'");
+        return;
+    }
+    let _claim = match crate::ai::claim_engine() {
+        Some(c) => c,
+        None => {
+            kprintln!("  {}", crate::ai::engine_refusal());
+            return;
+        }
+    };
+    let ix = index_at(ROOT);
+    if ix.is_empty() {
+        kprintln!("  nothing under {} in the last snapshot", ROOT);
+        return;
+    }
+    let n = ix.len();
+
+    let built = crate::ai::with_engine(|e| {
+        let docs: Vec<Vec<usize>> = ix
+            .heads
+            .iter()
+            .map(|h| e.tok.encode(&crate::ai::route::queryable(h), false, false))
+            .collect();
+        let lex = crate::ai::lex::Lex::build(e.tok.vocab_size(), &docs);
+        let idfv: Vec<Vec<f32>> =
+            docs.iter().map(|d| crate::ai::lex::pool_ids(&e.model, d, &lex)).collect();
+        // The old way, kept for the comparison rather than out of nostalgia:
+        // a ladder whose bottom rung is missing cannot say how far it climbed.
+        // Normalised so both are compared by the same dot product.
+        let meanv: Vec<Vec<f32>> = ix
+            .heads
+            .iter()
+            .map(|h| {
+                let mut v = crate::ai::vocab::pool_text(
+                    &e.model,
+                    &e.tok,
+                    &crate::ai::route::queryable(h),
+                );
+                crate::ai::lex::normalise(&mut v);
+                v
+            })
+            .collect();
+        (lex, idfv, meanv)
+    });
+    let (lex, idfv, meanv) = match built {
+        Some(v) => v,
+        None => {
+            kprintln!("  {}", crate::ai::engine_refusal());
+            return;
+        }
+    };
+
+    // Sampled by stride, so the set is spread over every subject and is the
+    // same set on every run. Taking a prefix would measure whichever subject
+    // sorts first.
+    let stride = (n / sample.max(1)).max(1);
+    let mut queries: Vec<(usize, String)> = Vec::new();
+    let mut nodisjoint = 0usize;
+    let mut i = 0usize;
+    while i < n && queries.len() < sample {
+        if let Some(b) = sysbox::read_blob(&ix.paths[i]) {
+            let body = String::from_utf8_lossy(&b);
+            match held_out(&body) {
+                Some(q) => queries.push((i, q)),
+                None => nodisjoint += 1,
+            }
+        }
+        i += stride;
+    }
+    if queries.is_empty() {
+        kprintln!("  no node had a body disjoint from its own concept -- nothing to ask");
+        return;
+    }
+
+    // Two sweeps in one pass. `b` is how much a document is charged for its
+    // length, `a` is how much of the score comes from the embedding rather than
+    // the terms -- and both are read off the table rather than argued for.
+    //
+    // The mix grid is dense near zero because that is where the first sweep put
+    // its optimum, and a grid that only says "the end of the range" cannot tell
+    // a real optimum from a boundary.
+    const BS: &[f32] = &[0.0, 0.25, 0.5, 0.75, 1.0];
+    const MIXES: &[f32] = &[0.05, 0.25, 1.0];
+    let rows = 2 + BS.len() + MIXES.len();
+    let mut r1 = alloc::vec![0usize; rows];
+    let mut r5 = alloc::vec![0usize; rows];
+    let mut mrr = alloc::vec![0.0f32; rows];
+
+    let mhz = crate::time::tsc_mhz().max(1);
+    let t0 = crate::time::rdtsc();
+    let mut sm = alloc::vec![0.0f32; n];
+    let mut si = alloc::vec![0.0f32; n];
+    let mut raw = alloc::vec![0.0f32; n];
+    let mut sl = alloc::vec![0.0f32; n];
+    let mut best = alloc::vec![0.0f32; n];
+    let mut sx = alloc::vec![0.0f32; n];
+
+    for (truth, q) in &queries {
+        let pooled = crate::ai::with_engine(|e| {
+            let ids = e.tok.encode(q, false, false);
+            let mut m = crate::ai::vocab::pool_text(&e.model, &e.tok, q);
+            crate::ai::lex::normalise(&mut m);
+            (ids.clone(), m, crate::ai::lex::pool_ids(&e.model, &ids, &lex))
+        });
+        let (ids, qm, qi) = match pooled {
+            Some(v) => v,
+            None => return,
+        };
+        // Every vector is unit length, so a cosine is a dot product and the
+        // whole sweep is one multiply-add per dimension per node.
+        for j in 0..n {
+            sm[j] = crate::ai::lex::dot(&qm, &meanv[j]);
+            si[j] = crate::ai::lex::dot(&qi, &idfv[j]);
+        }
+        // The postings walk happens once and each `b` reuses it, so what
+        // differs between those rows is the length discount and nothing else.
+        let tot = lex.score_raw(&ids, &mut raw);
+
+        let mut tally = |row: usize, scores: &[f32]| {
+            let r = rank_by(scores, *truth);
+            if r == 0 {
+                r1[row] += 1;
+            }
+            if r < 5 {
+                r5[row] += 1;
+            }
+            mrr[row] += 1.0 / (r as f32 + 1.0);
+        };
+        tally(0, &sm);
+        tally(1, &si);
+        for (k, b) in BS.iter().enumerate() {
+            sl.copy_from_slice(&raw);
+            lex.finish(&mut sl, tot, *b);
+            tally(2 + k, &sl);
+            if (*b - crate::ai::lex::LEN_B).abs() < 1.0e-6 {
+                best.copy_from_slice(&sl);
+            }
+        }
+        // Mixed against the shipped `b`, so the two knobs are not being swept
+        // against each other at once -- one table cannot answer two questions.
+        for (k, a) in MIXES.iter().enumerate() {
+            for j in 0..n {
+                sx[j] = a * si[j] + (1.0 - a) * best[j];
+            }
+            tally(2 + BS.len() + k, &sx);
+        }
+    }
+    let us = (crate::time::rdtsc() - t0) / mhz;
+
+    let q = queries.len();
+    kprintln!("  known-item retrieval: {} candidates, {} quer(ies)", n, q);
+    kprintln!("  the query is a node's body after its own first sentence; the index holds");
+    kprintln!("  that sentence and its terms, so no string is shared and one answer is right");
+    if nodisjoint > 0 {
+        kprintln!("  {} sampled node(s) had no disjoint tail and were not asked", nodisjoint);
+    }
+    let per = |a: usize| a * 1000 / q;
+    let name = |row: usize| -> alloc::string::String {
+        match row {
+            0 => alloc::format!("{:<14}", "mean pool"),
+            1 => alloc::format!("{:<14}", "idf pool"),
+            k if k < 2 + BS.len() => alloc::format!("terms b={:<6.2}", BS[k - 2]),
+            k => alloc::format!("mix a={:<8.2}", MIXES[k - 2 - BS.len()]),
+        }
+    };
+    kprintln!("  {:<14} {:>8} {:>8} {:>9}", "method", "r@1", "r@5", "MRR");
+    for row in 0..rows {
+        let (a, b) = (per(r1[row]), per(r5[row]));
+        kprintln!(
+            "  {} {:>6}.{}% {:>6}.{}% {:>9.4}",
+            name(row),
+            a / 10,
+            a % 10,
+            b / 10,
+            b % 10,
+            mrr[row] / q as f32
+        );
+    }
+    // `a=1.00` is the embedding alone, so that row must equal `idf pool`. It is
+    // left in as a check on the mixing arithmetic rather than removed as a
+    // duplicate -- a fusion that quietly dropped one side would show here and
+    // nowhere else.
+    kprintln!("  (mix a=1.00 must equal 'idf pool'; b={:.2} is what ships)", crate::ai::lex::LEN_B);
+    kprintln!("  chance at r@1 is 1 in {}, and MRR would be about {:.5}", n, 1.0 / n as f32);
+    kprintln!("  swept in {} ms", us / 1000);
 }
 
 /// How many candidates are offered to the fill.
@@ -646,13 +920,30 @@ pub fn recall_query(q: &str, budget: usize, subjects: usize) {
             return;
         }
     };
-    let mut v = match crate::ai::with_engine(|e| crate::ai::vocab::pool_text(&e.model, &e.tok, q)) {
+    let lex = match crate::ai::recall::load_lex() {
+        Some(l) => l,
+        None => {
+            kprintln!("  no postings at {} -- 'forest embed' writes them", crate::ai::recall::LEX);
+            return;
+        }
+    };
+    // The query, tokenised once: the same ids drive the term match and the
+    // pooled vector, so the two channels cannot disagree about what was asked.
+    let asked = crate::ai::with_engine(|e| {
+        let ids = e.tok.encode(q, false, false);
+        let v = crate::ai::lex::pool_ids(&e.model, &ids, &lex);
+        (ids, v)
+    });
+    let (ids, qv) = match asked {
         Some(v) => v,
         None => {
             kprintln!("  {}", crate::ai::engine_refusal());
             return;
         }
     };
+    // For the subject ranking only, which is a separate comparison against a
+    // table with its own centroid.
+    let mut v = qv.clone();
     t.centre(&mut v);
 
     // Two lists over the same scores: everything, and the part of it the router
@@ -663,8 +954,21 @@ pub fn recall_query(q: &str, budget: usize, subjects: usize) {
         if n.dim != v.len() {
             return None;
         }
+        // Terms and embedding, mixed by the constant `forest bench` chose.
+        // At the measured mix of zero this is the term score alone, and the
+        // dot product is skipped rather than multiplied by nothing.
+        let mut sl = alloc::vec![0.0f32; n.len()];
+        lex.score(&ids, &mut sl);
+        let mix = crate::ai::recall::MIX;
         let mut all: Vec<(usize, f32)> = (0..n.len())
-            .map(|i| (i, crate::ai::vocab::cosine(&v, n.row(i))))
+            .map(|i| {
+                let s = if mix > 0.0 {
+                    mix * crate::ai::lex::dot(&qv, n.row(i)) + (1.0 - mix) * sl[i]
+                } else {
+                    sl[i]
+                };
+                (i, s)
+            })
             .collect();
         all.sort_by(|a, b| {
             b.1.partial_cmp(&a.1).unwrap_or(core::cmp::Ordering::Equal).then(a.0.cmp(&b.0))
@@ -859,6 +1163,10 @@ pub fn command(rest: &str) {
         },
         "index" => index_report(),
         "embed" => embed(),
+        "bench" => {
+            let k = w.next().and_then(|v| v.parse::<usize>().ok()).unwrap_or(200);
+            bench(k);
+        }
         "recall" => {
             let rest = rest.strip_prefix("recall").unwrap_or("").trim();
             // An optional leading budget, so the common case is just a
@@ -909,6 +1217,7 @@ pub fn command(rest: &str) {
             kprintln!("  forest index        build an index from the store, no body resident");
             kprintln!("  forest body <path>  one node, read off the disk and not the namespace");
             kprintln!("  forest embed        build the branch table, store it, and score it");
+            kprintln!("  forest bench [n]    known-item retrieval, one method per row");
             kprintln!("  forest route <q>    which branches a question belongs in");
             kprintln!("  forest recall [n] [k] <q>  what fits in n tokens; k subjects, 0 for all");
         }

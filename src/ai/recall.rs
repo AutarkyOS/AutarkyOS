@@ -40,6 +40,9 @@ use crate::sysbox;
 /// Where the per-node vectors live.
 pub const NODES: &str = "/ai/route/nodes";
 
+/// And the inverted index beside them.
+pub const LEX: &str = "/ai/route/lex";
+
 const MAGIC: &[u8; 8] = b"GLADOSNV";
 
 /// One pooled vector per node, keyed by path.
@@ -120,43 +123,26 @@ impl Nodes {
     }
 }
 
-impl Nodes {
-    /// Subtract the routing table's centroid from every row, in place.
-    ///
-    /// **Both sides or neither**, which is the trap `route::centre` names: the
-    /// query is centred against the subject table, so comparing it to raw node
-    /// vectors would put a residual against a whole vector and answer a
-    /// perfectly plausible cosine to a different question.
-    pub fn centre_with(&mut self, t: &crate::ai::route::Table) {
-        if t.centroid.len() != self.dim {
-            return;
-        }
-        for i in 0..self.paths.len() {
-            let row = &mut self.vecs[i * self.dim..(i + 1) * self.dim];
-            for (a, c) in row.iter_mut().zip(t.centroid.iter()) {
-                *a -= *c;
-            }
-        }
-    }
-}
-
 static CACHE: crate::sync::Racy<Option<Nodes>> = crate::sync::Racy::new(None);
 
-/// The node table, loaded once and kept, already centred.
+/// The node table, loaded once and kept.
 ///
 /// Twenty megabytes at dim 576 over nine thousand nodes -- the price of not
 /// reading and re-hashing the disk once per question. `forget` drops it, and
 /// `forest embed` calls that when it writes a new one, so the cache cannot
 /// outlive the table it came from.
+///
+/// **Not centred.** Rows are IDF-weighted and unit length by construction, so a
+/// cosine against another such row is already a plain dot product. The routing
+/// table's centroid belongs to the *subject* comparison and was measured there;
+/// applying it here would take a constant out of one side of a different
+/// comparison, which is exactly the both-sides-or-neither trap `route::centre`
+/// is written to warn about.
 pub fn with_nodes<R>(f: impl FnOnce(&Nodes) -> R) -> Option<R> {
     unsafe {
         let slot = CACHE.get();
         if slot.is_none() {
-            let mut n = load()?;
-            if let Some(t) = crate::ai::route::load() {
-                n.centre_with(&t);
-            }
-            *slot = Some(n);
+            *slot = Some(load()?);
         }
         slot.as_ref().map(f)
     }
@@ -173,6 +159,38 @@ pub fn load() -> Option<Nodes> {
 pub fn store(n: &Nodes) -> bool {
     sysbox::write_blob(NODES, n.encode())
 }
+
+pub fn load_lex() -> Option<crate::ai::lex::Lex> {
+    crate::ai::lex::Lex::decode(&sysbox::read_blob(LEX)?)
+}
+
+pub fn store_lex(l: &crate::ai::lex::Lex) -> bool {
+    sysbox::write_blob(LEX, l.encode())
+}
+
+/// How much of the score comes from the embedding rather than the terms.
+///
+/// **Zero, and that is a measurement rather than a dismissal.** `forest bench`
+/// swept it over a known-item task with 8,913 candidates and no string shared
+/// between query and index:
+///
+///     mean pool      r@1  0.5%    MRR 0.0098
+///     idf pool       r@1  5.5%    MRR 0.0799
+///     terms          r@1 87.8%    MRR 0.9095
+///
+/// and every weight above zero came out worse than zero -- 84.8% at a=0.05,
+/// 68.6% at a=0.25, and the embedding alone at 5.5%. So the
+/// embedding channel is switched off for node retrieval, and the constant is
+/// here rather than inlined so the shipped behaviour and the measurement cannot
+/// drift apart in silence.
+///
+/// What this is *not* is a claim that embeddings are useless. It is one
+/// checkpoint's embedding table, mean- and IDF-pooled with no forward pass,
+/// against exact term matching on a corpus of questions -- where names and
+/// numbers either appear or do not, and that is most of the signal. A different
+/// model, or a fusion on ranks rather than on raw scores, may well move it. The
+/// sweep is one command, and it prints every rung.
+pub const MIX: f32 = 0.0;
 
 /// A candidate to render: where it came from and how good it looked.
 pub struct Cand {
