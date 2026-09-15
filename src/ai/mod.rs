@@ -27,6 +27,7 @@ pub mod model;
 pub mod probe;
 pub mod problem;
 pub mod redqueen;
+pub mod route;
 pub mod sample;
 pub mod skill;
 pub mod study;

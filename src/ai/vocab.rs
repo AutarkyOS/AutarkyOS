@@ -75,6 +75,15 @@ pub struct Head {
     b2: Vec<f32>, // dim
 }
 
+/// Pool one piece of text, for a caller outside this module.
+///
+/// The dimension is the model's, so no caller has to agree with it separately
+/// -- a router built at one width against a table written at another is a
+/// mismatch nothing would report, since both are only floats.
+pub fn pool_text(model: &Model, tok: &Tokenizer, text: &str) -> Vec<f32> {
+    pool(model, tok, text, model.cfg.dim)
+}
+
 /// Pool the embeddings of a piece of text into one vector.
 fn pool(model: &Model, tok: &Tokenizer, text: &str, dim: usize) -> Vec<f32> {
     let ids = tok.encode(text, false, false);

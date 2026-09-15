@@ -5063,6 +5063,55 @@ whether any of it worked.
 walking directory chunks only and reads bytes out of a blob with
 `cas::read_blocks`.
 
+### Routing a question to a branch
+
+`src/ai/route.rs`, and it is the Phase 3 **baseline** rather than the router --
+the thing a fitted probe has to beat, in the shape the plan asked for.
+
+A branch vector is the mean of its nodes' pooled head embeddings, and a query
+is pooled the same way and compared by cosine. **No forward pass anywhere**:
+`vocab::pool_text` averages embedding-table rows, so there is no attention, no
+layer and no KV cache, which is what makes routing nine thousand nodes
+affordable here at all. `forest embed` builds and scores the table, `forest
+route <question>` asks it.
+
+Two decisions exist so the number is not a lie:
+
+- **The subject is never pooled.** A head is `subject | concept | terms` and
+  the subject *is* the branch path, so a descriptor built from it would be
+  reading the label off the back. Concept and terms only, on both sides.
+- **Accuracy is leave-one-out, and it is free.** A branch vector is a mean, so
+  removing one node is `(sum - v) / (n - 1)` exactly -- every node is a held-out
+  test point against a branch that never saw it, with no split to arrange. The
+  table therefore stores **sums and counts**, not means: a mean throws away
+  precisely what scoring after the fact needs.
+
+Measured on the 8,913-node forest with SmolLM2-135M, dim 576, deterministic
+across runs:
+
+    8913 node(s) over 16 subject(s) -- 8157 had a shard folded in
+    plain      top-1 17.0%   top-3 47.2%
+    centred    top-1 28.6%   top-3 44.2%
+    6.2% is chance over 16 subject(s)
+    built and scored in 9164 ms
+
+**The first measurement found a design error, which is the reason to take one.**
+Keyed by *branch* it read 7.6%, and two of every three classes were `part-00`
+and `part-01` of one category -- `tools/forest.py` shards a directory to bound
+fanout, so that asked the router to split one subject in half at an arbitrary
+point. `route::subject_of` folds a `part-NN` component and `forest embed`
+reports how many it folded, so a forest that plainly has shards and folds none
+says so.
+
+**Centring is measured, not assumed.** Mean-pooled English shares a large common
+direction, which left every cosine bunched in 0.66-0.76; subtracting the
+centroid spreads them from 0.69 down to 0.17. It is scored both ways over
+identical vectors in one walk -- the only comparison that means anything -- and
+it sharpens top-1 by 11.6 points while costing 3.0 on top-3. It is on because
+top-1 won, and **that choice is budget-dependent**: a retrieval loading three
+subjects would prefer the other one. Both figures print every run so it can be
+revisited with evidence.
+
 `find`, `locate` and `locate_under` do the walking; `read_at`, `read_all` and
 `head_line` are the byte-granular side. `read_blocks` had been finished and
 unreachable for as long as it had existed. `forest::index_at` is the other

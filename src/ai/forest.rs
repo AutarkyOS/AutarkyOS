@@ -428,6 +428,237 @@ pub fn show_stored(path: &str) {
     }
 }
 
+// --- routing -------------------------------------------------------------
+
+/// Build the branch table from the index, store it, and score it.
+///
+/// **One walk for both.** Pooling every head costs the index -- one block a
+/// node -- plus a tokenizer pass; the leave-one-out scoring that follows reuses
+/// the vectors already in hand, so the accuracy figure is free rather than a
+/// second run of everything.
+///
+/// The vectors are held for that second pass and then dropped. At dim 576 over
+/// nine thousand nodes that is about 20 MB, transient, against a heap that
+/// starts at 320 MiB -- worth stating because the alternative is walking the
+/// disk twice to save it.
+pub fn embed() {
+    if !sysbox::stored::available() {
+        kprintln!("  no store mounted -- 'store init', then 'snap', and this reads from that");
+        return;
+    }
+    let ix = index_at(ROOT);
+    if ix.is_empty() {
+        kprintln!("  nothing under {} in the last snapshot -- 'snap' after importing", ROOT);
+        return;
+    }
+    let mhz = crate::time::tsc_mhz().max(1);
+    let t0 = crate::time::rdtsc();
+
+    let built = crate::ai::with_engine(|e| {
+        let dim = e.model.cfg.dim;
+        let mut t = crate::ai::route::Table {
+            dim,
+            names: Vec::new(),
+            counts: Vec::new(),
+            sums: Vec::new(),
+            centroid: Vec::new(),
+        };
+        let mut vecs: Vec<Vec<f32>> = Vec::with_capacity(ix.len());
+        let mut owner: Vec<usize> = Vec::with_capacity(ix.len());
+        for i in 0..ix.len() {
+            let b = crate::ai::route::subject_of(&ix.paths[i]);
+            let bi = match t.find(b) {
+                Some(j) => j,
+                None => {
+                    t.names.push(String::from(b));
+                    t.counts.push(0);
+                    t.sums.resize(t.names.len() * dim, 0.0);
+                    t.names.len() - 1
+                }
+            };
+            let v = crate::ai::vocab::pool_text(
+                &e.model,
+                &e.tok,
+                &crate::ai::route::queryable(&ix.heads[i]),
+            );
+            for (acc, x) in t.sums[bi * dim..(bi + 1) * dim].iter_mut().zip(v.iter()) {
+                *acc += *x;
+            }
+            t.counts[bi] += 1;
+            owner.push(bi);
+            vecs.push(v);
+        }
+        (t, vecs, owner)
+    });
+    let (mut t, vecs, owner) = match built {
+        Some(v) => v,
+        None => {
+            kprintln!("  {}", crate::ai::engine_refusal());
+            return;
+        }
+    };
+
+    // The fold is reported rather than assumed. If `tools/forest.py` ever
+    // spells a shard differently, this number drops to zero on a forest that
+    // plainly has them, and somebody sees it.
+    let folded = ix
+        .paths
+        .iter()
+        .filter(|p| crate::ai::route::subject_of(p) != crate::ai::route::branch_of(p))
+        .count();
+    kprintln!(
+        "  {} node(s) over {} subject(s), dim {} -- {} node(s) had a shard folded in",
+        ix.len(),
+        t.len(),
+        t.dim,
+        folded
+    );
+
+    // **Scored twice over identical data, which is the only way the comparison
+    // says anything.** Same nodes, same vectors, same leave-one-out; one
+    // constant shift between the two runs. Measuring centring on a second walk
+    // would put the host's scheduler and the disk in the difference.
+    let plain = score_loo(&t, &vecs, &owner);
+
+    // The centroid is the mean of every node vector -- the direction all
+    // English text shares, which is what leaves the cosines bunched.
+    let mut c = alloc::vec![0.0f32; t.dim];
+    for v in &vecs {
+        for (a, x) in c.iter_mut().zip(v.iter()) {
+            *a += *x;
+        }
+    }
+    let n = vecs.len().max(1) as f32;
+    for a in c.iter_mut() {
+        *a /= n;
+    }
+    t.centroid = c;
+    let centred = score_loo(&t, &vecs, &owner);
+
+    // **Chosen on top-1, and that choice is not obviously the right one.**
+    // Measured here: centring takes top-1 from 17.0% to 28.6% and takes top-3
+    // from 47.2% *down* to 44.2%. So it sharpens the first answer and costs a
+    // little of the first three, and which of those matters depends on a budget
+    // that does not exist yet -- a retrieval loading one subject wants the
+    // first number and one loading three wants the second.
+    //
+    // Top-1 wins by 11.6 points where top-3 loses by 3.0, so it is on. The
+    // figures are printed both ways every run precisely so whoever builds the
+    // budgeted retrieval can revisit this with evidence rather than re-deriving
+    // it, and a forest with different subjects may well answer differently.
+    if centred.0 < plain.0 {
+        t.centroid.clear();
+    }
+
+    let bytes = t.encode().len();
+    let wrote = crate::ai::route::store(&t);
+    let us = (crate::time::rdtsc() - t0) / mhz;
+
+    // Tenths of a percent in whole numbers: no float formatting to get wrong
+    // and the figure reads the same either way.
+    let per = |a: usize, b: usize| if b == 0 { 0 } else { a * 1000 / b };
+    let show = |what: &str, r: (usize, usize, usize, usize)| {
+        let (o1, o3) = (per(r.0, r.2), per(r.1, r.2));
+        kprintln!(
+            "  {:<10} top-1 {}.{}%   top-3 {}.{}%",
+            what,
+            o1 / 10,
+            o1 % 10,
+            o3 / 10,
+            o3 % 10
+        );
+    };
+    let ch = per(1, t.len().max(1));
+    kprintln!(
+        "  leave-one-out over {} node(s), {} alone in their subject",
+        plain.2,
+        plain.3
+    );
+    show("plain", plain);
+    show("centred", centred);
+    kprintln!("  {}.{}% is chance over {} subject(s)", ch / 10, ch % 10, t.len());
+    if wrote {
+        kprintln!(
+            "  {} B of table at {}, centring {}",
+            bytes,
+            crate::ai::route::TABLE,
+            if t.centroid.is_empty() { "off -- it did not win" } else { "on" }
+        );
+    } else {
+        kprintln!("  the table would not write to {}", crate::ai::route::TABLE);
+    }
+    kprintln!("  built and scored in {} ms, no forward pass anywhere", us / 1000);
+}
+
+/// Leave-one-out over every node: (top-1, top-3, scored, alone).
+///
+/// The query is centred here and the branch vectors centre themselves, so both
+/// sides move together or neither does. Centring one and not the other compares
+/// a residual against a whole vector, which is a different question with a
+/// perfectly plausible cosine.
+fn score_loo(
+    t: &crate::ai::route::Table,
+    vecs: &[Vec<f32>],
+    owner: &[usize],
+) -> (usize, usize, usize, usize) {
+    let m = crate::ai::route::means(t);
+    let (mut top1, mut top3, mut scored, mut alone) = (0usize, 0usize, 0usize, 0usize);
+    for i in 0..vecs.len() {
+        match t.without(owner[i], &vecs[i]) {
+            None => alone += 1,
+            Some(loo) => {
+                let mut q = vecs[i].clone();
+                t.centre(&mut q);
+                let r = crate::ai::route::rank_of(t, &m, &q, owner[i], &loo);
+                scored += 1;
+                if r == 0 {
+                    top1 += 1;
+                }
+                if r < 3 {
+                    top3 += 1;
+                }
+            }
+        }
+    }
+    (top1, top3, scored, alone)
+}
+
+/// Where a question should be looked for.
+pub fn route_query(q: &str) {
+    let t = match crate::ai::route::load() {
+        Some(t) => t,
+        None => {
+            kprintln!("  no routing table at {} -- 'forest embed' builds one", crate::ai::route::TABLE);
+            return;
+        }
+    };
+    let v = match crate::ai::with_engine(|e| crate::ai::vocab::pool_text(&e.model, &e.tok, q)) {
+        Some(v) => v,
+        None => {
+            kprintln!("  {}", crate::ai::engine_refusal());
+            return;
+        }
+    };
+    // A table written at one width and read at another is a mismatch nothing
+    // would report, since both sides are only floats. Checked rather than
+    // assumed, because swapping the checkpoint is an ordinary thing to do.
+    if v.len() != t.dim {
+        kprintln!(
+            "  the table is dim {} and this model is dim {} -- 'forest embed' to rebuild it",
+            t.dim,
+            v.len()
+        );
+        return;
+    }
+    let m = crate::ai::route::means(&t);
+    let mut v = v;
+    t.centre(&mut v);
+    for (i, score) in crate::ai::route::rank(&t, &m, &v).iter().take(5) {
+        let name = t.names[*i].strip_prefix(ROOT).unwrap_or(&t.names[*i]);
+        kprintln!("  {:.4}  {:<46} {} node(s)", score, name, t.counts[*i]);
+    }
+}
+
 pub fn command(rest: &str) {
     let mut w = rest.split_whitespace();
     match w.next().unwrap_or("") {
@@ -442,6 +673,15 @@ pub fn command(rest: &str) {
             None => kprintln!("  usage: forest show <path under the root>"),
         },
         "index" => index_report(),
+        "embed" => embed(),
+        "route" => {
+            let q = rest.strip_prefix("route").unwrap_or("").trim();
+            if q.is_empty() {
+                kprintln!("  usage: forest route <question>");
+            } else {
+                route_query(q);
+            }
+        }
         "body" => match w.next() {
             Some(p) => show_stored(p),
             None => kprintln!("  usage: forest body <path under the root>"),
@@ -454,6 +694,8 @@ pub fn command(rest: &str) {
             kprintln!("  forest cost         resident bytes, and what an index would hold");
             kprintln!("  forest index        build an index from the store, no body resident");
             kprintln!("  forest body <path>  one node, read off the disk and not the namespace");
+            kprintln!("  forest embed        build the branch table, store it, and score it");
+            kprintln!("  forest route <q>    which branches a question belongs in");
         }
     }
 }
