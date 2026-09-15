@@ -5027,20 +5027,48 @@ becomes insertion order, and every positional split boundary depends on it.
 Past 9999 the padding truncates and the property fails silently, which is why
 `dataset.py` refuses to emit a larger bundle.
 
-**`src/sysbox/stored.rs` is the other door, and it is the one a corpus needs.**
-Everything else here works on the *working tree*, which is `Node::Blob(Vec<u8>)`
-all the way down and therefore entirely resident. That is right for a namespace
-and wrong for anything large: `read_node` walks every node at restore and
-SHA-256s every blob, and a machine whose snapshot held an 8,913-node forest was
-driven with a 900-second deadline and **never reached a prompt**.
+**`Node::Away(ChunkRef)` is a blob that is on disk and not in memory**, and it
+is the reason a corpus can be in the namespace at all. Its chunk reference is
+everything the tree needs: `hash` is the blob's content address, because
+`content_hash` of a blob is exactly `sha256(bytes)` and that is exactly what
+`Store::put` computes, and `len` is its length. So an away node hashes,
+compares, counts and serialises **identically** to the blob it stands for, and
+every address from it to the root is bit-identical whether or not the bytes are
+here. That is not a coincidence; it is the property the store was designed
+around, and it is why the variant cost nothing anywhere else.
 
-`stored` resolves a path by walking **directory chunks only** -- `find`,
-`locate`, `locate_under` -- and then reads bytes out of a blob with
-`cas::read_blocks`, which had been finished and unreachable for as long as it
-had existed. `read_at`, `read_all` and `head_line` are the byte-granular side of
-it. `forest::index_at` is the consumer: heads and chunk references in memory,
-bodies on disk, 2.6 MB of index against 7.7 MB of bodies on that same forest,
-built in 30 s with nothing resident.
+`read_node` therefore does not read a blob at all, and restore costs one chunk
+read per *directory* instead of one per node plus a SHA-256 over every byte on
+the disk. Measured on the 8,913-node forest:
+
+    before   never reached a prompt, with a 900-second deadline
+    after    39 s for the whole run -- QEMU start, boot, selftests, four commands
+             8913 of 8913 file(s) on disk, 7,705,500 B that never came into memory
+             heap 32 MB used, against ~100 MB with the same forest resident
+
+Two things the compiler could not catch, both `_ => None` arms that compile
+perfectly on a match over two variants of three: `read_blob` would have reported
+every restored file as **missing**, and `blob_len` the same. Adding a variant
+finds the exhaustive matches for you and not these.
+
+`sysbox::fetch` is the read path, and unlike a bare ranged read it **verifies**:
+the whole blob is read and `ChunkRef::hash` is its content address, so one
+SHA-256 settles whether these are the bytes the tree names. Nothing caches the
+result, deliberately -- a cache with no eviction is exactly how a corpus moved
+out of memory ends up back in it, one read at a time, with nothing saying so.
+`du` reports how much of a subtree is away, which is the figure that says
+whether any of it worked.
+
+**`src/sysbox/stored.rs` is the door underneath that.** It resolves a path by
+walking directory chunks only and reads bytes out of a blob with
+`cas::read_blocks`.
+
+`find`, `locate` and `locate_under` do the walking; `read_at`, `read_all` and
+`head_line` are the byte-granular side. `read_blocks` had been finished and
+unreachable for as long as it had existed. `forest::index_at` is the other
+consumer: heads and chunk references in memory, bodies on disk, 2.6 MB of index
+against 7.7 MB of bodies on that same forest, built in 30 s with nothing
+resident.
 
 Two trades are opposite on purpose. A directory goes through `Store::get`:
 small, verified against its own address, few of them. A blob goes through

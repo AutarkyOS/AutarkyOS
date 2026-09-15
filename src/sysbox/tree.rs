@@ -46,6 +46,25 @@ const DIR_MAGIC: &[u8; 8] = b"GLADOSTR";
 
 pub enum Node {
     Blob(Vec<u8>),
+    /// A blob that is on disk and not in memory.
+    ///
+    /// Its `ChunkRef` is the whole of what the tree needs to know about it.
+    /// `hash` is the blob's **content address**, because `content_hash` of a
+    /// blob is exactly `sha256(bytes)` and that is exactly what `Store::put`
+    /// computes; `len` is its length. So an away node hashes, compares, counts
+    /// and serialises identically to the blob it stands for, and every address
+    /// from it to the root is bit-identical whether or not the bytes are
+    /// resident.
+    ///
+    /// **That is not a coincidence, it is the property the store was designed
+    /// around**, and it is why this variant costs nothing anywhere else: a
+    /// representation that changed an address would have broken `same`, `diff`,
+    /// every snapshot and every stored lineage at once.
+    ///
+    /// What it does change is that reading the tree can now fail. A resident
+    /// tree was self-contained; this one depends on the store staying
+    /// readable, which is stated here rather than discovered when a disk goes.
+    Away(ChunkRef),
     /// Kept sorted by name. Sorting is not for lookup speed -- these are tiny
     /// -- but so that serialisation is canonical: the same contents must
     /// produce the same bytes, or the hash means nothing.
@@ -57,10 +76,29 @@ impl Node {
         Node::Dir(Vec::new())
     }
 
+    /// A blob is a blob whether or not its bytes are here. Answering anything
+    /// else would re-address every directory above an away node.
     pub fn kind(&self) -> u8 {
         match self {
-            Node::Blob(_) => KIND_BLOB,
+            Node::Blob(_) | Node::Away(_) => KIND_BLOB,
             Node::Dir(_) => KIND_DIR,
+        }
+    }
+
+    /// How long this blob is, without reading it. `None` for a directory.
+    pub fn blob_len(&self) -> Option<u64> {
+        match self {
+            Node::Blob(b) => Some(b.len() as u64),
+            Node::Away(r) => Some(r.len),
+            Node::Dir(_) => None,
+        }
+    }
+
+    /// Where this blob lives, if it is not here.
+    pub fn away(&self) -> Option<ChunkRef> {
+        match self {
+            Node::Away(r) => Some(*r),
+            _ => None,
         }
     }
 
@@ -75,6 +113,9 @@ impl Node {
 pub fn clone_node(n: &Node) -> Node {
     match n {
         Node::Blob(b) => Node::Blob(b.clone()),
+        // Forty-eight bytes, whatever the blob weighs. `cp` of an away subtree
+        // is therefore nearly as cheap in memory as it always was on disk.
+        Node::Away(r) => Node::Away(*r),
         Node::Dir(es) => Node::Dir(es.iter().map(|(k, v)| (k.clone(), clone_node(v))).collect()),
     }
 }
@@ -96,6 +137,10 @@ pub fn content_hash(n: &Node) -> Hash {
             h.update(b);
             h.finish()
         }
+        // Already computed, by `Store::put`, over these exact bytes. Reading
+        // the blob back to hash it again would answer the same thing and undo
+        // the entire point of the variant.
+        Node::Away(r) => r.hash,
         Node::Dir(es) => {
             let mut h = Sha256::new();
             h.update(b"tree");
@@ -131,7 +176,7 @@ pub fn resolve<'a>(root: &'a Node, path: &[String]) -> Option<&'a Node> {
                 let i = es.binary_search_by(|(k, _)| k.as_str().cmp(part.as_str())).ok()?;
                 cur = &es[i].1;
             }
-            Node::Blob(_) => return None,
+            Node::Blob(_) | Node::Away(_) => return None,
         }
     }
     Some(cur)
@@ -145,7 +190,7 @@ pub fn resolve_mut<'a>(root: &'a mut Node, path: &[String]) -> Option<&'a mut No
                 let i = es.binary_search_by(|(k, _)| k.as_str().cmp(part.as_str())).ok()?;
                 cur = &mut es[i].1;
             }
-            Node::Blob(_) => return None,
+            Node::Blob(_) | Node::Away(_) => return None,
         }
     }
     Some(cur)
@@ -173,7 +218,7 @@ pub fn put(root: &mut Node, path: &[String], node: Node) -> Result<(), PutError>
     for part in &path[..path.len() - 1] {
         let es = match cur {
             Node::Dir(es) => es,
-            Node::Blob(_) => return Err(PutError::NotADirectory),
+            Node::Blob(_) | Node::Away(_) => return Err(PutError::NotADirectory),
         };
         let i = match es.binary_search_by(|(k, _)| k.as_str().cmp(part.as_str())) {
             Ok(i) => i,
@@ -193,7 +238,7 @@ pub fn put(root: &mut Node, path: &[String], node: Node) -> Result<(), PutError>
             }
             Ok(())
         }
-        Node::Blob(_) => Err(PutError::NotADirectory),
+        Node::Blob(_) | Node::Away(_) => Err(PutError::NotADirectory),
     }
 }
 
@@ -211,7 +256,7 @@ pub fn remove(root: &mut Node, path: &[String]) -> Option<Node> {
             let i = es.binary_search_by(|(k, _)| k.as_str().cmp(leaf.as_str())).ok()?;
             Some(es.remove(i).1)
         }
-        Node::Blob(_) => None,
+        Node::Blob(_) | Node::Away(_) => None,
     }
 }
 
@@ -226,6 +271,11 @@ pub struct Stats {
     pub apparent: u64,
     /// Bytes that actually have to exist: distinct content counted once.
     pub unique: u64,
+    /// How many of those files are on disk rather than in memory.
+    pub away: u64,
+    /// And what they would weigh if they were here. This is the figure that
+    /// says whether moving a corpus out of memory actually worked.
+    pub away_bytes: u64,
 }
 
 pub fn stats(n: &Node) -> Stats {
@@ -237,13 +287,18 @@ pub fn stats(n: &Node) -> Stats {
 
 fn walk_stats(n: &Node, s: &mut Stats, seen: &mut Vec<Hash>) {
     match n {
-        Node::Blob(b) => {
+        Node::Blob(_) | Node::Away(_) => {
+            let len = n.blob_len().unwrap_or(0);
             s.files += 1;
-            s.apparent += b.len() as u64;
+            s.apparent += len;
+            if matches!(n, Node::Away(_)) {
+                s.away += 1;
+                s.away_bytes += len;
+            }
             let h = content_hash(n);
             if let Err(i) = seen.binary_search(&h) {
                 seen.insert(i, h);
-                s.unique += b.len() as u64;
+                s.unique += len;
             }
         }
         Node::Dir(es) => {
