@@ -5442,6 +5442,34 @@ measurement was got wrong three separate times: a grid sweep scored on the test
 set, cross-validation folded by template family, and a test set that *moved*
 whenever the corpus was appended to.
 
+**And a fourth, of a kind the other three do not cover: a harness that was not
+asking the question at all.** GSM8K read 0.0% on every checkpoint this project
+has ever run, and that number was quoted as evidence about small models and
+arithmetic. It was four defects in `tools/lm_eval.py`:
+
+- `--hf-tokenizer` defaulted to SmolLM2's **49,152**-token vocabulary, which is
+  right for SmolLM2 and wrong for every Qwen checkpoint here (151,669 and
+  248,320). Handed the wrong one, a model receives ids belonging to another
+  vocabulary and answers with a degenerate run of one token. Observed, at 0.0%.
+- `--max-new` was **64** against answers that are **133 tokens on average**, so
+  two thirds of every completion was cut off before the line the score is read
+  from.
+- Nothing told it to stop, so the extractor read its number out of a fabricated
+  next question.
+- The dense runner was llama2-shaped -- derived head width, interleaved RoPE, no
+  QK-Norm -- and raised `operands could not be broadcast` on Qwen3, so it never
+  produced a figure for one at all. It is a thin adapter over `reference.py`
+  now; two dense implementations do not stay agreeing.
+
+**The lesson is the instrument, not the four bugs.** Every one of them is
+obvious the moment you look at what the model actually returned, and nothing
+ever printed it -- the harness recorded a score and threw the text away. `--show
+N` prints the raw completion and stays for that reason. A rail that reads zero
+is not a result until its output has been read; a score with no transcript
+behind it is an assertion.
+
+`design/benchmarks.md` carries the withdrawal and the struck-through row.
+
 There are **three** splits, and `vocab::splits()` is the single place anything
 asks for them. It returns the compiled `SEED_TRAIN` and `SEED_VAL_END` until a
 bundle is imported over the corpus, and the imported boundaries after. Reading
