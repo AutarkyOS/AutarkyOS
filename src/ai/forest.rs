@@ -441,6 +441,334 @@ pub fn show_stored(path: &str) {
 /// nine thousand nodes that is about 20 MB, transient, against a heap that
 /// starts at 320 MiB -- worth stating because the alternative is walking the
 /// disk twice to save it.
+/// The forest as one vector per node, with the subject each belongs to.
+///
+/// Extracted because the fitted probe has to see *exactly* what the cosine
+/// baseline sees. Two walks would put the tokeniser, the document frequencies
+/// and the pooling in the difference between them, and the whole point of the
+/// comparison is that nothing is in the difference but the classifier.
+pub struct Vectorised {
+    pub ix: Index,
+    pub dim: usize,
+    pub vecs: Vec<Vec<f32>>,
+    /// Which subject each node belongs to, as an index into `names`.
+    pub labels: Vec<usize>,
+    pub names: Vec<String>,
+}
+
+pub fn vectorise() -> Option<Vectorised> {
+    let ix = index_at(ROOT);
+    if ix.is_empty() {
+        return None;
+    }
+    // One token list per node over exactly the text the index holds, then the
+    // document frequencies, then the vectors those frequencies weight. The
+    // order matters: a weight cannot be known until the whole corpus has been
+    // seen, so pooling has to come second.
+    let built = crate::ai::with_engine(|e| {
+        let docs: Vec<Vec<usize>> = ix
+            .heads
+            .iter()
+            .map(|h| crate::ai::lex::tokens(&e.tok, &crate::ai::route::queryable(h)))
+            .collect();
+        let lex = crate::ai::lex::Lex::build(e.tok.vocab_size(), &docs);
+        let vecs: Vec<Vec<f32>> =
+            docs.iter().map(|d| crate::ai::lex::pool_ids(&e.model, d, &lex)).collect();
+        (e.model.cfg.dim, vecs)
+    })?;
+    let (dim, vecs) = built;
+
+    let mut names: Vec<String> = Vec::new();
+    let mut labels: Vec<usize> = Vec::with_capacity(ix.len());
+    for p in ix.paths.iter() {
+        let b = crate::ai::route::subject_of(p);
+        let li = match names.iter().position(|n| n == b) {
+            Some(j) => j,
+            None => {
+                names.push(String::from(b));
+                names.len() - 1
+            }
+        };
+        labels.push(li);
+    }
+    Some(Vectorised { ix, dim, vecs, labels, names })
+}
+
+/// Hold out every `HOLD`-th node.
+///
+/// **Striding and not a prefix, because the forest is sorted by path** and a
+/// path begins with its subject -- so the last fifth of it is whole subjects
+/// the fit would never have seen, and both routers would score zero on them
+/// for a reason that has nothing to do with either. `train.rs` makes the same
+/// choice about `-n` for the same reason.
+const HOLD: usize = 5;
+
+
+/// The fitted router, against the cosine baseline, on the same held-out nodes.
+///
+/// Phase 3's second half. `route.rs` calls itself "the baseline the fitted
+/// probe has to beat", and this is the thing that was supposed to try -- with
+/// the plan's own permission to fail written into it: *if it does not, the
+/// baseline stands and that is the result.*
+///
+/// ### Everything that could make the comparison a lie, and what is done
+///
+/// **One walk.** Both routers score the identical vectors from one
+/// `vectorise`, so the tokeniser, the document frequencies and the pooling are
+/// not in the difference between them. Only the classifier is.
+///
+/// **The baseline is rebuilt from the training slice.** `forest embed` scores
+/// leave-one-out against a table built from every node, which is free and
+/// correct *for a mean*. A probe cannot be refit per node, so it needs a real
+/// held-out slice -- and a baseline whose table had seen those nodes would be
+/// the leakage this project has already got wrong twice elsewhere.
+///
+/// **Paired, on the same items.** Two percentages over two sets is not a
+/// comparison. `fixed` and `broke` count where they disagree, which is what
+/// `godel`'s J1 reads and the only thing that survives a small slice.
+///
+/// **The separation gate runs first.** `harness::probe_features` exists
+/// because `Feature::Hidden` once fitted a probe on features carrying no class
+/// information at all, and a fit on collapsed features produces a confident
+/// classifier of noise. Same-class against different-class cosine, printed,
+/// and the fit is refused when the gap is nothing.
+pub fn fit() {
+    if !sysbox::stored::available() {
+        kprintln!("  no store mounted -- 'store init', then 'snap', and this reads from that");
+        return;
+    }
+    let Some(v) = vectorise() else {
+        kprintln!("  nothing under {} in the last snapshot -- 'snap' after importing", ROOT);
+        return;
+    };
+    let classes = v.names.len();
+    if classes < 2 {
+        kprintln!("  {} subject(s) -- there is nothing to route between", classes);
+        return;
+    }
+    let mhz = crate::time::tsc_mhz().max(1);
+    let t0 = crate::time::rdtsc();
+
+    // --- the split ----------------------------------------------------
+    let mut train: Vec<usize> = Vec::new();
+    let mut held: Vec<usize> = Vec::new();
+    for i in 0..v.ix.len() {
+        if i % HOLD == HOLD - 1 {
+            held.push(i);
+        } else {
+            train.push(i);
+        }
+    }
+    kprintln!(
+        "  {} node(s) over {} subject(s), dim {} -- {} fitted, {} held out",
+        v.ix.len(),
+        classes,
+        v.dim,
+        train.len(),
+        held.len()
+    );
+    if held.is_empty() || train.is_empty() {
+        kprintln!("  not enough to split");
+        return;
+    }
+
+    // --- the gate -----------------------------------------------------
+    //
+    // Sampled rather than exhaustive: the full pairing over seven thousand
+    // vectors is twenty-five million cosines, and what is being measured is a
+    // mean that a few thousand pairs already pins.
+    let (mut same, mut same_n) = (0.0f64, 0usize);
+    let (mut diff, mut diff_n) = (0.0f64, 0usize);
+    let step = (train.len() / 96).max(1);
+    let mut a = 0;
+    while a < train.len() {
+        let mut b = a + step;
+        while b < train.len() {
+            let (i, j) = (train[a], train[b]);
+            let c = crate::ai::vocab::cosine(&v.vecs[i], &v.vecs[j]) as f64;
+            if v.labels[i] == v.labels[j] {
+                same += c;
+                same_n += 1;
+            } else {
+                diff += c;
+                diff_n += 1;
+            }
+            b += step;
+        }
+        a += step;
+    }
+    let same_m = if same_n > 0 { same / same_n as f64 } else { 0.0 };
+    let diff_m = if diff_n > 0 { diff / diff_n as f64 } else { 0.0 };
+    let gap = same_m - diff_m;
+    kprintln!(
+        "  separation   same {}  different {}  gap {}",
+        f3(same_m),
+        f3(diff_m),
+        f3(gap)
+    );
+    // The number the gate turns on is small on purpose: what it exists to
+    // catch is a gap of *nothing*, which is what collapsed features give.
+    if gap < 0.005 {
+        crate::console::set_color(crate::gfx::console::LTRED);
+        kprintln!("  the features carry no subject information, so nothing is fitted");
+        crate::console::set_color(crate::gfx::console::LTGRAY);
+        kprintln!("  a probe over these would be a confident classifier of noise");
+        return;
+    }
+
+    // --- the baseline, rebuilt from the training slice only -----------
+    let mut t = crate::ai::route::Table {
+        dim: v.dim,
+        names: v.names.clone(),
+        counts: alloc::vec![0u32; classes],
+        sums: alloc::vec![0.0f32; classes * v.dim],
+        centroid: Vec::new(),
+    };
+    for &i in train.iter() {
+        let bi = v.labels[i];
+        for (acc, x) in t.sums[bi * v.dim..(bi + 1) * v.dim].iter_mut().zip(v.vecs[i].iter()) {
+            *acc += *x;
+        }
+        t.counts[bi] += 1;
+    }
+    // Centred, because `forest embed` measured that as the better setting for
+    // top-1 and this has to compare against the baseline at its best rather
+    // than against a version of it nobody would run.
+    let mut c = alloc::vec![0.0f32; v.dim];
+    for &i in train.iter() {
+        for (acc, x) in c.iter_mut().zip(v.vecs[i].iter()) {
+            *acc += *x;
+        }
+    }
+    for acc in c.iter_mut() {
+        *acc /= train.len() as f32;
+    }
+    t.centroid = c;
+    let means = crate::ai::route::means(&t);
+
+    // --- the probe ----------------------------------------------------
+    let train_x: Vec<Vec<f32>> = train.iter().map(|&i| v.vecs[i].clone()).collect();
+    let train_y: Vec<usize> = train.iter().map(|&i| v.labels[i]).collect();
+    let Some(p) = crate::ai::probe::Probe::fit(&train_x, &train_y, classes, LAMBDA) else {
+        kprintln!("  the fit did not solve -- singular, or a label out of range");
+        return;
+    };
+    drop(train_x);
+
+    // --- scored on the same items, one after the other ----------------
+    let (mut base_ok, mut probe_ok) = (0usize, 0usize);
+    let (mut fixed, mut broke) = (0usize, 0usize);
+    for &i in held.iter() {
+        let want = v.labels[i];
+        let mut q = v.vecs[i].clone();
+        t.centre(&mut q);
+        let b = crate::ai::route::rank(&t, &means, &q)
+            .first()
+            .map(|(j, _)| *j)
+            .unwrap_or(usize::MAX);
+        let pr = p.predict(&v.vecs[i]);
+        let (bg, pg) = (b == want, pr == want);
+        base_ok += bg as usize;
+        probe_ok += pg as usize;
+        match (bg, pg) {
+            (false, true) => fixed += 1,
+            (true, false) => broke += 1,
+            _ => {}
+        }
+    }
+    let n = held.len() as f64;
+    let chance = 100.0 / classes as f64;
+    kprintln!(
+        "  cosine       top-1 {}%   ({} of {})",
+        f1(100.0 * base_ok as f64 / n),
+        base_ok,
+        held.len()
+    );
+    kprintln!(
+        "  probe        top-1 {}%   ({} of {}), {} parameter(s)",
+        f1(100.0 * probe_ok as f64 / n),
+        probe_ok,
+        held.len(),
+        p.params()
+    );
+    kprintln!("  chance is {}% over {} subject(s)", f1(chance), classes);
+
+    // McNemar over the disagreements, which is the only part of two
+    // percentages that carries information when the slice is this size.
+    let (f, b) = (fixed as f64, broke as f64);
+    let chi = if f + b > 0.0 { (f - b) * (f - b) / (f + b) } else { 0.0 };
+    kprintln!(
+        "  paired       fixed {}, broke {}, chi {} ({})",
+        fixed,
+        broke,
+        f2(chi),
+        if chi >= 3.84 { "past 95%" } else { "inside the noise" }
+    );
+
+    let ms = (crate::time::rdtsc() - t0) / (mhz * 1000);
+    kprintln!("  fitted and scored in {} ms", ms);
+
+    // --- the verdict, and it is allowed to be no ----------------------
+    if probe_ok > base_ok && chi >= 3.84 {
+        crate::console::set_color(crate::gfx::console::LTGREEN);
+        kprintln!("  the probe beats the baseline, so it is what 'forest route' will use");
+        crate::console::set_color(crate::gfx::console::LTGRAY);
+        if crate::sysbox::write_blob(PROBE, p.to_bytes()) {
+            kprintln!("  {} -- {} byte(s)", PROBE, p.byte_len());
+            kprintln!("  'snap' to keep it");
+        } else {
+            kprintln!("  could not write {}", PROBE);
+        }
+    } else {
+        crate::console::set_color(crate::gfx::console::YELLOW);
+        kprintln!("  the baseline stands, and that is the result");
+        crate::console::set_color(crate::gfx::console::LTGRAY);
+        kprintln!("  nothing was stored. A probe that does not beat a mean is a probe");
+        kprintln!("  whose 9,000 parameters are buying a difference nobody measured.");
+    }
+    crate::console::set_color(crate::gfx::console::WHITE);
+}
+
+/// A decimal, without asking core for float formatting.
+///
+/// The rest of this file prints tenths as `{}.{}` over a scaled integer, which
+/// is the same decision: the numbers here are percentages and cosines, and a
+/// fixed number of places is what makes two runs comparable at a glance.
+fn dp(x: f64, places: u32) -> String {
+    let scale = 10i64.pow(places);
+    let neg = x < 0.0;
+    let a = if neg { -x } else { x };
+    let v = (a * scale as f64 + 0.5) as i64;
+    alloc::format!(
+        "{}{}.{:0w$}",
+        if neg { "-" } else { "" },
+        v / scale,
+        v % scale,
+        w = places as usize
+    )
+}
+
+fn f1(x: f64) -> String {
+    dp(x, 1)
+}
+fn f2(x: f64) -> String {
+    dp(x, 2)
+}
+fn f3(x: f64) -> String {
+    dp(x, 3)
+}
+
+/// Ridge, and the same value every other fit in this tree uses.
+///
+/// Not swept. A sweep would need a third slice to choose on, and choosing on
+/// the held-out one is exactly the leakage the split exists to prevent -- so
+/// the constant stays until somebody wants the sweep enough to pay for the
+/// slice.
+const LAMBDA: f32 = 1.0;
+
+/// Where a probe lives once one has earned its place.
+pub const PROBE: &str = "/ai/route/probe";
+
 pub fn embed() {
     if !sysbox::stored::available() {
         kprintln!("  no store mounted -- 'store init', then 'snap', and this reads from that");
@@ -1314,6 +1642,11 @@ fn score_loo(
 }
 
 /// Where a question should be looked for.
+/// The fitted probe, if one has earned its place.
+pub fn load_probe() -> Option<crate::ai::probe::Probe> {
+    crate::ai::probe::Probe::from_bytes(&sysbox::read_blob(PROBE)?)
+}
+
 pub fn route_query(q: &str) {
     let t = match crate::ai::route::load() {
         Some(t) => t,
@@ -1322,7 +1655,30 @@ pub fn route_query(q: &str) {
             return;
         }
     };
-    let v = match crate::ai::with_engine(|e| crate::ai::vocab::pool_text(&e.model, &e.tok, q)) {
+    // **The query has to be pooled the way the table was built.**
+    //
+    // It was not. `pool_text` is a plain mean of raw embedding rows; the table,
+    // the node vectors and the probe are all `lex::pool_ids`, which unit-scales
+    // each row and weights it by inverse document frequency. Those are
+    // different spaces, so every number this verb printed was a cosine between
+    // a question in one and a subject in another -- perfectly plausible, and
+    // about nothing. `forest recall` had it right all along, which is what
+    // made the difference visible.
+    //
+    // The postings are what carry the weights, so without them there is no way
+    // to put the query in the right space and saying so beats answering anyway.
+    let lex = match crate::ai::recall::load_lex() {
+        Some(l) => l,
+        None => {
+            kprintln!("  no postings at {} -- 'forest embed' writes them", crate::ai::recall::LEX);
+            kprintln!("  without them a query cannot be weighted the way the table was");
+            return;
+        }
+    };
+    let v = match crate::ai::with_engine(|e| {
+        let ids = crate::ai::lex::tokens(&e.tok, q);
+        crate::ai::lex::pool_ids(&e.model, &ids, &lex)
+    }) {
         Some(v) => v,
         None => {
             kprintln!("  {}", crate::ai::engine_refusal());
@@ -1340,9 +1696,39 @@ pub fn route_query(q: &str) {
         );
         return;
     }
+    // The probe first when there is one, because `forest fit` only stores one
+    // that beat the mean on held-out nodes -- and both are shown, because a
+    // router that quietly replaced another is a router nobody can check.
+    match load_probe() {
+        Some(p) if p.classes() == t.len() && p.dim() == t.dim => {
+            let scores = p.scores(&v);
+            let mut order: Vec<usize> = (0..scores.len()).collect();
+            order.sort_by(|a, b| {
+                scores[*b]
+                    .partial_cmp(&scores[*a])
+                    .unwrap_or(core::cmp::Ordering::Equal)
+                    .then(a.cmp(b))
+            });
+            kprintln!("  probe:");
+            for i in order.iter().take(5) {
+                let name = t.names[*i].strip_prefix(ROOT).unwrap_or(&t.names[*i]);
+                kprintln!("  {:.4}  {:<46} {} node(s)", scores[*i], name, t.counts[*i]);
+            }
+        }
+        Some(p) => kprintln!(
+            "  a probe is stored but it is {}x{} against a table of {}x{} -- 'forest fit' again",
+            p.classes(),
+            p.dim(),
+            t.len(),
+            t.dim
+        ),
+        None => {}
+    }
+
     let m = crate::ai::route::means(&t);
     let mut v = v;
     t.centre(&mut v);
+    kprintln!("  cosine:");
     for (i, score) in crate::ai::route::rank(&t, &m, &v).iter().take(5) {
         let name = t.names[*i].strip_prefix(ROOT).unwrap_or(&t.names[*i]);
         kprintln!("  {:.4}  {:<46} {} node(s)", score, name, t.counts[*i]);
@@ -1364,6 +1750,7 @@ pub fn command(rest: &str) {
         },
         "index" => index_report(),
         "embed" => embed(),
+        "fit" => fit(),
         "why" => {
             let rest = rest.strip_prefix("why").unwrap_or("").trim();
             let (show, q) = match rest.split_once(' ') {

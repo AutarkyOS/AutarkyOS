@@ -56,7 +56,17 @@ pub enum Error {
 
 impl From<block::Error> for Error {
     fn from(e: block::Error) -> Self {
-        Error::Io(e)
+        match e {
+            // **A refused write is not an I/O error and must not read as one.**
+            // `nvme::write` answers `0xFFFC` when writes have never been
+            // unlocked, which is the ordinary state of every boot that did not
+            // run `store init` -- and it arrived here as `Io(Io(65532))`, a
+            // number that sends an operator to look at the disk. `Unsafe`
+            // already had the right words attached to it and simply never
+            // reached them.
+            block::Error::Io(nvme::ERR_LOCKED) => Error::Unsafe,
+            other => Error::Io(other),
+        }
     }
 }
 

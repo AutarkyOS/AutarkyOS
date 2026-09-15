@@ -343,13 +343,13 @@ impl Nvme {
     /// Windows, and there is no undo for a misplaced LBA.
     pub fn write(&mut self, lba: u64, count: u16, buf: *const u8) -> Result<(), u16> {
         if !writes_unlocked() {
-            return Err(0xFFFC);
+            return Err(ERR_LOCKED);
         }
         // Outside the claimed region is refused, and this is the check the
         // gate was missing. `store` unlocks for its own region; without this
         // the unlock was a licence to write the partition table.
         if !may_write(lba, count as u32) {
-            return Err(0xFFFB);
+            return Err(ERR_OUTSIDE);
         }
         let bytes = count as usize * self.block_size as usize;
         if count as u32 > self.max_transfer_blocks {
@@ -407,6 +407,12 @@ pub fn write_window() -> Option<(u64, u64)> {
 
 /// Would this write be allowed?
 ///
+/// Writes have never been unlocked. The ordinary state of a boot that only
+/// mounted a store, since mounting one deliberately does not unlock it.
+pub const ERR_LOCKED: u16 = 0xFFFC;
+/// Unlocked, but this write falls outside the region that was claimed.
+pub const ERR_OUTSIDE: u16 = 0xFFFB;
+
 /// Separated from `write` so the gate can be checked without a device and
 /// without writing anything -- the property is arithmetic, and a safety gate
 /// nobody can test is a safety gate nobody has tested.

@@ -1797,6 +1797,12 @@ fn report_store_error(e: cas::Error) {
         cas::Error::Full => err("the store region is full"),
         cas::Error::NoDevice => err("no block device"),
         cas::Error::HashMismatch => err("an object failed to verify against its address"),
+        // The other two sentinels the block layer answers with. Named here
+        // rather than printed as numbers, for the reason the locked one is:
+        // a number sends somebody to look at the hardware.
+        cas::Error::Io(crate::store::block::Error::Io(crate::dev::nvme::ERR_OUTSIDE)) => {
+            err("that write falls outside the region 'store unlock' claimed")
+        }
         other => {
             console::set_color(LTRED);
             kprintln!("  store error: {:?}", other);
