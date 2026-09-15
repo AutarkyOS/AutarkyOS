@@ -46,6 +46,9 @@ pub const LIB_POLY: &str = include_str!("lib/poly.ai&xi");
 /// Physics in quantities that carry their units.
 pub const LIB_PHYS: &str = include_str!("lib/phys.ai&xi");
 
+/// Chemistry: formulas parsed, molar masses summed exactly.
+pub const LIB_CHEM: &str = include_str!("lib/chem.ai&xi");
+
 /// Every library, as (path, source).
 ///
 /// One list, so seeding `/lib` and checking what is in it cannot disagree
@@ -58,6 +61,7 @@ pub const LIBS: &[(&str, &str)] = &[
     ("/lib/num.ai&xi", LIB_NUM),
     ("/lib/poly.ai&xi", LIB_POLY),
     ("/lib/phys.ai&xi", LIB_PHYS),
+    ("/lib/chem.ai&xi", LIB_CHEM),
 ];
 
 /// Every `fn name(` a library source declares, in order.
@@ -466,7 +470,7 @@ pub fn lib_selftest() -> bool {
     // warning the documentation used to have to carry.
     check(
         "a length is approximate and says so, which /lib/geom declined to answer",
-        vt(M, "dist(list(0,0), list(1,1))", "~1.414214"),
+        vt(M, "dist(list(0,0), list(1,1))", "~1.41421"),
     );
     check(
         "the pivot test is an ordering, since != calls an approximate zero nonzero",
@@ -624,6 +628,57 @@ pub fn lib_selftest() -> bool {
         "Planck's constant does not fit, and says so rather than rounding",
         lib_of(H, "si(662607015, -42, \"m^2*kg/s\")").is_none()
             && vi(H, "si(299792458, 0, \"m/s\") == c()", 1),
+    );
+
+    // --- chemistry --------------------------------------------------------
+    const C: &str = "/lib/chem";
+
+    check(
+        "the table reads by symbol and by atomic number",
+        vt(C, "el(\"Fe\").name", "iron") && vt(C, "byz(26).sym", "Fe"),
+    );
+    // A molar mass is a sum of terminating decimals, so it is a fraction and
+    // the rounding happens once, where somebody asks to read it.
+    check(
+        "water is exactly 3603/200 g/mol, and 18.015 when read",
+        vt(C, "molar(\"H2O\")", "3603/200") && vt(C, "real(molar(\"H2O\"))", "~18.015"),
+    );
+    check(
+        "a parenthesised group, and its multiplier",
+        vt(C, "real(molar(\"Ca(OH)2\"))", "~74.092")
+            && vt(C, "real(molar(\"H2SO4\"))", "~98.072"),
+    );
+    // Cobalt against carbon monoxide. There is no way to be helpful about the
+    // capital and be right about both, so the case is the answer.
+    check(
+        "Co is cobalt and CO is carbon monoxide",
+        vt(C, "real(molar(\"Co\"))", "~58.933") && vt(C, "real(molar(\"CO\"))", "~28.01"),
+    );
+    // The refusals, and there are three of them because the table is partial
+    // on purpose: an unknown element must take the whole formula with it
+    // rather than contributing nothing to the sum.
+    check(
+        "an element the table does not carry refuses the whole formula",
+        vi(C, "molar(\"H2Xx\")", -1) && vi(C, "molar(\"Ca(OH2\")", -1) && vi(C, "molar(\"CaOH)2\")", -1),
+    );
+    check(
+        "atoms are counted through a group, not only at the top level",
+        vi(C, "countof(\"Ca(OH)2\", \"O\")", 2) && vi(C, "countof(\"Al2(SO4)3\", \"O\")", 12),
+    );
+    check(
+        "a mass fraction, and grams from moles exactly",
+        vi(C, "round(fracmass(\"Fe2O3\", \"Fe\") * 1000)", 699)
+            && vt(C, "gram(2, \"H2O\")", "3603/100"),
+    );
+    // **The claim exactness is for.** Four point oh three two grams of
+    // hydrogen and thirty-one point nine nine eight of oxygen are exactly two
+    // moles and exactly one, which is exactly what `2 H2 + O2` asks for. In
+    // floating point those two ratios differ in the last bit and one of the
+    // reagents is declared limiting on a rounding error.
+    check(
+        "two exactly stoichiometric reagents compare equal, not by a rounding error",
+        vi(C, "limiting(rat(4032,1000), \"H2\", 2, rat(31998,1000), \"O2\", 1)", 0)
+            && vi(C, "limiting(4, \"H2\", 2, 16, \"O2\", 1)", 1),
     );
 
     // --- how approximate the approximations are ---------------------------
@@ -1111,7 +1166,7 @@ pub fn selftest() -> bool {
     // square root of two is a type that admits what it is. `~` is in the
     // rendering for that reason: a transcript, a ledger line or a forest
     // node's method shows which of its numbers are trustworthy.
-    if !text("real(2)", "~2") || !text("pi()", "~3.141593") {
+    if !text("real(2)", "~2") || !text("pi()", "~3.14159") {
         return false;
     }
     // **Inexactness is opt-in, exactly as exact division was.** `sqrt(2)` is
@@ -1120,7 +1175,7 @@ pub fn selftest() -> bool {
     if !int("sqrt(2)", 1) || !int("sqrt(144)", 12) {
         return false;
     }
-    if !text("sqrt(real(2))", "~1.414214") {
+    if !text("sqrt(real(2))", "~1.41421") {
         return false;
     }
     // There is no way to *write* one. The lexer has no float -- which is what

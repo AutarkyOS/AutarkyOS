@@ -607,10 +607,23 @@ pub fn num_pow(base: &Value, e: i64) -> Result<Value, String> {
 
 /// An approximate value, written so it cannot be mistaken for an exact one.
 ///
-/// The `~` is the point. Six places because `f32` carries about seven
-/// significant digits and printing more would be inventing them; trailing
-/// zeros come off so a whole-valued approximation reads as `~3` rather than
-/// `~3.000000` while still saying it is approximate.
+/// The `~` is the point. Trailing zeros come off, so a whole-valued
+/// approximation reads as `~3` rather than `~3.000000` while still saying it
+/// is approximate.
+///
+/// **Six *significant* digits, not six decimal places, and the difference is a
+/// bug this printed for a while.** The reasoning was right -- `f32` carries
+/// about seven significant digits and printing more invents them -- and six
+/// decimal places only implements it for values below ten. At 74.092 it is
+/// nine significant digits, so the molar mass of calcium hydroxide came back
+/// `~74.091995`: three digits of float noise presented as measurement, from a
+/// number that is exactly 18523/250 one call earlier.
+///
+/// So the number of places is taken from the magnitude. Below one it stays at
+/// six, which is fewer than six significant digits for something very small
+/// and is left that way deliberately -- the alternative is exponent notation,
+/// and a number that reads `~0.000123` is not claiming anything it does not
+/// have.
 pub fn render_approx(v: f32) -> String {
     if v.is_nan() {
         return String::from("~nan");
@@ -618,7 +631,23 @@ pub fn render_approx(v: f32) -> String {
     if v.is_infinite() {
         return String::from(if v > 0.0 { "~inf" } else { "~-inf" });
     }
-    let mut s = format!("{:.6}", v);
+    let a = v.abs();
+    let places = if a >= 100_000.0 {
+        0
+    } else if a >= 10_000.0 {
+        1
+    } else if a >= 1_000.0 {
+        2
+    } else if a >= 100.0 {
+        3
+    } else if a >= 10.0 {
+        4
+    } else if a >= 1.0 {
+        5
+    } else {
+        6
+    };
+    let mut s = format!("{:.*}", places, v);
     if s.contains('.') {
         while s.ends_with('0') {
             s.pop();

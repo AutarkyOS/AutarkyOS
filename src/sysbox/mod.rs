@@ -320,13 +320,25 @@ pub fn restore_latest() {
                     seed_tools(s);
                     seed_apps(s);
                 }
-                // Asked separately, because a snapshot predating the library
-                // has tools and no /lib -- and a restore that put the tools
-                // back while leaving the import path empty would break every
-                // stored program that depends on one.
-                if children("/lib").is_empty() {
-                    seed_lib(s);
-                }
+                // **Unconditionally, and the guard that used to be here was a
+                // real bug.** It asked whether `/lib` was *empty*, when the
+                // question is whether it holds every library this image
+                // carries -- so the moment the set grew from six to seven,
+                // every machine that had ever taken a snapshot restored the
+                // six it already had and the seventh never appeared. Nothing
+                // said so; `use "/lib/chem"` simply answered that there was
+                // no such file, on a kernel that had it compiled in.
+                //
+                // So `/lib` belongs to the image rather than to the machine:
+                // it is seeded from `LIBS` at every boot and an edit made
+                // there does not survive one. That is the same rule the
+                // routing corpus follows and the reason it can be relied on at
+                // all -- a program that needs its own version of something
+                // keeps it in its own subtree, which is where the jail admits
+                // it anyway. `/ai/tools` is deliberately not like this: it is
+                // where `agent learn` writes, so it is the machine's and is
+                // only re-seeded when it has been emptied.
+                seed_lib(s);
             });
             console::set_color(LTGREEN);
             kprintln!("  restored snapshot {} ({} files)", seq, files);
