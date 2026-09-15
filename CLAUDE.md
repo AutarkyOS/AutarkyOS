@@ -3088,13 +3088,90 @@ the machine, so `net_ifaces` is Read and `tcp_connect` is not.
 `words` prints the table grouped by class. It is the reference.
 
 What Aiksi reaches today: text (split/join/substr/find/replace/upper/lower/
-trim/starts/ends/contains/chr/ord/repeat/pad/hexenc/hexdec), integer arithmetic
-(no floats -- adding them for one builtin changes every arithmetic path), lists
+trim/starts/ends/contains/chr/ord/repeat/pad/hexenc/hexdec), a four-rung
+numeric tower (below), lists
 (sort/reverse/slice/index/remove/range/push/set/get/len), the namespace
 (read/write/ls/exists/rm/size/is_dir/hash_of/applet), the clock and counters
 (rtc_now/rtc_unix/uptime/tsc/tsc_mhz/ticks/hz), tasks and memory, `pci_list`,
 network status, sockets (dns_resolve/tcp_*/http_get/https_get/udp_send/ping),
 the model (`ask`), the framebuffer, and raw memory and I/O ports.
+
+### Numbers, in four rungs
+
+This said "no floats -- adding them for one builtin changes every arithmetic
+path" for a long time, and the objection was right about the *path* and wrong
+about the conclusion. What it argued for was making inexactness opt-in rather
+than absent:
+
+    Int(i64)            10/3 is 3, as it always was
+    Rat(i64, i64)       rat(10, 3) is 10/3, exactly
+    Qty(i64, i64, Dim)  qty(9, "m/s^2") is 9 m/s^2, and adding seconds is an error
+    Approx(f32)         real(2) is ~2, and the tilde is in the rendering
+
+**Every rung is reached through a named builtin and by no other route**, which
+is what keeps the promise that nothing written earlier moved: `rat` is the only
+way to make a fraction, `qty` the only way to attach a unit, and `real` plus the
+transcendentals the only ways to make an approximation. There is no float
+*literal*, deliberately -- that is what keeps `.` unambiguously field access.
+
+Each rung has a canonical form and that is load-bearing. `rational` collapses a
+denominator of one back to `Int`, `quantity` collapses an empty dimension back
+to a plain number, so `3` and `3/1` and `3 dimensionless` are one value and not
+three that render, hash and compare differently.
+
+Two things worth knowing before touching the arithmetic:
+
+- **This target cannot divide a 128-bit integer.** `__udivti3` and `__umodti3`
+  link and do not return; one `u128 %` in a gcd loop stopped boot with no fault
+  and no output, three sections before the shell. `rat_binary` therefore
+  cross-reduces in `i64` and says so. A 128-bit *comparison* is fine -- it is a
+  subtract -- which is why the orderings may use one.
+- **Branch order in `binary` is Qty, Approx, Rat, Int**, and it is not
+  cosmetic: a quantity meeting a fraction would otherwise route through
+  `rat_binary` and silently lose its dimension.
+
+`num_cmp` is one ordering that `min`, `max`, `clamp` and `sort` all read. It
+agrees with `<` everywhere except NaN, deliberately, and both sites say to read
+the other before changing either.
+
+### The standard library at `/lib`
+
+Seven files of Aiksi source, compiled into the image with `include_str!` and
+seeded into `/lib` at every boot from `aiksi::LIBS`. Compiled in for the reason
+the routing corpus is: `/lib` is where a sandboxed program's dependencies are
+allowed to live, so a machine that has never mounted a store still has to have
+one.
+
+| | |
+|---|---|
+| `prob` | combinatorics and the exact half of statistics; a probability *is* a fraction |
+| `geom` | plane geometry over exact coordinates, and a convex hull that cannot contradict itself |
+| `mat` | linear algebra; Gaussian elimination where "is this pivot zero" has an honest answer |
+| `num` | number theory, and modular arithmetic with no 128-bit intermediate anywhere |
+| `poly` | polynomials, including the two operations whole numbers cannot express |
+| `phys` | physics in quantities that carry their units |
+| `chem` | formulas parsed, molar masses summed exactly |
+
+**`/lib` belongs to the image and not to the machine.** It is re-seeded
+unconditionally at boot and after restore, so an edit made there does not
+survive a reboot; a program needing its own version keeps it in its own subtree,
+where the jail admits it anyway. The guard that used to be there asked whether
+`/lib` was *empty*, which froze every snapshotted machine at whatever library
+set it had when it first snapshotted -- the seventh library simply never
+appeared, with nothing said.
+
+**Three structural claims walk `LIBS` at `diag lib`** and they exist because of
+one trap: a user function **shadows a builtin**, deliberately, and `use` is
+textual inclusion. So a library declaring `trim` silently takes the string
+builtin away from every program that imports it. The claims are that every
+library imports and runs its top level, that no declared name is a builtin, and
+that no two libraries declare one name. `/lib/poly` was written with exactly
+that `trim` and with an `area` colliding with `/lib/geom`'s, and this is what
+found both.
+
+The headline measurement is `inv(hilb(3))`. The Hilbert matrix is the standard
+ill-conditioned example and its inverse is a matrix of *whole numbers*, which no
+floating-point library recovers at any precision. This one does.
 
 Everything that is *actually a struct* answers a record: `pci_list` gives
 `Device`, `rtc_now` gives `Time`, `net_ifaces` gives `Iface`, plus `net_config`,
@@ -4949,6 +5026,29 @@ That is why `vocab::record` zero-pads blob names to four digits: sorted order
 becomes insertion order, and every positional split boundary depends on it.
 Past 9999 the padding truncates and the property fails silently, which is why
 `dataset.py` refuses to emit a larger bundle.
+
+**`src/sysbox/stored.rs` is the other door, and it is the one a corpus needs.**
+Everything else here works on the *working tree*, which is `Node::Blob(Vec<u8>)`
+all the way down and therefore entirely resident. That is right for a namespace
+and wrong for anything large: `read_node` walks every node at restore and
+SHA-256s every blob, and a machine whose snapshot held an 8,913-node forest was
+driven with a 900-second deadline and **never reached a prompt**.
+
+`stored` resolves a path by walking **directory chunks only** -- `find`,
+`locate`, `locate_under` -- and then reads bytes out of a blob with
+`cas::read_blocks`, which had been finished and unreachable for as long as it
+had existed. `read_at`, `read_all` and `head_line` are the byte-granular side of
+it. `forest::index_at` is the consumer: heads and chunk references in memory,
+bodies on disk, 2.6 MB of index against 7.7 MB of bodies on that same forest,
+built in 30 s with nothing resident.
+
+Two trades are opposite on purpose. A directory goes through `Store::get`:
+small, verified against its own address, few of them. A blob goes through
+`read_blocks`: ranged, allocation-free and **unverified**, because the hash
+covers the whole blob and a range is not the whole blob. And there is **one
+static 64 KiB scratch buffer**, which is the fix `cas::dma`'s own note asks for
+-- that one allocates per call and never frees, measured at 4,096 bytes plus the
+rounded length per blob.
 
 NVMe writes are locked by default. `store::init` unlocks only after
 `find_store_region` names a target, and `Store::format` re-checks. On a disk
