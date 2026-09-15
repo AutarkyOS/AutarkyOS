@@ -4583,10 +4583,51 @@ inboxes.
 TCP advances only while the shell is idle (`tcp::service` from the idle loop)
 or inside a blocking call. There is no interrupt-driven receive.
 
-The wireless card is CNVi, so the MAC is in the PCH and the M.2 module is a
-radio. `net/wifi.rs` identifies hardware and refuses to pretend; `hardware()`
-projects `dev::registry` down to the network parts, so the naming lives in one
-table rather than two, and boot prints it.
+### What is actually in this laptop, read off it rather than remembered
+
+Enumerated from Windows on the GF63 itself (`Get-PnpDevice -Class Net`), not
+recalled:
+
+| | |
+|---|---|
+| **Intel Wi-Fi 6 AX201 160MHz** | `8086:51f0`, **00:14.3** -- CNVi, so the MAC is a PCH function |
+| Realtek RTL8168 GbE | `10ec:8168`, driven |
+| Intel Wireless Bluetooth | USB `8087:0026`, no HCI here |
+| *(no USB wireless dongle is plugged in)* | |
+
+`0x51f0` is in `INTEL_CNVI_IDS`, so the registry names the part correctly.
+
+**CNVi is not the obstacle, and saying it was sent at least one session down
+the wrong road.** The registry used to read "the radio is in the PCH over an
+undocumented interface". CNVio -- the link between the chipset and the radio
+module -- is undocumented, and *the host never speaks it*. From here the part
+is an ordinary PCIe function with BARs and MSI-X, driven the way `iwlwifi`
+drives a discrete card. The cost is `iwlwifi`'s cost: a firmware image in
+Intel's TLV container, the context-info structure that bootstraps it, then a
+host command protocol -- PHY and MAC contexts, bindings, stations, time events
+-- before one frame moves. Thousands of lines, every step
+match-it-exactly-or-silence, and no emulator models any of it.
+
+And "a signed firmware blob that is not redistributable" was simply **wrong**.
+`LICENCE.iwlwifi_firmware` permits redistribution and use in binary form
+without modification, which is why Debian ships it in `non-free-firmware` --
+the label for redistributable-and-not-free. Not modifiable and not open source
+are different objections from the one that had been recorded.
+
+**The cheap paths, in order.** A phone in USB tethering mode presents CDC-ECM
+or RNDIS, both `Support::Driver` today, and `dev::registry` already calls that
+"the closest thing to a universal wireless driver there is" -- it works now and
+needs no new code. After that, an RTL8188EU dongle: `xhci` already identifies
+one, reads its chip id and runs `bring_up`, and the efuse decoder, LLT chain,
+firmware container parser, channel plan and both descriptor formats are written
+and asserted at boot. Bulk endpoints are not missing either, since `xhci`
+configures and drives them for CDC and RNDIS. What is left there is the on-wire
+sequence and `impl Radio`. The AX201 is the largest of the three and the only
+one that uses the laptop's own radio.
+
+`net/wifi.rs` identifies hardware and refuses to pretend; `hardware()` projects
+`dev::registry` down to the network parts, so the naming lives in one table
+rather than two, and boot prints it.
 
 ### Wireless: a seam, a shared layer, and no drivers
 
@@ -4656,13 +4697,18 @@ Owed, and written at the top of `ccmp.rs` rather than only here: an IEEE
 802.11-2016 Annex J CCMP vector. The cipher is checked against RFC 3610; the
 *framing* is structural and round-trip only.
 
-For the rtl8188eu dongle specifically, `desc` builds and reads the TX and RX
-descriptors and `bring_up` applies all four initialisation tables including the
-radio. What is missing is the transport: LLT, the FIFO boundary that gates the
-MAC TX/RX enables, channel selection, efuse, firmware, and handing a descriptor
-to a bulk endpoint -- and then `impl Radio` over it. None of the chip-facing
-half can be exercised here, since QEMU models no wireless part at all. `ath9k`
-is named in the registry as the tractable one: SoftMAC, and no firmware blob.
+For the rtl8188eu dongle specifically, more exists than a summary here once
+claimed: `xhci` identifies the part, reads its chip id and calls `bring_up`,
+which applies all four initialisation tables including the radio over the
+register interface, and `efuse_decode`, `efuse_mac`, `llt_chain`, `fw_parse`,
+`fw_pages`, `channel_mhz` and both descriptor formats are written and asserted
+at boot. **Bulk endpoints are not missing** -- `xhci::configure_bulk`,
+`bulk_in` and `bulk_out` exist and carry CDC and RNDIS traffic today. What is
+left is the on-wire sequence that uses those pieces (write the LLT, set the
+FIFO boundary that gates the MAC TX/RX enables, read the efuse, upload the
+firmware, select a channel) and then `impl Radio` over the descriptors. None of
+the chip-facing half can be exercised here, since QEMU models no wireless part
+at all.
 
 ### Crypto (`src/crypto/`)
 

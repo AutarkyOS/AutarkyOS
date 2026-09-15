@@ -306,15 +306,37 @@ pub static TABLE: &[Entry] = &[
         bus: Bus::Pci,
         rule: Match::Ids(0x8086, INTEL_CNVI_IDS),
         role: Role::Wireless,
-        what: "Intel Wi-Fi 6/6E, CNVi in the chipset",
-        support: Support::Known("the radio is in the PCH over an undocumented interface, plus a signed blob"),
+        what: "Intel Wi-Fi 6/6E AX2xx, CNVi -- the MAC is a PCH function",
+        // **This said "the radio is in the PCH over an undocumented
+        // interface", and that named the wrong obstacle.** CNVi does put the
+        // MAC and baseband in the chipset with only the radio on the M.2
+        // module, joined by CNVio, and CNVio is undocumented -- but *the host
+        // never speaks it*. From here the part is an ordinary PCIe function
+        // (00:14.3 on this laptop, 8086:51f0) with BARs and MSI-X, driven the
+        // way `iwlwifi` drives a discrete card; the link to the radio module
+        // is the hardware's own business.
+        //
+        // So the cost is `iwlwifi`'s cost and not a reverse-engineering
+        // project: a firmware image in Intel's TLV container, the context-info
+        // structure that bootstraps it, and then a host command protocol --
+        // PHY and MAC contexts, bindings, stations, time events -- before one
+        // frame moves. Large, and every step is match-it-exactly-or-silence
+        // with no emulator anywhere. Written down as what it is, because
+        // "undocumented" reads as impossible and this is merely big.
+        support: Support::Known("iwlwifi: a firmware image and a host command protocol, not an undocumented bus"),
     },
     Entry {
         bus: Bus::Pci,
         rule: Match::Ids(0x8086, INTEL_WIFI_IDS),
         role: Role::Wireless,
         what: "Intel discrete Wi-Fi card",
-        support: Support::Known("iwlwifi, and a signed firmware blob that is not redistributable"),
+        // "not redistributable" was simply wrong. `LICENCE.iwlwifi_firmware`
+        // permits redistribution and use in binary form without modification,
+        // which is why Debian ships it at all -- in `non-free-firmware`,
+        // which is precisely the label for redistributable-and-not-free. It
+        // cannot be modified and it is not open source, and those are
+        // different objections from the one that was recorded here.
+        support: Support::Known("iwlwifi: a firmware image, redistributable in binary but not open"),
     },
     Entry {
         bus: Bus::Pci,
@@ -453,14 +475,25 @@ pub static TABLE: &[Entry] = &[
         rule: Match::Ids(0x0BDA, RTL8188EU_IDS_REALTEK),
         role: Role::Wireless,
         what: "Realtek RTL8188EU wireless dongle",
-        support: Support::Partial("rtl8188eu", "identified and readable; no association and no datapath"),
+        // Understated, and the understatement was doing harm: it read as a
+        // driver nobody had started. `xhci` identifies the part, reads its
+        // chip id and runs `bring_up`, which applies all four initialisation
+        // tables including the radio over the register interface; the efuse
+        // decoder, the LLT chain, the firmware container parser, the channel
+        // plan and both descriptor formats are written and asserted at boot.
+        // Bulk endpoints are not missing either -- `xhci` configures and
+        // drives them for CDC and RNDIS already.
+        //
+        // What is left is the sequence that uses those pieces on the wire,
+        // and then `impl Radio`, above which everything is done.
+        support: Support::Partial("rtl8188eu", "chip comes up and its tables apply; the on-wire sequence and impl Radio are left"),
     },
     Entry {
         bus: Bus::Usb,
         rule: Match::Ids(0x2357, RTL8188EU_IDS_TPLINK),
         role: Role::Wireless,
         what: "TP-Link RTL8188EU wireless dongle",
-        support: Support::Partial("rtl8188eu", "identified and readable; no association and no datapath"),
+        support: Support::Partial("rtl8188eu", "chip comes up and its tables apply; the on-wire sequence and impl Radio are left"),
     },
     Entry {
         bus: Bus::Usb,
@@ -1001,11 +1034,33 @@ pub fn checks() -> Vec<(&'static str, bool)> {
     ));
 
     // A CNVi wireless part must not fall through to the generic wireless row,
-    // because the generic row's reason is wrong for it.
+    // because the generic row's reason is wrong for it. `0x51f0` is the part
+    // actually fitted to the GF63 this is developed on, read off the machine
+    // rather than remembered: Intel Wi-Fi 6 AX201 at 00:14.3.
+    //
+    // **Asserted as a distinction and not as a spelling.** This compared
+    // `e.what` against a transcribed string, so renaming the row broke a claim
+    // about something that had not changed -- the mistake this file makes a
+    // point of avoiding two claims further down, arriving from the other
+    // direction. What has to hold is that the specific row wins over the
+    // generic one, and that survives either being reworded.
     let cnvi = Ident { bus: Bus::Pci, vendor: 0x8086, device: 0x51f0, class: 0x02, subclass: 0x80, prog_if: 0x00 };
+    let nameless = Ident { bus: Bus::Pci, vendor: 0x1234, device: 0x5678, class: 0x02, subclass: 0x80, prog_if: 0x00 };
     out.push((
-        "the wireless in this laptop is named exactly, not filed under 'wireless'",
-        lookup(&cnvi).map(|e| e.what) == Some("Intel Wi-Fi 6/6E, CNVi in the chipset"),
+        "the wireless in this laptop is named exactly, not filed under the generic row",
+        lookup(&cnvi).map(|e| e.role) == Some(Role::Wireless)
+            && lookup(&nameless).map(|e| e.role) == Some(Role::Wireless)
+            && lookup(&cnvi).map(|e| e.what) != lookup(&nameless).map(|e| e.what),
+    ));
+    // And the reason it carries is its own. A part whose obstacle is a
+    // firmware image should not inherit "recognised as wireless, but not this
+    // model", which is what falling through would have said.
+    out.push((
+        "and it carries its own reason rather than the generic one",
+        match (lookup(&cnvi).map(|e| &e.support), lookup(&nameless).map(|e| &e.support)) {
+            (Some(Support::Known(a)), Some(Support::Known(b))) => a != b,
+            _ => false,
+        },
     ));
 
     out.push((
