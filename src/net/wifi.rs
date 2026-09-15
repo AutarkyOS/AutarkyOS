@@ -1,38 +1,52 @@
-//! Wireless: identification now, a driver later.
+//! Wireless: which part is fitted, and what is left to do for it.
 //!
-//! This module deliberately does not pretend. There is no 802.11 stack here
-//! and `wlan0` will not carry a packet. What it does is name the card, which
-//! is the one thing standing between here and a driver -- and which cannot be
-//! done from a QEMU guest at all, because QEMU emulates no wireless hardware.
-//! The answer only exists on the GF63.
+//! **This file used to say "there is no 802.11 stack here" and list the stack
+//! among the costs still to be paid.** That was true when it was written and
+//! stopped being true three commits ago. It is recorded rather than quietly
+//! edited because it is the exact failure this project keeps meeting: a note
+//! describing what the code *was* reads identically to one describing what it
+//! *is*, and the next reader is sent off to build something that exists.
 //!
-//! ### What a wireless driver actually costs
+//! ### What exists, and it is everything above the part
 //!
-//! It is worth writing down, because "add WiFi" sounds like the same size of
-//! job as "add Ethernet" and is not. The e1000 was ~350 lines: map a BAR, set
-//! up two descriptor rings, poll them. For a modern wireless card:
+//! | | |
+//! |---|---|
+//! | `dev::radio` | the seam: 802.11 frames in and out, and the channel plan |
+//! | `net::softmac` | Ethernet over 802.11, sequence numbers, CCMP in software |
+//! | `net::mlme` | scan, authenticate, associate, four-way, install keys |
+//! | `net::ccmp` | the link cipher: masks, packet numbers, replay |
+//! | `crypto::ccm` | AES-CCM, against RFC 3610 |
+//! | `net::wpa2` | the handshake, both halves of it |
+//!
+//! All of it is chip independent and all of it is asserted at boot against a
+//! loopback radio and a fake access point -- `diag radio`, `diag softmac`,
+//! `diag ccmp`, `diag ccm`, `diag mlme` -- with nothing plugged in. So what a
+//! new part costs is one `impl Radio`: start it, tune it, move a frame, and
+//! say in `Caps` whether the host or the firmware runs everything else.
+//!
+//! ### What is missing is per part, and the registry names it per part
+//!
+//! `dev::registry` is where to look rather than here, because it is one table
+//! beside the ids it matches and this would be a second copy that drifts. The
+//! shape of the answers:
 //!
 //!   * **Firmware.** Intel's AX-series will not initialise without a signed
-//!     blob -- roughly a megabyte, loaded into the device over a bootstrap
-//!     protocol before it does anything. It is not redistributable, it is not
-//!     documented, and the loading sequence differs between families. That is
-//!     the single largest obstacle, and no amount of writing code avoids it.
-//!   * **A host command interface.** Not descriptor rings and registers but an
-//!     asynchronous command/response protocol with the firmware, with its own
-//!     versioned message formats.
-//!   * **802.11 itself.** Scanning, authentication, association, and the fact
-//!     that a wireless frame is not an Ethernet frame -- three or four address
-//!     fields depending on direction, plus fragmentation and aggregation.
-//!   * **WPA2/WPA3.** The four-way handshake, which needs PBKDF2-HMAC-SHA1 for
-//!     the pairwise master key, AES key wrap, and CCMP for the data path.
-//!     GLaDOS will have most of those primitives once TLS exists, which is the
-//!     one part of this that gets cheaper by waiting.
+//!     blob -- roughly a megabyte, loaded over a bootstrap protocol before the
+//!     part does anything. Not redistributable, not documented, and the
+//!     sequence differs between families. It is the single largest obstacle
+//!     and no amount of writing code avoids it.
+//!   * **A host command interface.** For a FullMAC part, not descriptor rings
+//!     and registers but an asynchronous command and response protocol with
+//!     the firmware, in its own versioned message formats. Such a part
+//!     implements `Nic` directly and skips `softmac` entirely, which is what
+//!     `Caps::softmac` exists to say.
+//!   * **An undocumented bus.** This machine's own is CNVi: the MAC lives in
+//!     the chipset and the M.2 module is a radio on an interface Intel has not
+//!     published. That one is not a driver-sized problem.
 //!
-//! So the honest order is: identify the card, then decide whether its firmware
-//! situation makes a driver possible at all. An Intel AX201 is a large project
-//! with a blob problem. Some Realtek and Atheros parts are considerably more
-//! tractable. Until the GF63 boots and prints a vendor and device id, every
-//! sentence after this one would be a guess.
+//! `ath9k`-class Atheros parts are the tractable case and the registry says so
+//! on the row: no blob at all, and SoftMAC, so everything above them is
+//! already written and already checked.
 
 
 /// PCI class 0x02 is a network controller; subclass 0x80 is "other", which is
@@ -159,17 +173,24 @@ pub fn hardware() -> alloc::vec::Vec<Hardware> {
     out
 }
 
-/// One network as a scan would report it.
+/// One network as a scan reports it.
 ///
-/// Nothing constructs this yet. It is here so the settings page is written
-/// against the shape a scan returns rather than against the absence of one,
-/// and so the day a driver can associate, the UI above it already works.
+/// Deliberately *not* `mlme::Bss`, which also carries the BSSID, the channel
+/// and whether the security is RSN or WEP -- facts the protocol needs and a
+/// person reading a list does not. `from_bss` is the one conversion, so the
+/// two shapes cannot drift into disagreeing about what a network is called.
 pub struct Network {
     pub ssid: alloc::string::String,
     /// dBm, as the radio reports it. Negative, closer to zero is stronger.
     pub rssi: i16,
     /// False for an open network, which the UI has to say out loud.
     pub secured: bool,
+}
+
+impl Network {
+    pub fn from_bss(b: &crate::net::mlme::Bss) -> Network {
+        Network { ssid: b.ssid.clone(), rssi: b.rssi as i16, secured: b.secured }
+    }
 }
 
 /// Signal as a count out of four, the way every operator already reads it.
@@ -267,8 +288,24 @@ pub fn report() {
         Some(Probe::Unsupported { vendor, device, what }) => {
             kprintln!("  {}", what);
             kprintln!("  pci {:04x}:{:04x}", vendor, device);
-            kprintln!("  no driver. see the note at the top of net/wifi.rs for");
-            kprintln!("  what one costs -- firmware is the deciding factor.");
+            // The reason comes off the registry row rather than out of a
+            // sentence here, so there is one place that says why a part is
+            // undriven and it is the place that matches the ids.
+            for h in hardware() {
+                if h.vendor == vendor && h.device == device {
+                    if let Some(gap) = h.gap {
+                        kprintln!("  no driver: {}", gap);
+                    }
+                }
+            }
         }
     }
+
+    // What is missing is the part, and saying so is the point of these lines.
+    // An operator told only "no wireless" cannot tell a machine with no stack
+    // from a machine with no radio, and those want completely different next
+    // steps -- one is months of work and the other is a dongle.
+    kprintln!("  everything above the radio is written and checked with no");
+    kprintln!("  hardware at all: diag radio, softmac, ccmp, ccm, mlme.");
+    kprintln!("  a new part is one impl of dev::radio::Radio.");
 }
