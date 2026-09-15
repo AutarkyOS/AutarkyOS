@@ -9,6 +9,7 @@ pub mod browse;
 pub mod compose;
 pub mod console;
 pub mod mines;
+pub mod netman;
 pub mod oracle;
 pub mod paint;
 pub mod write;

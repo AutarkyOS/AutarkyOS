@@ -175,21 +175,69 @@ pub fn hardware() -> alloc::vec::Vec<Hardware> {
 
 /// One network as a scan reports it.
 ///
-/// Deliberately *not* `mlme::Bss`, which also carries the BSSID, the channel
-/// and whether the security is RSN or WEP -- facts the protocol needs and a
-/// person reading a list does not. `from_bss` is the one conversion, so the
-/// two shapes cannot drift into disagreeing about what a network is called.
+/// The display shape of `mlme::Bss`, and `from_bss` is the one conversion so
+/// the two cannot drift into disagreeing about what a network is called.
 pub struct Network {
+    /// The network's name. **SSID and ESSID are the same field**; ESSID is the
+    /// older name for it, from when a distinction between independent and
+    /// infrastructure networks was still being drawn. Showing both would be
+    /// showing one thing twice under two labels, so this shows one.
     pub ssid: alloc::string::String,
+    /// The access point's own address, which is what BSSID means. This is the
+    /// one field that tells two access points carrying the same network apart,
+    /// so it is the thing to look at when a laptop keeps joining the far one.
+    pub bssid: crate::net::Mac,
+    pub channel: u8,
     /// dBm, as the radio reports it. Negative, closer to zero is stronger.
     pub rssi: i16,
     /// False for an open network, which the UI has to say out loud.
     pub secured: bool,
+    /// An RSN element was present, so WPA2 or later. Without it, `secured`
+    /// means WEP, which is a different thing wearing the same word.
+    pub rsn: bool,
 }
 
 impl Network {
     pub fn from_bss(b: &crate::net::mlme::Bss) -> Network {
-        Network { ssid: b.ssid.clone(), rssi: b.rssi as i16, secured: b.secured }
+        Network {
+            ssid: b.ssid.clone(),
+            bssid: b.bssid,
+            channel: b.channel,
+            rssi: b.rssi as i16,
+            secured: b.secured,
+            rsn: b.rsn,
+        }
+    }
+
+    /// What the security actually is, in the three words that differ.
+    ///
+    /// **"Secured" is not one state.** An open network and a WEP network are
+    /// both things this machine can join and neither is protected; WEP has
+    /// been broken since 2001 and a list that calls it secured is telling the
+    /// operator the opposite of what is true.
+    pub fn security(&self) -> &'static str {
+        match (self.secured, self.rsn) {
+            (false, _) => "open",
+            (true, false) => "WEP (broken)",
+            (true, true) => "WPA2-CCMP",
+        }
+    }
+
+    pub fn band(&self) -> &'static str {
+        match crate::dev::radio::band_of(self.channel) {
+            Some(crate::dev::radio::Band::G24) => "2.4",
+            Some(crate::dev::radio::Band::G5) => "5",
+            None => "?",
+        }
+    }
+
+    /// `02:00:00:00:00:aa`, which is how everybody writes one.
+    pub fn ap(&self) -> alloc::string::String {
+        let b = &self.bssid;
+        alloc::format!(
+            "{:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
+            b[0], b[1], b[2], b[3], b[4], b[5]
+        )
     }
 }
 
@@ -247,6 +295,15 @@ pub fn adapter() -> Adapter {
 /// one who sees why there is no list can act on it. Every arm is a real
 /// answer, and none of them is an empty list standing in for a missing driver.
 pub fn scan() -> Result<alloc::vec::Vec<Network>, &'static str> {
+    // A radio that is actually installed answers for itself, and an empty list
+    // from one is a real answer -- "nothing in range" -- rather than the
+    // missing-driver case this function's other arms exist to name. The
+    // difference matters because the two need opposite next steps, and a page
+    // that showed one empty list for both is what this module opens by
+    // refusing to do.
+    if let Some(w) = crate::net::wlan() {
+        return Ok(w.networks());
+    }
     match adapter() {
         // The driver powers this chip on and loads its MAC registers, and the
         // PHY, AGC and radio tables are transcribed. What is missing is the

@@ -135,6 +135,7 @@ const ICMP_ECHO_REPLY: u8 = 0;
 pub mod ccmp;
 pub mod hostile;
 pub mod mlme;
+pub mod rehearsal;
 pub mod softmac;
 pub mod css;
 pub mod dhcp;
@@ -227,6 +228,21 @@ pub fn wlan() -> Option<&'static mut dyn Wlan> {
     ifaces()[WLAN0].nic.as_mut()?.wireless()
 }
 
+/// What the wireless part calls itself, for anything that shows an adapter.
+pub fn wlan_name() -> Option<&'static str> {
+    Some(wlan()?.radio_name())
+}
+
+/// The network `wlan0` is on, by name.
+pub fn wlan_ssid() -> Option<alloc::string::String> {
+    wlan()?.ssid()
+}
+
+/// The access point `wlan0` is on.
+pub fn wlan_ap() -> Option<Mac> {
+    wlan()?.joined_ap()
+}
+
 /// Milliseconds since boot, for the state machine that takes a clock.
 ///
 /// `rdtsc` and not `ticks()`, which is what this tree's own note says to use
@@ -249,12 +265,61 @@ pub fn now_ms() -> u64 {
 /// receive interrupts in this kernel, so a protocol advances when somebody
 /// gives it a slice. Cheap when there is no radio, which is every machine
 /// this has run on so far.
-pub fn wifi_service() {
+/// One turn of the wireless state machine, and nothing else.
+///
+/// **Two tasks call this**, so it is claimed rather than merely careful:
+/// `wlan()` hands out `&mut dyn Wlan`, and two of those at once is undefined
+/// behaviour whatever they then do. The shell's idle loop calls it as often as
+/// it goes round; the clock task calls it ten times a second so a scan keeps
+/// moving while the shell is busy inside a long command -- which is not a
+/// testing convenience, it is a scan that otherwise stalls for as long as
+/// anything else is running.
+///
+/// It draws nothing. That is the whole reason it is separate from
+/// `wifi_service`: `desk::draw` writes the compositor's back buffer through a
+/// `&mut` and runs on the shell's task, and calling it from the clock task
+/// would be the second writer that `paint_clock` takes a claim to avoid.
+pub fn wifi_poll() {
+    if WIFI_BUSY.swap(true, core::sync::atomic::Ordering::Acquire) {
+        return;
+    }
     let now = now_ms();
     if let Some(w) = wlan() {
         w.poll_mlme(now);
     }
+    WIFI_BUSY.store(false, core::sync::atomic::Ordering::Release);
 }
+
+/// The same, plus a repaint when what is in the air has changed.
+///
+/// **Only from the shell's idle loop**, because of the draw. A scan takes
+/// seconds and happens between keystrokes, so a window showing one has nothing
+/// to repaint on: the desktop draws when something happens and out here
+/// nothing does, which reads as a Rescan button that did nothing until you
+/// click something else.
+///
+/// On *change* rather than on a timer. A frame is about two milliseconds and a
+/// scan settles after a few seconds, so the whole of one costs a handful of
+/// frames. The state name is a `&'static str` from one table, so comparing the
+/// pointer is comparing the state.
+pub fn wifi_service() {
+    wifi_poll();
+    let Some(w) = wlan() else { return };
+    let (state, secure) = w.status();
+    let seen = w.networks().len();
+    let now_key = (state.as_ptr() as usize, seen, secure as usize);
+    let last = unsafe { &mut *WIFI_SEEN.get() };
+    if *last != now_key {
+        *last = now_key;
+        crate::gfx::desk::draw();
+    }
+}
+
+/// What the last `wifi_service` saw, so a repaint happens on change only.
+static WIFI_SEEN: Racy<(usize, usize, usize)> = Racy::new((0, 0, 0));
+/// Held across a poll, because the shell and the clock both reach for it.
+static WIFI_BUSY: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
 
 // --- routing -------------------------------------------------------------
 

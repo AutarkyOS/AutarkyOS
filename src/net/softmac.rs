@@ -159,6 +159,11 @@ impl<R: Radio> Link<R> {
         self.bssid
     }
 
+    /// What the part underneath calls itself.
+    pub fn name(&self) -> &'static str {
+        self.radio.name()
+    }
+
     /// Take the management frames seen since the last call.
     ///
     /// **There is one drain on a radio**, and whichever of the two consumers
@@ -222,7 +227,19 @@ impl<R: Radio> Nic for Link<R> {
     }
 
     fn receive(&mut self) -> Option<Vec<u8>> {
-        loop {
+        // **Bounded, because the loop's exit condition belongs to the driver.**
+        // `rx` returning `None` is what ends this, and a part that always has
+        // one more frame -- a ring the driver never advances, a fake that
+        // manufactures beacons on demand -- turns this into a kernel that
+        // stops answering with no fault and no message. That is not
+        // hypothetical: the rehearsal radio did exactly it, and what it looked
+        // like was a shell that never gave the prompt back.
+        //
+        // Sixty-four is well past what a real part delivers between polls and
+        // far short of a hang; what is left in the queue is taken on the next
+        // call, which is the next trip round the idle loop.
+        const PER_CALL: usize = 64;
+        for _ in 0..PER_CALL {
             let got = self.radio.rx()?;
             if got.frame.len() < 24 {
                 self.dropped_malformed += 1;
@@ -306,6 +323,7 @@ impl<R: Radio> Nic for Link<R> {
             eth.extend_from_slice(payload);
             return Some(eth);
         }
+        None
     }
 
     fn kind(&self) -> Kind {

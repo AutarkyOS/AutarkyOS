@@ -319,6 +319,14 @@ impl<R: Radio> Station<R> {
                 best = Some(b.clone());
             }
         }
+        // A scan with no network named is a scan, and it is over. Reporting
+        // "no access point is carrying that network" would be true of the
+        // empty string and useless to read: the operator asked what is in the
+        // air, got an answer, and is not looking for anything yet.
+        if self.ssid.is_empty() {
+            self.state = State::Idle;
+            return;
+        }
         let b = match best {
             Some(b) => b,
             None => {
@@ -601,7 +609,32 @@ impl<R: Radio> Wlan for Station<R> {
     }
 
     fn networks(&self) -> Vec<crate::net::wifi::Network> {
-        self.seen.iter().map(crate::net::wifi::Network::from_bss).collect()
+        let mut v: Vec<crate::net::wifi::Network> =
+            self.seen.iter().map(crate::net::wifi::Network::from_bss).collect();
+        // Strongest first, which is the order a person wants and also the
+        // order `choose` picks in -- a list sorted differently from the
+        // decision would have the operator reading one thing and the machine
+        // doing another.
+        v.sort_by(|a, b| b.rssi.cmp(&a.rssi));
+        v
+    }
+
+    fn ssid(&self) -> Option<String> {
+        if self.state != State::Running {
+            return None;
+        }
+        self.target.as_ref().map(|b| b.ssid.clone())
+    }
+
+    fn joined_ap(&self) -> Option<Mac> {
+        if self.state != State::Running {
+            return None;
+        }
+        self.target.as_ref().map(|b| b.bssid)
+    }
+
+    fn radio_name(&self) -> &'static str {
+        self.link.name()
     }
 }
 
@@ -710,16 +743,41 @@ impl Ap {
         let sent = core::mem::take(&mut radio.sent);
         let mut out: Vec<Vec<u8>> = Vec::new();
         for f in sent {
-            if on != self.channel {
-                continue;
-            }
-            match dot11::mgmt_subtype(&f) {
-                Some(s) => self.on_mgmt(s, &f, &mut out),
-                None => self.on_data(&f, &mut out),
-            }
+            self.handle(&f, on, &mut out);
         }
         for f in out {
             radio.inbox.push(f);
+        }
+    }
+
+    /// One frame heard, and whatever this would say back.
+    ///
+    /// Split out of `serve` so something that is not a `Loopback` can drive an
+    /// access point -- `net::rehearsal` puts several of these behind one radio
+    /// to make a room. The channel is an argument because that is the whole of
+    /// whether this access point can hear the frame at all.
+    pub fn handle(&mut self, f: &[u8], on: u8, out: &mut Vec<Vec<u8>>) {
+        if on != self.channel {
+            return;
+        }
+        match dot11::mgmt_subtype(f) {
+            Some(s) => self.on_mgmt(s, f, out),
+            None => self.on_data(f, out),
+        }
+    }
+
+    /// Let the station address this access point at all.
+    ///
+    /// A fake built for one station knows who it is talking to at
+    /// construction. A room does not: every access point in it has to answer
+    /// whichever station probes, so the address is set when one does.
+    pub fn talking_to(&mut self, sta: Mac) {
+        if self.sta != sta {
+            self.sta = sta;
+            self.authed = false;
+            self.assoced = false;
+            self.auth = None;
+            self.keys = None;
         }
     }
 

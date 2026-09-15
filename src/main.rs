@@ -721,6 +721,12 @@ fn clock_task() {
         // `sysbox::autosnap_poll` for why it cannot happen here.
         sysbox::autosnap_tick();
 
+        // The wireless state machine, so a scan keeps moving while the shell
+        // is inside a long command. `wifi_poll` and not `wifi_service`: the
+        // second one draws, and the compositor's back buffer belongs to the
+        // shell's task. Claimed against the idle loop, which calls it too.
+        net::wifi_poll();
+
         let tenths = dev::lapic::ticks() * 10 / TIMER_HZ as u64;
         if tenths != last {
             let crossed_second = tenths / 10 != last / 10;

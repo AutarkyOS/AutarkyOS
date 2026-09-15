@@ -67,6 +67,17 @@ pub trait Wlan {
     /// that has to mean either.
     fn status(&self) -> (&'static str, bool);
     fn networks(&self) -> Vec<crate::net::wifi::Network>;
+    /// The network this is on, by name, or nothing if it is not on one.
+    fn ssid(&self) -> Option<alloc::string::String>;
+    /// The *access point* this is on, which is the one thing that tells two
+    /// carrying the same network apart. Anything marking "the one we are on"
+    /// in a list has to match this and not the name -- the first version of
+    /// the network manager matched the name and put the mark on both.
+    fn joined_ap(&self) -> Option<Mac>;
+    /// What the part calls itself. Straight from `Radio::name`, so a radio
+    /// with no chip behind it says so and every window showing an adapter
+    /// shows the word it chose.
+    fn radio_name(&self) -> &'static str;
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]

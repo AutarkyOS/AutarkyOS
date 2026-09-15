@@ -1710,7 +1710,7 @@ pub fn program_manager() -> Panel {
         run("System status", "win open status"),
         run("Memory", "win open memory"),
         run("Tasks", "win open tasks"),
-        run("Network", "win open network"),
+        run("Network", "network"),
         run("Storage", "win open storage"),
         run("Files", "win open files"),
         run("Mind (workspace)", "mind open"),

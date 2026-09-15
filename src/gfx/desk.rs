@@ -1165,6 +1165,13 @@ pub fn open_write(path: &str) {
     open_app("Write", ICO_WRITE, Box::new(super::write::Writer::new(path)), w, h);
 }
 
+/// The network manager. Its own icon, because it is the one window an
+/// operator opens when the network is the thing that is wrong.
+pub fn open_netman() {
+    let (w, h) = super::netman::NetMan::preferred();
+    open_app("Network", ICO_NET, Box::new(super::netman::NetMan::new()), w, h);
+}
+
 pub fn open_todo() {
     let (w, h) = super::todo::Todo::preferred();
     open_app("ToDo", ICO_TODO, Box::new(super::todo::Todo::new()), w, h);

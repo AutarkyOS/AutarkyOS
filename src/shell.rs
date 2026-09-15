@@ -4405,6 +4405,7 @@ fn execute(line: &str, boot: &BootInfo, acpi: &Option<Acpi>, interp: &mut aiksi:
             other => kprintln!("  usage: initiative on|off|now (got '{}')", other),
         },
         "mines" | "minesweeper" => crate::gfx::desk::open_mines(),
+        "network" | "netman" => crate::gfx::desk::open_netman(),
         "agentlog" => crate::gfx::desk::open_agentlog(),
         "todo" => {
             // No args opens the runbook window -- what someone clicking the
@@ -7871,6 +7872,42 @@ fn wifi_cmd(rest: &str) {
                 }
             }
         }
+        // A radio with no chip behind it, so the manager and everything under
+        // it can be looked at on a machine with no wireless part. Loud about
+        // what it is, here and in the window, because a list of networks that
+        // do not exist shown the way a real list is shown is the one thing
+        // this must not do.
+        "rehearse" | "rehearsal" => {
+            if a == "off" {
+                let w = &mut crate::net::ifaces()[crate::net::WLAN0];
+                let had = w.nic.is_some();
+                w.nic = None;
+                w.up = false;
+                kprintln!(
+                    "  {}",
+                    if had { "wlan0 is empty again" } else { "wlan0 was already empty" }
+                );
+                return;
+            }
+            if crate::net::ifaces()[crate::net::WLAN0].nic.is_some() {
+                kprintln!("  wlan0 already has a driver. 'wifi rehearse off' first.");
+                return;
+            }
+            let mac = [0x02, 0x47, 0x4C, 0x41, 0x44, 0x53];
+            let r = crate::net::rehearsal::Rehearsal::new(mac);
+            if !crate::net::attach_radio(r) {
+                kprintln!("  refused, which should not happen: a rehearsal radio is SoftMAC");
+                return;
+            }
+            console::set_color(YELLOW);
+            kprintln!("  NOT REAL HARDWARE. A synthetic room, so the stack above the");
+            kprintln!("  radio can be driven on a machine that has no radio.");
+            console::set_color(LTGRAY);
+            for line in crate::net::rehearsal::Rehearsal::room() {
+                kprintln!("    {}", line);
+            }
+            kprintln!("  'network' opens the manager. 'wifi scan' from here, then 'wifi'.");
+        }
         "frames" => {
             // Not an operator command so much as a tap for the host-side
             // checker, and printed rather than returned because a serial line
@@ -7887,7 +7924,9 @@ fn wifi_cmd(rest: &str) {
             }
         },
         _ => {
-            kprintln!("  usage: wifi [status] | scan | join <ssid> [pass] | leave | frames");
+            kprintln!("  usage: wifi [status] | scan | join <ssid> [pass] | leave");
+            kprintln!("         wifi rehearse [off]   a synthetic room, for when there is no radio");
+            kprintln!("         wifi frames           every frame as hex, for tools/dot11check.py");
         }
     }
 }
