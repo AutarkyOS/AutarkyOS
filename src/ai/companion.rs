@@ -245,6 +245,30 @@ pub fn turn(message: &str, opts: &super::GenOpts) -> usize {
         // pinning none of it.
         let n = super::with_engine(|e| e.tok.encode(&sys, true, false).len()).unwrap_or(0);
         unsafe { *SYS_LEN.get() = n };
+        // **Said at the one moment both numbers are known.** `sink_count`
+        // clamps the pinned span to a third of the trained length, and when
+        // that bites the *tail* of the system turn stops being pinned -- it
+        // scrolls out like any other text, taking whatever was at the end of
+        // it. `/ai/about` is appended to and is therefore always at the end,
+        // so what is lost is precisely what the operator most recently asked
+        // to be remembered.
+        //
+        // Nothing reported this. `widen_if_near_the_wall` only warns when the
+        // pinned span falls to `MIN_SINKS`, which is a different and much
+        // later failure, so a system turn one token over the ceiling looked
+        // exactly like one that fitted.
+        if let Some(trained) = super::with_engine(|e| e.model.cfg.seq_len) {
+            let ceiling = (trained / 3).max(MIN_SINKS);
+            if n > ceiling {
+                crate::kprintln!(
+                    "  (the system turn is {} tokens and only {} can be pinned -- the last {} \
+                     will scroll; '/ai/about' is what grows it)",
+                    n,
+                    ceiling,
+                    n - ceiling
+                );
+            }
+        }
         prompt.push_str(&sys);
     } else {
         // Close the assistant's previous turn before opening the user's. The

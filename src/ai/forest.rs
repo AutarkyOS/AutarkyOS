@@ -552,6 +552,20 @@ pub fn embed() {
 
     let bytes = t.encode().len();
     let wrote = crate::ai::route::store(&t);
+
+    // The per-node vectors, beside the subject table. Written raw: centring is
+    // the subject table's centroid and it is applied at load, so one table can
+    // be rebuilt without the other going stale in a way nothing would notice.
+    let nodes = crate::ai::recall::Nodes {
+        dim: t.dim,
+        paths: ix.paths.clone(),
+        vecs: vecs.iter().flat_map(|v| v.iter().copied()).collect(),
+    };
+    let nbytes = nodes.encode().len();
+    let nwrote = crate::ai::recall::store(&nodes);
+    // Whatever was cached came from the table that was just replaced.
+    crate::ai::recall::forget();
+
     let us = (crate::time::rdtsc() - t0) / mhz;
 
     // Tenths of a percent in whole numbers: no float formatting to get wrong
@@ -587,7 +601,178 @@ pub fn embed() {
     } else {
         kprintln!("  the table would not write to {}", crate::ai::route::TABLE);
     }
+    if nwrote {
+        kprintln!("  {} B of node vectors at {}", nbytes, crate::ai::recall::NODES);
+    } else {
+        kprintln!("  the node vectors would not write to {}", crate::ai::recall::NODES);
+    }
     kprintln!("  built and scored in {} ms, no forward pass anywhere", us / 1000);
+}
+
+/// How many candidates are offered to the fill.
+///
+/// The fill is best-first and skips what will not fit, so offering more than a
+/// budget can hold costs only the bodies fetched for them -- a handful of disk
+/// reads at a few hundred bytes a node. Offering too *few* is the error that
+/// matters: the budget would go unspent with nothing saying why.
+const OFFERED: usize = 24;
+
+/// What would go into the turn for this question, and what it costs.
+///
+/// `subjects` of zero scores every node, which is the **default and the
+/// accurate one**. Routing filters to the top few subjects first, which is what
+/// a corpus too large to score exhaustively would have to do -- and its price
+/// is measured here rather than assumed. On this forest it is steep: routing to
+/// three subjects of sixteen found four of the nine entries a full scan chose,
+/// while scoring all nine thousand nodes costs five million multiply-adds and
+/// no disk at all. The router earns its keep when the vectors stop fitting, and
+/// not before.
+pub fn recall_query(q: &str, budget: usize, subjects: usize) {
+    // Held for the whole call, so the pooling and every token count come from
+    // the same engine. Without it another task can take it mid-fill and the
+    // counter starts answering "no", which the fill would read as "nothing
+    // fits" and render an empty block for no visible reason.
+    let _claim = match crate::ai::claim_engine() {
+        Some(c) => c,
+        None => {
+            kprintln!("  {}", crate::ai::engine_refusal());
+            return;
+        }
+    };
+    let t = match crate::ai::route::load() {
+        Some(t) => t,
+        None => {
+            kprintln!("  no routing table -- 'forest embed' builds one");
+            return;
+        }
+    };
+    let mut v = match crate::ai::with_engine(|e| crate::ai::vocab::pool_text(&e.model, &e.tok, q)) {
+        Some(v) => v,
+        None => {
+            kprintln!("  {}", crate::ai::engine_refusal());
+            return;
+        }
+    };
+    t.centre(&mut v);
+
+    // Two lists over the same scores: everything, and the part of it the router
+    // would have reached. The second is what a corpus too large to score
+    // exhaustively would be limited to, so the difference between them is the
+    // price of routing -- measured here rather than asserted.
+    let lists = crate::ai::recall::with_nodes(|n| {
+        if n.dim != v.len() {
+            return None;
+        }
+        let mut all: Vec<(usize, f32)> = (0..n.len())
+            .map(|i| (i, crate::ai::vocab::cosine(&v, n.row(i))))
+            .collect();
+        all.sort_by(|a, b| {
+            b.1.partial_cmp(&a.1).unwrap_or(core::cmp::Ordering::Equal).then(a.0.cmp(&b.0))
+        });
+        let m = crate::ai::route::means(&t);
+        let keep: Vec<usize> = crate::ai::route::rank(&t, &m, &v)
+            .iter()
+            .take(subjects)
+            .map(|(i, _)| *i)
+            .collect();
+        let named: Vec<String> = keep.iter().map(|k| t.names[*k].clone()).collect();
+        let take = |src: &[(usize, f32)]| -> Vec<(String, f32)> {
+            src.iter().take(OFFERED).map(|(i, sc)| (n.paths[*i].clone(), *sc)).collect()
+        };
+        let routed: Vec<(usize, f32)> = if subjects == 0 {
+            all.clone()
+        } else {
+            all.iter()
+                .copied()
+                .filter(|(i, _)| {
+                    let sub = crate::ai::route::subject_of(&n.paths[*i]);
+                    named.iter().any(|k| k == sub)
+                })
+                .collect()
+        };
+        Some((take(&all), take(&routed), named, n.len()))
+    })
+    .flatten();
+    let (all, routed, named, total) = match lists {
+        Some(v) => v,
+        None => {
+            kprintln!("  no node vectors at {} -- 'forest embed' writes them", crate::ai::recall::NODES);
+            kprintln!("  (or the table's width does not match this model -- rebuild it)");
+            return;
+        }
+    };
+
+    let bodies = |list: &[(String, f32)]| -> Vec<crate::ai::recall::Cand> {
+        list.iter()
+            .filter_map(|(path, score)| {
+                let b = sysbox::read_blob(path)?;
+                Some(crate::ai::recall::Cand {
+                    path: path.clone(),
+                    score: *score,
+                    body: String::from_utf8_lossy(&b).into_owned(),
+                })
+            })
+            .collect()
+    };
+    // Encoded the way `generate` will, per the module header. A refusal answers
+    // `usize::MAX`, so a candidate is dropped rather than admitted -- the safe
+    // direction, since the whole point is never to exceed the budget.
+    let count = |text: &str| {
+        crate::ai::with_engine(|e| e.tok.encode(text, false, false).len()).unwrap_or(usize::MAX)
+    };
+
+    let rc = bodies(&routed);
+    let ac = bodies(&all);
+    let rf = crate::ai::recall::fill(&rc, budget, count);
+    let af = crate::ai::recall::fill(&ac, budget, count);
+
+    if subjects == 0 {
+        kprintln!("  every subject, {} node(s) scored", total);
+    } else {
+        kprintln!("  {} subject(s) of {}, {} node(s) scored", named.len(), t.len(), total);
+        for nm in &named {
+            kprintln!("    {}", nm.strip_prefix(ROOT).unwrap_or(nm));
+        }
+    }
+    kprintln!(
+        "  budget {} token(s), used {}, {} entr(ies) kept, {} skipped",
+        budget,
+        rf.tokens,
+        rf.taken.len(),
+        rf.skipped
+    );
+    // The claim, stated where it can be read rather than only in a suite.
+    if rf.tokens > budget {
+        kprintln!("  OVER BUDGET -- this is the one thing this must not do");
+    }
+
+    // What routing cost, in the only currency that matters here: how much of
+    // the answer a full scan would have given was still found. Printed only
+    // when routing was on, because comparing a full scan against itself is a
+    // line that always reads perfect and means nothing.
+    if subjects > 0 {
+        let same = rf
+            .taken
+            .iter()
+            .filter(|i| af.taken.iter().any(|j| ac[*j].path == rc[**i].path))
+            .count();
+        kprintln!(
+            "  a full scan would have used {} token(s) over {} entr(ies); routing found {} of them",
+            af.tokens,
+            af.taken.len(),
+            same
+        );
+    }
+
+    for (n, i) in rf.taken.iter().enumerate() {
+        let c = &rc[*i];
+        let short = c.path.strip_prefix(ROOT).unwrap_or(&c.path);
+        kprintln!("  {:.4}  {}. {}", c.score, n + 1, short);
+    }
+    kprintln!("  ---- what would go into the turn ----");
+    for line in rf.text.lines() {
+        kprintln!("  {}", line);
+    }
 }
 
 /// Leave-one-out over every node: (top-1, top-3, scored, alone).
@@ -674,6 +859,35 @@ pub fn command(rest: &str) {
         },
         "index" => index_report(),
         "embed" => embed(),
+        "recall" => {
+            let rest = rest.strip_prefix("recall").unwrap_or("").trim();
+            // An optional leading budget, so the common case is just a
+            // question and the uncommon one needs no flag to parse.
+            // An optional leading budget, then an optional subject count, so
+            // the common case is a bare question. Zero subjects means score
+            // everything, which is the default because it is the accurate one.
+            let num = |s: &str| s.parse::<usize>().ok();
+            let (budget, rest) = match rest.split_once(' ') {
+                Some((h, t)) => match num(h) {
+                    Some(b) => (b, t.trim()),
+                    None => (256, rest),
+                },
+                None => (256, rest),
+            };
+            let (subjects, q) = match rest.split_once(' ') {
+                Some((h, t)) => match num(h) {
+                    Some(k) => (k, t.trim()),
+                    None => (0, rest),
+                },
+                None => (0, rest),
+            };
+            if q.is_empty() {
+                kprintln!("  usage: forest recall [budget] [subjects] <question>");
+                kprintln!("  no subject count scores every node, which is the accurate way");
+            } else {
+                recall_query(q, budget, subjects);
+            }
+        }
         "route" => {
             let q = rest.strip_prefix("route").unwrap_or("").trim();
             if q.is_empty() {
@@ -696,6 +910,7 @@ pub fn command(rest: &str) {
             kprintln!("  forest body <path>  one node, read off the disk and not the namespace");
             kprintln!("  forest embed        build the branch table, store it, and score it");
             kprintln!("  forest route <q>    which branches a question belongs in");
+            kprintln!("  forest recall [n] [k] <q>  what fits in n tokens; k subjects, 0 for all");
         }
     }
 }

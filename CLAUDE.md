@@ -5112,6 +5112,53 @@ top-1 won, and **that choice is budget-dependent**: a retrieval loading three
 subjects would prefer the other one. Both figures print every run so it can be
 revisited with evidence.
 
+### Budgeted retrieval
+
+`src/ai/recall.rs`. Phase 4: pick nodes for a question and render as many as a
+token budget admits. `forest recall [budget] [subjects] <question>`.
+
+**The budget is counted, never estimated.** `fill` takes the counter as a
+closure and re-encodes the accumulated block after every candidate, because
+tokenisation is not additive at a boundary -- summing per-node counts drifts,
+always in the direction of admitting one node too many. Measured: budget 1500,
+used 1496, nine entries kept, fifteen skipped, identical across runs.
+
+Two decisions the suite pins down. A candidate that does not fit is **skipped
+rather than ending the fill** -- the list is sorted by score and not by size, so
+stopping at the first overflow throws away every smaller entry behind one large
+one and leaves the budget unspent with nothing saying why. And the preamble is
+only paid for once something fits beneath it: a heading promising entries with
+nothing under it is worse than silence.
+
+**Scoring everything is the default, because the measurement said so.**
+`recall::Nodes` is one pooled vector per node, 21 MB at dim 576 over 8,913
+nodes, written by `forest embed` and cached after one load. With it resident,
+nine thousand cosines is five million multiply-adds and no disk at all -- so
+routing first costs recall and buys nothing at this size. Measured on the same
+question at budget 1500: routing to three subjects of sixteen found **four of
+the nine** entries a full scan chose, for the same 1496 tokens. Routing is
+opt-in, and prints that price every time. It earns its keep when the vectors
+stop fitting, and not before.
+
+Both sides are centred or neither is: the query is centred against the subject
+table, so `Nodes::centre_with` applies the same centroid at load. Comparing a
+centred query to raw node vectors answers a perfectly plausible cosine to a
+different question.
+
+**And the silent unpinning is closed.** `sink_count` clamps the pinned span to a
+third of the trained length, and when that bit, the *tail* of the system turn
+stopped being pinned and scrolled out with no message -- `/ai/about` is appended
+to and is therefore always at the end, so what was lost was precisely what the
+operator had most recently asked to be remembered. `companion::turn` now says so
+at the one moment both numbers are known:
+
+    (the system turn is 199 tokens and only 170 can be pinned --
+     the last 29 will scroll; '/ai/about' is what grows it)
+
+`widen_if_near_the_wall` only warned when the pinned span fell to `MIN_SINKS`,
+which is a different and much later failure, so a system turn one token over the
+ceiling looked exactly like one that fitted.
+
 `find`, `locate` and `locate_under` do the walking; `read_at`, `read_all` and
 `head_line` are the byte-granular side. `read_blocks` had been finished and
 unreachable for as long as it had existed. `forest::index_at` is the other
