@@ -19,6 +19,7 @@
 //! step, `rm` cannot destroy content, and a snapshot costs nothing. Those are
 //! not features bolted on, they are what content addressing already implies.
 
+pub mod stored;
 pub mod tree;
 
 use crate::gfx::console::{self, LTCYAN, LTGREEN, LTGRAY, LTRED, WHITE, YELLOW};

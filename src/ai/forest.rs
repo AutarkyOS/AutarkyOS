@@ -38,6 +38,7 @@ use alloc::string::String;
 use alloc::vec::Vec;
 
 use crate::kprintln;
+use crate::store::cas;
 use crate::sysbox;
 
 /// Where `pkg add` leaves a package named `forest`.
@@ -249,9 +250,15 @@ pub fn cost() {
         heads += head_bytes(&p);
     }
     kprintln!("  {} node(s), {} B of bodies resident", c.nodes, c.bytes);
-    kprintln!("  {} B of head lines -- what an index would hold", heads);
+    kprintln!("  {} B of head lines -- the *text* an index holds", heads);
     let pct = if c.bytes == 0 { 0 } else { heads * 100 / c.bytes };
     kprintln!("  heads are {}% of the forest, so {}% could leave memory", pct, 100 - pct);
+    // That second figure was quoted as what an index costs and it is not. A
+    // usable index also has to know each node's path and where its body lives,
+    // which `forest index` measures against a real one: 1,577,626 B of heads
+    // became 2,602,495 B of index over 8,913 nodes, so 20% became 33%. Still
+    // two thirds of the corpus leaving memory, and not four fifths.
+    kprintln!("  'forest index' is the figure including paths and chunk refs");
     kprintln!("  widest directory {}, deepest {} level(s) under the root", c.widest, c.deepest);
     kprintln!("  every node was read to measure this; nothing caches it yet");
 }
@@ -274,6 +281,136 @@ fn head_bytes(dir: &str) -> usize {
     total
 }
 
+// --- the index, and bodies that need not be resident ---------------------
+
+/// A forest's heads in memory and its bodies on disk.
+///
+/// This is the shape the whole retrieval design was described in: the head is
+/// `subject | concept | terms` and is what a router pools over, the body is
+/// everything else and is what reaches the context. Keeping the first and not
+/// the second is what makes a corpus larger than memory usable at all, and the
+/// measured split says how much that buys -- `forest cost` put heads at 20% of
+/// an 8,913-node forest, so four fifths of it can leave.
+pub struct Index {
+    pub paths: Vec<String>,
+    pub heads: Vec<String>,
+    pub bodies: Vec<cas::ChunkRef>,
+}
+
+impl Index {
+    pub fn len(&self) -> usize {
+        self.paths.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.paths.is_empty()
+    }
+
+    /// What the index costs in memory.
+    ///
+    /// The strings plus a chunk reference each. `ChunkRef` is a hash, an LBA
+    /// and a length, so 48 bytes -- taken from `size_of` rather than written
+    /// down, since a field added to it would otherwise make this quietly wrong
+    /// in the direction that matters.
+    pub fn resident(&self) -> usize {
+        let mut n = self.bodies.len() * core::mem::size_of::<cas::ChunkRef>();
+        for h in &self.heads {
+            n += h.len();
+        }
+        for q in &self.paths {
+            n += q.len();
+        }
+        n
+    }
+
+    /// What the bodies would cost if they were resident too.
+    pub fn body_bytes(&self) -> u64 {
+        self.bodies.iter().map(|r| r.len).sum()
+    }
+
+    /// One body, read off the disk on demand.
+    pub fn body(&self, i: usize) -> Option<Vec<u8>> {
+        sysbox::stored::read_all(self.bodies.get(i)?)
+    }
+
+    pub fn position(&self, path: &str) -> Option<usize> {
+        self.paths.iter().position(|q| q == path)
+    }
+}
+
+/// Build an index from the store alone.
+///
+/// **Nothing here reads the working tree**, and that is the claim rather than
+/// an implementation note: a forest that was never restored into memory -- or
+/// one too large to be -- is still indexable. The cost is one directory chunk
+/// per branch and one block per node, against `read_node`'s whole-blob read
+/// and SHA-256 per node, which is what makes restoring a large forest take
+/// longer than the boot deadline.
+pub fn index_at(root: &str) -> Index {
+    let mut ix = Index { paths: Vec::new(), heads: Vec::new(), bodies: Vec::new() };
+    for (path, cr) in sysbox::stored::locate_under(root) {
+        let head = match sysbox::stored::head_line(&cr) {
+            Some(h) => h,
+            None => continue,
+        };
+        ix.paths.push(path);
+        ix.heads.push(head);
+        ix.bodies.push(cr);
+    }
+    ix
+}
+
+pub fn index_report() {
+    if !sysbox::stored::available() {
+        kprintln!("  no store mounted -- 'store init', then 'snap', and this reads from that");
+        return;
+    }
+    let mhz = crate::time::tsc_mhz().max(1);
+    let t0 = crate::time::rdtsc();
+    let ix = index_at(ROOT);
+    let us = (crate::time::rdtsc() - t0) / mhz;
+    if ix.is_empty() {
+        kprintln!("  nothing under {} in the last snapshot -- 'snap' after importing", ROOT);
+        return;
+    }
+    let mem = ix.resident();
+    let disk = ix.body_bytes();
+    kprintln!("  {} node(s) indexed from the store, no body resident", ix.len());
+    kprintln!("  {} B of index in memory, {} B of bodies left on disk", mem, disk);
+    let pct = if disk == 0 { 0 } else { mem as u64 * 100 / disk };
+    kprintln!("  the index is {}% of what the bodies weigh", pct);
+    kprintln!("  built in {} ms, reading one block per node and no body", us / 1000);
+}
+
+/// One body, fetched through the store rather than out of the namespace.
+///
+/// Beside `show` rather than replacing it, deliberately: the two read the same
+/// node by different routes, so running both is the cheapest way to see that
+/// the ranged path agrees with the resident one.
+pub fn show_stored(path: &str) {
+    let full = if path.starts_with('/') {
+        String::from(path)
+    } else {
+        let mut p = String::from(ROOT);
+        p.push('/');
+        p.push_str(path);
+        p
+    };
+    match sysbox::stored::locate(&full) {
+        None => kprintln!("  no stored node at {} -- 'snaps' to see what is stored", full),
+        Some(cr) => match sysbox::stored::read_all(&cr) {
+            None => kprintln!("  the store would not answer for {}", full),
+            Some(b) => {
+                kprintln!("  {} B at lba {}, read without the namespace", cr.len, cr.lba);
+                let text = alloc::string::String::from_utf8_lossy(&b);
+                for line in text.lines() {
+                    kprintln!("  {}", line);
+                }
+            }
+        },
+    }
+}
+
 pub fn command(rest: &str) {
     let mut w = rest.split_whitespace();
     match w.next().unwrap_or("") {
@@ -287,12 +424,19 @@ pub fn command(rest: &str) {
             Some(p) => show(p),
             None => kprintln!("  usage: forest show <path under the root>"),
         },
+        "index" => index_report(),
+        "body" => match w.next() {
+            Some(p) => show_stored(p),
+            None => kprintln!("  usage: forest body <path under the root>"),
+        },
         other => {
             kprintln!("  no such forest verb: {}", other);
             kprintln!("  forest              trees and node counts");
             kprintln!("  forest tree <name>  branches under one trunk");
             kprintln!("  forest show <path>  one node, head and body");
             kprintln!("  forest cost         resident bytes, and what an index would hold");
+            kprintln!("  forest index        build an index from the store, no body resident");
+            kprintln!("  forest body <path>  one node, read off the disk and not the namespace");
         }
     }
 }
@@ -364,6 +508,69 @@ pub fn selftest() -> bool {
         "the head is the first line, with the key removed",
         h.as_deref() == Some("a | b | c"),
     );
+
+    // --- the stored tree, which needs a store to be one ---------------------
+    //
+    // These are the claims about reading a body that is not resident, so they
+    // need a formatted store with a snapshot in it. On a machine with none
+    // they **do not run and say so**, rather than passing: a suite reporting
+    // that ranged reads work on a machine where none has ever been performed
+    // is the `smp` canary failure in a different subsystem.
+    //
+    // `/lib` is the subject because it is seeded identically at every boot and
+    // nothing writes to it, so the stored copy and the resident one agree by
+    // construction -- which is what lets the comparison below mean something
+    // about the read path rather than about whether somebody edited a file.
+    let stored = sysbox::stored::locate_under("/lib");
+    match stored.first() {
+        None => {
+            console::set_color(LTGRAY);
+            kprintln!("  ....  no snapshot holds /lib, so 6 claim(s) about the stored tree did not run");
+            kprintln!("        'store init', 'store unlock' and 'snap' make them runnable");
+            console::set_color(LTGRAY);
+        }
+        Some((path, cr)) => {
+            let live = sysbox::read_blob(path).unwrap_or_default();
+            check(
+                "a path resolves in the stored tree, and a directory is not a blob",
+                sysbox::stored::locate(path).is_some() && sysbox::stored::locate("/lib").is_none(),
+            );
+            check(
+                "the whole blob through the ranged path is the resident blob",
+                sysbox::stored::read_all(cr).as_deref() == Some(&live[..]),
+            );
+            // The two that would pass on an implementation that ignored the
+            // offset entirely: one inside a block, one deliberately crossing
+            // a boundary, since blocks are 512 bytes and this spans two.
+            let mid = sysbox::stored::read_at(cr, 100, 50);
+            check(
+                "a range inside one block is those bytes and not the first ones",
+                live.len() > 150 && mid.as_deref() == Some(&live[100..150]),
+            );
+            let span = sysbox::stored::read_at(cr, 500, 100);
+            check(
+                "and a range crossing a block boundary is still those bytes",
+                live.len() > 600 && span.as_deref() == Some(&live[500..600]),
+            );
+            check(
+                "one block reaches the head, whatever the body weighs",
+                sysbox::stored::head_line(cr).is_some()
+                    && sysbox::stored::head_line(cr)
+                        == core::str::from_utf8(&live)
+                            .ok()
+                            .and_then(|t| t.lines().next())
+                            .map(String::from),
+            );
+            // Past the end must be empty rather than whatever the next chunk
+            // holds, which `read_blocks` refuses at the block level and this
+            // clamps at the byte level -- the neighbour's bytes are a
+            // perfectly plausible node belonging to something else.
+            check(
+                "an offset past the end answers nothing, not the next chunk",
+                sysbox::stored::read_at(cr, cr.len, 16).as_deref() == Some(&[][..]),
+            );
+        }
+    }
 
     ok
 }
