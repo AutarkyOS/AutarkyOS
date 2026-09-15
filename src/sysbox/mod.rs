@@ -922,8 +922,33 @@ pub fn write_blob(path: &str, data: Vec<u8>) -> bool {
 /// time, with nothing saying so. A repeated read costs a repeated disk read,
 /// and a caller wanting a body twice should keep it.
 pub fn fetch(r: &cas::ChunkRef) -> Option<Vec<u8>> {
-    let bytes = stored::read_at(r, 0, r.len as usize)?;
+    // **Both failures are said out loud**, and they have to be. Every caller
+    // above this sees `Option<Vec<u8>>` and reads `None` as "no such file" --
+    // so a store that went away under a restored tree, and a body that no
+    // longer matches its own address, would both present as a file that was
+    // never there. On a machine that printed "restored snapshot 2 (9,649
+    // files)" a minute earlier, that is the worst shape a failure can take.
+    let bytes = match stored::read_at(r, 0, r.len as usize) {
+        Some(v) => v,
+        None => {
+            console::set_color(LTRED);
+            kprintln!(
+                "  a body on disk would not read back (lba {}, {} B) -- store gone, or a read in flight",
+                r.lba,
+                r.len
+            );
+            console::set_color(LTGRAY);
+            return None;
+        }
+    };
     if crate::store::sha256::hash(&bytes) != r.hash {
+        console::set_color(LTRED);
+        kprintln!(
+            "  a body on disk failed its own address (lba {}, {} B) -- the store is corrupt here",
+            r.lba,
+            r.len
+        );
+        console::set_color(LTGRAY);
         return None;
     }
     Some(bytes)

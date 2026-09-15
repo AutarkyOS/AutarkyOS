@@ -29,12 +29,24 @@
 //! callers here: 64 KiB taken the first time somebody asks and reused for the
 //! life of the boot, so a million ranged reads cost what one does.
 //!
-//! It is **not reentrant**, which is the same bargain `Racy` makes and is
-//! stated for the same reason: one core, one caller at a time, and nothing
-//! here may be reached from an interrupt.
+//! **It is claimed rather than merely documented.** A single shared buffer
+//! that two callers may enter is not a caution, it is a silent corruption: the
+//! scheduler preempts at 100 Hz, `read_blob` is on the shell's path and on the
+//! resident mind's, and a second caller landing mid-read would overwrite the
+//! first one's bytes and hand both of them a plausible answer assembled from
+//! two different blobs. So entry takes an `AtomicBool` and a contended read is
+//! **refused and counted**, which is a failure somebody can see.
+//!
+//! That also serialises this path's device commands as a side effect, which is
+//! worth stating precisely because it is not the guarantee it looks like:
+//! `nvme::CONTROLLER` is a `Racy` and not a lock, so `cas::get` -- which has
+//! its own freshly allocated buffer -- can still interleave with anything.
+//! This narrows one hazard rather than removing the class.
 
 use alloc::string::String;
 use alloc::vec::Vec;
+
+use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use crate::store::{self, block, cas};
 use crate::sync::Racy;
@@ -48,6 +60,75 @@ const SCRATCH_BYTES: usize = 64 * 1024;
 
 /// The scratch buffer's address, or zero before anything has asked for it.
 static SCRATCH: Racy<u64> = Racy::new(0);
+
+/// Whether somebody is inside a ranged read right now.
+static BUSY: AtomicBool = AtomicBool::new(false);
+
+/// How many reads were refused because somebody already was.
+///
+/// Expected to stay at zero. It is a counter rather than a panic because a
+/// refused read is recoverable -- the caller gets nothing and says so -- and
+/// because a number that has moved is evidence, where a machine that stopped
+/// is only a machine that stopped.
+static CONTENDED: AtomicU64 = AtomicU64::new(0);
+
+/// Released on every path out, including the early returns inside the loop.
+struct Held;
+
+impl Drop for Held {
+    fn drop(&mut self) {
+        BUSY.store(false, Ordering::Release);
+    }
+}
+
+fn hold() -> Option<Held> {
+    if BUSY.swap(true, Ordering::Acquire) {
+        let n = CONTENDED.fetch_add(1, Ordering::Relaxed) + 1;
+        // The first few, and then quiet. This should never happen, so it is
+        // worth a line; if it happens in a loop, a line per iteration would
+        // bury the thing that caused it.
+        if n <= 3 {
+            crate::gfx::console::set_color(crate::gfx::console::LTRED);
+            crate::kprintln!("  [stored] a ranged read was refused: another one is in flight");
+            crate::gfx::console::set_color(crate::gfx::console::LTGRAY);
+        }
+        return None;
+    }
+    Some(Held)
+}
+
+/// How many ranged reads have been refused for contention. Zero on a healthy
+/// machine, and `diag forest` asserts it has not moved.
+pub fn contended() -> u64 {
+    CONTENDED.load(Ordering::Relaxed)
+}
+
+/// Does the buffer actually refuse a second caller?
+///
+/// **A guard that has never refused anything is indistinguishable from no
+/// guard.** That is the objection `smp.rs` records about its own one-shot
+/// canary, which passed over a deadlock; a counter sitting at zero is exactly
+/// as convincing whether the check works or was deleted. So the hold is taken
+/// here on purpose, the read underneath it must fail, and -- the half that is
+/// easy to leave out -- the next read must succeed, or the guard is a one-way
+/// door that breaks the machine the first time it fires.
+///
+/// The red line it prints on the way through is that refusal happening, and is
+/// expected rather than a fault.
+pub fn refuses_while_held(r: &cas::ChunkRef) -> bool {
+    let before = CONTENDED.load(Ordering::Relaxed);
+    let held = match hold() {
+        Some(h) => h,
+        // Somebody else is inside one right now, which is itself the thing
+        // being tested for -- but it means this cannot run, so it must not
+        // report success.
+        None => return false,
+    };
+    let refused = read_at(r, 0, 1).is_none();
+    drop(held);
+    let released = read_at(r, 0, 1).is_some();
+    refused && released && CONTENDED.load(Ordering::Relaxed) == before + 1
+}
 
 fn bs() -> u64 {
     block::block_size() as u64
@@ -154,12 +235,27 @@ fn collect(
 /// property of the chunk the caller already holds and a short answer is the
 /// truthful one; a request starting past the end answers nothing at all.
 pub fn read_at(r: &cas::ChunkRef, off: u64, len: usize) -> Option<Vec<u8>> {
+    read_at_with(r, off, len, SCRATCH_BYTES as u64 / bs())
+}
+
+/// The same read with the window size supplied.
+///
+/// **This exists so the loop can be tested.** With the real 64 KiB scratch, a
+/// window holds 128 blocks and every read anybody has made here fits in one
+/// command -- so the multi-window path, which is the only part of this
+/// function with arithmetic worth getting wrong, had no coverage at all. A
+/// claim passing `1` walks it a block at a time over a real blob and requires
+/// the same bytes back.
+pub fn read_at_with(r: &cas::ChunkRef, off: u64, len: usize, cap: u64) -> Option<Vec<u8>> {
     if len == 0 || off >= r.len {
         return Some(Vec::new());
     }
     let len = len.min((r.len - off) as usize);
     let b = bs();
-    let cap = (SCRATCH_BYTES as u64 / b).max(1);
+    let cap = cap.max(1);
+    // Named, not `_`: `let _ = hold()?` drops the guard immediately and the
+    // buffer would be unheld for the whole read it was taken for.
+    let _held = hold()?;
     let buf = scratch()?;
     store::with(|st| {
         let mut out = Vec::with_capacity(len);

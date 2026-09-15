@@ -105,23 +105,39 @@ fn egcd(a: int, b: int) {
 // multiply, and it is what makes `isprime` correct on numbers where the
 // obvious implementation silently wraps.
 //
-// **The bound is 2^62 and it is a refusal rather than a hope.** Both `r + a`
-// and `a + a` reach up to 2m, so a modulus at or above 2^62 would overflow
-// the very additions that exist to avoid overflowing the multiply. That is
-// the one sliver of the positive range this cannot serve, and answering -1 is
-// better than answering a wrapped value that looks like a residue.
+// **There is no upper bound, and removing the one there was fixed a silent
+// wrong answer.** The doubling used to be written `(a + a) % m`, which reaches
+// 2m and therefore overflows once m passes 2^62 -- so this refused a modulus
+// in that range with -1, and `isprime` turned that refusal into *composite*.
+// A prime between 2^62 and 2^63 was reported as not prime, quietly, by a
+// function whose whole job is to be certain.
+//
+// `addmod` is the fix and it is smaller than the bound was. Both arguments are
+// already residues, so their sum is below 2m; subtracting m *first* when the
+// sum would reach it keeps every intermediate below m and nothing ever
+// overflows. That works to `i64::MAX` and needs no case left over.
 fn mulmod(a: int, b: int, m: int): int {
-  if (m <= 0 || m >= 4611686018427387904) { return -1 }
+  if (m <= 0) { return -1 }
   a = md(a, m)
   b = md(b, m)
   if (m < 3037000500) { return a * b % m }
   r = 0
   while (b > 0) {
-    if (b % 2 == 1) { r = (r + a) % m }
-    a = (a + a) % m
+    if (b % 2 == 1) { r = addmod(r, a, m) }
+    a = addmod(a, a, m)
     b = b / 2
   }
   return r
+}
+
+// a + b mod m, for a and b already below m, without ever forming a + b.
+//
+// `m - b` is safe because b is below m, and `a >= m - b` is exactly the test
+// for whether the sum would reach m -- so the branch that would have
+// overflowed is the branch that subtracts instead.
+fn addmod(a: int, b: int, m: int): int {
+  if (a >= m - b) { return a - (m - b) }
+  return a + b
 }
 
 // b^e mod m, by squaring. A negative exponent is the inverse raised to the
@@ -185,9 +201,12 @@ fn crt(a: int, m: int, b: int, n: int): int {
 // (four suffice below 3.2 * 10^9), and the saving is not worth a table of
 // thresholds that has to be right.
 //
-// It rests on `mulmod` entirely: with the obvious `a * b % m` this reports
-// composites as prime the moment the modulus passes three billion, which is
-// the failure that looks like a working primality test.
+// It rests on `mulmod` entirely, in both directions. With the obvious
+// `a * b % m` it reports composites as *prime* the moment the modulus passes
+// three billion; with a `mulmod` that refuses a modulus it cannot handle, it
+// reports primes as *composite* above that refusal -- because a refusal of -1
+// is not 1 and is not n-1, which is what this loop calls a witness to
+// compositeness. Both failures look exactly like a working primality test.
 fn isprime(n: int): int {
   if (n < 2) { return 0 }
   ws = list(2, 3, 5, 7, 11, 13, 17, 19, 23, 29, 31, 37)

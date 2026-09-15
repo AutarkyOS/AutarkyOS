@@ -560,6 +560,7 @@ pub fn num_cmp(a: &Value, b: &Value) -> Result<core::cmp::Ordering, String> {
 /// and a negative power inverts the dimension with the magnitude, so a
 /// reciprocal second really is a hertz.
 pub fn num_pow(base: &Value, e: i64) -> Result<Value, String> {
+    const MAX_POW: u64 = 4096;
     // A whole base and a non-negative power answer exactly what they answered
     // before this existed, saturation and the clamp at 62 included. Every
     // program, core and stored candidate written earlier still means what it
@@ -573,9 +574,18 @@ pub fn num_pow(base: &Value, e: i64) -> Result<Value, String> {
             return Ok(Value::Int(acc));
         }
     }
+    // A bound, because the exponent is a caller's number and this loop is not
+    // interruptible from inside. **Refused rather than clamped**: clamping
+    // answers a different question confidently, which is exactly what the old
+    // `e.clamp(0, 62)` did when it turned every negative exponent into 1. The
+    // `Int` path above keeps its clamp, and only because changing it would move
+    // what programs written before this answered.
+    if e.unsigned_abs() > MAX_POW {
+        return Err(format!("exponent out of range: at most {} here", MAX_POW));
+    }
     if let Value::Approx(x) = base {
         let mut acc = 1.0f32;
-        for _ in 0..e.unsigned_abs().min(4096) {
+        for _ in 0..e.unsigned_abs() {
             acc *= *x;
         }
         return Ok(Value::Approx(if e < 0 { 1.0 / acc } else { acc }));
@@ -598,7 +608,7 @@ pub fn num_pow(base: &Value, e: i64) -> Result<Value, String> {
     // Exact, so an overflow is an error rather than a saturation. A saturated
     // exact answer is a confidently wrong one, which is the whole objection
     // `rat_binary` makes.
-    for _ in 0..e.unsigned_abs().min(4096) {
+    for _ in 0..e.unsigned_abs() {
         acc = rat_binary("*", acc, (n, d))?.as_rat()?;
         dim = dim_combine(dim, k, 1)?;
     }

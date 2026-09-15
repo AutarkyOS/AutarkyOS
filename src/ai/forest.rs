@@ -295,6 +295,12 @@ pub struct Index {
     pub paths: Vec<String>,
     pub heads: Vec<String>,
     pub bodies: Vec<cas::ChunkRef>,
+    /// Nodes whose head would not read back.
+    ///
+    /// Counted rather than ignored. A node dropping out of an index silently
+    /// is a node the router can never reach, and an index that is quietly
+    /// short by a hundred looks exactly like one that is complete.
+    pub skipped: usize,
 }
 
 impl Index {
@@ -347,11 +353,15 @@ impl Index {
 /// and SHA-256 per node, which is what makes restoring a large forest take
 /// longer than the boot deadline.
 pub fn index_at(root: &str) -> Index {
-    let mut ix = Index { paths: Vec::new(), heads: Vec::new(), bodies: Vec::new() };
+    let mut ix =
+        Index { paths: Vec::new(), heads: Vec::new(), bodies: Vec::new(), skipped: 0 };
     for (path, cr) in sysbox::stored::locate_under(root) {
         let head = match sysbox::stored::head_line(&cr) {
             Some(h) => h,
-            None => continue,
+            None => {
+                ix.skipped += 1;
+                continue;
+            }
         };
         ix.paths.push(path);
         ix.heads.push(head);
@@ -380,6 +390,13 @@ pub fn index_report() {
     let pct = if disk == 0 { 0 } else { mem as u64 * 100 / disk };
     kprintln!("  the index is {}% of what the bodies weigh", pct);
     kprintln!("  built in {} ms, reading one block per node and no body", us / 1000);
+    if ix.skipped > 0 {
+        kprintln!("  {} node(s) would not read back and are not in it", ix.skipped);
+    }
+    let refused = sysbox::stored::contended();
+    if refused > 0 {
+        kprintln!("  {} ranged read(s) were refused for contention", refused);
+    }
 }
 
 /// One body, fetched through the store rather than out of the namespace.
@@ -525,7 +542,7 @@ pub fn selftest() -> bool {
     match stored.first() {
         None => {
             console::set_color(LTGRAY);
-            kprintln!("  ....  no snapshot holds /lib, so 6 claim(s) about the stored tree did not run");
+            kprintln!("  ....  no snapshot holds /lib, so 14 claim(s) about the stored tree did not run");
             kprintln!("        'store init', 'store unlock' and 'snap' make them runnable");
             console::set_color(LTGRAY);
         }
@@ -568,6 +585,69 @@ pub fn selftest() -> bool {
             check(
                 "an offset past the end answers nothing, not the next chunk",
                 sysbox::stored::read_at(cr, cr.len, 16).as_deref() == Some(&[][..]),
+            );
+
+            // --- the arithmetic, at the edges ---------------------------
+            //
+            // Everything above reads comfortably inside the blob. These are
+            // the places a ranged read goes wrong: the last byte, a length
+            // that runs off the end, an offset sitting exactly on a block
+            // boundary, and zero.
+            let n = live.len() as u64;
+            check(
+                "the very last byte, which is the one an off-by-one loses",
+                n > 0
+                    && sysbox::stored::read_at(cr, n - 1, 1).as_deref()
+                        == Some(&live[live.len() - 1..]),
+            );
+            check(
+                "a length running off the end is clamped to what is there, not refused",
+                n > 4
+                    && sysbox::stored::read_at(cr, n - 4, 4096).as_deref()
+                        == Some(&live[live.len() - 4..]),
+            );
+            check(
+                "an offset exactly on a block boundary, where skip is zero",
+                live.len() > 700
+                    && sysbox::stored::read_at(cr, 512, 100).as_deref() == Some(&live[512..612]),
+            );
+            check(
+                "a zero-length read is empty rather than one block",
+                sysbox::stored::read_at(cr, 10, 0).as_deref() == Some(&[][..]),
+            );
+
+            // **The loop had never run.** The scratch holds 128 blocks, every
+            // read anybody had made fit in one command, and the multi-window
+            // path -- the only arithmetic here worth getting wrong -- had no
+            // coverage at all. `read_at_with` exists so a claim can shrink the
+            // window to a single block and walk a real blob the long way.
+            check(
+                "the whole blob read one block at a time is the whole blob",
+                sysbox::stored::read_at_with(cr, 0, live.len(), 1).as_deref() == Some(&live[..]),
+            );
+            check(
+                "and an awkward range agrees however many windows it takes",
+                live.len() > 1600
+                    && sysbox::stored::read_at_with(cr, 513, 1000, 1).as_deref()
+                        == Some(&live[513..1513])
+                    && sysbox::stored::read_at_with(cr, 513, 1000, 2).as_deref()
+                        == Some(&live[513..1513]),
+            );
+
+            // The buffer is one buffer. If this has moved, two callers have
+            // been inside a ranged read at once and one of them was refused --
+            // which is the outcome that was designed for, and still a thing to
+            // know about rather than a thing to pass over.
+            check(
+                "nothing has needed to be refused for contention during this boot",
+                sysbox::stored::contended() == 0,
+            );
+            // And the guard is shown to work rather than assumed, because a
+            // counter at zero says nothing about whether anything is checking.
+            // The red line above this one is the refusal, on purpose.
+            check(
+                "the one buffer does refuse a second caller, and works again after",
+                sysbox::stored::refuses_while_held(cr),
             );
         }
     }

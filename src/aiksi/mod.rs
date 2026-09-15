@@ -461,6 +461,15 @@ pub fn lib_selftest() -> bool {
         "a shape mismatch answers nothing rather than a product",
         matches!(lib_of(M, "mul(ident(2), ident(3))"), Some(Value::Nil)),
     );
+    // **The promise the header makes, demonstrated rather than asserted.**
+    // Entries grow during elimination, and the point of refusing to wrap is
+    // that a saturated exact answer is a confidently wrong one. So a size that
+    // fits must answer, and a size that does not must *fail* -- a library that
+    // silently returned a wrapped determinant would look identical from here.
+    check(
+        "a 5x5 Hilbert determinant fits, and a 12x12 errors rather than wrapping",
+        lib_of(M, "det(hilb(5))").is_some() && lib_of(M, "det(hilb(12))").is_none(),
+    );
     check(
         "matrix times vector, which is the shape a layer is",
         vt(M, "mv(list(list(1,2), list(3,4)), list(5,6))", "[17, 39]"),
@@ -508,6 +517,16 @@ pub fn lib_selftest() -> bool {
     check(
         "2^61 - 1 is prime, decided through that multiply rather than a coin flip",
         vi(N, "isprime(2305843009213693951)", 1),
+    );
+    // Past 2^62, where the doubling used to overflow and `mulmod` used to
+    // refuse. (m-1)^2 is congruent to 1 for every m, so this needs no prime to
+    // be known and lands squarely in the range that was broken: before the
+    // subtract-first `addmod` it answered -1, and `isprime` read that as a
+    // witness and called primes composite.
+    check(
+        "a modular square near i64::MAX, where the doubling used to overflow",
+        vi(N, "mulmod(8999999999999999999, 8999999999999999999, 9000000000000000000)", 1)
+            && vi(N, "modpow(2, 10, 9000000000000000000)", 1024),
     );
     check("factorisation, with repeats", vt(N, "factor(360)", "[2, 2, 2, 3, 3, 5]"));
     check(
@@ -1275,6 +1294,14 @@ pub fn selftest() -> bool {
         return false;
     }
     if !text("pow(qty(3, \"m\"), 0)", "1") || !text("pow(real(2), -2)", "~0.25") {
+        return false;
+    }
+    // Bounded, and **refused rather than clamped**. Clamping is what the old
+    // implementation did when it turned every negative exponent into 1: it
+    // answers a different question, confidently. The whole-number path keeps
+    // its clamp and only because changing it would move what programs written
+    // before this answered.
+    if run("pow(rat(1,2), 100000)").is_some() || run("pow(2, -100000)").is_some() {
         return false;
     }
     // `sort` tested "is this a number" with `as_int`, so a list of fractions
