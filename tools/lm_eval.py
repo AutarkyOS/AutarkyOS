@@ -307,6 +307,68 @@ def dequantize(v):
     return v
 
 
+def backend_vocab(backend):
+    """How many rows the classifier has, whichever loader built it."""
+    for probe in (
+        lambda: backend.cfg["vocab_size"],
+        lambda: backend.cfg["vocab"],
+        lambda: backend.cfg["n_vocab"],
+        lambda: backend.cfg["vocab_len"],
+    ):
+        try:
+            v = probe()
+            if isinstance(v, int) and v > 0:
+                return v
+        except Exception:
+            pass
+    return None
+
+
+class DenseRef:
+    """The dense path, borrowed from `tools/reference.py` rather than rebuilt.
+
+    **There were two dense implementations here and only one of them was
+    right.** This file carried its own, written for llama2: head width derived
+    as `dim // heads`, RoPE pairing `2i` with `2i+1`, and no QK-Norm. Qwen3 has
+    none of those -- it *states* a head width of 128 where the derivation gives
+    64, it pairs `i` with `i + head_dim/2`, and it RMSNorms every head's query
+    and key before the rotation. CLAUDE.md names all three as the mistakes that
+    produce a model which loads, runs and writes confident nonsense.
+
+    Here it did not even get that far: the shapes stopped agreeing and the
+    dense path raised `operands could not be broadcast together`. Which means
+    it has never produced a Qwen3 number at all, and any figure attributed to
+    one did not come through this code.
+
+    `reference.py` is the numeric oracle this project already checks the kernel
+    against, and it has all three right. So the second implementation is gone
+    rather than repaired -- `model.rs` makes the objection twice: two things
+    that are supposed to agree do not stay agreeing.
+    """
+
+    def __init__(self, path, max_len):
+        import reference as R
+
+        self.R = R
+        self.cfg, self.w = R.load(path)
+        self.max_len = max_len
+        self.reset()
+
+    def reset(self):
+        self.cache = self.R.new_cache(self.cfg, self.max_len)
+        self.pos = 0
+
+    def feed(self, ids):
+        ids = list(ids)
+        if self.pos + len(ids) > self.max_len:
+            raise ValueError(
+                f"{self.pos + len(ids)} tokens into a {self.max_len} context"
+            )
+        logits = self.R.forward(self.cfg, self.w, ids, self.cache, self.pos)
+        self.pos += len(ids)
+        return logits
+
+
 def make_backend(model_path, max_len):
     """Returns (runner, note). runner.feed(tokens) -> logits of the last token.
 
@@ -323,11 +385,7 @@ def make_backend(model_path, max_len):
         tensors, cfg = v4.load(model_path)
         note = f"hybrid arch {cfg['arch']}, {len(cfg['layer_types'])} layers"
         return Hybrid35(tensors, cfg, max_len), note
-    cfg, w = dense_load(str(model_path))
-    w = dequantize(w)
-    kv = cfg["dim"] // cfg["heads"] * cfg["kv_heads"]
-    note = f"dense dim {cfg['dim']}, {cfg['layers']} layers"
-    return DenseRunner2(cfg, w, kv, max_len=max_len), note
+    return DenseRef(str(model_path), max_len)
 
 
 class DenseRunner2(DenseRunner):
@@ -491,31 +549,81 @@ def gold_number(answer):
     return last_number(answer.split("####")[-1])
 
 
-def run_gsm8k(backend, hf, tok, limit, max_new):
+# Where a 5-shot completion stops being an answer.
+#
+# **Without this the score is read out of the wrong text.** Nothing makes a
+# base model stop after one answer; it carries straight on with "Question: ..."
+# and invents the next one, and `last_number` then returns a number out of
+# whatever it drifted into. The stop is the same one every published GSM8K
+# harness uses, and the blank line matters as much as the word because the
+# few-shot prefix separates its examples with one.
+STOP = ("\nQuestion:", "\n\n")
+
+
+def cut_at_stop(text):
+    for sep in STOP:
+        j = text.find(sep)
+        if j >= 0:
+            text = text[:j]
+    return text
+
+
+def run_gsm8k(backend, hf, tok, limit, max_new, show=0, shots=5):
     d = snapshot_dir("datasets--gsm8k")
     train = parquet_rows(find_file(d, "train"))
     test = parquet_rows(find_file(d, "test"))[: limit or 25]
 
-    shots = train[:5]
+    shots = train[:shots]
     prefix = "".join(
         f"Question: {s['question']}\nAnswer: {s['answer']}\n\n" for s in shots)
+
+    # A prompt that does not fit is a prompt whose front falls off, and what
+    # falls off first is the examples that make it few-shot. Said out loud
+    # rather than scored: a silent 0% looks exactly like a model that cannot
+    # do arithmetic.
+    room = getattr(backend, "max_len", None)
+    if room:
+        need = max(
+            len(hf.encode(prefix + f"Question: {r['question']}\nAnswer:",
+                          add_special_tokens=False).ids)
+            for r in test) + max_new
+        if need > room:
+            print(f"  the longest prompt plus {max_new} new is {need} tokens "
+                  f"and the context is {room} -- raise --seq or lower --max-new")
+            return 0.0
 
     eos = tok.eos
     right = 0
     t0 = time.time()
+    shown = 0
     for i, r in enumerate(test):
         backend.reset()
         ids = hf.encode(prefix + f"Question: {r['question']}\nAnswer:",
                         add_special_tokens=False).ids
+        if shown < show:
+            print("      prompt %d tok, budget %d new" % (len(ids), max_new))
         logits = backend.feed(ids)
         gen = []
+        text = ""
         for _ in range(max_new):
             nxt = int(np.argmax(logits))
             if nxt == eos:
                 break
             gen.append(nxt)
+            text = detok(tok, gen)
+            # Checked on the decoded text rather than on a token, because a
+            # stop is a string and the tokeniser is free to split it across
+            # two pieces. Re-decoding each step costs nothing next to a
+            # forward pass.
+            if any(sep in text for sep in STOP):
+                break
             logits = backend.feed([nxt])
-        text = detok(tok, gen)
+        text = cut_at_stop(text)
+        if shown < show:
+            shown += 1
+            print("      --- what it actually said (%d tok) ---" % len(gen))
+            print("      " + text.replace(chr(10), chr(10) + "      ")[:1400])
+            print("      --- end ---")
         got = last_number(text)
         want = gold_number(r["answer"])
         hit = got is not None and want is not None and abs(float(got) - float(want)) < 1e-4
@@ -525,7 +633,7 @@ def run_gsm8k(backend, hf, tok, limit, max_new):
         print(f"  [{i + 1}/{len(test)}] acc {right / (i + 1):6.1%}  "
               f"({(time.time() - t0) / (i + 1):.1f}s/q)", end="\r")
     print()
-    print(f"  gsm8k (5-shot greedy, n={len(test)}, <= {max_new} new): {right / len(test):6.1%}")
+    print(f"  gsm8k ({len(shots)}-shot greedy, n={len(test)}, <= {max_new} new): {right / len(test):6.1%}")
     return right / len(test)
 
 
@@ -651,10 +759,20 @@ def main():
     ap.add_argument("tokenizer")
     ap.add_argument("--task", default="", choices=["", "mmlu", "gsm8k", "niah", "route"])
     ap.add_argument("--limit", type=int, default=0)
-    ap.add_argument("--shots", type=int, default=0)
+    ap.add_argument("--shots", type=int, default=0,
+                    help="few-shot examples; gsm8k used a hardcoded 5 and "
+                         "ignored this, which is 684 tokens of prompt")
     ap.add_argument("--latent", type=int, default=0,
                     help="Coconut-style frozen-state refinement passes per token (hybrid only)")
-    ap.add_argument("--max-new", type=int, default=64)
+    # **64 was less than half an answer.** Measured over the test slice with
+    # the harness's own tokeniser: a GSM8K answer is 133 tokens on average and
+    # 213 at worst, so two thirds of every completion was being cut off before
+    # it reached the line the score is read from -- and `last_number` then
+    # returned a figure out of the middle of the reasoning. That is most of
+    # why this task has read 0.0% on every checkpoint ever put through it.
+    ap.add_argument("--max-new", type=int, default=256)
+    ap.add_argument("--show", type=int, default=0,
+                    help="print the raw completion for the first N questions")
     ap.add_argument("--contexts", type=int, nargs="+", default=[512, 1024, 2048])
     ap.add_argument("--check", action="store_true",
                     help="prove the incremental hybrid against ref35, then exit")
@@ -674,19 +792,56 @@ def main():
     hf = HFTok.from_file(hf_path)
     tok = Tok(args.tokenizer)
 
-    max_len = {"mmlu": 2048, "gsm8k": 1024, "niah": max(args.contexts) + 64,
+    # gsm8k was 1024 and the 5-shot prompt is 749 tokens on average, 800 at
+    # worst -- which fit while the budget was 64 and stops fitting the moment
+    # it is large enough to hold an answer. The two numbers have to move
+    # together, so they are worked out together.
+    max_len = {"mmlu": 2048, "gsm8k": 2048, "niah": max(args.contexts) + 64,
                "route": 2048}[args.task]
-    backend, note = make_backend(args.model, max_len)
+    made = make_backend(args.model, max_len)
+    backend, note = made if isinstance(made, tuple) else (
+        made,
+        f"dense dim {made.cfg['dim']}, {made.cfg['layers']} layers"
+        + (", qk-norm" if made.cfg.get("qk_norm") else "")
+        + f", head_dim {made.cfg['head_dim']}",
+    )
     if hasattr(backend, "latent_k"):
         backend.latent_k = args.latent
         if args.latent:
             note += f", latent x{args.latent}"
+    # **The encoder has to be the model's own, and nothing was checking.**
+    #
+    # `--hf-tokenizer` defaults to `tools/hf/tokenizer.json`, which is
+    # SmolLM2's 49,152-token vocabulary. Handed a Qwen3.5 checkpoint, whose
+    # vocabulary is 151,669, every prompt was encoded into ids that mean
+    # something else entirely -- and the model answered the only way it could,
+    # with a degenerate run of one token. It scored 0.0%, and that figure went
+    # into this project's notes as a fact about the model.
+    #
+    # There is no way to notice this from the output: wrong ids produce
+    # confident nonsense, not an error. So it is checked here, and the run is
+    # refused rather than scored.
+    mv = backend_vocab(backend)
+    hv = hf.get_vocab_size()
+    if mv and abs(mv - hv) > max(64, mv // 100):
+        print(f"[lm_eval] the model's vocabulary is {mv} and "
+              f"{Path(hf_path).parent.name}/{Path(hf_path).name} holds {hv}.")
+        print("          Those are different tokenizers, so every prompt would be")
+        print("          encoded into ids that mean something else. Pass")
+        print("          --hf-tokenizer <the model's own tokenizer.json>.")
+        sys.exit(2)
+    if mv and tok.vocab and abs(len(tok.vocab) - mv) > max(64, mv // 100):
+        print(f"[lm_eval] the model's vocabulary is {mv} and the kernel tokenizer "
+              f"holds {len(tok.vocab)} -- detokenisation would be unreadable.")
+        sys.exit(2)
+
     print(f"[lm_eval] {Path(args.model).name}: {note}, task {args.task}")
 
     if args.task == "mmlu":
         run_mmlu(backend, hf, args.limit)
     elif args.task == "gsm8k":
-        run_gsm8k(backend, hf, tok, args.limit, args.max_new)
+        run_gsm8k(backend, hf, tok, args.limit, args.max_new, args.show,
+                  args.shots if args.shots else 5)
     elif args.task == "niah":
         run_niah(backend, hf, tok, args.contexts, args.limit)
     elif args.task == "route":
