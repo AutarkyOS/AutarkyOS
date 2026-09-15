@@ -332,6 +332,9 @@ pub struct Loopback {
     /// Frames queued for it to receive.
     pub inbox: Vec<Vec<u8>>,
     pub hw_ccmp: bool,
+    /// False makes it a FullMAC part: firmware runs the MLME, so such a part
+    /// implements `Nic` directly and `softmac` is not in its path at all.
+    pub softmac: bool,
     /// A part that claims hardware crypto and then refuses the key, which is
     /// the one lie the interface cannot catch and the fallback it forces.
     pub refuse_key: bool,
@@ -347,6 +350,7 @@ impl Loopback {
             sent: Vec::new(),
             inbox: Vec::new(),
             hw_ccmp: false,
+            softmac: true,
             refuse_key: false,
             keys_taken: 0,
         }
@@ -366,7 +370,7 @@ impl Radio for Loopback {
     }
 
     fn caps(&self) -> Caps {
-        Caps { softmac: true, hw_ccmp: self.hw_ccmp, band5: true, max_frame: 2304 }
+        Caps { softmac: self.softmac, hw_ccmp: self.hw_ccmp, band5: true, max_frame: 2304 }
     }
 
     fn mac(&self) -> Mac {

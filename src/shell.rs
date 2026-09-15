@@ -259,6 +259,9 @@ pub fn run(boot: &BootInfo, acpi: &Option<Acpi>) -> ! {
             // 100 times a second, so this is also the stack's clock -- an
             // open connection only advances between keystrokes.
             crate::net::tcp::service();
+            // Beside TCP because it is the same bargain: no receive
+            // interrupts, so a state machine advances when the shell is idle.
+            crate::net::wifi_service();
             // USB is polled and not interrupt-driven in this kernel, so a
             // keyboard on it is only heard from when somebody asks. Here
             // rather than in the timer tick for the same reason the pointer
@@ -2249,7 +2252,7 @@ fn execute(line: &str, boot: &BootInfo, acpi: &Option<Acpi>, interp: &mut aiksi:
             }
         }
         "mine" => mine_cmd(rest),
-        "wlan" | "wifi" => crate::net::wifi::report(),
+        "wlan" | "wifi" => wifi_cmd(rest),
         "trust" => match rest.trim() {
             "verify" => crate::net::trust::verify_roots(),
             _ => crate::net::trust::report(),
@@ -7792,6 +7795,92 @@ fn push_num(s: &mut String, mut v: u64) {
     }
     for &c in &b[i..] {
         s.push(c as char);
+    }
+}
+
+/// `wifi`, and the four things an operator can do with a radio.
+///
+/// The passphrase is typed here and **is not stored anywhere**: it goes into
+/// `wpa2::pmk`, which is 4096 rounds of PBKDF2 over it, and the passphrase
+/// itself is dropped when `join` returns. There is no saved-network list on
+/// purpose -- writing one means writing a passphrase into a content-addressed
+/// store where every past root hash still names it.
+fn wifi_cmd(rest: &str) {
+    let mut it = rest.splitn(3, ' ');
+    let sub = it.next().unwrap_or("").trim();
+    let a = it.next().unwrap_or("").trim();
+    let b = it.next().unwrap_or("").trim();
+
+    match sub {
+        "" | "status" => {
+            match crate::net::wlan() {
+                None => crate::net::wifi::report(),
+                Some(w) => {
+                    let (state, secure) = w.status();
+                    kprintln!("  wlan0  {}", state);
+                    kprintln!(
+                        "         {}",
+                        if secure {
+                            "encrypted with a key from the handshake"
+                        } else {
+                            "NOT encrypted -- anything sent is readable in the room"
+                        }
+                    );
+                    let seen = w.networks();
+                    if !seen.is_empty() {
+                        kprintln!("  {} network(s) heard in the last scan:", seen.len());
+                        for n in seen.iter() {
+                            kprintln!(
+                                "    {:<20} {} bars  {}",
+                                n.ssid,
+                                crate::net::wifi::bars(n.rssi),
+                                if n.secured { "secured" } else { "OPEN" }
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        "scan" => match crate::net::wlan() {
+            None => match crate::net::wifi::scan() {
+                Ok(_) => {}
+                Err(why) => kprintln!("  {}", why),
+            },
+            Some(w) => {
+                // A scan is the first half of joining, so it is `join` with no
+                // network named rather than a second path through the same
+                // state machine -- two ways to sweep the channels is two
+                // things to keep agreeing about dwell times and DFS.
+                w.join("", "", crate::net::now_ms());
+                kprintln!("  scanning. 'wifi' in a few seconds to see what answered.");
+            }
+        },
+        "join" => {
+            if a.is_empty() {
+                kprintln!("  usage: wifi join <ssid> [passphrase]");
+                kprintln!("  no passphrase means an open network, and saying so is");
+                kprintln!("  deliberate: a network that turns out to be encrypted is");
+                kprintln!("  refused rather than joined in the clear.");
+                return;
+            }
+            match crate::net::wlan() {
+                None => kprintln!("  no wireless driver. 'wifi' says what is fitted."),
+                Some(w) => {
+                    w.join(a, b, crate::net::now_ms());
+                    kprintln!("  joining {}. 'wifi' to watch it.", a);
+                }
+            }
+        }
+        "leave" => match crate::net::wlan() {
+            None => kprintln!("  no wireless driver."),
+            Some(w) => {
+                w.leave_net();
+                kprintln!("  left, and the access point was told rather than left guessing.");
+            }
+        },
+        _ => {
+            kprintln!("  usage: wifi [status] | scan | join <ssid> [pass] | leave");
+        }
     }
 }
 

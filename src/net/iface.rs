@@ -35,16 +35,48 @@ pub trait Nic {
     fn receive(&mut self) -> Option<Vec<u8>>;
     /// For display, and for deciding whether wireless commands apply.
     fn kind(&self) -> Kind;
+
+    /// The wireless half, for a driver that has one.
+    ///
+    /// **A default of `None` rather than a second trait object beside the
+    /// first**, because an interface has one driver and two handles to it
+    /// would be two owners of one part. A wired card answers `None` and every
+    /// caller above may ask without knowing which kind it holds -- the same
+    /// bargain `Radio::set_key` makes one layer down, and for the same reason:
+    /// the honest answer is the default.
+    fn wireless(&mut self) -> Option<&mut dyn Wlan> {
+        None
+    }
+}
+
+/// What an interface can be asked once it is wireless.
+///
+/// Deliberately small, and deliberately taking the clock as an argument the
+/// way `mlme::Station::poll` does -- everything here is a pass-through to that
+/// state machine, and a trait that read the clock itself would put the one
+/// thing making the MLME testable behind a layer that is not.
+pub trait Wlan {
+    fn join(&mut self, ssid: &str, pass: &str, now_ms: u64);
+    fn leave_net(&mut self);
+    /// One turn. Cheap, and safe to call as often as the caller likes.
+    fn poll_mlme(&mut self, now_ms: u64);
+    /// What it is doing, and whether the link is actually encrypted.
+    ///
+    /// Two facts and not one: an open network that associated is working and
+    /// is not secure, and an operator is owed both rather than a single word
+    /// that has to mean either.
+    fn status(&self) -> (&'static str, bool);
+    fn networks(&self) -> Vec<crate::net::wifi::Network>;
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Kind {
     Ethernet,
-    /// Nothing constructs this yet -- it is the shape the slot is waiting in,
-    /// and the compiler is right that it is unused. Kept because a wireless
-    /// driver is a driver plus this one line, not a change to the interface
-    /// layer.
-    #[allow(dead_code)]
+    /// Constructed by `mlme::Station` and by `softmac::Link`. This said
+    /// "nothing constructs this yet -- it is the shape the slot is waiting
+    /// in", which was true for a long time and is the note that gets left
+    /// behind: the slot was filled and the comment describing the empty slot
+    /// still read like a description of the present.
     Wireless,
     Loopback,
 }

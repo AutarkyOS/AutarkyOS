@@ -150,7 +150,7 @@ pub mod wifi;
 pub mod wpa2;
 pub mod x509;
 
-use iface::{Interface, Kind, Loopback, Nic};
+use iface::{Interface, Kind, Loopback, Nic, Wlan};
 
 pub const UNSPECIFIED: Ipv4 = [0, 0, 0, 0];
 pub const BROADCAST_IP: Ipv4 = [255, 255, 255, 255];
@@ -191,6 +191,68 @@ pub fn ecam() -> Option<u64> {
 
 pub fn index_of(name: &str) -> Option<usize> {
     ifaces().iter().position(|i| i.name == name)
+}
+
+// --- wireless ------------------------------------------------------------
+
+/// Make a radio into `wlan0`.
+///
+/// **This is the whole of what a wireless driver has to do here**, and saying
+/// so is the point of the function existing rather than each driver assembling
+/// its own stack: write `impl Radio`, call this, and everything above --
+/// 802.11 framing, sequence numbers, CCMP, the association state machine, the
+/// four-way handshake -- is already written, already shared, and already
+/// checked at boot with no hardware.
+///
+/// A FullMAC part does **not** come through here. Its firmware has already run
+/// the MLME, so it implements `Nic` directly and is installed like the wired
+/// card; `Caps::softmac` is how a part says which of the two it is.
+pub fn attach_radio<R: crate::dev::radio::Radio + 'static>(radio: R) -> bool {
+    if !radio.caps().softmac {
+        return false;
+    }
+    let sta = mlme::Station::new(radio);
+    let w = &mut ifaces()[WLAN0];
+    w.nic = Some(alloc::boxed::Box::new(sta));
+    // Administratively up, and `usable()` still reads the link -- an
+    // unassociated station is a driver that is present and a network that is
+    // not, which are different facts and reported separately.
+    w.up = true;
+    true
+}
+
+/// The wireless half of `wlan0`, if there is one.
+pub fn wlan() -> Option<&'static mut dyn Wlan> {
+    ifaces()[WLAN0].nic.as_mut()?.wireless()
+}
+
+/// Milliseconds since boot, for the state machine that takes a clock.
+///
+/// `rdtsc` and not `ticks()`, which is what this tree's own note says to use
+/// for a duration -- the tick counter is wall-clock-ish and a deadline is a
+/// duration. The fallback exists because an uncalibrated TSC reads zero for
+/// the frequency, and dividing by it is a state machine whose deadlines are
+/// never met and whose retries are never reached: a link that fails by never
+/// failing, which is the worst shape available.
+pub fn now_ms() -> u64 {
+    let mhz = crate::time::tsc_mhz();
+    if mhz == 0 {
+        return crate::dev::lapic::ticks() * 1000 / crate::TIMER_HZ as u64;
+    }
+    crate::time::rdtsc() / (mhz * 1000)
+}
+
+/// One turn of the wireless state machine, from wherever the idle loop is.
+///
+/// Beside `tcp::service` and for the same reason it is there: there are no
+/// receive interrupts in this kernel, so a protocol advances when somebody
+/// gives it a slice. Cheap when there is no radio, which is every machine
+/// this has run on so far.
+pub fn wifi_service() {
+    let now = now_ms();
+    if let Some(w) = wlan() {
+        w.poll_mlme(now);
+    }
 }
 
 // --- routing -------------------------------------------------------------

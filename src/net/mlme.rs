@@ -32,7 +32,7 @@ use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 
 use crate::dev::radio::{self, Radio, Rx};
-use crate::net::iface::{Kind, Nic};
+use crate::net::iface::{Kind, Nic, Wlan};
 use crate::net::ieee80211 as dot11;
 use crate::net::softmac::{Link, ETHERTYPE_EAPOL};
 use crate::net::wpa2;
@@ -583,6 +583,28 @@ impl<R: Radio> Station<R> {
     }
 }
 
+impl<R: Radio> Wlan for Station<R> {
+    fn join(&mut self, ssid: &str, pass: &str, now_ms: u64) {
+        self.start(ssid, pass, now_ms);
+    }
+
+    fn leave_net(&mut self) {
+        self.stop();
+    }
+
+    fn poll_mlme(&mut self, now_ms: u64) {
+        self.poll(now_ms);
+    }
+
+    fn status(&self) -> (&'static str, bool) {
+        (self.state.name(), self.secured())
+    }
+
+    fn networks(&self) -> Vec<crate::net::wifi::Network> {
+        self.seen.iter().map(crate::net::wifi::Network::from_bss).collect()
+    }
+}
+
 impl<R: Radio> Nic for Station<R> {
     fn mac(&self) -> Mac {
         self.link.mac()
@@ -607,6 +629,10 @@ impl<R: Radio> Nic for Station<R> {
 
     fn kind(&self) -> Kind {
         Kind::Wireless
+    }
+
+    fn wireless(&mut self) -> Option<&mut dyn Wlan> {
+        Some(self)
     }
 }
 
@@ -1051,6 +1077,119 @@ pub fn selftest() -> bool {
         "and it can join again afterwards, with a key of its own",
         sta.state() == State::Running && sta.secured(),
     );
+
+    // --- and through the trait objects the interface layer holds -------
+    //
+    // `wlan0` holds a driver behind `dyn Nic` and asks it for `wireless()`, so
+    // a `Station` that works as a concrete type and is unreachable through the
+    // vtable would be a stack nothing can drive. Driven here through
+    // `&mut dyn Nic`, which carries the same vtable a `Box` does and differs
+    // only in who owns the value -- and the fixture has to keep owning it,
+    // because the access point reaches the radio underneath.
+    let mut sta2 = Station::new(Loopback::new(me));
+    let mut ap2 = Ap::new(ap_mac, me, "glados", "correct horse", 6);
+    let mut t = 0u64;
+    {
+        let n: &mut dyn Nic = &mut sta2;
+        if let Some(w) = n.wireless() {
+            w.join("glados", "correct horse", t);
+        }
+    }
+    let mut running = false;
+    for _ in 0..200 {
+        ap2.serve(sta2.link_mut().radio_mut());
+        t += DWELL_MS;
+        let n: &mut dyn Nic = &mut sta2;
+        match n.wireless() {
+            Some(w) => {
+                w.poll_mlme(t);
+                if w.status().0 == "running" {
+                    running = true;
+                }
+            }
+            None => break,
+        }
+        if running {
+            break;
+        }
+    }
+    {
+        let n: &mut dyn Nic = &mut sta2;
+        let kind = n.kind();
+        let (state, secure) = n.wireless().map(|w| w.status()).unwrap_or(("none", false));
+        check(
+            "a driver behind the vtable answers the wireless half and gets on",
+            running && state == "running" && secure && kind == Kind::Wireless,
+        );
+    }
+    {
+        let n: &mut dyn Nic = &mut sta2;
+        let list = n.wireless().map(|w| w.networks()).unwrap_or_default();
+        check(
+            "and it reports what the scan heard, as a name and a signal",
+            list.iter().any(|x| x.ssid == "glados" && x.secured && x.rssi < 0),
+        );
+    }
+    // A wired card answers None to the same question, which is the whole
+    // reason the method has a default rather than the interface layer keeping
+    // a second handle and a flag saying which one is real.
+    let mut wired = crate::net::iface::Loopback::new();
+    {
+        let n: &mut dyn Nic = &mut wired;
+        let kind = n.kind();
+        check(
+            "an interface that is not wireless says so rather than pretending",
+            n.wireless().is_none() && kind != Kind::Wireless,
+        );
+    }
+
+    // --- and installed as wlan0, which is all a driver has to do -------
+    //
+    // `attach_radio` is the whole interface between a wireless driver and this
+    // stack, so a claim that it works is a claim that writing `impl Radio` is
+    // sufficient. Run only on a machine whose `wlan0` is empty, which is every
+    // machine so far: clobbering a real driver to test the thing that installs
+    // drivers would be the suite breaking what it checks.
+    if crate::net::ifaces()[crate::net::WLAN0].nic.is_none() {
+        let mut fullmac = Loopback::new(me);
+        fullmac.softmac = false;
+        check(
+            "a FullMAC part is refused here, because its firmware ran the MLME",
+            !crate::net::attach_radio(fullmac)
+                && crate::net::ifaces()[crate::net::WLAN0].nic.is_none(),
+        );
+
+        let attached = crate::net::attach_radio(Loopback::new(me));
+        check(
+            "and a SoftMAC part becomes wlan0, reachable as wireless",
+            attached
+                && crate::net::wlan().is_some()
+                && crate::net::ifaces()[crate::net::WLAN0]
+                    .nic
+                    .as_ref()
+                    .map(|n| n.kind() == Kind::Wireless)
+                    .unwrap_or(false),
+        );
+        // The clock the real path uses, rather than the fixture's counter.
+        // Nothing here asserts a duration -- only that it moves, because a
+        // clock stuck at zero is a state machine whose deadlines never arrive.
+        let t0 = crate::net::now_ms();
+        for _ in 0..64 {
+            core::hint::spin_loop();
+        }
+        crate::net::wifi_service();
+        check(
+            "the kernel's own clock moves, so deadlines can be reached at all",
+            crate::net::now_ms() >= t0 && crate::net::wlan().map(|w| w.status().0) == Some("idle"),
+        );
+
+        // Put it back. `wlan0` is empty on a machine with no wireless driver
+        // and that is exactly what it was a moment ago, so this restores the
+        // interface table rather than approximating it.
+        let w = &mut crate::net::ifaces()[crate::net::WLAN0];
+        w.nic = None;
+        w.up = false;
+    }
 
     // --- and every way it goes wrong ----------------------------------
     // A deauthentication ends it. Unauthenticated, because 802.11w is not here,
