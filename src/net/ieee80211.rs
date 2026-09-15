@@ -30,7 +30,12 @@ pub const MGMT_HDR: usize = 24;
 const TYPE_MGMT: u8 = 0;
 const TYPE_DATA: u8 = 2;
 const SUBTYPE_DATA: u8 = 0;
+const SUBTYPE_ASSOC_REQ: u8 = 0;
+const SUBTYPE_ASSOC_RESP: u8 = 1;
 const SUBTYPE_PROBE_REQ: u8 = 4;
+const SUBTYPE_DISASSOC: u8 = 10;
+const SUBTYPE_AUTH: u8 = 11;
+const SUBTYPE_DEAUTH: u8 = 12;
 const SUBTYPE_PROBE_RESP: u8 = 5;
 const SUBTYPE_BEACON: u8 = 8;
 
@@ -78,6 +83,25 @@ pub fn data_to_ds(bssid: &[u8; 6], sa: &[u8; 6], da: &[u8; 6], seq: u16, body: &
     f.extend_from_slice(da);
     // Sequence number in the top twelve bits, fragment number in the low four.
     f.extend_from_slice(&(((seq & 0x0FFF) << 4) as u16).to_le_bytes());
+    f.extend_from_slice(body);
+    f
+}
+
+/// A data frame from an access point to one of its stations.
+///
+/// FromDS, so the addresses are destination, BSSID, source -- a different
+/// order from `data_to_ds` for the same three parties, which is the whole
+/// reason `data_addrs` exists and the reason both directions are built here
+/// rather than one being assumed to be the other reversed.
+pub fn data_from_ds(da: &[u8; 6], bssid: &[u8; 6], sa: &[u8; 6], seq: u16, body: &[u8]) -> Vec<u8> {
+    let mut f = Vec::with_capacity(24 + body.len());
+    f.push((SUBTYPE_DATA << 4) | (TYPE_DATA << 2));
+    f.push(0x02); // FromDS
+    f.extend_from_slice(&[0, 0]); // duration
+    f.extend_from_slice(da);
+    f.extend_from_slice(bssid);
+    f.extend_from_slice(sa);
+    f.extend_from_slice(&((seq & 0x0FFF) << 4).to_le_bytes());
     f.extend_from_slice(body);
     f
 }
@@ -283,6 +307,285 @@ pub fn probe_request(sa: [u8; 6], ssid: &str, rates: &[u8]) -> Vec<u8> {
 /// element uses: half-megabit units, with the top bit marking a rate the
 /// network requires rather than merely supports.
 pub const BASIC_RATES: &[u8] = &[0x82, 0x84, 0x8B, 0x96, 0x0C, 0x12, 0x18, 0x24];
+
+// ---------------------------------------------------------------------------
+// The frames that get a station onto a network
+// ---------------------------------------------------------------------------
+//
+// Authenticate, associate, and the two ways either end says it is leaving.
+// All four are management frames with the same header and a short fixed body,
+// and all four are *chip independent* -- a FullMAC part's firmware sends these
+// itself, and every SoftMAC part in the world needs exactly this.
+
+/// A status code of zero is success, and nothing else is.
+pub const STATUS_SUCCESS: u16 = 0;
+/// Open System, the only authentication algorithm worth implementing: WPA2
+/// does its real authentication in the four-way handshake afterwards, and
+/// Shared Key is WEP's, which is broken by design and whose challenge-response
+/// hands an eavesdropper a known plaintext.
+pub const AUTH_OPEN: u16 = 0;
+
+pub const REASON_LEAVING: u16 = 3;
+
+/// The RSN element for WPA2-Personal with CCMP, complete with its id and
+/// length so it can be appended whole.
+///
+/// **An association request carries the ciphers the station is choosing**, and
+/// an access point that offers CCMP refuses a station that asks for anything
+/// else -- so this is not a description of what is supported, it is the
+/// choice. Group CCMP, pairwise CCMP, AKM PSK, no RSN capabilities. TKIP is
+/// deliberately absent: offering it lets an access point pick it, and a
+/// downgrade a station volunteered for is still a downgrade.
+pub const RSN_CCMP_PSK: [u8; 22] = [
+    IE_RSN, 20, // element id and length
+    0x01, 0x00, // version 1
+    0x00, 0x0F, 0xAC, 0x04, // group cipher: CCMP
+    0x01, 0x00, 0x00, 0x0F, 0xAC, 0x04, // one pairwise cipher: CCMP
+    0x01, 0x00, 0x00, 0x0F, 0xAC, 0x02, // one AKM: PSK
+    0x00, 0x00, // RSN capabilities
+];
+
+/// Capability bits a station claims in an association request. ESS, because
+/// this is an infrastructure network and not ad-hoc; Privacy when the network
+/// is encrypted, which has to agree with the RSN element or the request is
+/// internally inconsistent and refused.
+const CAP_ESS: u16 = 1 << 0;
+
+/// The header every management frame shares.
+///
+/// Neither ToDS nor FromDS is set -- management frames are between a station
+/// and an access point directly, so A1 is always the destination, A2 the
+/// sender and A3 the BSSID, with none of the reshuffling `data_addrs` exists
+/// for. `seq` is ours to fill here and not the chip's, which is the whole
+/// difference between SoftMAC and FullMAC written as one argument.
+fn mgmt_header(subtype: u8, da: &[u8; 6], sa: &[u8; 6], bssid: &[u8; 6], seq: u16) -> Vec<u8> {
+    let mut f = Vec::with_capacity(MGMT_HDR);
+    f.push((subtype << 4) | (TYPE_MGMT << 2));
+    f.push(0);
+    f.extend_from_slice(&0u16.to_le_bytes()); // duration
+    f.extend_from_slice(da);
+    f.extend_from_slice(sa);
+    f.extend_from_slice(bssid);
+    f.extend_from_slice(&((seq & 0x0FFF) << 4).to_le_bytes());
+    f
+}
+
+/// The management subtype of a frame, or nothing if it is not management.
+pub fn mgmt_subtype(frame: &[u8]) -> Option<u8> {
+    if frame.len() < MGMT_HDR {
+        return None;
+    }
+    let fc = frame[0];
+    if (fc >> 2) & 0x3 != TYPE_MGMT {
+        return None;
+    }
+    Some((fc >> 4) & 0xF)
+}
+
+/// Destination, sender and BSSID of a management frame.
+pub fn mgmt_addrs(frame: &[u8]) -> Option<([u8; 6], [u8; 6], [u8; 6])> {
+    mgmt_subtype(frame)?;
+    let at = |off: usize| -> [u8; 6] {
+        let mut m = [0u8; 6];
+        m.copy_from_slice(&frame[off..off + 6]);
+        m
+    };
+    Some((at(4), at(10), at(16)))
+}
+
+/// True when this frame is addressed to us or to everybody.
+///
+/// Worth a function because the broadcast case is the one that gets forgotten:
+/// an access point tearing down a whole BSS sends one deauthentication to
+/// `ff:ff:ff:ff:ff:ff`, and a station that only matched its own address stays
+/// associated to a network that has stopped talking to it.
+pub fn addressed_to(frame: &[u8], me: &[u8; 6]) -> bool {
+    match mgmt_addrs(frame) {
+        Some((da, _, _)) => &da == me || da == BROADCAST,
+        None => false,
+    }
+}
+
+/// Build an Open System authentication frame.
+///
+/// `seq_no` is the *transaction* sequence number and is not the frame's
+/// sequence control -- 1 from the station, 2 from the access point. Two
+/// counters with the same name in one frame, and swapping them produces an
+/// authentication nobody answers.
+pub fn auth_open(bssid: &[u8; 6], sa: &[u8; 6], seq: u16, seq_no: u16) -> Vec<u8> {
+    let mut f = mgmt_header(SUBTYPE_AUTH, bssid, sa, bssid, seq);
+    f.extend_from_slice(&AUTH_OPEN.to_le_bytes());
+    f.extend_from_slice(&seq_no.to_le_bytes());
+    f.extend_from_slice(&STATUS_SUCCESS.to_le_bytes());
+    f
+}
+
+/// What an authentication frame says.
+pub struct Auth {
+    pub alg: u16,
+    pub seq_no: u16,
+    pub status: u16,
+}
+
+pub fn parse_auth(frame: &[u8]) -> Option<Auth> {
+    if mgmt_subtype(frame)? != SUBTYPE_AUTH || frame.len() < MGMT_HDR + 6 {
+        return None;
+    }
+    let b = &frame[MGMT_HDR..];
+    Some(Auth { alg: u16le(b), seq_no: u16le(&b[2..]), status: u16le(&b[4..]) })
+}
+
+/// Build an association request.
+///
+/// The SSID goes in even though the frame is addressed to one BSSID, because
+/// an access point carrying several networks on one radio tells them apart by
+/// exactly this element.
+pub fn assoc_request(
+    bssid: &[u8; 6],
+    sa: &[u8; 6],
+    seq: u16,
+    ssid: &str,
+    rates: &[u8],
+    rsn: bool,
+) -> Vec<u8> {
+    let mut f = mgmt_header(SUBTYPE_ASSOC_REQ, bssid, sa, bssid, seq);
+    let cap = if rsn { CAP_ESS | CAP_PRIVACY } else { CAP_ESS };
+    f.extend_from_slice(&cap.to_le_bytes());
+    // Listen interval, in beacon periods: how long the station may sleep
+    // before the access point may discard buffered frames for it. Ten is
+    // ordinary, and nothing here sleeps, so it costs the access point a little
+    // buffering it will never have to do.
+    f.extend_from_slice(&10u16.to_le_bytes());
+
+    f.push(IE_SSID);
+    f.push(ssid.len() as u8);
+    f.extend_from_slice(ssid.as_bytes());
+    f.push(IE_RATES);
+    f.push(rates.len() as u8);
+    f.extend_from_slice(rates);
+    if rsn {
+        f.extend_from_slice(&RSN_CCMP_PSK);
+    }
+    f
+}
+
+/// What an association response says.
+pub struct AssocResp {
+    pub status: u16,
+    /// Association identifier. The top two bits are set by convention and are
+    /// not part of the number, so masking is required rather than tidy: an
+    /// unmasked AID of 1 reads as 49153.
+    pub aid: u16,
+}
+
+pub fn parse_assoc_resp(frame: &[u8]) -> Option<AssocResp> {
+    if mgmt_subtype(frame)? != SUBTYPE_ASSOC_RESP || frame.len() < MGMT_HDR + 6 {
+        return None;
+    }
+    let b = &frame[MGMT_HDR..];
+    Some(AssocResp { status: u16le(&b[2..]), aid: u16le(&b[4..]) & 0x3FFF })
+}
+
+/// Build a deauthentication, which ends everything, or a disassociation,
+/// which ends only the association and leaves the station authenticated.
+pub fn deauth(bssid: &[u8; 6], sa: &[u8; 6], seq: u16, reason: u16) -> Vec<u8> {
+    let mut f = mgmt_header(SUBTYPE_DEAUTH, bssid, sa, bssid, seq);
+    f.extend_from_slice(&reason.to_le_bytes());
+    f
+}
+
+pub fn disassoc(bssid: &[u8; 6], sa: &[u8; 6], seq: u16, reason: u16) -> Vec<u8> {
+    let mut f = mgmt_header(SUBTYPE_DISASSOC, bssid, sa, bssid, seq);
+    f.extend_from_slice(&reason.to_le_bytes());
+    f
+}
+
+/// The reason in a deauthentication or disassociation, and nothing else.
+pub fn parse_reason(frame: &[u8]) -> Option<(u8, u16)> {
+    let sub = mgmt_subtype(frame)?;
+    if sub != SUBTYPE_DEAUTH && sub != SUBTYPE_DISASSOC {
+        return None;
+    }
+    if frame.len() < MGMT_HDR + 2 {
+        return None;
+    }
+    Some((sub, u16le(&frame[MGMT_HDR..])))
+}
+
+/// Build an association response. Only an access point sends one, and the one
+/// that exists here is the fake in `mlme`'s selftest -- which is exactly why
+/// it belongs beside the parser rather than inside the test: a builder and a
+/// parser written in one place agree with each other and prove nothing, and
+/// these two are read by code that never sees the other.
+pub fn assoc_response(sta: &[u8; 6], bssid: &[u8; 6], seq: u16, status: u16, aid: u16) -> Vec<u8> {
+    let mut f = mgmt_header(SUBTYPE_ASSOC_RESP, sta, bssid, bssid, seq);
+    f.extend_from_slice(&(CAP_ESS | CAP_PRIVACY).to_le_bytes());
+    f.extend_from_slice(&status.to_le_bytes());
+    f.extend_from_slice(&(0xC000 | (aid & 0x3FFF)).to_le_bytes());
+    f
+}
+
+/// Build an authentication response: the access point's side, transaction
+/// sequence number 2. A separate function from `auth_open` rather than a
+/// direction flag, because the addresses go in a different order and a flag
+/// is how that becomes a runtime decision nobody reads.
+pub fn auth_response(sta: &[u8; 6], bssid: &[u8; 6], seq: u16, status: u16) -> Vec<u8> {
+    let mut f = mgmt_header(SUBTYPE_AUTH, sta, bssid, bssid, seq);
+    f.extend_from_slice(&AUTH_OPEN.to_le_bytes());
+    f.extend_from_slice(&2u16.to_le_bytes());
+    f.extend_from_slice(&status.to_le_bytes());
+    f
+}
+
+/// Build a beacon, for the same reason `assoc_response` exists.
+pub fn beacon(bssid: &[u8; 6], seq: u16, ssid: &str, channel: u8, rsn: bool) -> Vec<u8> {
+    beacon_like(SUBTYPE_BEACON, &BROADCAST, bssid, seq, ssid, channel, rsn)
+}
+
+/// A probe response: the same body as a beacon, addressed to the station that
+/// asked. `parse_beacon` reads either, which is why one scan can use whichever
+/// arrives first -- and why the two builders differ only in the two fields
+/// that genuinely differ.
+pub fn probe_response(
+    sta: &[u8; 6],
+    bssid: &[u8; 6],
+    seq: u16,
+    ssid: &str,
+    channel: u8,
+    rsn: bool,
+) -> Vec<u8> {
+    beacon_like(SUBTYPE_PROBE_RESP, sta, bssid, seq, ssid, channel, rsn)
+}
+
+fn beacon_like(
+    sub: u8,
+    da: &[u8; 6],
+    bssid: &[u8; 6],
+    seq: u16,
+    ssid: &str,
+    channel: u8,
+    rsn: bool,
+) -> Vec<u8> {
+    let mut f = mgmt_header(sub, da, bssid, bssid, seq);
+    f.extend_from_slice(&0u64.to_le_bytes()); // timestamp
+    f.extend_from_slice(&100u16.to_le_bytes()); // beacon interval
+    let cap = if rsn { CAP_ESS | CAP_PRIVACY } else { CAP_ESS };
+    f.extend_from_slice(&cap.to_le_bytes());
+
+    f.push(IE_SSID);
+    f.push(ssid.len() as u8);
+    f.extend_from_slice(ssid.as_bytes());
+    f.push(IE_RATES);
+    f.push(BASIC_RATES.len() as u8);
+    f.extend_from_slice(BASIC_RATES);
+    f.push(IE_DS_PARAM);
+    f.push(1);
+    f.push(channel);
+    if rsn {
+        f.extend_from_slice(&RSN_CCMP_PSK);
+    }
+    f
+}
 
 /// Frames built here, parsed here, and compared against what went in.
 ///

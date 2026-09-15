@@ -192,6 +192,58 @@ fn inv_mix_columns(s: &mut [u8; 16]) {
     }
 }
 
+/// RFC 3394 AES key wrap, the direction an access point uses.
+///
+/// **Here because the other direction had nothing to check it against.**
+/// `key_unwrap` is verified by the published vector below and by refusing a
+/// wrong KEK, and neither of those says the loop indexes `t` correctly in the
+/// direction nobody runs -- an authenticator cannot be built out of an
+/// unwrapper. So the wrap is written, checked against the *same* vector's
+/// wrapped bytes, and round-tripped.
+pub fn key_wrap(kek: &[u8], plain: &[u8]) -> Option<Vec<u8>> {
+    if plain.len() < 16 || plain.len() % 8 != 0 {
+        return None;
+    }
+    let aes = Aes::new(kek)?;
+    let n = plain.len() / 8;
+    // The default IV. Unwrapping checks for exactly this, which is what makes
+    // a wrong key detectable instead of merely producing other bytes.
+    let mut a = [0xA6u8; 8];
+    let mut r: Vec<[u8; 8]> = (0..n)
+        .map(|i| {
+            let mut b = [0u8; 8];
+            b.copy_from_slice(&plain[8 * i..8 * i + 8]);
+            b
+        })
+        .collect();
+
+    for j in 0..6 {
+        for i in 1..=n {
+            let mut block = [0u8; 16];
+            block[..8].copy_from_slice(&a);
+            block[8..16].copy_from_slice(&r[i - 1]);
+            aes.encrypt_block(&mut block);
+            a.copy_from_slice(&block[..8]);
+            r[i - 1].copy_from_slice(&block[8..16]);
+            // The counter is xored into A *after* encryption here and before
+            // decryption there, which is the one asymmetry in the algorithm
+            // and the only place the two directions can silently disagree.
+            let t = (n * j + i) as u64;
+            let tb = t.to_be_bytes();
+            for k in 0..8 {
+                a[k] ^= tb[k];
+            }
+        }
+    }
+
+    let mut out = Vec::with_capacity(8 + n * 8);
+    out.extend_from_slice(&a);
+    for b in r {
+        out.extend_from_slice(&b);
+    }
+    Some(out)
+}
+
 /// RFC 3394 AES key unwrap, which is how WPA2 delivers the group key.
 ///
 /// The integrity check value is fixed and known, so a wrong key is detected
@@ -279,7 +331,7 @@ pub fn selftest() -> bool {
         0xFF,
     ];
     match key_unwrap(&kek, &wrapped) {
-        None => false,
+        None => return false,
         Some(k) => {
             if k[..] != want_key[..] {
                 return false;
@@ -288,7 +340,17 @@ pub fn selftest() -> bool {
             // returning garbage.
             let mut bad = kek;
             bad[0] ^= 1;
-            key_unwrap(&bad, &wrapped).is_none()
+            if key_unwrap(&bad, &wrapped).is_some() {
+                return false;
+            }
         }
+    }
+
+    // And the same vector read the other way: wrapping the key must produce
+    // exactly the bytes above. A wrap checked only by its own unwrapper agrees
+    // with itself about a counter both of them got wrong.
+    match key_wrap(&kek, &want_key) {
+        None => false,
+        Some(w) => w[..] == wrapped[..] && key_unwrap(&kek, &w).as_deref() == Some(&want_key[..]),
     }
 }

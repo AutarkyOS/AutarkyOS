@@ -47,12 +47,25 @@ use crate::net::Mac;
 /// link encrypted.
 pub const ETHERTYPE_EAPOL: u16 = 0x888E;
 
+/// How many management frames may pile up before the oldest is dropped.
+///
+/// Bounded because a machine parked next to a busy access point hears beacons
+/// forever, and an unattended one would grow this queue until the heap gave
+/// out. Small because the MLME drains it every poll and anything older than a
+/// poll is stale by definition.
+const MGMT_QUEUE: usize = 24;
+
 pub struct Link<R: Radio> {
     radio: R,
     bssid: Mac,
     keys: Option<ccmp::Keys>,
     seq: u16,
     joined: bool,
+    /// Management frames seen while draining the radio for data, kept whole
+    /// with what the radio reported about them -- the signal strength is how a
+    /// scan picks between two access points carrying the same network, and it
+    /// exists nowhere but here.
+    mgmt: Vec<Rx>,
     /// Counted rather than logged: a frame dropped for one of these reasons is
     /// ordinary in ones and a fault in thousands, and a line each would bury
     /// the shell under a busy access point.
@@ -69,6 +82,7 @@ impl<R: Radio> Link<R> {
             keys: None,
             seq: 0,
             joined: false,
+            mgmt: Vec::new(),
             dropped_unprotected: 0,
             dropped_replay: 0,
             dropped_malformed: 0,
@@ -128,10 +142,31 @@ impl<R: Radio> Link<R> {
         self.bssid = [0; 6];
     }
 
-    fn next_seq(&mut self) -> u16 {
+    /// The next sequence number, for whoever is building the frame.
+    ///
+    /// Public because management frames need one too and the MLME builds
+    /// those. **One counter for both**, which is what the standard says and
+    /// also the only arrangement that cannot produce two frames a moment apart
+    /// carrying the same number -- a duplicate as far as the receiver is
+    /// concerned, and silently discarded by it.
+    pub fn next_seq(&mut self) -> u16 {
         let s = self.seq;
         self.seq = (self.seq + 1) & 0x0FFF;
         s
+    }
+
+    pub fn bssid(&self) -> Mac {
+        self.bssid
+    }
+
+    /// Take the management frames seen since the last call.
+    ///
+    /// **There is one drain on a radio**, and whichever of the two consumers
+    /// calls first must not consume what the other needs. So `receive` sets
+    /// these aside as it goes rather than the MLME reading the radio itself,
+    /// and an ordinary data path that never asks simply lets them expire.
+    pub fn take_mgmt(&mut self) -> Vec<Rx> {
+        core::mem::take(&mut self.mgmt)
     }
 
     /// Send one raw 802.11 frame, unencrypted. For management and EAPOL.
@@ -139,10 +174,10 @@ impl<R: Radio> Link<R> {
         self.radio.tx(frame).is_ok()
     }
 
-    /// Take one frame off the radio without unwrapping it, for the MLME.
-    pub fn rx_raw(&mut self) -> Option<Rx> {
-        self.radio.rx()
-    }
+    // There is deliberately no `rx_raw`. A second way to take a frame off the
+    // radio is a second consumer racing the first for the same queue, and
+    // whichever called would silently eat what the other needed -- which is
+    // the whole reason `receive` sets management frames aside instead.
 }
 
 impl<R: Radio> Nic for Link<R> {
@@ -189,11 +224,21 @@ impl<R: Radio> Nic for Link<R> {
     fn receive(&mut self) -> Option<Vec<u8>> {
         loop {
             let got = self.radio.rx()?;
-            let frame = got.frame;
-            if frame.len() < 24 {
+            if got.frame.len() < 24 {
                 self.dropped_malformed += 1;
                 continue;
             }
+            // A management frame is not data and is not malformed either:
+            // authentication, association and both kinds of goodbye all arrive
+            // here and belong to the MLME above. Set aside rather than dropped.
+            if dot11::mgmt_subtype(&got.frame).is_some() {
+                if self.mgmt.len() >= MGMT_QUEUE {
+                    self.mgmt.remove(0);
+                }
+                self.mgmt.push(got);
+                continue;
+            }
+            let frame = got.frame;
             let protected = u16::from_le_bytes([frame[0], frame[1]]) & 0x4000 != 0;
 
             let (hdr, body) = if protected {
