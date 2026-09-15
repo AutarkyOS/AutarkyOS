@@ -5121,19 +5121,47 @@ The task is known-item retrieval and it is built so it cannot be gamed: a node's
 `concept` is the *first sentence* of its `text`, so the index holds the concept
 and its terms while the query is everything after that first sentence. Prose
 from the same node that the index has never seen, one right answer in 8,913,
-chance 0.011%. `forest bench [n]` runs it; 198 queries, one row per method,
-same queries and same candidates throughout:
+chance 0.011%. `forest bench [n]` runs it, and asks **two ways**: the long
+query is the whole body tail, the short one is its first eight words, which is
+what a person types. 198 queries, same candidates and same nodes throughout:
 
-    method              r@1      r@5       MRR
-    mean pool           0.5%      1.0%    0.0098
-    idf pool            5.5%      9.5%    0.0799
-    terms b=0.00       81.8%     91.4%    0.8594
-    terms b=0.25       83.8%     94.4%    0.8841
-    terms b=0.50       87.8%     94.4%    0.9095     <- ships
-    terms b=0.75       86.3%     93.4%    0.8955
-    terms b=1.00       81.8%     91.4%    0.8634
-    mix a=0.05         84.8%     94.4%    0.8901
-    mix a=1.00          5.5%      9.5%    0.0799
+    method               L r@1   L r@5   L MRR     S r@1   S r@5   S MRR
+    mean pool             0.5%    1.0%  0.0098      8.0%   16.1%  0.1097
+    idf pool              5.5%    9.5%  0.0799     30.8%   44.4%  0.3757
+    terms b=0.00         81.8%   91.4%  0.8594     45.9%   63.1%  0.5440
+    terms b=0.25         83.8%   94.4%  0.8841     47.9%   65.6%  0.5636
+    terms b=0.50         87.8%   94.4%  0.9095     47.9%   67.1%  0.5681   <- ships
+    terms b=0.75         86.3%   93.4%  0.8955     46.4%   66.1%  0.5588
+    bm25 k=1.2 b=0.50    79.2%   90.9%  0.8464     42.4%   62.1%  0.5109
+    bm25 k=1.2 b=0.75    81.8%   92.9%  0.8652     42.4%   62.1%  0.5140
+    mix a=0.10           81.8%   92.4%  0.8683     47.4%   66.1%  0.5622
+    mix a=0.50           44.9%   54.0%  0.4947     46.9%   61.1%  0.5384
+
+**Two named gaps closed, one of them with a negative result.**
+
+*Term-frequency saturation made it worse.* It was the obvious fix for a ranking
+that looked like it was counting words, and BM25 measures 79.2% against 87.8%.
+The reason is in the corpus: these are short questions with almost no term
+repetition, so `tf` is nearly always 1 and the saturation collapses to a
+constant -- what is left of BM25 is its *length* normalisation, which sits
+**inside** the saturation where `k1` multiplies it, and that measured worse than
+charging the sum directly. The constant, the `tf` column and the grid row all
+stay so the day the corpus grows longer documents the answer is one command
+away.
+
+*Short queries are much harder and change nothing.* 47.9% against 87.8% is the
+honest cost of a terse question, and `b = 0.50` wins both columns -- so the
+worry that a constant tuned on long queries was tuned on the wrong distribution
+was worth checking and came back clean. The interesting half of that table is
+the embedding: 5.5% on long queries and **30.8%** on short ones, which closes
+most of the gap and still never opens one.
+
+**The families are three different normalisations, and conflating two of them
+cost a measurement.** The first grid had only `bm25 k=0` where `terms b=X`
+belonged -- and at `k1 = 0` BM25's length term drops out entirely, because it
+only ever appears multiplied by `k1`. Three rows came back identical, the
+discount looked like it did nothing, and the row that had actually won was
+missing. `M::Terms`, `M::Bm25` and `M::Mix` are separate for that reason.
 
 Three corrections, each visible in a row above:
 
@@ -5148,7 +5176,7 @@ Three corrections, each visible in a row above:
 - **A length discount.** Asked for the derivative of a polynomial, the first
   answer was about *roulette* -- a long node holding `what`, `is`, `of` and `a`.
   A long document collects more small weights than a short one carrying the
-  words that mattered. BM25's `b` charges for that: 81.8% to 87.8%.
+  words that mattered. Charging for that: 81.8% to 87.8%.
 
 **`LEN_B` is 0.5 and not the textbook 0.75**, because the sweep has an interior
 optimum there -- which is the difference between a value chosen and a value
@@ -5163,12 +5191,11 @@ is one command that prints every rung. The subject router still uses embeddings
 and improved for free when the pooling did, from 28.6% to **34.7%** top-1 against
 6.2% chance.
 
-What this does *not* fix: scoring is presence-only, with no term-frequency
-saturation, and the benchmark's queries are long where a typed question is
-short. Both are visible in the same example -- the four entries returned for
-"what is the derivative of a polynomial" are all polynomial questions, but the
-one specifically about differentiating one ranks below three that say
-"polynomial" twice.
+What this does *not* fix: the four entries returned for "what is the derivative
+of a polynomial" are all polynomial questions, and the one specifically about
+differentiating one is not first. Both candidate explanations were tested --
+term frequency and query length -- and neither was it, so the cause is still
+open and is now the *only* thing open rather than one of three.
 
 ### Budgeted retrieval
 

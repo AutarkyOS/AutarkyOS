@@ -174,12 +174,15 @@ pub fn store_lex(l: &crate::ai::lex::Lex) -> bool {
 /// swept it over a known-item task with 8,913 candidates and no string shared
 /// between query and index:
 ///
-///     mean pool      r@1  0.5%    MRR 0.0098
-///     idf pool       r@1  5.5%    MRR 0.0799
-///     terms          r@1 87.8%    MRR 0.9095
+///                    long query      short query
+///     mean pool      r@1  0.5%       r@1  8.0%
+///     idf pool       r@1  5.5%       r@1 30.8%
+///     terms          r@1 87.8%       r@1 47.9%
 ///
-/// and every weight above zero came out worse than zero -- 84.8% at a=0.05,
-/// 68.6% at a=0.25, and the embedding alone at 5.5%. So the
+/// and every weight above zero came out worse -- 81.8%/47.4% at a=0.10, down to
+/// 44.9%/46.9% at a=0.50. The embedding is far stronger on a short query than a
+/// long one, which is the interesting half of that table: it closes most of the
+/// gap and still never opens one. So the
 /// embedding channel is switched off for node retrieval, and the constant is
 /// here rather than inlined so the shipped behaviour and the measurement cannot
 /// drift apart in silence.

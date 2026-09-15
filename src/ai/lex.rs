@@ -56,7 +56,36 @@ pub struct Lex {
     pub df: Vec<u32>,
     /// How many *distinct* tokens each document has.
     pub len: Vec<u32>,
+    /// How often each posting's token occurs in that posting's document.
+    ///
+    /// Parallel to `nodes`, one byte each and saturating. A token appearing
+    /// more than 255 times in a node is a node that has stopped being a node,
+    /// and the difference between 255 and 400 occurrences changes no ranking
+    /// once the saturation below has had its say.
+    pub tf: Vec<u8>,
 }
+
+/// How fast term frequency saturates. BM25's `k1`.
+///
+/// The second occurrence of a word says much less than the first and the
+/// twentieth says almost nothing, which is what `tf*(k1+1)/(tf + k1*norm)`
+/// encodes.
+///
+/// **Not on the shipped path, and that is a measured result rather than an
+/// omission.** Saturating term frequency was the obvious fix for a ranking that
+/// looked like it was counting words, and `forest bench` says it makes things
+/// worse here -- 79.2% against 87.8% on long queries and 42.4% against 47.9% on
+/// short ones. The reason is visible in the corpus: these are short questions
+/// with almost no term repetition, so `tf` is nearly always 1 and the whole
+/// saturation term collapses to a constant. What is left of BM25 is its
+/// *length* normalisation, which sits inside the saturation where `k1`
+/// multiplies it, and that measured worse than charging the sum directly.
+///
+/// So this is a fact about a corpus of short questions and not about BM25. The
+/// constant, the `tf` column and the grid row all stay, because the day the
+/// corpus grows longer documents the answer is one command away rather than a
+/// rewrite.
+pub const TF_K1: f32 = 1.2;
 
 /// How much a document is charged for its length. BM25's `b`.
 ///
@@ -107,6 +136,14 @@ impl Lex {
     /// Query tokens are deduplicated first: a word said twice is not twice the
     /// evidence, and without this a repeated term quietly doubles its own
     /// weight against every other.
+    /// What ships, with the constants `forest bench` chose.
+    ///
+    /// The `Terms` family: presence, then a length charge on the sum. **Not
+    /// BM25**, and the sweep is why -- putting the charge inside the saturation
+    /// where `k1` multiplies it measured worse here, on both long and short
+    /// queries. That is a fact about a corpus of short questions with little
+    /// term repetition, not about BM25, and the grid keeps both so the day the
+    /// corpus changes the answer is one command away.
     pub fn score(&self, query: &[usize], out: &mut [f32]) {
         let total = self.score_raw(query, out);
         self.finish(out, total, LEN_B);
@@ -158,6 +195,67 @@ impl Lex {
         }
     }
 
+    /// BM25 over the postings: IDF, saturating term frequency, length charge.
+    ///
+    /// **One function for both scorings.** At `k1 = 0` the saturation term is
+    /// `tf*1/(tf + 0)` = 1, which is presence -- so the row this had before is
+    /// this row with a knob at zero, and the sweep can compare them without two
+    /// code paths that might differ for a second reason.
+    ///
+    /// Divided by the query's own IDF mass at the end, so the score is the
+    /// share of what was asked that the document accounts for and is comparable
+    /// across queries of different lengths.
+    pub fn bm25(&self, query: &[usize], out: &mut [f32], k1: f32, b: f32) {
+        for v in out.iter_mut() {
+            *v = 0.0;
+        }
+        let avg = self.avg_len();
+        let mut seen: Vec<usize> = Vec::with_capacity(query.len());
+        let mut total = 0.0f32;
+        for t in query {
+            if seen.contains(t) {
+                continue;
+            }
+            seen.push(*t);
+            let w = self.idf(*t);
+            total += w;
+            if w <= 0.0 {
+                continue;
+            }
+            let (a, z) = match self.range(*t) {
+                Some(v) => v,
+                None => continue,
+            };
+            for k in a..z {
+                let n = self.nodes[k] as usize;
+                let f = self.tf[k] as f32;
+                let l = *self.len.get(n).unwrap_or(&1) as f32;
+                let norm = 1.0 - b + b * (l / avg);
+                if let Some(sc) = out.get_mut(n) {
+                    *sc += w * (f * (k1 + 1.0)) / (f + k1 * norm).max(1.0e-6);
+                }
+            }
+        }
+        if total > 0.0 {
+            for v in out.iter_mut() {
+                *v /= total;
+            }
+        }
+    }
+
+    /// Where a token's postings start and stop. Public for the suite, which
+    /// has to reach one to check that occurrences were counted.
+    pub fn range_of(&self, t: usize) -> (usize, usize) {
+        self.range(t).unwrap_or((0, 0))
+    }
+
+    fn range(&self, t: usize) -> Option<(usize, usize)> {
+        if t + 1 >= self.starts.len() {
+            return None;
+        }
+        Some((self.starts[t] as usize, self.starts[t + 1] as usize))
+    }
+
     pub fn avg_len(&self) -> f32 {
         if self.len.is_empty() {
             return 1.0;
@@ -194,22 +292,35 @@ impl Lex {
         }
         let total = starts[vocab] as usize;
         let mut nodes = alloc::vec![0u32; total];
+        let mut tf = alloc::vec![0u8; total];
         let mut len = alloc::vec![0u32; docs.len()];
         let mut at = starts.clone();
+        let mut slot: Vec<usize> = Vec::new();
         for (i, d) in docs.iter().enumerate() {
             seen.clear();
+            slot.clear();
             for t in d {
-                if *t < vocab && !seen.contains(t) {
-                    seen.push(*t);
-                    nodes[at[*t] as usize] = i as u32;
-                    at[*t] += 1;
+                if *t >= vocab {
+                    continue;
+                }
+                match seen.iter().position(|x| x == t) {
+                    // Already posted: bump the count in the slot it went to.
+                    Some(k) => tf[slot[k]] = tf[slot[k]].saturating_add(1),
+                    None => {
+                        seen.push(*t);
+                        let where_ = at[*t] as usize;
+                        slot.push(where_);
+                        nodes[where_] = i as u32;
+                        tf[where_] = 1;
+                        at[*t] += 1;
+                    }
                 }
             }
             // Distinct, because that is what the postings count and a length
             // measured differently from what it normalises is not a length.
             len[i] = seen.len() as u32;
         }
-        Lex { vocab, docs: docs.len() as u32, starts, nodes, df, len }
+        Lex { vocab, docs: docs.len() as u32, starts, nodes, df, len, tf }
     }
 
     pub fn encode(&self) -> Vec<u8> {
@@ -230,6 +341,7 @@ impl Lex {
         for v in &self.df {
             out.extend_from_slice(&v.to_le_bytes());
         }
+        out.extend_from_slice(&self.tf);
         out
     }
 
@@ -244,7 +356,7 @@ impl Lex {
         if vocab == 0 || vocab > 1 << 22 {
             return None;
         }
-        let want = 20 + (docs as usize + vocab + 1 + total + vocab) * 4;
+        let want = 20 + (docs as usize + vocab + 1 + total + vocab) * 4 + total;
         if b.len() != want {
             return None;
         }
@@ -261,10 +373,12 @@ impl Lex {
         let starts = take(vocab + 1, &mut at);
         let nodes = take(total, &mut at);
         let df = take(vocab, &mut at);
+        let tf = b[at..at + total].to_vec();
+        at += total;
         if at != b.len() || starts.last().copied().unwrap_or(0) as usize != total {
             return None;
         }
-        Some(Lex { vocab, docs, starts, nodes, df, len })
+        Some(Lex { vocab, docs, starts, nodes, df, len, tf })
     }
 }
 
@@ -428,12 +542,56 @@ pub fn selftest() -> bool {
         u[1] > u[0],
     );
 
+    // --- term frequency, and the knob that turns it off -----------------
+    //
+    // Document 3 is `[0, 5, 5, 5]`: token 5 three times, in one document.
+    check(
+        "term frequency counts occurrences where document frequency counted documents",
+        lex.tf[lex.range_of(5).0] == 3 && lex.df[5] == 1,
+    );
+    // **`k1 = 0` is presence**, exactly: the saturation term becomes
+    // `tf*1/(tf+0)` = 1 whatever `tf` is. So the scoring this shipped before is
+    // this scoring with the knob at zero, and the two are one function rather
+    // than two that might drift apart for a second reason.
+    let mut p0 = alloc::vec![0.0f32; 4];
+    let mut p1 = alloc::vec![0.0f32; 4];
+    lex.bm25(&[5], &mut p0, 0.0, 0.0);
+    let t = lex.score_raw(&[5], &mut p1);
+    lex.finish(&mut p1, t, 0.0);
+    check(
+        "bm25 with k1 = 0 is presence scoring, to the bit",
+        p0 == p1,
+    );
+    // Three occurrences are worth more than one and nowhere near three times
+    // more. That is the whole of what saturation is for: the second mention of
+    // a word says much less than the first.
+    let rep3 = alloc::vec![
+        alloc::vec![9usize, 9, 9, 1],
+        alloc::vec![9usize, 1],
+        alloc::vec![2usize],
+        alloc::vec![3usize],
+    ];
+    let l3 = Lex::build(10, &rep3);
+    let mut u = alloc::vec![0.0f32; 4];
+    l3.bm25(&[9], &mut u, TF_K1, 0.0);
+    check(
+        "three occurrences beat one, and by far less than three times",
+        u[0] > u[1] && u[0] < u[1] * 2.0,
+    );
+
     let enc = lex.encode();
     let back = Lex::decode(&enc);
     check(
         "the index round-trips through its own bytes",
         match &back {
-            Some(d) => d.vocab == 6 && d.docs == 4 && d.df == lex.df && d.nodes == lex.nodes,
+            Some(d) => {
+                d.vocab == 6
+                    && d.docs == 4
+                    && d.df == lex.df
+                    && d.nodes == lex.nodes
+                    && d.tf == lex.tf
+                    && d.len == lex.len
+            }
             None => false,
         },
     );

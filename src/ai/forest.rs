@@ -770,116 +770,178 @@ pub fn bench(sample: usize) {
         return;
     }
 
-    // Two sweeps in one pass. `b` is how much a document is charged for its
-    // length, `a` is how much of the score comes from the embedding rather than
-    // the terms -- and both are read off the table rather than argued for.
-    //
-    // The mix grid is dense near zero because that is where the first sweep put
-    // its optimum, and a grid that only says "the end of the range" cannot tell
-    // a real optimum from a boundary.
-    const BS: &[f32] = &[0.0, 0.25, 0.5, 0.75, 1.0];
-    const MIXES: &[f32] = &[0.05, 0.25, 1.0];
-    let rows = 2 + BS.len() + MIXES.len();
-    let mut r1 = alloc::vec![0usize; rows];
-    let mut r5 = alloc::vec![0usize; rows];
-    let mut mrr = alloc::vec![0.0f32; rows];
+    // **One knob per column, both swept, and the queries asked two ways.**
+    // `k1` is how fast a repeated term stops adding, `b` is how much a document
+    // is charged for its length. `k1 = 0` collapses to presence scoring, so the
+    // row this shipped before is in the grid rather than beside it.
+    // **Three families, because they are three different normalisations and
+    // the first sweep conflated two of them.** `Terms` divides the summed IDF
+    // mass by a length charge *after* the sum; BM25 puts the charge inside the
+    // saturation, where it is multiplied by `k1` -- so BM25 at `k1 = 0` is not
+    // "presence with a length discount", it is presence with **no** discount at
+    // all, and a grid that only had those two rows reported the discount as
+    // having no effect. The row that had actually won came back missing.
+    enum M {
+        /// Presence, then a length charge on the sum.
+        Terms(f32),
+        /// Saturating term frequency, with the charge inside it.
+        Bm25(f32, f32),
+        /// The best `Terms` row, mixed with the embedding.
+        Mix(f32),
+    }
+    let grid = alloc::vec![
+        M::Terms(0.00),
+        M::Terms(0.25),
+        M::Terms(0.50),
+        M::Terms(0.75),
+        M::Bm25(1.2, 0.50),
+        M::Bm25(1.2, 0.75),
+        M::Mix(0.10),
+        M::Mix(0.30),
+        M::Mix(0.50),
+    ];
+    let rows = 2 + grid.len();
+
+    // Two query sets over the same nodes. **The long one is the body tail; the
+    // short one is its first eight words**, which is about the length of a
+    // question somebody types. A constant tuned on long queries and used on
+    // short ones is tuned on the wrong distribution, and until now there was no
+    // way to see that.
+    const SHORT_WORDS: usize = 8;
+    let shorten = |q: &str| -> String {
+        let mut out = String::new();
+        for (k, w) in q.split_whitespace().take(SHORT_WORDS).enumerate() {
+            if k > 0 {
+                out.push(' ');
+            }
+            out.push_str(w);
+        }
+        out
+    };
 
     let mhz = crate::time::tsc_mhz().max(1);
     let t0 = crate::time::rdtsc();
     let mut sm = alloc::vec![0.0f32; n];
     let mut si = alloc::vec![0.0f32; n];
-    let mut raw = alloc::vec![0.0f32; n];
     let mut sl = alloc::vec![0.0f32; n];
+    let mut raw = alloc::vec![0.0f32; n];
     let mut best = alloc::vec![0.0f32; n];
-    let mut sx = alloc::vec![0.0f32; n];
+    let mut r1 = [alloc::vec![0usize; rows], alloc::vec![0usize; rows]];
+    let mut r5 = [alloc::vec![0usize; rows], alloc::vec![0usize; rows]];
+    let mut mrr = [alloc::vec![0.0f32; rows], alloc::vec![0.0f32; rows]];
 
-    for (truth, q) in &queries {
-        let pooled = crate::ai::with_engine(|e| {
-            let ids = e.tok.encode(q, false, false);
-            let mut m = crate::ai::vocab::pool_text(&e.model, &e.tok, q);
-            crate::ai::lex::normalise(&mut m);
-            (ids.clone(), m, crate::ai::lex::pool_ids(&e.model, &ids, &lex))
-        });
-        let (ids, qm, qi) = match pooled {
-            Some(v) => v,
-            None => return,
-        };
-        // Every vector is unit length, so a cosine is a dot product and the
-        // whole sweep is one multiply-add per dimension per node.
-        for j in 0..n {
-            sm[j] = crate::ai::lex::dot(&qm, &meanv[j]);
-            si[j] = crate::ai::lex::dot(&qi, &idfv[j]);
-        }
-        // The postings walk happens once and each `b` reuses it, so what
-        // differs between those rows is the length discount and nothing else.
-        let tot = lex.score_raw(&ids, &mut raw);
-
-        let mut tally = |row: usize, scores: &[f32]| {
-            let r = rank_by(scores, *truth);
-            if r == 0 {
-                r1[row] += 1;
-            }
-            if r < 5 {
-                r5[row] += 1;
-            }
-            mrr[row] += 1.0 / (r as f32 + 1.0);
-        };
-        tally(0, &sm);
-        tally(1, &si);
-        for (k, b) in BS.iter().enumerate() {
-            sl.copy_from_slice(&raw);
-            lex.finish(&mut sl, tot, *b);
-            tally(2 + k, &sl);
-            if (*b - crate::ai::lex::LEN_B).abs() < 1.0e-6 {
-                best.copy_from_slice(&sl);
-            }
-        }
-        // Mixed against the shipped `b`, so the two knobs are not being swept
-        // against each other at once -- one table cannot answer two questions.
-        for (k, a) in MIXES.iter().enumerate() {
+    for set in 0..2 {
+        for (truth, full) in &queries {
+            let q = if set == 0 { full.clone() } else { shorten(full) };
+            let pooled = crate::ai::with_engine(|e| {
+                let ids = e.tok.encode(&q, false, false);
+                let mut m = crate::ai::vocab::pool_text(&e.model, &e.tok, &q);
+                crate::ai::lex::normalise(&mut m);
+                (ids.clone(), m, crate::ai::lex::pool_ids(&e.model, &ids, &lex))
+            });
+            let (ids, qm, qi) = match pooled {
+                Some(v) => v,
+                None => return,
+            };
+            // Every vector is unit length, so a cosine is a dot product and the
+            // sweep is one multiply-add per dimension per node.
             for j in 0..n {
-                sx[j] = a * si[j] + (1.0 - a) * best[j];
+                sm[j] = crate::ai::lex::dot(&qm, &meanv[j]);
+                si[j] = crate::ai::lex::dot(&qi, &idfv[j]);
             }
-            tally(2 + BS.len() + k, &sx);
+
+            let mut tally = |row: usize, scores: &[f32]| {
+                let r = rank_by(scores, *truth);
+                if r == 0 {
+                    r1[set][row] += 1;
+                }
+                if r < 5 {
+                    r5[set][row] += 1;
+                }
+                mrr[set][row] += 1.0 / (r as f32 + 1.0);
+            };
+            tally(0, &sm);
+            tally(1, &si);
+            // The postings walk once, reused by every `Terms` row, so what
+            // differs between them is the charge and nothing else.
+            let tot = lex.score_raw(&ids, &mut raw);
+            for (k, m) in grid.iter().enumerate() {
+                match m {
+                    M::Terms(b) => {
+                        sl.copy_from_slice(&raw);
+                        lex.finish(&mut sl, tot, *b);
+                        if (*b - crate::ai::lex::LEN_B).abs() < 1.0e-6 {
+                            best.copy_from_slice(&sl);
+                        }
+                    }
+                    M::Bm25(k1, b) => lex.bm25(&ids, &mut sl, *k1, *b),
+                    // Against the shipped `Terms` row, so two knobs are never
+                    // swept against each other at once.
+                    M::Mix(a) => {
+                        for j in 0..n {
+                            sl[j] = a * si[j] + (1.0 - a) * best[j];
+                        }
+                    }
+                }
+                tally(2 + k, &sl);
+            }
         }
     }
     let us = (crate::time::rdtsc() - t0) / mhz;
 
     let q = queries.len();
-    kprintln!("  known-item retrieval: {} candidates, {} quer(ies)", n, q);
-    kprintln!("  the query is a node's body after its own first sentence; the index holds");
-    kprintln!("  that sentence and its terms, so no string is shared and one answer is right");
+    kprintln!("  known-item retrieval: {} candidates, {} quer(ies), asked two ways", n, q);
+    kprintln!("  long  -- a node's body after its own first sentence");
+    kprintln!("  short -- the first {} words of that, which is what a person types", SHORT_WORDS);
+    kprintln!("  the index holds that first sentence and its terms, so no string is shared");
     if nodisjoint > 0 {
         kprintln!("  {} sampled node(s) had no disjoint tail and were not asked", nodisjoint);
     }
     let per = |a: usize| a * 1000 / q;
     let name = |row: usize| -> alloc::string::String {
         match row {
-            0 => alloc::format!("{:<14}", "mean pool"),
-            1 => alloc::format!("{:<14}", "idf pool"),
-            k if k < 2 + BS.len() => alloc::format!("terms b={:<6.2}", BS[k - 2]),
-            k => alloc::format!("mix a={:<8.2}", MIXES[k - 2 - BS.len()]),
+            0 => alloc::format!("{:<18}", "mean pool"),
+            1 => alloc::format!("{:<18}", "idf pool"),
+            k => match grid[k - 2] {
+                M::Terms(b) => alloc::format!("terms b={:<10.2}", b),
+                M::Bm25(k1, b) => alloc::format!("bm25 k={:.1} b={:<7.2}", k1, b),
+                M::Mix(a) => alloc::format!("mix a={:<12.2}", a),
+            },
         }
     };
-    kprintln!("  {:<14} {:>8} {:>8} {:>9}", "method", "r@1", "r@5", "MRR");
+    kprintln!(
+        "  {:<18} {:>7} {:>7} {:>7}   {:>7} {:>7} {:>7}",
+        "method",
+        "L r@1",
+        "L r@5",
+        "L MRR",
+        "S r@1",
+        "S r@5",
+        "S MRR"
+    );
     for row in 0..rows {
-        let (a, b) = (per(r1[row]), per(r5[row]));
+        let (la, lb) = (per(r1[0][row]), per(r5[0][row]));
+        let (sa, sb) = (per(r1[1][row]), per(r5[1][row]));
         kprintln!(
-            "  {} {:>6}.{}% {:>6}.{}% {:>9.4}",
+            "  {} {:>5}.{}% {:>5}.{}% {:>7.4}   {:>5}.{}% {:>5}.{}% {:>7.4}",
             name(row),
-            a / 10,
-            a % 10,
-            b / 10,
-            b % 10,
-            mrr[row] / q as f32
+            la / 10,
+            la % 10,
+            lb / 10,
+            lb % 10,
+            mrr[0][row] / q as f32,
+            sa / 10,
+            sa % 10,
+            sb / 10,
+            sb % 10,
+            mrr[1][row] / q as f32
         );
     }
-    // `a=1.00` is the embedding alone, so that row must equal `idf pool`. It is
-    // left in as a check on the mixing arithmetic rather than removed as a
-    // duplicate -- a fusion that quietly dropped one side would show here and
-    // nowhere else.
-    kprintln!("  (mix a=1.00 must equal 'idf pool'; b={:.2} is what ships)", crate::ai::lex::LEN_B);
-    kprintln!("  chance at r@1 is 1 in {}, and MRR would be about {:.5}", n, 1.0 / n as f32);
+    kprintln!(
+        "  shipping the terms family at b={:.2}; chance at r@1 is 1 in {}",
+        crate::ai::lex::LEN_B,
+        n
+    );
     kprintln!("  swept in {} ms", us / 1000);
 }
 
