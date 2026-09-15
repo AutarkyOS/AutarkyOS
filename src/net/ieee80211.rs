@@ -587,6 +587,55 @@ fn beacon_like(
     f
 }
 
+/// Every frame this module builds, at fixed inputs, as hex.
+///
+/// **The one thing the boot selftests structurally cannot check.** Every
+/// 802.11 claim in this tree builds a frame with these functions and reads it
+/// back with the parsers beside them, so a field written in the wrong order is
+/// read back in the wrong order and agrees with itself perfectly. The suites
+/// pass and no access point in the world will answer.
+///
+/// So the bytes go out to where something that is not this can read them:
+/// `tools/dot11check.py` puts every line through **scapy**, which is somebody
+/// else's implementation of these formats and reads real captures. That is the
+/// same bargain `tokenizer.py --verify` and `manifest.py --verify` make, and
+/// the reason it is a shell verb rather than a suite is that the second
+/// opinion cannot live in the kernel -- a checker compiled in here would be a
+/// third thing written from the same understanding.
+///
+/// Inputs are constants so the host can rebuild the identical frame and
+/// compare byte for byte rather than field by field.
+pub fn dump() {
+    use crate::kprintln;
+    let me: [u8; 6] = [0x02, 0, 0, 0, 0, 0x11];
+    let ap: [u8; 6] = [0x02, 0, 0, 0, 0, 0xAA];
+    const SEQ: u16 = 7;
+
+    let line = |name: &str, f: &[u8]| {
+        let mut hex = alloc::string::String::with_capacity(f.len() * 2);
+        for b in f {
+            hex.push(char::from_digit((b >> 4) as u32, 16).unwrap_or('0'));
+            hex.push(char::from_digit((b & 0xF) as u32, 16).unwrap_or('0'));
+        }
+        kprintln!("frame {} {}", name, hex);
+    };
+
+    line("auth_req", &auth_open(&ap, &me, SEQ, 1));
+    line("auth_resp", &auth_response(&me, &ap, SEQ, 0));
+    line("assoc_req_rsn", &assoc_request(&ap, &me, SEQ, "glados", BASIC_RATES, true));
+    line("assoc_req_open", &assoc_request(&ap, &me, SEQ, "glados", BASIC_RATES, false));
+    line("assoc_resp", &assoc_response(&me, &ap, SEQ, 0, 7));
+    line("deauth", &deauth(&me, &ap, SEQ, REASON_LEAVING));
+    line("disassoc", &disassoc(&me, &ap, SEQ, 8));
+    line("beacon", &beacon(&ap, SEQ, "glados", 6, true));
+    line("probe_resp", &probe_response(&me, &ap, SEQ, "glados", 6, true));
+    line("probe_req", &probe_request(me, "glados", BASIC_RATES));
+    line("rsn_element", &RSN_CCMP_PSK);
+    line("snap", &snap_wrap(0x0800, b"payload"));
+    line("data_to_ds", &data_to_ds(&ap, &me, &ap, SEQ, &snap_wrap(0x0800, b"payload")));
+    line("data_from_ds", &data_from_ds(&me, &ap, &ap, SEQ, &snap_wrap(0x0800, b"payload")));
+}
+
 /// Frames built here, parsed here, and compared against what went in.
 ///
 /// This is the whole verification available without a radio, and it is worth

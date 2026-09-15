@@ -582,6 +582,35 @@ pub fn selftest() -> bool {
         "each frame takes the next sequence number",
         seq_of(&link.radio_mut().sent[0]) + 1 == seq_of(&link.radio_mut().sent[1]),
     );
+    // Twelve bits, so it wraps after four thousand and ninety-six frames --
+    // which on a link carrying anything at all is minutes, not a corner case.
+    // A counter that ran on into the fragment number would put a 1 in the low
+    // four bits and every receiver would read the frame as fragment one of
+    // something it never saw the start of.
+    {
+        let mut w = Link::new(Loopback::new(me));
+        let _ = w.radio_mut().start();
+        for _ in 0..4095 {
+            let _ = w.next_seq();
+        }
+        let last = w.next_seq();
+        let wrapped = w.next_seq();
+        check(
+            "and after four thousand and ninety-six it wraps to zero, not to 4096",
+            last == 4095 && wrapped == 0,
+        );
+        w.join(bssid);
+        let _ = w.keyed(&tk, 0);
+        let _ = w.transmit(&eth);
+        check(
+            "a frame built on the wrapped counter still has a clear fragment number",
+            w.radio_mut()
+                .sent
+                .last()
+                .map(|f| u16::from_le_bytes([f[22], f[23]]) & 0x000F == 0)
+                .unwrap_or(false),
+        );
+    }
 
     // --- hardware crypto, and a part that claims it and then will not --
     let mut hw = Loopback::new(me);

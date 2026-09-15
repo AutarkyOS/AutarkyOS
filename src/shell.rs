@@ -7871,6 +7871,14 @@ fn wifi_cmd(rest: &str) {
                 }
             }
         }
+        "frames" => {
+            // Not an operator command so much as a tap for the host-side
+            // checker, and printed rather than returned because a serial line
+            // is the only thing that reaches out of this machine.
+            crate::net::ieee80211::dump();
+            crate::net::ccmp::dump();
+            crate::net::wpa2::dump();
+        }
         "leave" => match crate::net::wlan() {
             None => kprintln!("  no wireless driver."),
             Some(w) => {
@@ -7879,7 +7887,7 @@ fn wifi_cmd(rest: &str) {
             }
         },
         _ => {
-            kprintln!("  usage: wifi [status] | scan | join <ssid> [pass] | leave");
+            kprintln!("  usage: wifi [status] | scan | join <ssid> [pass] | leave | frames");
         }
     }
 }

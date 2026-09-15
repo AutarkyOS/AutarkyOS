@@ -1171,16 +1171,29 @@ pub fn selftest() -> bool {
                     .unwrap_or(false),
         );
         // The clock the real path uses, rather than the fixture's counter.
-        // Nothing here asserts a duration -- only that it moves, because a
-        // clock stuck at zero is a state machine whose deadlines never arrive.
+        //
+        // **The units are the claim, not that it moves.** Every deadline here
+        // is a number of milliseconds, and `now_ms` is a division -- so a
+        // clock answering microseconds makes `DWELL_MS` a hundred and twenty
+        // *microseconds*, the scan blows through thirty-eight channels before
+        // one beacon interval has elapsed, and every network in the building
+        // is missed. On hardware that reads as a radio that hears nothing,
+        // which is the most expensive symptom to debug and the cheapest thing
+        // to check: sleep a known time and see what the clock says.
         let t0 = crate::net::now_ms();
-        for _ in 0..64 {
-            core::hint::spin_loop();
+        crate::time::delay_us(50_000);
+        let moved = crate::net::now_ms().saturating_sub(t0);
+        check(
+            "a 50 ms wait reads as about 50 ms, so the deadlines are in the unit they say",
+            (40..=70).contains(&moved),
+        );
+        if !(40..=70).contains(&moved) {
+            crate::kprintln!("        50 ms of delay_us read as {} ms", moved);
         }
         crate::net::wifi_service();
         check(
-            "the kernel's own clock moves, so deadlines can be reached at all",
-            crate::net::now_ms() >= t0 && crate::net::wlan().map(|w| w.status().0) == Some("idle"),
+            "and a poll through the interface leaves the station where it was",
+            crate::net::wlan().map(|w| w.status().0) == Some("idle"),
         );
 
         // Put it back. `wlan0` is empty on a machine with no wireless driver

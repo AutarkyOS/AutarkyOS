@@ -283,6 +283,33 @@ impl Keys {
     }
 }
 
+/// A protected frame at fixed inputs, for `tools/dot11check.py`.
+///
+/// The CCMP *header* is what this exposes to an outside reader -- six packet
+/// number bytes in an order that is not the order they are counted in, a key
+/// id in the top two bits of the fifth byte, and ExtIV always set. Scapy
+/// parses that structure, so the framing gets a second opinion even though the
+/// cryptography still does not: an Annex J vector is what the top of this file
+/// says is owed, and this is not it.
+pub fn dump() {
+    use crate::kprintln;
+    let me: [u8; 6] = [0x02, 0, 0, 0, 0, 0x11];
+    let ap: [u8; 6] = [0x02, 0, 0, 0, 0, 0xAA];
+    let tk = [0x5Au8; 16];
+    let body = crate::net::ieee80211::snap_wrap(0x0800, b"payload");
+    let plain = crate::net::ieee80211::data_to_ds(&ap, &me, &ap, 7, &body);
+    // A packet number with a different value in every byte, so a reader that
+    // reversed the order or dropped a byte cannot land on the same answer.
+    if let Some(p) = protect(&tk, &plain, 0x060504030201, 2) {
+        let mut hex = alloc::string::String::with_capacity(p.len() * 2);
+        for b in &p {
+            hex.push(char::from_digit((b >> 4) as u32, 16).unwrap_or('0'));
+            hex.push(char::from_digit((b & 0xF) as u32, 16).unwrap_or('0'));
+        }
+        kprintln!("frame ccmp {}", hex);
+    }
+}
+
 pub fn selftest() -> bool {
     use crate::gfx::console::{self, LTGRAY, LTGREEN, LTRED};
     let mut ok = true;
