@@ -421,7 +421,7 @@ impl Reader {
     /// This does not evaluate anything. It only needs each opcode's shape:
     /// how many term arguments follow it, and how many targets after those.
     /// That is a finite table and it is the whole of the function.
-    fn skip_data(&mut self) -> Option<()> {
+    fn skip_data(&mut self, ns: &Namespace, scope: usize) -> Option<()> {
         let op = self.u8()?;
         let (args, targets) = match op {
             // Constants and inline literals.
@@ -497,28 +497,46 @@ impl Reader {
                 }
                 _ => return None,
             },
-            // A bare name. Stepped over as a leaf: in this position it is
-            // almost always an object rather than a call, and a call whose
-            // arguments were misread would leave the walk somewhere other than
-            // the last byte, which is checked.
+            // A bare name, which is an object to read *or* a call. This
+            // stepped over it as a leaf, on the reasoning that in a data
+            // position it is almost always an object -- and the one place that
+            // is wrong is the one that matters most.
+            //
+            // `OperationRegion (PXCS, SystemMemory, PC2M (_ADR), 0x480)` on
+            // this laptop: the base is a one-argument call. Skipped as a leaf,
+            // the argument `_ADR` was then taken for the *length*, the region's
+            // recorded bytes ended one term short, and evaluating it ran off
+            // the end. `PXCS` is the window every PCIe root port's link state
+            // is read through, so that single mis-skip is what made 48 of this
+            // firmware's conditionals undecidable and hid 90 of its 92 power
+            // resources.
+            //
+            // The arity comes from the namespace, which by this point holds
+            // everything declared before this point in the table. A name that
+            // is not there yet falls back to the old leaf behaviour, so a
+            // forward reference costs exactly what it always cost.
             0x5C | b'^' | b'_' | b'A'..=b'Z' | 0x2E | 0x2F => {
                 self.at -= 1;
-                self.name()?;
-                (0, 0)
+                let p = self.name()?;
+                let want = match ns.resolve(scope, &p).map(|n| ns.node(n).kind) {
+                    Some(Kind::Method { args, .. }) => args as usize,
+                    _ => 0,
+                };
+                (want, 0)
             }
             _ => return None,
         };
         for _ in 0..args {
-            self.skip_data()?;
+            self.skip_data(ns, scope)?;
         }
         for _ in 0..targets {
-            self.skip_target()?;
+            self.skip_target(ns, scope)?;
         }
         Some(())
     }
 
     /// Step over a target: nothing, a local, an argument, or a name.
-    fn skip_target(&mut self) -> Option<()> {
+    fn skip_target(&mut self, ns: &Namespace, scope: usize) -> Option<()> {
         match self.peek()? {
             0x00 => {
                 self.at += 1;
@@ -530,7 +548,7 @@ impl Reader {
             }
             // Index and DerefOf are legal targets and carry their own
             // arguments.
-            0x88 | 0x83 => self.skip_data(),
+            0x88 | 0x83 => self.skip_data(ns, scope),
             0x5B => {
                 self.at += 1;
                 self.skip(1)?;
@@ -709,7 +727,7 @@ impl Namespace {
                     None => return Some(Stop { table, at, why: Why::BadName }),
                 };
                 let start = r.at;
-                if r.skip_data().is_none() {
+                if r.skip_data(self, scope).is_none() {
                     let b = r.b.get(start).copied().unwrap_or(0);
                     return Some(Stop { table, at: start, why: Why::Unknown(b) });
                 }
@@ -837,7 +855,7 @@ impl Namespace {
                 };
                 let start = r.at;
                 for _ in 0..2 {
-                    if r.skip_data().is_none() {
+                    if r.skip_data(self, scope).is_none() {
                         return Some(Stop { table, at, why: Why::Overrun });
                     }
                 }
@@ -874,7 +892,7 @@ impl Namespace {
                 // fatal. The cost is that a name initialised by a top-level
                 // store reads as whatever it was declared with.
                 r.at = at;
-                if r.skip_data().is_some() {
+                if r.skip_data(self, scope).is_some() {
                     return None;
                 }
                 return Some(Stop { table, at, why: Why::Unknown(other) });
@@ -933,7 +951,7 @@ impl Namespace {
             0x13 => {
                 let start = r.at;
                 for _ in 0..3 {
-                    if r.skip_data().is_none() {
+                    if r.skip_data(self, scope).is_none() {
                         return Some(Stop { table, at, why: Why::Overrun });
                     }
                 }
@@ -994,7 +1012,7 @@ impl Namespace {
                 let start = r.at;
                 for _ in 0..2 {
                     let here = r.at;
-                    if r.skip_data().is_none() {
+                    if r.skip_data(self, scope).is_none() {
                         let b = r.b.get(here).copied().unwrap_or(0);
                         return Some(Stop { table, at: here, why: Why::Unknown(b) });
                     }
@@ -1062,7 +1080,7 @@ impl Namespace {
                     None => return Some(Stop { table, at, why: Why::BadName }),
                 };
                 let here = r.at;
-                if r.skip_data().is_none() {
+                if r.skip_data(self, scope).is_none() {
                     let b = r.b.get(here).copied().unwrap_or(0);
                     return Some(Stop { table, at: here, why: Why::Unknown(b) });
                 }

@@ -3944,7 +3944,17 @@ fn execute(line: &str, boot: &BootInfo, acpi: &Option<Acpi>, interp: &mut aiksi:
             console::set_color(LTGRAY);
         }
         "acpi" if rest.trim().starts_with("load") => {
-            crate::acpi::load_report(rest.trim()[4..].trim());
+            // A trailing '+' adds the table to the namespace already there,
+            // which is how a machine's whole set of tables gets assembled from
+            // dumps: one DSDT and, on this laptop, fourteen SSDTs.
+            {
+                let a = rest.trim()[4..].trim();
+                let (p, add) = match a.strip_suffix('+') {
+                    Some(h) => (h.trim(), true),
+                    None => (a, false),
+                };
+                crate::acpi::load_report(p, add);
+            }
         }
         "acpi" if rest.trim().starts_with("eval") => match acpi {
             Some(a) => crate::acpi::eval_report(a, rest.trim()[4..].trim()),

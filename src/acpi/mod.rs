@@ -1226,7 +1226,18 @@ pub fn aml_selftest(a: &Option<Acpi>) -> bool {
 /// the tables it normally reads are firmware memory that outlives everything,
 /// and a blob has to make the same promise. One leak per load, on a diagnostic
 /// path nobody runs in a loop.
-pub fn load_report(path: &str) {
+/// Load a dumped table, optionally on top of the namespace already there.
+///
+/// **One table is not a machine.** This laptop has a DSDT and fourteen SSDTs,
+/// and the DSDT is the one that does *not* hold the discrete GPU's power
+/// control -- `Opt2Tabl` does. Loading one at a time and reading the result
+/// answers a question about a fifteenth of the firmware, which is how an
+/// afternoon went into a construct that turned out to be about WWAN slots.
+///
+/// So `extend` puts a table into the namespace the last one built, which is
+/// what `load_namespace` does with the machine's own tables and what makes a
+/// dump of somebody else's firmware testable here at all.
+pub fn load_report(path: &str, extend: bool) {
     let Some(bytes) = crate::sysbox::read_blob(path) else {
         crate::kprintln!("  no such file: {}", path);
         return;
@@ -1251,7 +1262,18 @@ pub fn load_report(path: &str) {
         crate::kprintln!("  {} byte(s), taken as a bare AML body", body.len());
     }
 
-    let mut ns = aml::Namespace::new();
+    // Either a fresh namespace or the one already standing, so a machine's
+    // whole table set can be assembled a file at a time.
+    let (mut ns, mut prior) = match (extend, NAMESPACE.lock().take()) {
+        (true, Some(n)) => {
+            let before = unsafe { *SUMMARY.get() };
+            (n, before)
+        }
+        (_, other) => {
+            drop(other);
+            (aml::Namespace::new(), None)
+        }
+    };
     let r = ns.load(body);
     let mut sum = NsSummary {
         tables: 1,
@@ -1271,6 +1293,18 @@ pub fn load_report(path: &str) {
     // route every finding about this firmware came through.
     settle(&mut ns, r.pending, &mut sum);
     sum.redefinitions = ns.redefinitions;
+    // Carry the running totals, so the line says what the namespace holds
+    // rather than what this one file added to it.
+    if let Some(p) = prior.take() {
+        sum.tables += p.tables;
+        sum.nodes = ns.len();
+        sum.offered += p.offered;
+        sum.skipped += p.skipped;
+        sum.conditionals += p.conditionals;
+        sum.decided += p.decided;
+        sum.undecided += p.undecided;
+        sum.stop = sum.stop.or(p.stop);
+    }
     crate::kprintln!("  {} node(s)", sum.nodes);
     match r.stop {
         None => crate::kprintln!("  walked to the last byte"),
