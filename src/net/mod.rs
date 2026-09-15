@@ -133,6 +133,7 @@ const ICMP_ECHO_REQUEST: u8 = 8;
 const ICMP_ECHO_REPLY: u8 = 0;
 
 pub mod ccmp;
+pub mod softmac;
 pub mod css;
 pub mod dhcp;
 pub mod dns;

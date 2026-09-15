@@ -28,9 +28,103 @@ pub const MGMT_HDR: usize = 24;
 /// Type 0 is management. The type field lives in bits 2 and 3 of the first
 /// byte, and the subtype in the top four.
 const TYPE_MGMT: u8 = 0;
+const TYPE_DATA: u8 = 2;
+const SUBTYPE_DATA: u8 = 0;
 const SUBTYPE_PROBE_REQ: u8 = 4;
 const SUBTYPE_PROBE_RESP: u8 = 5;
 const SUBTYPE_BEACON: u8 = 8;
+
+/// LLC/SNAP: `AA AA 03` then a three-byte OUI of zero, then the EtherType.
+///
+/// **This is how an Ethernet payload rides on 802.11**, and it is why a
+/// wireless frame is eight bytes longer than the Ethernet one it carries
+/// rather than the fourteen an Ethernet header costs -- the addresses moved
+/// into the 802.11 header and only the type came along.
+pub const SNAP: [u8; 6] = [0xAA, 0xAA, 0x03, 0x00, 0x00, 0x00];
+
+pub fn snap_wrap(ethertype: u16, payload: &[u8]) -> Vec<u8> {
+    let mut b = Vec::with_capacity(8 + payload.len());
+    b.extend_from_slice(&SNAP);
+    b.extend_from_slice(&ethertype.to_be_bytes());
+    b.extend_from_slice(payload);
+    b
+}
+
+/// Take an EtherType and a payload back out. Nothing if it is not SNAP.
+///
+/// Refused rather than skipped: an 802.11 body that is not SNAP is some other
+/// encapsulation, and reading its ninth byte onwards as an IP packet would
+/// hand the stack something that parses and is not what was sent.
+pub fn snap_unwrap(body: &[u8]) -> Option<(u16, &[u8])> {
+    if body.len() < 8 || body[..6] != SNAP {
+        return None;
+    }
+    Some((u16::from_be_bytes([body[6], body[7]]), &body[8..]))
+}
+
+/// A data frame from a station to its access point.
+///
+/// ToDS, so the addresses are BSSID, source, destination in that order -- which
+/// is not the order they appear in on a frame coming the other way. That
+/// reshuffling is the whole of `data_addrs` below, and it is the thing that
+/// makes 802.11 addressing worth a function rather than three slices.
+pub fn data_to_ds(bssid: &[u8; 6], sa: &[u8; 6], da: &[u8; 6], seq: u16, body: &[u8]) -> Vec<u8> {
+    let mut f = Vec::with_capacity(24 + body.len());
+    f.push((SUBTYPE_DATA << 4) | (TYPE_DATA << 2));
+    f.push(0x01); // ToDS
+    f.extend_from_slice(&[0, 0]); // duration, filled by the radio
+    f.extend_from_slice(bssid);
+    f.extend_from_slice(sa);
+    f.extend_from_slice(da);
+    // Sequence number in the top twelve bits, fragment number in the low four.
+    f.extend_from_slice(&(((seq & 0x0FFF) << 4) as u16).to_le_bytes());
+    f.extend_from_slice(body);
+    f
+}
+
+/// Who a data frame is really from and to, whichever way it was going.
+///
+/// **Four layouts, and the addresses mean different things in each.** A station
+/// sending to its access point puts the BSSID first; the access point sending
+/// back puts the destination first. Reading A1 as the destination is correct
+/// exactly half the time, which is the worst possible rate for a bug: it works
+/// on everything you send and fails on everything you receive.
+pub fn data_addrs(frame: &[u8]) -> Option<([u8; 6], [u8; 6])> {
+    if frame.len() < 24 {
+        return None;
+    }
+    let fc = u16::from_le_bytes([frame[0], frame[1]]);
+    if (fc >> 2) & 0x3 != TYPE_DATA as u16 {
+        return None;
+    }
+    let at = |off: usize| -> [u8; 6] {
+        let mut m = [0u8; 6];
+        m.copy_from_slice(&frame[off..off + 6]);
+        m
+    };
+    let (a1, a2, a3) = (at(4), at(10), at(16));
+    let to_ds = fc & 0x0100 != 0;
+    let from_ds = fc & 0x0200 != 0;
+    Some(match (to_ds, from_ds) {
+        // Ad-hoc: destination, source, then the BSSID nobody routes by.
+        (false, false) => (a1, a2),
+        // To the access point: BSSID, source, destination.
+        (true, false) => (a3, a2),
+        // From the access point: destination, BSSID, source.
+        (false, true) => (a1, a3),
+        // Between two access points, where the real source is a fourth
+        // address that sits *after* the sequence control rather than beside
+        // the others -- which is why this cannot be an index into a loop.
+        (true, true) => {
+            if frame.len() < 30 {
+                return None;
+            }
+            let mut a4 = [0u8; 6];
+            a4.copy_from_slice(&frame[24..30]);
+            (a3, a4)
+        }
+    })
+}
 
 /// Information element numbers this module knows.
 const IE_SSID: u8 = 0;
