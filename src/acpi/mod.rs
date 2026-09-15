@@ -533,6 +533,15 @@ pub struct NsSummary {
     pub tables: usize,
     pub nodes: usize,
     pub skipped: usize,
+    /// Conditionals found at a term level, and how they went. `decided` counts
+    /// the ones whose predicate evaluated; `undecided` the ones where it
+    /// faulted, which are stepped over exactly as every conditional used to be.
+    pub conditionals: usize,
+    pub decided: usize,
+    pub undecided: usize,
+    /// Rounds it took to settle. More than one means a branch that was taken
+    /// contained another conditional.
+    pub rounds: usize,
     pub redefinitions: usize,
     /// Where a walk stopped short, if one did. The whole point of the walk is
     /// that this is `None`.
@@ -545,10 +554,169 @@ pub struct NsSummary {
 ///
 /// Order is not cosmetic: an SSDT may extend a scope the DSDT opened, so
 /// loading them out of order leaves names unresolvable.
+/// How many times to go round deciding conditionals.
+///
+/// A branch that is taken can hold another conditional, so one pass is not
+/// enough; but the nesting firmware actually writes is two or three deep, and
+/// an unbounded loop over bytes that are still being interpreted is not a loop
+/// this kernel should have. The round count is reported, so a table that needs
+/// more says so rather than being silently cut off.
+const MAX_ROUNDS: usize = 8;
+
+/// Decide the conditionals the walk recorded, and walk the branches taken.
+///
+/// **Separate from the walk because neither half can do the other's work.**
+/// Building needs `&mut Namespace`; deciding a predicate needs an `Interp`
+/// over `&Namespace`. Here they happen one after the other, and the loop
+/// repeats because a branch that gets taken can hold conditionals of its own.
+///
+/// A predicate that faults leaves its block stepped over, which is exactly
+/// what every conditional used to get -- so this only ever adds namespace, and
+/// a firmware construct nothing here understands costs what it always cost.
+fn settle(ns: &mut aml::Namespace, mut pending: alloc::vec::Vec<aml::Pending>, sum: &mut NsSummary) {
+    let mut undecided_why: alloc::vec::Vec<alloc::string::String> = alloc::vec::Vec::new();
+    let mut tally = Tally::new();
+    sum.conditionals += pending.len();
+    for round in 0..MAX_ROUNDS {
+        if pending.is_empty() {
+            break;
+        }
+        sum.rounds = round + 1;
+        let mut take: alloc::vec::Vec<(aml::Pending, usize, usize)> = alloc::vec::Vec::new();
+        for p in &pending {
+            let Some(body) = ns.table_bytes(p.table) else { continue };
+            // A fresh interpreter per predicate, so one runaway `While` inside
+            // a firmware helper cannot spend the budget the next hundred
+            // predicates need.
+            let mut it = eval::Interp::new(ns);
+            match it.eval_arg_at(body, p.pred_at, p.scope) {
+                Ok((v, body_at)) => {
+                    sum.decided += 1;
+                    if v.int().unwrap_or(0) != 0 {
+                        take.push((*p, body_at, p.then_end));
+                    } else if p.else_start != usize::MAX {
+                        take.push((*p, p.else_start, p.else_end));
+                    }
+                    // False with no `Else` is a decision and not a failure:
+                    // the firmware said this machine does not have that.
+                }
+                Err(e) => {
+                    sum.undecided += 1;
+                    // **Why** it could not be decided, because "53 undecided"
+                    // does not say whether the answer is one missing opcode or
+                    // fifty different ones. Capped, and the scope is named so
+                    // the block can be found in the table.
+                    if undecided_why.len() < 12 {
+                        let where_ = ns.path(p.scope);
+                        undecided_why.push(alloc::format!(
+                            "{}  at {}..{}  {}",
+                            where_,
+                            p.pred_at,
+                            p.then_end,
+                            fault_text(&e)
+                        ));
+                    }
+                    *tally.entry_for(&e) += 1;
+                }
+            }
+        }
+        pending = alloc::vec::Vec::new();
+        for (p, start, end) in take {
+            let (n, more, sk, stop) = ns.walk_branch(p.table, p.scope, p.depth, start, end);
+            sum.nodes += n;
+            sum.skipped += sk;
+            if sum.stop.is_none() {
+                sum.stop = stop;
+            }
+            pending.extend(more);
+        }
+    }
+    // Whatever is still pending after the last round was never decided.
+    sum.undecided += pending.len();
+    unsafe {
+        *WHY.get() = undecided_why;
+        *WHY_TALLY.get() = tally.rows();
+    }
+}
+
+/// Why the undecided ones could not be decided, kept for `acpi why`.
+static WHY: crate::sync::Racy<alloc::vec::Vec<alloc::string::String>> =
+    crate::sync::Racy::new(alloc::vec::Vec::new());
+static WHY_TALLY: crate::sync::Racy<alloc::vec::Vec<(alloc::string::String, usize)>> =
+    crate::sync::Racy::new(alloc::vec::Vec::new());
+
+/// A count per distinct reason. Small and linear because the number of
+/// distinct faults in one firmware table is single digits.
+struct Tally {
+    rows: alloc::vec::Vec<(alloc::string::String, usize)>,
+}
+
+impl Tally {
+    fn new() -> Tally {
+        Tally { rows: alloc::vec::Vec::new() }
+    }
+    fn entry_for(&mut self, e: &eval::Fault) -> &mut usize {
+        // The kind rather than the detail: fifty `NotFound`s of fifty
+        // different names are one problem, not fifty.
+        let key = match e {
+            eval::Fault::NotFound(_) => alloc::string::String::from("a name the namespace does not hold"),
+            eval::Fault::Opcode(op, _) => alloc::format!("no arm for opcode {:#04x}", op),
+            eval::Fault::ExtOpcode(op, _) => alloc::format!("no arm for ext opcode {:#04x}", op),
+            eval::Fault::Region(sp) => alloc::format!("a region in {}", space_name(*sp)),
+            eval::Fault::Budget => alloc::string::String::from("the step budget"),
+            eval::Fault::Depth => alloc::string::String::from("nesting"),
+            eval::Fault::Type(t) => alloc::format!("a type: {}", t),
+            eval::Fault::Truncated => alloc::string::String::from("the bytes ended"),
+            eval::Fault::DivideByZero => alloc::string::String::from("divide by zero"),
+            eval::Fault::Args => alloc::string::String::from("argument count"),
+        };
+        if let Some(i) = self.rows.iter().position(|(k, _)| *k == key) {
+            return &mut self.rows[i].1;
+        }
+        self.rows.push((key, 0));
+        let n = self.rows.len() - 1;
+        &mut self.rows[n].1
+    }
+    fn rows(self) -> alloc::vec::Vec<(alloc::string::String, usize)> {
+        self.rows
+    }
+}
+
+/// What stopped the undecided conditionals, as a tally and then as examples.
+pub fn why_report() {
+    let tally = unsafe { &*WHY_TALLY.get() };
+    let why = unsafe { &*WHY.get() };
+    if tally.is_empty() {
+        crate::kprintln!("  every conditional was decided");
+        return;
+    }
+    crate::kprintln!("  what stopped the rest:");
+    for (k, n) in tally.iter() {
+        crate::kprintln!("    {:>4}  {}", n, k);
+    }
+    if !why.is_empty() {
+        crate::kprintln!("  the first few, with the scope they are in:");
+        for line in why.iter() {
+            crate::kprintln!("    {}", line);
+        }
+    }
+}
+
 pub fn load_namespace(a: &Acpi) -> NsSummary {
     let mut ns = aml::Namespace::new();
-    let mut sum =
-        NsSummary { tables: 0, nodes: 0, skipped: 0, redefinitions: 0, stop: None, offered: 0 };
+    let mut sum = NsSummary {
+        tables: 0,
+        nodes: 0,
+        skipped: 0,
+        conditionals: 0,
+        decided: 0,
+        undecided: 0,
+        rounds: 0,
+        redefinitions: 0,
+        stop: None,
+        offered: 0,
+    };
+    let mut pending: alloc::vec::Vec<aml::Pending> = alloc::vec::Vec::new();
     for t in a.aml_tables() {
         if !t.sound {
             // A table that does not add up is not walked. Executing bytes that
@@ -561,10 +729,13 @@ pub fn load_namespace(a: &Acpi) -> NsSummary {
         sum.tables += 1;
         sum.nodes += r.nodes;
         sum.skipped += r.skipped_conditionals;
+        pending.extend(r.pending);
         if sum.stop.is_none() {
             sum.stop = r.stop;
         }
     }
+
+    settle(&mut ns, pending, &mut sum);
     sum.redefinitions = ns.redefinitions;
     *NAMESPACE.lock() = Some(ns);
     unsafe { *SUMMARY.get() = Some(sum) };
@@ -648,9 +819,22 @@ pub fn ns_report(a: &Acpi, filter: &str) {
             }
         }
     }
+    // What the conditionals did, because "it walked to the end" says nothing
+    // about how much of the table is actually in the namespace. An undecided
+    // block is one whose predicate faulted, and its names do not exist -- the
+    // state every conditional was in before any of them were decided.
+    if sum.conditionals > 0 {
+        crate::kprintln!(
+            "  {} conditional(s): {} decided, {} undecided, in {} round(s)",
+            sum.conditionals,
+            sum.decided,
+            sum.undecided,
+            sum.rounds
+        );
+    }
     if sum.skipped > 0 {
         crate::kprintln!(
-            "  {} conditional block(s) skipped whole; names inside are not defined",
+            "  {} block(s) stepped over: a bare Else, or a While declaring names",
             sum.skipped
         );
     }
@@ -1069,15 +1253,25 @@ pub fn load_report(path: &str) {
 
     let mut ns = aml::Namespace::new();
     let r = ns.load(body);
-    let sum = NsSummary {
+    let mut sum = NsSummary {
         tables: 1,
         nodes: r.nodes,
         skipped: r.skipped_conditionals,
-        redefinitions: ns.redefinitions,
+        conditionals: 0,
+        decided: 0,
+        undecided: 0,
+        rounds: 0,
+        redefinitions: 0,
         stop: r.stop,
         offered: body.len(),
     };
-    crate::kprintln!("  {} node(s)", r.nodes);
+    // The same settling `load_namespace` does. Without it the one route that
+    // can be driven over a serial line -- load a dumped table, walk it -- would
+    // be the one route that never sees the conditionals decided, which is the
+    // route every finding about this firmware came through.
+    settle(&mut ns, r.pending, &mut sum);
+    sum.redefinitions = ns.redefinitions;
+    crate::kprintln!("  {} node(s)", sum.nodes);
     match r.stop {
         None => crate::kprintln!("  walked to the last byte"),
         Some(s) => {
@@ -1095,8 +1289,24 @@ pub fn load_report(path: &str) {
             crate::kprintln!("  bytes {}..{}:{}", from, to, line);
         }
     }
-    if r.skipped_conditionals > 0 {
-        crate::kprintln!("  {} conditional block(s) skipped whole", r.skipped_conditionals);
+    // What the conditionals did, because "it walked to the end" says nothing
+    // about how much of the table is actually in the namespace. An undecided
+    // block is one whose predicate faulted, and its names do not exist -- the
+    // state every conditional was in before any of them were decided.
+    if sum.conditionals > 0 {
+        crate::kprintln!(
+            "  {} conditional(s): {} decided, {} undecided, in {} round(s)",
+            sum.conditionals,
+            sum.decided,
+            sum.undecided,
+            sum.rounds
+        );
+    }
+    if sum.skipped > 0 {
+        crate::kprintln!(
+            "  {} block(s) stepped over: a bare Else, or a While declaring names",
+            sum.skipped
+        );
     }
     if ns.redefinitions > 0 {
         crate::kprintln!("  {} name(s) defined more than once", ns.redefinitions);

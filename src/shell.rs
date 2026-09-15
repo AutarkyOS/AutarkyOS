@@ -3954,6 +3954,9 @@ fn execute(line: &str, boot: &BootInfo, acpi: &Option<Acpi>, interp: &mut aiksi:
             Some(a) => crate::acpi::ns_report(a, rest.trim()[2..].trim()),
             None => kprintln!("  ACPI was not parsed"),
         },
+        // Why the namespace is not the whole table. Its own verb because
+        // "53 undecided" is a number and this is the reason behind it.
+        "acpi" if rest.trim() == "why" => crate::acpi::why_report(),
         "acpi" if rest.trim() == "tables" => match acpi {
             Some(a) => crate::acpi::report(a),
             None => {

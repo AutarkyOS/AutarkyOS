@@ -550,14 +550,45 @@ impl Reader {
 /// following rubbish. Real firmware nests perhaps six deep.
 const MAX_DEPTH: usize = 32;
 
+/// One `If` at a term level, recorded rather than decided.
+///
+/// **The walk cannot decide these and the evaluator cannot build a namespace,
+/// so neither can do it alone.** Building needs `&mut Namespace`; evaluating a
+/// predicate needs `&Namespace` and an `Interp` over it. So the walk writes
+/// down where each conditional was and the caller decides them afterwards,
+/// against the namespace the walk has by then finished building -- and repeats,
+/// because a branch it takes can contain more.
+#[derive(Clone, Copy)]
+pub struct Pending {
+    pub table: usize,
+    pub scope: usize,
+    pub depth: usize,
+    /// Where the predicate expression begins. The body begins wherever that
+    /// expression ends, which is not knowable without evaluating it, so the
+    /// decider hands that offset back.
+    pub pred_at: usize,
+    pub then_end: usize,
+    /// The `Else` that follows, if one does. `usize::MAX` when none.
+    pub else_start: usize,
+    pub else_end: usize,
+}
+
 /// What one table's walk established.
 pub struct Loaded {
     pub nodes: usize,
-    /// Conditional blocks skipped whole. Names inside them are not defined,
-    /// and the count is here so that is a visible number rather than a silent
-    /// absence.
+    /// Conditional blocks stepped over without being recorded: a bare `Else`
+    /// with no `If` before it, and `While`, which has no place at a term level
+    /// that declares names.
     pub skipped_conditionals: usize,
+    /// Conditionals whose predicate somebody else has to decide.
+    pub pending: Vec<Pending>,
     pub stop: Option<Stop>,
+}
+
+/// What the walk is accumulating besides nodes.
+struct Walk {
+    skipped: usize,
+    pending: Vec<Pending>,
 }
 
 impl Namespace {
@@ -570,8 +601,8 @@ impl Namespace {
         self.tables.push(body);
         let before = self.nodes.len();
         let mut r = Reader { b: body, at: 0 };
-        let mut skipped = 0usize;
-        let stop = self.terms(&mut r, body.len(), 0, table, 0, &mut skipped);
+        let mut w = Walk { skipped: 0, pending: Vec::new() };
+        let stop = self.terms(&mut r, body.len(), 0, table, 0, &mut w);
         // The claim that matters. Anything but the exact end means a package
         // length was misread, and every name after that point is fiction.
         let stop = match stop {
@@ -579,7 +610,38 @@ impl Namespace {
             None if r.at != body.len() => Some(Stop { table, at: r.at, why: Why::NotAtEnd }),
             None => None,
         };
-        Loaded { nodes: self.nodes.len() - before, skipped_conditionals: skipped, stop }
+        Loaded {
+            nodes: self.nodes.len() - before,
+            skipped_conditionals: w.skipped,
+            pending: w.pending,
+            stop,
+        }
+    }
+
+    /// Walk one branch of a conditional that has now been decided.
+    ///
+    /// `depth + 1` because the branch is nested inside the conditional, which
+    /// keeps `MAX_DEPTH` meaning what it meant: a bound on how far a misread
+    /// length can drag the walk before it gives up.
+    pub fn walk_branch(
+        &mut self,
+        table: usize,
+        scope: usize,
+        depth: usize,
+        start: usize,
+        end: usize,
+    ) -> (usize, Vec<Pending>, usize, Option<Stop>) {
+        let Some(body) = self.table_bytes(table) else {
+            return (0, Vec::new(), 0, None);
+        };
+        if start > end || end > body.len() {
+            return (0, Vec::new(), 0, Some(Stop { table, at: start, why: Why::Overrun }));
+        }
+        let before = self.nodes.len();
+        let mut r = Reader { b: body, at: start };
+        let mut w = Walk { skipped: 0, pending: Vec::new() };
+        let stop = self.terms(&mut r, end, scope, table, depth + 1, &mut w);
+        (self.nodes.len() - before, w.pending, w.skipped, stop)
     }
 
     /// Walk a term list up to `end`, defining into `scope`.
@@ -590,14 +652,14 @@ impl Namespace {
         scope: usize,
         table: usize,
         depth: usize,
-        skipped: &mut usize,
+        w: &mut Walk,
     ) -> Option<Stop> {
         if depth > MAX_DEPTH {
             return Some(Stop { table, at: r.at, why: Why::TooDeep });
         }
         while r.at < end {
             let at = r.at;
-            if let Some(s) = self.term(r, scope, table, depth, skipped) {
+            if let Some(s) = self.term(r, scope, table, depth, w) {
                 return Some(s);
             }
             // A term that consumed nothing would spin here forever, and a
@@ -615,7 +677,7 @@ impl Namespace {
         scope: usize,
         table: usize,
         depth: usize,
-        skipped: &mut usize,
+        w: &mut Walk,
     ) -> Option<Stop> {
         let at = r.at;
         let op = match r.u8() {
@@ -672,7 +734,7 @@ impl Namespace {
                     Some(i) => i,
                     None => return Some(Stop { table, at, why: Why::BadName }),
                 };
-                if let Some(s) = self.terms(r, end, inner, table, depth + 1, skipped) {
+                if let Some(s) = self.terms(r, end, inner, table, depth + 1, w) {
                     return Some(s);
                 }
                 r.at = end;
@@ -702,22 +764,64 @@ impl Namespace {
                 }
                 r.at = end;
             }
-            // If, Else and While at the top level.
+            // `If` at a term level, with the `Else` that may follow it.
             //
-            // Skipped whole, and counted. Their predicates are expressions,
-            // and stepping over an expression needs length rules this walk
-            // deliberately does not have. Descending unconditionally would be
-            // worse than skipping rather than better: it would define both
-            // arms of a choice the firmware makes, so a machine would appear
-            // to have devices it does not. Firmware uses these at the top
-            // level for `_OSI` checks, and the count says whether this machine
-            // is one that does.
-            0xA0 | 0xA1 | 0xA2 => {
+            // **Recorded, not skipped, and not descended into either.** The
+            // old comment argued that descending unconditionally is worse than
+            // skipping, because it would define both arms of a choice the
+            // firmware makes and the machine would appear to have devices it
+            // does not. That is right, and the conclusion drawn from it was
+            // wrong: the answer is to decide the predicate, which needs an
+            // evaluator, which needs the namespace this walk is still
+            // building. So it is written down and decided afterwards.
+            //
+            // What skipping cost, measured on this laptop's own DSDT: 142
+            // blocks, and inside them 11 of the 11 `_PR0` packages and 90 of
+            // the 92 `_ON` methods. Every power resource on the machine was
+            // invisible, which is to say nothing could be turned on.
+            0xA0 => {
                 let end = match r.pkg() {
                     Some(v) => v,
                     None => return Some(Stop { table, at, why: Why::Overrun }),
                 };
-                *skipped += 1;
+                let pred_at = r.at;
+                // An `Else` is a separate term that happens to follow. Pairing
+                // them here rather than recording two is what makes "neither
+                // arm" impossible to express and "both arms" impossible to
+                // reach.
+                r.at = end;
+                let (mut else_start, mut else_end) = (usize::MAX, end);
+                if r.peek() == Some(0xA1) {
+                    let _ = r.u8();
+                    match r.pkg() {
+                        Some(e) => {
+                            else_start = r.at;
+                            else_end = e;
+                        }
+                        None => return Some(Stop { table, at, why: Why::Overrun }),
+                    }
+                }
+                w.pending.push(Pending {
+                    table,
+                    scope,
+                    depth,
+                    pred_at,
+                    then_end: end,
+                    else_start,
+                    else_end,
+                });
+                r.at = else_end;
+            }
+            // A bare `Else` with no `If` before it, and `While`. The first is
+            // a malformed table and the second has no business declaring names
+            // at a term level; both are stepped over and counted, which is
+            // what every conditional used to get.
+            0xA1 | 0xA2 => {
+                let end = match r.pkg() {
+                    Some(v) => v,
+                    None => return Some(Stop { table, at, why: Why::Overrun }),
+                };
+                w.skipped += 1;
                 r.at = end;
             }
             // CreateByteField and its relatives: a source buffer, an index,
@@ -755,7 +859,7 @@ impl Namespace {
                     Some(v) => v,
                     None => return Some(Stop { table, at, why: Why::Overrun }),
                 };
-                return self.ext_term(r, ext, at, scope, table, depth, skipped);
+                return self.ext_term(r, ext, at, scope, table, depth, w);
             }
             other => {
                 // A bare expression at the top level. `Store (GSIP, SIPV)` is
@@ -787,7 +891,7 @@ impl Namespace {
         scope: usize,
         table: usize,
         depth: usize,
-        skipped: &mut usize,
+        w: &mut Walk,
     ) -> Option<Stop> {
         // The declarations that carry a package length and a term list, which
         // is every container kind. Handled together because they differ only
@@ -815,7 +919,7 @@ impl Namespace {
                 Some((p, seg)) => self.ensure(p, seg, kind, table, (r.at, end)),
                 None => return Some(Stop { table, at, why: Why::BadName }),
             };
-            if let Some(s) = self.terms(r, end, inner, table, depth + 1, skipped) {
+            if let Some(s) = self.terms(r, end, inner, table, depth + 1, w) {
                 return Some(s);
             }
             r.at = end;

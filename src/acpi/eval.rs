@@ -131,8 +131,35 @@ enum Flow {
     Continue,
 }
 
+/// ACPI's number for PCI configuration space.
+pub const SPACE_PCI_CONFIG: u8 = 2;
+
+/// How far up the namespace to look for a device's address. Real nesting is
+/// host bridge, port, function: three. The bound is here because this walks a
+/// parent chain and a malformed one could be a ring.
+const MAX_ANCESTRY: usize = 16;
+
 pub struct Interp<'a> {
     ns: &'a Namespace,
+    /// Names a running method declared for itself.
+    ///
+    /// **`Name` is legal inside a method body** and firmware uses it, usually
+    /// as a scratch buffer built once and read back a few lines later. ACPI
+    /// scopes such a name to the invocation and deletes it on return, which a
+    /// real implementation does by mutating the namespace -- and this
+    /// interpreter holds the namespace immutably on purpose, because
+    /// evaluating something must not be able to define anything.
+    ///
+    /// So they live here instead, for the life of one `Interp`, which is one
+    /// call chain, which is the lifetime ACPI gives them. Keyed by spelling
+    /// and flat: two methods that each declare `TMP_` and run under one
+    /// `Interp` would share it, and firmware that did that would already be
+    /// relying on a deletion this cannot perform.
+    ///
+    /// Before this existed a method beginning with `Name` failed at its first
+    /// byte. On this laptop's DSDT that was 48 of the 53 conditionals that
+    /// could not be decided, and behind them 90 of its 92 power resources.
+    scratch: Vec<(String, Value)>,
     locals: [Value; 8],
     args: [Value; 7],
     steps: u64,
@@ -245,7 +272,15 @@ impl Cursor {
 impl<'a> Interp<'a> {
     pub fn new(ns: &'a Namespace) -> Interp<'a> {
         const NONE: Value = Value::Uninit;
-        Interp { ns, locals: [NONE; 8], args: [NONE; 7], steps: 0, depth: 0, debug: None }
+        Interp {
+            ns,
+            scratch: Vec::new(),
+            locals: [NONE; 8],
+            args: [NONE; 7],
+            steps: 0,
+            depth: 0,
+            debug: None,
+        }
     }
 
     pub fn steps(&self) -> u64 {
@@ -338,6 +373,20 @@ impl<'a> Interp<'a> {
     fn statement(&mut self, c: &mut Cursor, scope: usize) -> Result<Flow, Fault> {
         let at = c.at;
         match c.peek().ok_or(Fault::Truncated)? {
+            // NameOp inside a method body: a name scoped to this invocation.
+            // See `Interp::scratch` for where it goes and why it does not go
+            // into the namespace.
+            0x08 => {
+                c.at += 1;
+                let p = c.name()?;
+                let v = self.arg(c, scope)?;
+                let key = name_of(&p);
+                match self.scratch.iter_mut().find(|(k, _)| *k == key) {
+                    Some(slot) => slot.1 = v,
+                    None => self.scratch.push((key, v)),
+                }
+                return Ok(Flow::Normal);
+            }
             // IfOp. The Else that may follow belongs to it, and has to be
             // stepped over even when the If was taken.
             0xA0 => {
@@ -639,6 +688,20 @@ impl<'a> Interp<'a> {
             b'\\' | b'^' | b'_' | 0x2E | 0x2F | b'A'..=b'Z' => {
                 c.at = at;
                 let p = c.name()?;
+                // `_OSI` belongs to the operating system and not to the
+                // firmware, so it is in no table and resolving it always
+                // fails. Every `If (_OSI (...))` in the DSDT therefore
+                // faulted, which on this laptop is most of them.
+                if is_osi(&p) {
+                    let asked = self.arg(c, scope)?;
+                    return Ok(Value::Int(osi(&asked)));
+                }
+                // A name this call chain declared for itself wins over the
+                // namespace, which is what scoping means.
+                let key = name_of(&p);
+                if let Some((_, v)) = self.scratch.iter().find(|(k, _)| *k == key) {
+                    return Ok(v.clone());
+                }
                 let node =
                     self.ns.resolve(scope, &p).ok_or_else(|| Fault::NotFound(name_of(&p)))?;
                 let want = match self.ns.node(node).kind {
@@ -863,6 +926,89 @@ fn to_bcd(v: u64) -> u64 {
 }
 
 /// A path as text, for an error that has to name something.
+/// Is this the call the operating system answers?
+///
+/// One segment, spelled `_OSI`, rooted or not: firmware writes both `_OSI` and
+/// `\_OSI` and they are the same call.
+fn is_osi(p: &Path) -> bool {
+    p.segs.len() == 1 && p.segs[0] == *b"_OSI" && p.parents == 0
+}
+
+/// What this kernel answers `_OSI` for, and why each line is there.
+///
+/// **This is a claim about which firmware path to take, not about being
+/// Windows.** Firmware gates its code on these strings because that is what it
+/// was tested against, so a kernel answering no to all of them gets the
+/// oldest, least exercised branch of somebody's DSDT -- or, as here, gets no
+/// branch at all and 142 blocks of the namespace never come into existence.
+/// Linux claims the newest Windows it knows for exactly this reason and
+/// deliberately does *not* claim "Linux", which firmware used to read as
+/// permission to do something else entirely.
+///
+/// The ceiling is a decision and is meant to be moved with evidence. Claiming
+/// a version says the firmware may use the paths it associates with that
+/// version; going further than the machine in front of us is how a kernel ends
+/// up on a path nobody has ever run.
+const OSI_YES: &[&str] = &[
+    "Windows 2000",
+    "Windows 2001",
+    "Windows 2001 SP1",
+    "Windows 2001 SP2",
+    "Windows 2001.1",
+    "Windows 2006",
+    "Windows 2006 SP1",
+    "Windows 2009",
+    "Windows 2012",
+    "Windows 2013",
+    "Windows 2015",
+    "Windows 2016",
+    "Windows 2017",
+    "Windows 2018",
+    "Windows 2019",
+    "Windows 2020",
+];
+
+/// 0xFFFFFFFF for yes and 0 for no, which is what ACPI specifies.
+///
+/// Anything not on the list is no, including "Linux" and including every
+/// feature string -- `Module Device`, `Processor Aggregator Device` and the
+/// rest are claims about implementing an ACPI feature, and this kernel
+/// implements none of them. Answering yes to one is how a machine gets handed
+/// a device it cannot drive.
+fn osi(asked: &Value) -> u64 {
+    let Value::Str(s) = asked else { return 0 };
+    if OSI_YES.iter().any(|w| w.eq_ignore_ascii_case(s)) {
+        0xFFFF_FFFF
+    } else {
+        0
+    }
+}
+
+/// Evaluate one TermArg sitting at `at` in `body`, in `scope`.
+///
+/// The way a conditional's predicate gets decided while the namespace is being
+/// built. Public because the builder is in another module and cannot reach
+/// `arg`, and narrow on purpose: it evaluates an expression and declares
+/// nothing.
+///
+/// **It answers where the expression ended as well as what it was**, because
+/// an `If`'s body begins immediately after its predicate and there is no
+/// length in front of it. Parsing the predicate is the only way to know where
+/// the body starts, which is why the walk that cannot evaluate could not skip
+/// past one either.
+impl<'a> Interp<'a> {
+    pub fn eval_arg_at(
+        &mut self,
+        body: &'static [u8],
+        at: usize,
+        scope: usize,
+    ) -> Result<(Value, usize), Fault> {
+        let mut c = Cursor { b: body, at };
+        let v = self.arg(&mut c, scope)?;
+        Ok((v, c.at))
+    }
+}
+
 pub fn name_of(p: &Path) -> String {
     let mut s = String::new();
     if p.rooted {
@@ -923,7 +1069,85 @@ impl<'a> Interp<'a> {
         let mut c = Cursor { b: body, at: 0 };
         let base = self.arg(&mut c, scope)?.int()?;
         let len = self.arg(&mut c, scope)?.int().unwrap_or(0);
+        // A `PCI_Config` region's declared base is an offset into somebody's
+        // config space, and *which* somebody is not in the region at all -- it
+        // is the device the region is declared inside. Resolved here so that
+        // everything downstream sees one flat address, which is what ECAM
+        // makes config space anyway.
+        if space == SPACE_PCI_CONFIG {
+            let at = self.pci_config_base(scope)?;
+            return Ok((space, at + base, len));
+        }
         Ok((space, base, len))
+    }
+
+    /// One direct child by name. Not `resolve`, which searches upward: an
+    /// ancestor's `_ADR` is a different device's address and finding it would
+    /// silently attribute a region to the wrong part.
+    fn child(&self, n: usize, seg: [u8; 4]) -> Option<usize> {
+        self.ns
+            .node(n)
+            .children
+            .iter()
+            .copied()
+            .find(|&c| self.ns.node(c).name == seg)
+    }
+
+    /// Where the config space of the device enclosing `scope` actually is.
+    ///
+    /// **A device's address is spread up the namespace, not held at it.**
+    /// `_ADR` gives device and function relative to whatever bus the parent
+    /// is, so a region inside `PC00.RP01.PXSX` needs RP01's `_ADR` to find the
+    /// bridge, the *bridge's own config space* to learn which bus it forwards,
+    /// and only then PXSX's `_ADR`. Walking up collects the chain; walking
+    /// back down resolves it.
+    ///
+    /// This is what `RP01.PXCS` needed, and `PXCS` is the window every PCIe
+    /// root port's link state is read through -- so without it the predicates
+    /// guarding this laptop's power resources could not be evaluated, and 90
+    /// of its 92 power resources did not exist.
+    fn pci_config_base(&mut self, scope: usize) -> Result<u64, Fault> {
+        let ecam = crate::acpi::parsed().and_then(|a| a.mcfg).ok_or(Fault::Region(SPACE_PCI_CONFIG))?;
+        // Innermost first, plus the host bridge's base bus number if it
+        // declares one. `_BBN` is usually zero and is usually absent, and a
+        // machine with more than one host bridge is exactly where assuming
+        // zero stops being harmless.
+        let mut chain: Vec<u64> = Vec::new();
+        let mut bbn: u64 = 0;
+        let mut n = scope;
+        for _ in 0..MAX_ANCESTRY {
+            if let Some(c) = self.child(n, *b"_ADR") {
+                chain.push(self.eval_node(c, &[])?.int()?);
+            }
+            if let Some(c) = self.child(n, *b"_BBN") {
+                bbn = self.eval_node(c, &[])?.int().unwrap_or(0);
+            }
+            let p = self.ns.node(n).parent;
+            if p == n {
+                break;
+            }
+            n = p;
+        }
+        if chain.is_empty() {
+            return Err(Fault::Region(SPACE_PCI_CONFIG));
+        }
+        let mut bus = bbn;
+        let (mut dev, mut func) = (0u64, 0u64);
+        let last = chain.len() - 1;
+        for (i, adr) in chain.iter().rev().enumerate() {
+            dev = (adr >> 16) & 0x1F;
+            func = adr & 0x7;
+            if i < last {
+                // Everything but the innermost is a bridge, and the bus it
+                // forwards is in its own config space at offset 0x19. Read
+                // rather than assumed: bus numbers are assigned by firmware
+                // and the DSDT never says what they came out as.
+                let a = ecam + (bus << 20) + (dev << 15) + (func << 12) + 0x18;
+                let v = unsafe { core::ptr::read_volatile(a as *const u32) };
+                bus = ((v >> 8) & 0xFF) as u64;
+            }
+        }
+        Ok(ecam + (bus << 20) + (dev << 15) + (func << 12))
     }
 
     /// A region's base and length, for a report that wants to show them.
@@ -958,6 +1182,17 @@ impl<'a> Interp<'a> {
             }),
             // The embedded controller, one byte per transaction.
             3 => crate::dev::ec::read(addr as u8).map(|v| v as u64).ok_or(Fault::Region(3)),
+            // PCI config, which `region_of` has already turned into an ECAM
+            // address -- so it is a memory read, and is one here rather than
+            // folded into arm 0 so that `space_name` can still say what it is.
+            SPACE_PCI_CONFIG => Ok(unsafe {
+                match bytes {
+                    1 => core::ptr::read_volatile(addr as *const u8) as u64,
+                    2 => core::ptr::read_volatile(addr as *const u16) as u64,
+                    4 => core::ptr::read_volatile(addr as *const u32) as u64,
+                    _ => core::ptr::read_volatile(addr as *const u64),
+                }
+            }),
             other => Err(Fault::Region(other)),
         }
     }
