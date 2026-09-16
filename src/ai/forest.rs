@@ -1918,6 +1918,10 @@ pub fn selftest() -> bool {
         }
         Some((path, cr)) => {
             let live = sysbox::read_blob(path).unwrap_or_default();
+            // Taken before this suite reads anything, because the claim about
+            // contention below is about what *else* touched the one buffer and
+            // the suite itself refuses a caller on purpose at the end.
+            let mark = sysbox::stored::contended();
             check(
                 "a path resolves in the stored tree, and a directory is not a blob",
                 sysbox::stored::locate(path).is_some() && sysbox::stored::locate("/lib").is_none(),
@@ -2008,9 +2012,22 @@ pub fn selftest() -> bool {
             // been inside a ranged read at once and one of them was refused --
             // which is the outcome that was designed for, and still a thing to
             // know about rather than a thing to pass over.
+            //
+            // **Against a mark rather than against zero, and that is the whole
+            // fix.** It read `contended() == 0`, which is a boot-wide canary
+            // that the very next claim poisons: `refuses_while_held` causes a
+            // refusal on purpose, so the counter is one from then on and a
+            // second run of this suite in the same boot failed here every
+            // time, on a mechanism that was working perfectly. `diag all`
+            // twice is exactly what the release gate does, so what it reported
+            // was a red line under `forest` on every clean machine.
+            //
+            // A claim that can only pass once per boot is not a canary. This
+            // one asks what it always meant to ask -- did anything other than
+            // this suite's own test need refusing -- and can be asked again.
             check(
-                "nothing has needed to be refused for contention during this boot",
-                sysbox::stored::contended() == 0,
+                "nothing but this suite's own test has been refused for contention",
+                sysbox::stored::contended() == mark,
             );
             // And the guard is shown to work rather than assumed, because a
             // counter at zero says nothing about whether anything is checking.
