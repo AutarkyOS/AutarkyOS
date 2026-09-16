@@ -563,6 +563,118 @@ button.wbtn:hover, #step2 button:hover, #step3 button:hover {
   text-decoration: none;
 }
 
+/* ------------------------------------------------------------- routes --- */
+
+/* Three ways to run this, and the download page has to answer "which one is
+   me?" before it answers anything else. The rewrite was prompted by people
+   asking how to try it *without* giving up a laptop, and the old page led
+   with `dd` -- so the virtual machine route is first, and the one that
+   overwrites a disk is last.
+
+   A grid rather than three headings, because the choice is a comparison: the
+   reader wants to see the cost of each next to the others, and three sections
+   stacked down the page hide two of them below the fold. */
+.routes {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 10px;
+  margin: 14px 0 18px;
+}
+.route {
+  background: var(--panel);
+  border: 1px solid var(--edge);
+  border-radius: var(--round);
+  padding: 11px 13px 13px;
+  display: flex;
+  flex-direction: column;
+}
+.route h3 { margin: 0 0 3px; font-size: 15px; }
+.route h3 a { text-decoration: none; }
+.route .tag {
+  display: inline-block;
+  font-size: 11px;
+  font-weight: bold;
+  text-transform: uppercase;
+  letter-spacing: .06em;
+  color: var(--link);
+  margin-bottom: 5px;
+}
+.route p { margin: 0 0 8px; font-size: 13px; color: var(--ink-dim); }
+.route .cost {
+  margin-top: auto;
+  font-size: 12px;
+  color: var(--ink-faint);
+  border-top: 1px solid var(--edge);
+  padding-top: 7px;
+}
+
+/* -------------------------------------------------------------- steps --- */
+
+/* A procedure, as distinct from a list of points. The counter is drawn rather
+   than left to the list marker because these steps carry code blocks and
+   notes under them, so the number has to stay legible beside an item several
+   lines tall -- a default marker sits on the first line and is lost. */
+ol.steps { list-style: none; padding-left: 0; counter-reset: step; margin: 10px 0; }
+ol.steps > li {
+  counter-increment: step;
+  position: relative;
+  padding-left: 34px;
+  margin: 0 0 13px;
+}
+ol.steps > li::before {
+  content: counter(step);
+  position: absolute;
+  left: 0;
+  top: 1px;
+  width: 23px;
+  height: 23px;
+  line-height: 23px;
+  text-align: center;
+  font-size: 12px;
+  font-weight: bold;
+  color: #fff;
+  background: var(--cap);
+  box-shadow: inset 0 1px 0 var(--cap-edge);
+  border-radius: 50%;
+}
+ol.steps > li > :first-child { margin-top: 0; }
+ol.steps > li > :last-child { margin-bottom: 0; }
+
+/* --------------------------------------------------------- image specs --- */
+
+/* One block per downloadable image. The table above it is for comparing at a
+   glance; this is for the reader who has narrowed to one and wants to know
+   what they are about to spend twenty minutes downloading. */
+.imgspec { margin: 0 0 16px; }
+.imgspec:last-child { margin-bottom: 0; }
+.imgspec h3 { margin: 0 0 6px; font-size: 15px; }
+.imgspec .file {
+  font-family: "Cascadia Mono", Consolas, "Courier New", monospace;
+  font-size: 13px;
+  word-break: break-all;
+}
+.imgspec dl { margin: 7px 0 0; display: grid; grid-template-columns: max-content 1fr; gap: 2px 14px; }
+.imgspec dt { color: var(--ink-faint); font-size: 12px; }
+.imgspec dd { margin: 0; font-size: 13px; }
+
+/* --------------------------------------------------------------- keys --- */
+
+/* Firmware boot-menu keys, which are a per-vendor fact and not a standard.
+   Rendered as a plain definition row rather than a table because it is two
+   columns of four words and a table draws more furniture than content. */
+.keys { display: grid; grid-template-columns: max-content 1fr; gap: 3px 16px; margin: 9px 0; font-size: 13px; }
+.keys dt { color: var(--ink-faint); }
+.keys dd { margin: 0; }
+.keys kbd {
+  font-family: "Cascadia Mono", Consolas, "Courier New", monospace;
+  font-size: 12px;
+  background: var(--code-bg);
+  border: 1px solid var(--edge);
+  border-bottom-width: 2px;
+  border-radius: var(--round-sm);
+  padding: 0 5px;
+}
+
 /* --------------------------------------------------------------- narrow --- */
 
 @media (max-width: 45rem) {
@@ -583,6 +695,11 @@ button.wbtn:hover, #step2 button:hover, #step3 button:hover {
   #footer { padding-left: 10px; padding-right: 10px; }
   #page { box-shadow: none; }
   h1 { font-size: 23px; }
+  /* Three cards at a third of 375px is 105px of column, which fits no
+     sentence. One per row, in the order they are ranked. */
+  .routes { grid-template-columns: 1fr; }
+  .imgspec dl, .keys { grid-template-columns: 1fr; gap: 1px 0; }
+  .imgspec dt, .keys dt { margin-top: 5px; }
 }
 
 @media (prefers-reduced-motion: reduce) {
