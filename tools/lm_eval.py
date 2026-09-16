@@ -344,6 +344,15 @@ class DenseRef:
     against, and it has all three right. So the second implementation is gone
     rather than repaired -- `model.rs` makes the objection twice: two things
     that are supposed to agree do not stay agreeing.
+
+    **And it is too slow to benchmark with**, which is a separate fact and
+    took a while to be worth stating: the oracle walks positions in Python, so
+    a 726-token 5-shot prefill is minutes and a full run is about ninety
+    minutes. `fastdense.Dense` is the same arithmetic with the position loop
+    turned into a matrix dimension, and it is the default here **only because
+    `fastdense.py --check` runs it against this oracle on real ids and refuses
+    to be used if the logits disagree.** `--oracle` takes this path instead,
+    which is what a disagreement is diagnosed with.
     """
 
     def __init__(self, path, max_len):
@@ -369,7 +378,16 @@ class DenseRef:
         return logits
 
 
-def make_backend(model_path, max_len):
+def make_dense(path, max_len, oracle):
+    """The fast runner, or the oracle it was proven against."""
+    if oracle:
+        return DenseRef(str(path), max_len)
+    import fastdense
+
+    return fastdense.Dense(str(path), max_len)
+
+
+def make_backend(model_path, max_len, oracle=False):
     """Returns (runner, note). runner.feed(tokens) -> logits of the last token.
 
     Dense and hybrid share the GLADOSM2 magic; the version field at offset 8
@@ -385,7 +403,7 @@ def make_backend(model_path, max_len):
         tensors, cfg = v4.load(model_path)
         note = f"hybrid arch {cfg['arch']}, {len(cfg['layer_types'])} layers"
         return Hybrid35(tensors, cfg, max_len), note
-    return DenseRef(str(model_path), max_len)
+    return make_dense(model_path, max_len, oracle)
 
 
 class DenseRunner2(DenseRunner):
@@ -776,6 +794,10 @@ def main():
     ap.add_argument("--contexts", type=int, nargs="+", default=[512, 1024, 2048])
     ap.add_argument("--check", action="store_true",
                     help="prove the incremental hybrid against ref35, then exit")
+    ap.add_argument("--oracle", action="store_true",
+                    help="run the dense path through reference.py itself -- "
+                         "correct, and about 40x slower. For diagnosing a "
+                         "disagreement, not for producing a figure.")
     ap.add_argument("--hf-tokenizer", default="")
     args = ap.parse_args()
 
@@ -798,12 +820,13 @@ def main():
     # together, so they are worked out together.
     max_len = {"mmlu": 2048, "gsm8k": 2048, "niah": max(args.contexts) + 64,
                "route": 2048}[args.task]
-    made = make_backend(args.model, max_len)
+    made = make_backend(args.model, max_len, args.oracle)
     backend, note = made if isinstance(made, tuple) else (
         made,
         f"dense dim {made.cfg['dim']}, {made.cfg['layers']} layers"
         + (", qk-norm" if made.cfg.get("qk_norm") else "")
-        + f", head_dim {made.cfg['head_dim']}",
+        + f", head_dim {made.cfg['head_dim']}"
+        + (", oracle" if args.oracle else ", batched"),
     )
     if hasattr(backend, "latent_k"):
         backend.latent_k = args.latent
