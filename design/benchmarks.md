@@ -12,7 +12,7 @@ datasets.
 | Rail | SmolLM2-135M (dense) | Qwen3.5-0.8B (hybrid) | **Qwen3.5-2B distill (hybrid)** | Chance |
 |---|---|---|---|---|
 | MMLU, 0-shot letter-logprob | 20.0% (n=50) | 30.0% (n=30) | **43.3%** (n=30) | 25% |
-| GSM8K, 5-shot greedy | ~~0.0%~~ **withdrawn** | ~~0.0%~~ **withdrawn** | ~~0.0%~~ **withdrawn** | ~0 |
+| GSM8K, 5-shot greedy | ~~0.0%~~ *re-run owed* | ~~0.0%~~ *re-run owed* | ~~0.0%~~ *re-run owed* | ~0 |
 | NIAH, 512/1024 | 0/7 | 6/6 | **6/6** | -- |
 | Route, constrained decode, 78 actions | 0.0% (n=50) | 33.3% (n=30) | **40.0%** (n=30) | ~1.3% |
 
@@ -55,17 +55,47 @@ passed is not recorded, so **those figures cannot be relied on without a
 re-run**; the SmolLM2 column is unaffected.
 
 `lm_eval.py` refuses a vocabulary mismatch now and `--show N` prints the raw
-completion, whose absence is what let all of this hide. Through the fixed path
-Qwen3-0.6B writes ordinary GSM8K answers -- `2 + (2/2) = <<2+1=3>>3` then
-`#### 3`, correct -- so the task measures the model now. No score is quoted
-here in its place: `reference.py` is an oracle rather than a benchmark runner
-and a full 5-shot run is about an hour and a half, so a real number waits on a
-dense runner that is fast *and* right.
+completion, whose absence is what let all of this hide.
 
-**Nothing in the GSM8K row should be quoted.** It is left struck through rather
-than deleted because it has been cited, in this file and elsewhere, as evidence
-that small models cannot do arithmetic -- and that conclusion was drawn from a
-harness that was not asking them.
+**Nothing in the GSM8K row should be quoted**, and it is left struck through
+rather than deleted because it has been cited, in this file and elsewhere, as
+evidence that small models cannot do arithmetic -- a conclusion drawn from a
+harness that was not asking them. The three columns are *owed a re-run* rather
+than withdrawn forever; what was missing was a dense runner that is fast and
+right, and there is one now.
+
+### The first GSM8K figure this project has that measures a model
+
+    Qwen3-0.6B, GSM8K 5-shot greedy, n=25, <= 256 new tokens
+
+    28.0%
+
+Dense, int8, its own tokenizer, through the fixed harness and
+`tools/fastdense.py`. Chance on this task is about zero, so 28% is the model
+doing the arithmetic rather than the harness finding a number somewhere.
+
+The transcripts are the point and are printed by `--show`:
+
+    Janet's ducks lay 16 eggs per day. She eats 3 eggs for breakfast and 4
+    eggs for baking muffins. So she eats 3 + 4 = <<3+4=7>>7 eggs per day.
+    The remaining eggs are 16 - 7 = <<16-7=9>>9 eggs.
+    She sells the remaining eggs at $2 per egg, so she makes 9 * 2 =
+    <<9*2=18>>18 dollars.
+    #### 18                                            (gold 18 -- right)
+
+Well-formed reasoning, the `####` the format asks for, the stop cutting
+cleanly, and a budget the answer fits inside. Every one of those was broken
+before, and each on its own reads as a model that cannot do arithmetic.
+
+**n=25 is a small sample and the figure is quoted as one.** The 95% interval on
+25 items is roughly plus or minus 18 points, so this establishes that the task
+measures the model and does not establish where between 10% and 46% the model
+sits. What it also is not, is a number about the three checkpoints in the table
+above: Qwen3-0.6B is a fourth, and the dense runner that made it affordable
+does not run the hybrids.
+
+Cost, since that is what was blocking: **26.1 s/question**, so a 25-question
+5-shot run is about eleven minutes where `reference.py` was about ninety.
 
 ## What the numbers say
 

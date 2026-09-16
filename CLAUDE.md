@@ -5468,7 +5468,24 @@ N` prints the raw completion and stays for that reason. A rail that reads zero
 is not a result until its output has been read; a score with no transcript
 behind it is an assertion.
 
-`design/benchmarks.md` carries the withdrawal and the struck-through row.
+**And the number it was hiding: 28.0%.** Qwen3-0.6B, GSM8K 5-shot greedy,
+n=25, through the fixed harness. The row read 0.0% on every checkpoint this
+project has ever run and was quoted as evidence about small models and
+arithmetic; the model had been doing the arithmetic the whole time and nothing
+was reading the answer.
+
+The last of the four defects needed a runner rather than a fix.
+`tools/fastdense.py` is `reference.py`'s arithmetic with the position loop
+turned into a matrix dimension -- 41x on the same logits, weights dequantised
+once instead of per call per layer per token, 26 s/question against about 180.
+It is allowed to exist only because `fastdense.py --check` runs it against the
+oracle on real ids and prints the largest disagreement; `lm_eval.py --oracle`
+takes the slow path, which is what a disagreement is diagnosed with. Two dense
+implementations do not stay agreeing unless something makes them.
+
+`design/benchmarks.md` carries the figure, the transcript it came from, and the
+interval on n=25 -- roughly plus or minus 18 points, so what it establishes is
+that the task measures the model rather than where the model sits.
 
 There are **three** splits, and `vocab::splits()` is the single place anything
 asks for them. It returns the compiled `SEED_TRAIN` and `SEED_VAL_END` until a
@@ -5531,27 +5548,40 @@ from those runs do not belong in a claim.
   `theme::text_w_of` and `theme::head_chars`/`tail_chars`.
 - **`extern "C"` on `x86_64-unknown-uefi` is Microsoft x64 and not System V.**
   The context switch is pinned to `extern "sysv64"` explicitly.
-- **`diag paging` followed by `diag smp` faults, and it is not fixed.** The
-  exact reproduction, in one boot, with no guest involved:
+- **Processor state that is per-core has to be adopted on every core, and the
+  failure looks like memory corruption somewhere else.** `diag paging` then
+  `diag smp` faulted with "reserved bit set in a page table entry", two
+  confident hypotheses were measured and both were wrong, and the third
+  attempt read the entry:
 
-      diag smp     passed
-      diag paging  passed
-      diag smp     #PF, reserved bit set in a page table entry
+      error 0x0000000000000009  reserved bit set in a page table entry
+        pt  0x8000000002c12063
 
-  Two worker cores fault at once on an address inside the sixteen-megabyte
-  matrix, at a rip in the AVX2 int8 kernel. It needs the sweep run *twice* to
-  show up under `diag all`, which is why it sat unseen: nothing had ever run
-  `diag all` twice in one boot, and the release gate for 1.3.4 is the first
-  thing that did.
-  What is ruled out. It is not the Linux work: it reproduces with no guest
-  ever loaded, and the same sequence passes on 1.3.3's code. It is not a
-  stale TLB or paging-structure cache on the workers -- reloading `CR3` at
-  `smp::claim_and_run`, which fully flushes both since nothing here sets the
-  `GLOBAL` bit, changes nothing. That leaves the entry being genuinely corrupt
-  *in memory*, with core 0 not faulting only because its own TLB still holds
-  the translation from before the corruption. The suspicion is `split_large`
-  or the `protect` that `paging::checks` runs around its deliberate fault, and
-  the next step is reading the offending entry rather than reasoning about it.
+  Bit 63, which is `NX` and is entirely legal -- boot prints `nx=1`. But
+  **`EFER.NXE` is per-core**: the trampoline sets `EFER.LME` to reach long
+  mode and stops, so nothing ever gave an application processor the rest. One
+  entry therefore meant no-execute on the bootstrap processor and *reserved*
+  on every other core, and the fault arrived on whichever core read it second.
+  `cpu::adopt_page_rights` does `CR0.WP` and `EFER.NXE` on every core and says
+  so when it cannot.
+
+  **Fixing it exposed the other half**: `paging::checks` borrowed a heap page,
+  made it read-only to watch the processor refuse a write, and restored it
+  with `Perm::RW`, which is precisely non-executable. Every run of the suite
+  left an `NX` page in the heap, and `diag code` and the Aiksi JIT both
+  allocate one and jump into it. `RWX` now, and the claim checks `exec` too --
+  "restored" was true of a page that had quietly lost a right nobody was
+  asking about yet.
+
+  Two lessons rather than one. It hid this long because the identity map is
+  built from 2 MiB pages, which never carried bit 63: `diag paging` is the
+  only thing in the tree that writes `NX` into a 4 KiB entry, and it frees
+  those pages straight back to the heap. And **`pagemap` found nothing,
+  correctly** -- it runs on the bootstrap processor, where the entry is legal.
+  The question was never what the entry said, it was which core was reading
+  it, which is a thing no single-core diagnostic can be asked.
+
+  Fixed in `d015e0d`. `diag all` twice in one boot passes.
 - **A longjmp into inlined code has no calling convention to lean on.**
   `recover::guard` saved the registers a callee must preserve, which is the
   right list for a function boundary and the wrong question entirely: `guard`
