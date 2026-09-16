@@ -28,6 +28,7 @@ forward before anything is measured with it.
 
 import argparse
 import json
+import random
 import re
 import sys
 import time
@@ -378,16 +379,18 @@ class DenseRef:
         return logits
 
 
-def make_dense(path, max_len, oracle):
+def make_dense(path, max_len, oracle, batch=1, device="auto", dtype="f32"):
     """The fast runner, or the oracle it was proven against."""
     if oracle:
         return DenseRef(str(path), max_len)
     import fastdense
 
-    return fastdense.Dense(str(path), max_len)
+    return fastdense.Dense(str(path), max_len, batch=batch,
+                           device=device, dtype=dtype, verbose=True)
 
 
-def make_backend(model_path, max_len, oracle=False):
+def make_backend(model_path, max_len, oracle=False, batch=1,
+                 device="auto", dtype="f32"):
     """Returns (runner, note). runner.feed(tokens) -> logits of the last token.
 
     Dense and hybrid share the GLADOSM2 magic; the version field at offset 8
@@ -403,7 +406,7 @@ def make_backend(model_path, max_len, oracle=False):
         tensors, cfg = v4.load(model_path)
         note = f"hybrid arch {cfg['arch']}, {len(cfg['layer_types'])} layers"
         return Hybrid35(tensors, cfg, max_len), note
-    return make_dense(model_path, max_len, oracle)
+    return make_dense(model_path, max_len, oracle, batch, device, dtype)
 
 
 class DenseRunner2(DenseRunner):
@@ -586,10 +589,26 @@ def cut_at_stop(text):
     return text
 
 
-def run_gsm8k(backend, hf, tok, limit, max_new, show=0, shots=5):
+def pick(rows, limit, seed):
+    """`limit` of them, drawn rather than sliced.
+
+    It was `rows[:limit]`, and a prefix is not a sample. Nothing suggests
+    GSM8K's test set is ordered by difficulty, but "probably not ordered" is
+    not a sampling method, and a figure from 25 items has to be able to say
+    where the 25 came from. Seeded, so the same `--limit` is the same
+    questions on every run and two checkpoints are compared on one set.
+    """
+    if not limit or limit >= len(rows):
+        return list(rows), len(rows)
+    idx = sorted(random.Random(seed).sample(range(len(rows)), limit))
+    return [rows[i] for i in idx], len(rows)
+
+
+def run_gsm8k(backend, hf, tok, limit, max_new, show=0, shots=5, batch=1, seed=0):
     d = snapshot_dir("datasets--gsm8k")
     train = parquet_rows(find_file(d, "train"))
-    test = parquet_rows(find_file(d, "test"))[: limit or 25]
+    rows = parquet_rows(find_file(d, "test"))
+    test, total = pick(rows, limit if limit is not None else 25, seed)
 
     shots = train[:shots]
     prefix = "".join(
@@ -614,44 +633,127 @@ def run_gsm8k(backend, hf, tok, limit, max_new, show=0, shots=5):
     right = 0
     t0 = time.time()
     shown = 0
-    for i, r in enumerate(test):
+    done_n = 0
+    # A backend that can hold several sequences at once decodes them together.
+    # Decode is one token at a time whatever you do, so a lone sequence drags
+    # every weight past the processor to compute one row; sixteen rows pay
+    # that once. Measured on CPU at 8.8 tok/s for one against 40.2 for
+    # sixteen. `Hybrid35` keeps a recurrent state per sequence and has no
+    # batched form, so it takes the second path unchanged.
+    wide = getattr(backend, "prefill", None)
+
+    # Encoded once, up front, so the grouping below can see the lengths. It is
+    # a tokenizer pass over 1,319 short strings and costs nothing next to one
+    # forward pass.
+    enc = [hf.encode(prefix + f"Question: {r['question']}\nAnswer:",
+                     add_special_tokens=False).ids for r in test]
+
+    # --- the shared prefix, and the reason it needs checking ----------------
+    #
+    # Every prompt begins with the same five worked examples, 688 of its 726
+    # tokens, and prefilling them 1,319 times is the single largest cost in
+    # the run. `Dense.hold_prefix` computes them once.
+    #
+    # **But `encode(a + b)` is not always `encode(a) + encode(b)`.** A
+    # byte-level BPE merges across a boundary, and this project has already
+    # paid for that once: `lex.rs` found `'what'` and `' what'` were different
+    # tokens with wildly different document frequencies, and the fix was to
+    # treat both sides the same way. Here the failure would be silent and
+    # worse -- the held prefix would be a set of keys for a tokenisation the
+    # prompt does not have. So the split is verified against every prompt and
+    # abandoned entirely if any one of them disagrees.
+    pre_ids = hf.encode(prefix, add_special_tokens=False).ids
+    shared = all(ids[:len(pre_ids)] == pre_ids for ids in enc) if wide else False
+    if wide and not shared:
+        print("      the prompts do not all start with the encoded prefix, so "
+              "it is recomputed per question (tokeniser boundary)")
+
+    # A held prefix must sit at the same columns in every row, so a group has
+    # to be one length -- see `Dense.hold_prefix`. Grouping by exact length
+    # costs nothing and buys both that and zero padding.
+    if wide and shared:
+        by_len = {}
+        for r, ids in zip(test, enc):
+            by_len.setdefault(len(ids), []).append((r, ids))
+        groups = [bucket[i:i + batch]
+                  for bucket in by_len.values()
+                  for i in range(0, len(bucket), batch)]
+    elif wide and batch > 1:
+        pairs = list(zip(test, enc))
+        groups = [pairs[i:i + batch] for i in range(0, len(pairs), batch)]
+    else:
+        groups = [[(r, ids)] for r, ids in zip(test, enc)]
+
+    if wide and shared:
+        print(f"      prefix {len(pre_ids)} tok held once, "
+              f"{len(groups)} group(s) of one length")
+
+    for pair in groups:
+        g = [r for r, _ in pair]
+        prompts = [ids for _, ids in pair]
         backend.reset()
-        ids = hf.encode(prefix + f"Question: {r['question']}\nAnswer:",
-                        add_special_tokens=False).ids
         if shown < show:
-            print("      prompt %d tok, budget %d new" % (len(ids), max_new))
-        logits = backend.feed(ids)
-        gen = []
-        text = ""
+            print("      prompt %d tok, budget %d new"
+                  % (max(len(p) for p in prompts), max_new))
+        if wide:
+            logits = (backend.prefill(prompts, prefix=pre_ids) if shared
+                      else backend.prefill(prompts))
+        else:
+            logits = np.asarray([backend.feed(prompts[0])])
+        B = len(g)
+        gen = [[] for _ in range(B)]
+        texts = [""] * B
+        fin = [False] * B
         for _ in range(max_new):
-            nxt = int(np.argmax(logits))
-            if nxt == eos:
+            nxt = [int(np.argmax(logits[b])) for b in range(B)]
+            for b in range(B):
+                if fin[b]:
+                    continue
+                if nxt[b] == eos:
+                    fin[b] = True
+                    continue
+                gen[b].append(nxt[b])
+                texts[b] = detok(tok, gen[b])
+                # Checked on the decoded text rather than on a token, because
+                # a stop is a string and the tokeniser is free to split it
+                # across two pieces. Re-decoding each step costs nothing next
+                # to a forward pass.
+                if any(sep in texts[b] for sep in STOP):
+                    fin[b] = True
+            if all(fin):
                 break
-            gen.append(nxt)
-            text = detok(tok, gen)
-            # Checked on the decoded text rather than on a token, because a
-            # stop is a string and the tokeniser is free to split it across
-            # two pieces. Re-decoding each step costs nothing next to a
-            # forward pass.
-            if any(sep in text for sep in STOP):
-                break
-            logits = backend.feed([nxt])
-        text = cut_at_stop(text)
-        if shown < show:
-            shown += 1
-            print("      --- what it actually said (%d tok) ---" % len(gen))
-            print("      " + text.replace(chr(10), chr(10) + "      ")[:1400])
-            print("      --- end ---")
-        got = last_number(text)
-        want = gold_number(r["answer"])
-        hit = got is not None and want is not None and abs(float(got) - float(want)) < 1e-4
-        right += hit
-        if i < 5:
-            print(f"      {'ok ' if hit else '-- '}got {got}  want {want}")
-        print(f"  [{i + 1}/{len(test)}] acc {right / (i + 1):6.1%}  "
-              f"({(time.time() - t0) / (i + 1):.1f}s/q)", end="\r")
+            # A finished row is still stepped, with a token whose output is
+            # thrown away. Dropping it from the batch would mean rebuilding
+            # the cache around the hole, which costs more than the wasted
+            # column -- and the batch ends when its *longest* answer does
+            # either way.
+            feed = [nxt[b] if not fin[b] else eos for b in range(B)]
+            if wide:
+                logits = backend.step(feed)
+            else:
+                logits = np.asarray([backend.feed([feed[0]])])
+
+        for b, r in enumerate(g):
+            text = cut_at_stop(texts[b])
+            if shown < show:
+                shown += 1
+                print("      --- what it actually said (%d tok) ---" % len(gen[b]))
+                print("      " + text.replace(chr(10), chr(10) + "      ")[:1400])
+                print("      --- end ---")
+            got = last_number(text)
+            want = gold_number(r["answer"])
+            hit = (got is not None and want is not None
+                   and abs(float(got) - float(want)) < 1e-4)
+            right += hit
+            done_n += 1
+            if done_n <= 5:
+                print(f"      {'ok ' if hit else '-- '}got {got}  want {want}")
+        print(f"  [{done_n}/{len(test)}] acc {right / done_n:6.1%}  "
+              f"({(time.time() - t0) / done_n:.1f}s/q)", end="\r")
     print()
-    print(f"  gsm8k ({len(shots)}-shot greedy, n={len(test)}, <= {max_new} new): {right / len(test):6.1%}")
+    frac = f" ({len(test)}/{total} = {len(test)/total:.1%} of the set)"
+    print(f"  gsm8k ({len(shots)}-shot greedy, n={len(test)}{frac}, "
+          f"<= {max_new} new): {right / len(test):6.1%}")
     return right / len(test)
 
 
@@ -794,6 +896,20 @@ def main():
     ap.add_argument("--contexts", type=int, nargs="+", default=[512, 1024, 2048])
     ap.add_argument("--check", action="store_true",
                     help="prove the incremental hybrid against ref35, then exit")
+    ap.add_argument("--batch", type=int, default=1,
+                    help="decode this many questions at once. Decode is "
+                         "memory-bound, so a batch is close to free per extra "
+                         "sequence; dense backends only.")
+    ap.add_argument("--all", action="store_true",
+                    help="every item in the task's set rather than --limit")
+    ap.add_argument("--seed", type=int, default=0,
+                    help="which sample --limit draws. Fixed, so two runs and "
+                         "two checkpoints see the same questions.")
+    ap.add_argument("--device", default="auto", choices=["auto", "cpu", "cuda"])
+    ap.add_argument("--dtype", default="f32", choices=["f32", "bf16", "fp16"],
+                    help="weight precision. f32 is what the oracle check "
+                         "passes at; the narrow ones hold the argmax and "
+                         "reorder the tail, so measure before quoting one.")
     ap.add_argument("--oracle", action="store_true",
                     help="run the dense path through reference.py itself -- "
                          "correct, and about 40x slower. For diagnosing a "
@@ -820,7 +936,14 @@ def main():
     # together, so they are worked out together.
     max_len = {"mmlu": 2048, "gsm8k": 2048, "niah": max(args.contexts) + 64,
                "route": 2048}[args.task]
-    made = make_backend(args.model, max_len, args.oracle)
+    # The KV cache is `layers * batch * max_len * kv_dim * 2`, so a batch
+    # multiplies it: 2048 at batch 16 is 7.5 GB on this checkpoint and 1152
+    # is 4.2. The 5-shot prompt is 800 tokens at worst and the budget is 256,
+    # so 1152 has room and `need` below refuses loudly if it does not.
+    if args.task == "gsm8k" and args.batch > 1:
+        max_len = min(max_len, 1152)
+    made = make_backend(args.model, max_len, args.oracle,
+                        batch=args.batch, device=args.device, dtype=args.dtype)
     backend, note = made if isinstance(made, tuple) else (
         made,
         f"dense dim {made.cfg['dim']}, {made.cfg['layers']} layers"
@@ -863,7 +986,8 @@ def main():
     if args.task == "mmlu":
         run_mmlu(backend, hf, args.limit)
     elif args.task == "gsm8k":
-        run_gsm8k(backend, hf, tok, args.limit, args.max_new, args.show,
+        run_gsm8k(backend, hf, tok, 0 if args.all else args.limit,
+                  args.max_new, args.show,
                   args.shots if args.shots else 5)
     elif args.task == "niah":
         run_niah(backend, hf, tok, args.contexts, args.limit)
