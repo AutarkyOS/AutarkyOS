@@ -56,7 +56,17 @@ pub enum Error {
 
 impl From<block::Error> for Error {
     fn from(e: block::Error) -> Self {
-        Error::Io(e)
+        match e {
+            // **A refused write is not an I/O error and must not read as one.**
+            // `nvme::write` answers `0xFFFC` when writes have never been
+            // unlocked, which is the ordinary state of every boot that did not
+            // run `store init` -- and it arrived here as `Io(Io(65532))`, a
+            // number that sends an operator to look at the disk. `Unsafe`
+            // already had the right words attached to it and simply never
+            // reached them.
+            block::Error::Io(nvme::ERR_LOCKED) => Error::Unsafe,
+            other => Error::Io(other),
+        }
     }
 }
 
@@ -110,6 +120,39 @@ fn blocks_for(bytes: u64) -> u64 {
 }
 
 /// A page-aligned scratch buffer sized to whole blocks.
+///
+/// **It is never freed, and here is what that costs, measured rather than
+/// estimated.** `alloc_dma` is `alloc_zeroed` with no matching `dealloc`, and
+/// every `put`, `get`, `commit`, `format` and `mount` comes through here. The
+/// request is `rounded + 4096`, so a blob of 512 bytes or fewer takes 4,608
+/// bytes of heap permanently.
+///
+/// Under QEMU, a fresh boot snapshotted twice with `autosnap off`:
+///
+///     snap 1   812 block(s)   heap 22,260,592 -> 25,773,456   +3,512,864
+///     snap 2     1 block(s)   heap 25,773,456 -> 25,786,992      +13,536
+///
+/// **The cost is per blob, not per block**, and the first version of this note
+/// said per block because the blobs it measured were one block each. A second
+/// measurement settled it: importing 8,913 forest nodes averaging 865 bytes
+/// wrote 21,425 blocks for `heap 30,199,328 -> 82,328,560`, which is 2,433
+/// bytes per *block* against the 4,315 above -- half, because a two-block blob
+/// pays one spare page rather than two. Per blob the two agree: about
+/// `4096 + ceil(size / 512) * 512`, which is exactly what the line below asks
+/// for. A figure in the wrong unit generalises in the wrong direction, and
+/// this one would have over-predicted a large corpus by a factor of two.
+///
+/// What that buys before it hurts: a full forest import plus its snapshot took
+/// the heap to 82 MiB of the ~1.9 GiB this machine reports, and `Written`
+/// memoises so an unchanged subtree is never re-put. A reboot clears it. So
+/// bulk import is affordable and *repeated* import in one session is not,
+/// which is the opposite of what anybody would assume.
+///
+/// The fix, when it is worth the risk of touching this path: every caller uses
+/// its buffer inside one short scope and none of them escapes, so one static
+/// scratch grown on demand would serve them all -- single core, one store, and
+/// `put`/`get` are not reentrant. Not done here, because this is the most
+/// dangerous code in the building and the leak is survivable at present sizes.
 fn dma(bytes: usize) -> Result<&'static mut [u8], Error> {
     let rounded = (blocks_for(bytes as u64) as usize).max(1) * bs() as usize;
     let p = nvme::alloc_dma(rounded + 4096).ok_or(Error::NoDevice)?;

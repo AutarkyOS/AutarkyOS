@@ -51,4 +51,5 @@ target = "x86_64-unknown-uefi"
 # #[target_feature], guarded by runtime detection.
 rustflags = [
     "-C", "target-feature=+sse,+sse2,-soft-float",
+    "-C", "link-arg=/MAP:target/glados.map",
 ]

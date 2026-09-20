@@ -786,7 +786,13 @@ pub fn draw(seed: &[u8; 32], n: u32) -> Proposal {
 /// the trade this module exists to refuse.
 fn record_seed() -> [u8; 32] {
     match sysbox::read_blob(LEDGER) {
-        Some(b) => sha256::hash(&b),
+        // Verdict lines only. A rollback appends a `revert` line so the record
+        // holds the undo, but the seed is a function of what was decided, not of
+        // what was later reversed -- otherwise undoing a thing would redirect the
+        // next draw. `verdict_bytes` returns the blob unchanged when it holds no
+        // revert lines, so a machine that has never rolled back hashes exactly
+        // what it always did and every existing lineage re-derives.
+        Some(b) => sha256::hash(&verdict_bytes(&b)),
         // Nothing recorded yet. A fixed seed rather than an arbitrary one, so
         // a fresh machine's first draw is the same on every fresh machine.
         None => sha256::hash(b"autark/draw/genesis"),
@@ -1381,10 +1387,31 @@ pub fn head() -> Option<[u8; 32]> {
     from_hex32(text.trim())
 }
 
-fn set_head(h: &[u8; 32]) {
+/// Point the head at a node, and say whether the pointer actually moved.
+///
+/// **The return value is the whole reason this is not `()`.** It discarded
+/// `write_text`'s answer, and that made one observable state ambiguous in a way
+/// nothing else in the module could resolve: `godel status` printing `1 adopted`
+/// beside `head: none`.
+///
+/// Exactly two things produce that pairing. A rollback to the frozen model
+/// detaches `HEAD` and never touches `ADOPTIONS`, which is a monotone count of
+/// adoptions *this boot* rather than a count of head movements -- benign, and
+/// the two figures simply measure different things. Or this write failed, in
+/// which case every adoption site increments the counter anyway and the machine
+/// is running an attached variant it cannot name. A silent write turns those
+/// into the same two lines of output, so an operator reading the status has no
+/// way to tell a normal undo from a namespace that stopped accepting writes.
+///
+/// Reporting it here rather than at the six call sites would be wrong: this
+/// function does not know whether its caller is adopting, rolling back or
+/// recording an incumbent, and "the head would not write" means something
+/// different in each. It answers; the caller decides what that is worth.
+#[must_use]
+fn set_head(h: &[u8; 32]) -> bool {
     let mut s = hex32(h);
     s.push('\n');
-    sysbox::write_text(HEAD, &s);
+    sysbox::write_text(HEAD, &s)
 }
 
 /// What one trial concluded, in enough detail that a later run can redo it.
@@ -1775,6 +1802,49 @@ pub fn spend_test_read() -> u32 {
     s.push('\n');
     sysbox::write_text(BUDGET, &s);
     n
+}
+
+/// The prefix that marks a ledger line as an *undo* rather than a verdict.
+///
+/// A verdict line begins with its sequence number, so it always starts with a
+/// digit; a revert line starts with this word and can therefore never be
+/// confused for one. `rollback` appends a line beginning with this, so the
+/// record of what the machine changed includes the un-change -- the invariant
+/// applies to undos as much as to adoptions -- while the two readers that treat
+/// the ledger as the search *substrate* skip it. If they did not, undoing a
+/// thing would silently change what the loop draws next (`record_seed`) and
+/// where the epoch boundary falls (`ledger_len`), so a rollback would steer the
+/// search it was meant only to reverse. That is the whole of the
+/// append-but-do-not-steer choice.
+const REVERT_TAG: &str = "revert ";
+
+fn is_revert(line: &str) -> bool {
+    line.starts_with(REVERT_TAG)
+}
+
+/// The ledger's bytes with revert lines removed, each kept line verbatim.
+///
+/// Byte-identical to the input when there are no revert lines, which is the
+/// property `record_seed` rests on: a machine that has never rolled back draws
+/// exactly the seed it always did, so this change re-derives every existing
+/// lineage rather than re-addressing it. `split_inclusive` keeps each line's
+/// own `\n`, so the reconstruction is exact rather than a rejoin that could
+/// drop or add a terminator.
+fn verdict_bytes(b: &[u8]) -> Vec<u8> {
+    let Ok(text) = core::str::from_utf8(b) else { return b.to_vec() };
+    let mut out = Vec::with_capacity(b.len());
+    for seg in text.split_inclusive('\n') {
+        if !is_revert(seg) {
+            out.extend_from_slice(seg.as_bytes());
+        }
+    }
+    out
+}
+
+/// How many verdict lines a ledger blob holds -- non-empty and not an undo.
+fn verdict_count(b: &[u8]) -> usize {
+    let Ok(text) = core::str::from_utf8(b) else { return 0 };
+    text.lines().filter(|l| !l.is_empty() && !is_revert(l)).count()
 }
 
 /// Append one line to the ledger.
@@ -2181,7 +2251,14 @@ fn ensure_head(e: &mut super::Engine) -> Option<[u8; 32]> {
         born: crate::dev::rtc::now().map(|d| crate::dev::rtc::unix_seconds(&d)).unwrap_or(0),
     };
     let vh = v.store();
-    set_head(&vh);
+    if !set_head(&vh) {
+        // `ensure_head` records what is *already* installed so a trial has a
+        // parent to hang from. Failing here is not a lost adoption, it is a
+        // lineage that will name the wrong parent, so the trial is refused
+        // rather than recorded against a root it did not descend from.
+        crate::kprintln!("  the head would not write -- refusing to record a lineage from nowhere");
+        return None;
+    }
     Some(vh)
 }
 
@@ -2420,7 +2497,11 @@ fn adjudicate(
         // The pointer moves last. A head naming a node that is not written yet
         // is a machine that cannot describe its own mind, and the ordering is
         // the only thing preventing it.
-        set_head(&vhash);
+        if !set_head(&vhash) {
+            // Loud, because the alternative is a machine running a mind it
+            // cannot name while its status line looks like an ordinary undo.
+            crate::kprintln!("  the head would not write -- this variant is attached and unnamed");
+        }
         let _ = e.model.detach_adapters();
         let _ = e.model.attach_adapters_unseeded(adapters);
         ADOPTIONS.fetch_add(1, Ordering::Relaxed);
@@ -2656,7 +2737,11 @@ pub fn trial_core(e: &mut super::Engine, h: &[u8; 32]) -> Result<Certificate, &'
         if !super::voter::install(h) {
             return Err("the core passed but would not install");
         }
-        set_head(&vhash);
+        if !set_head(&vhash) {
+            // Loud, because the alternative is a machine running a mind it
+            // cannot name while its status line looks like an ordinary undo.
+            crate::kprintln!("  the head would not write -- this variant is attached and unnamed");
+        }
         ADOPTIONS.fetch_add(1, Ordering::Relaxed);
     }
 
@@ -2902,7 +2987,11 @@ pub fn trial_deep(
             }
         }
         variant.store();
-        set_head(&vhash);
+        if !set_head(&vhash) {
+            // Loud, because the alternative is a machine running a mind it
+            // cannot name while its status line looks like an ordinary undo.
+            crate::kprintln!("  the head would not write -- this variant is attached and unnamed");
+        }
         ADOPTIONS.fetch_add(1, Ordering::Relaxed);
     } else {
         // Put the machine back. This is the half `deeptrain` never had: it
@@ -3009,7 +3098,11 @@ pub fn trial_skill(h: &[u8; 32]) -> Result<Certificate, &'static str> {
             return Err("it passed and the toolkit would not take it");
         }
         variant.store();
-        set_head(&vhash);
+        if !set_head(&vhash) {
+            // Loud, because the alternative is a machine running a mind it
+            // cannot name while its status line looks like an ordinary undo.
+            crate::kprintln!("  the head would not write -- this variant is attached and unnamed");
+        }
         ADOPTIONS.fetch_add(1, Ordering::Relaxed);
     }
 
@@ -3169,7 +3262,11 @@ pub fn trial_config(e: &mut super::Engine, rule: u8) -> Result<Certificate, &'st
             return Err("it passed and the configuration would not save");
         }
         variant.store();
-        set_head(&vhash);
+        if !set_head(&vhash) {
+            // Loud, because the alternative is a machine running a mind it
+            // cannot name while its status line looks like an ordinary undo.
+            crate::kprintln!("  the head would not write -- this variant is attached and unnamed");
+        }
         ADOPTIONS.fetch_add(1, Ordering::Relaxed);
     }
 
@@ -3474,7 +3571,11 @@ pub fn trial_judge(
             return Err(Refused::Judge("it passed and the new bar would not save"));
         }
         variant.store();
-        set_head(&vhash);
+        if !set_head(&vhash) {
+            // Loud, because the alternative is a machine running a mind it
+            // cannot name while its status line looks like an ordinary undo.
+            crate::kprintln!("  the head would not write -- this variant is attached and unnamed");
+        }
         ADOPTIONS.fetch_add(1, Ordering::Relaxed);
     }
 
@@ -3962,6 +4063,11 @@ pub fn rollback(e: &mut super::Engine) -> Result<Option<[u8; 32]>, &'static str>
         }
         let _ = e.model.detach_adapters();
         sysbox::detach(HEAD);
+        // The undo goes on the record, after it has actually happened. Appended,
+        // never rewritten, so it passes the same append-only guard the verdicts
+        // do; `to=root....` mirrors how a root parent is rendered in a verdict
+        // line. The seed and the epoch clock skip it -- see `REVERT_TAG`.
+        record_revert(&h, None);
         return Ok(None);
     };
     let Some(pv) = Variant::load(&parent) else { return Err("parent is not stored") };
@@ -4072,8 +4178,36 @@ pub fn rollback(e: &mut super::Engine) -> Result<Option<[u8; 32]>, &'static str>
             }
         }
     }
-    set_head(&parent);
+    // Everything else about the rollback has already happened -- the adapter is
+    // restored, the core and the rule are back. A head that will not write here
+    // leaves the machine running the parent under a pointer naming the child,
+    // which is the one outcome worse than not rolling back at all, so it is an
+    // error rather than a warning.
+    if !set_head(&parent) {
+        return Err("everything was restored but the head would not write -- it still names the old variant");
+    }
+    // Recorded only now, once every restoration above has succeeded and the head
+    // actually names the parent: a revert line the machine could not honour would
+    // be exactly the kind of false record the invariant exists to forbid.
+    record_revert(&h, Some(&parent));
     Ok(Some(parent))
+}
+
+/// Write the undo down: the node left, and where the head went back to.
+///
+/// One line, appended, beginning with `REVERT_TAG` so the search readers skip it
+/// while `ledger_tail` still shows it. `to=root....` when the head detached to
+/// the frozen model, matching the verdict line's spelling of a root parent.
+fn record_revert(from: &[u8; 32], to: Option<&[u8; 32]>) {
+    let mut line = String::from(REVERT_TAG);
+    line.push_str("variant=");
+    line.push_str(&short(from));
+    line.push_str(" to=");
+    match to {
+        Some(p) => line.push_str(&short(p)),
+        None => line.push_str("root...."),
+    }
+    ledger_append(&line);
 }
 
 pub fn set_enabled(on: bool) {
@@ -4101,10 +4235,14 @@ pub fn ledger_tail(n: usize) -> Vec<String> {
 }
 
 /// How many verdicts have been recorded. The rotation's clock.
+///
+/// Verdicts, not lines: a `revert` line is part of the record but not part of
+/// the search, so it does not advance the epoch. Without this an undo would
+/// shift the Red Queen boundary (`is_boundary`) and change when the criterion
+/// may next move, which is a rollback steering the loop through the back door.
 pub fn ledger_len() -> usize {
     let Some(bytes) = sysbox::read_blob(LEDGER) else { return 0 };
-    let Ok(text) = core::str::from_utf8(&bytes) else { return 0 };
-    text.lines().filter(|l| !l.is_empty()).count()
+    verdict_count(&bytes)
 }
 
 /// Deep points, walked by markers exactly as `GRID` is.
@@ -4184,6 +4322,17 @@ const JUDGE_GRID: &[(f32, usize)] = &[
     (MCNEMAR_95, 2),
     (MCNEMAR_95, 6),
     (2.00, 2),
+    // Both axes at their loosest, which is the point an operator command proved
+    // adoptable (bar 0.5, floor 2: the 2-of-24 candidate whose anchor rose
+    // 52.2% to 60.9%). It was missing here, so the nightly rotation was strictly
+    // more conservative than the axis could adopt -- U3 was decorative
+    // unattended, reachable only by hand. Adding it does not weaken any judge:
+    // `trial_judge` still grounds the change on the held-out anchor and spends
+    // a test read to do it, so the loop can reach this point at night only when
+    // the anchor confirms it, which is exactly the honesty U3 is testing. The
+    // grid's job is reachability; the grounding gate, not the grid's timidity,
+    // is what keeps a loosening honest.
+    (JUDGE_MIN, 2),
 ];
 
 /// Trials in an epoch.
@@ -4650,6 +4799,40 @@ pub fn selftest() -> bool {
         "a hash survives being written down and read back",
         from_hex32(&hex32(&h)) == Some(h),
     );
+
+    // The rollback record (option B): an undo is written to the ledger, but the
+    // two functions that read the ledger as the search substrate skip it, so
+    // recording an undo cannot redirect the loop. These are the pure halves of
+    // `record_seed` and `ledger_len`, checked on synthetic ledgers -- the live
+    // one is append-only under `sysbox::guard` and a selftest must never write
+    // to it. A revert line is what `record_revert` emits.
+    {
+        let l1 = b"1 h3 parent=root.... variant=aabbccdd n=40 pred=win\n";
+        let l2 = b"2 h4 parent=aabbccdd variant=eeff0011 n=40 pred=win\n";
+        let rev = b"revert variant=eeff0011 to=aabbccdd\n";
+        let mut verdicts = Vec::new();
+        verdicts.extend_from_slice(l1);
+        verdicts.extend_from_slice(l2);
+        let mut with_revert = verdicts.clone();
+        with_revert.extend_from_slice(rev);
+
+        claim(
+            "a ledger with no undo filters byte-for-byte to itself, so old lineages re-derive",
+            verdict_bytes(&verdicts) == verdicts,
+        );
+        claim(
+            "a revert line leaves the draw seed exactly what the verdicts alone produce",
+            sha256::hash(&verdict_bytes(&with_revert)) == sha256::hash(&verdicts),
+        );
+        claim(
+            "an undo does not advance the epoch clock -- two verdicts count as two, revert or not",
+            verdict_count(&verdicts) == 2 && verdict_count(&with_revert) == 2,
+        );
+        claim(
+            "a verdict line begins with its sequence digit and is never taken for an undo",
+            !is_revert("1 h3 parent=root....") && is_revert("revert variant=eeff0011 to=aabbccdd"),
+        );
+    }
 
     // The property the whole DAG rests on: identical content is the same
     // node, and `born` is deliberately outside the hash so that a variant

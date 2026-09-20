@@ -268,6 +268,56 @@ pub fn project(steps: usize) -> Projection {
     Projection { hist, branches, steps, dt_s: 1.0, felt, fitted }
 }
 
+/// One behavioural-drift number: how far the machine's telemetry departs from
+/// its own fitted one-step dynamics, x100 so it renders without a float
+/// formatter. Zero until there are enough samples to fit -- the same `>= 4` the
+/// projection needs -- which is honest: no history, no drift claim.
+///
+/// It reuses the Oracle's own `fit_var` (residual standard deviation is exactly
+/// "the spread the model could not explain"), but **normalised per variable** --
+/// the residual divided by that variable's own spread over the window -- so the
+/// number is the *fraction* of each variable's variation the one-step model
+/// missed, averaged over the variables that actually moved. Without the
+/// normalisation heap-KiB (tens of thousands) would swamp switch/s and tasks
+/// (single digits) and "drift" would just track the heap's scale; with it, drift
+/// is dimensionless and a rising value genuinely means the machine is behaving in
+/// a way its recent past does not predict. A flat variable (spread ~0) is
+/// perfectly predictable and contributes nothing rather than dividing by zero.
+///
+/// The arena samples this per step as its behavioural-coherence signal; it needs
+/// no keyboard entropy, so it reads on a headless machine where the touch ring
+/// stays dark.
+pub fn drift_centi() -> i32 {
+    let hist = history();
+    if hist.len() < 4 {
+        return 0;
+    }
+    let mut sum = 0.0f32;
+    let mut counted = 0u32;
+    for j in 0..NVARS {
+        let (_w, resid) = fit_var(&hist, j);
+        let mut mean = 0.0f32;
+        for s in hist.iter() {
+            mean += s.vars[j];
+        }
+        mean /= hist.len() as f32;
+        let mut ss = 0.0f32;
+        for s in hist.iter() {
+            let d = s.vars[j] - mean;
+            ss += d * d;
+        }
+        let spread = super::tensor::sqrtf(ss / hist.len() as f32);
+        if spread > 1e-3 {
+            sum += resid / spread;
+            counted += 1;
+        }
+    }
+    if counted == 0 {
+        return 0;
+    }
+    ((sum / counted as f32) * 100.0) as i32
+}
+
 /// Print a projection into the terminal -- the headless face, and what
 /// `drive.py` verifies.
 pub fn futures_report() {

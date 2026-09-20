@@ -1,40 +1,53 @@
-//! Wireless: identification now, a driver later.
+//! Wireless: which part is fitted, and what is left to do for it.
 //!
-//! This module deliberately does not pretend. There is no 802.11 stack here
-//! and `wlan0` will not carry a packet. What it does is name the card, which
-//! is the one thing standing between here and a driver -- and which cannot be
-//! done from a QEMU guest at all, because QEMU emulates no wireless hardware.
-//! The answer only exists on the GF63.
+//! **This file used to say "there is no 802.11 stack here" and list the stack
+//! among the costs still to be paid.** That was true when it was written and
+//! stopped being true three commits ago. It is recorded rather than quietly
+//! edited because it is the exact failure this project keeps meeting: a note
+//! describing what the code *was* reads identically to one describing what it
+//! *is*, and the next reader is sent off to build something that exists.
 //!
-//! ### What a wireless driver actually costs
+//! ### What exists, and it is everything above the part
 //!
-//! It is worth writing down, because "add WiFi" sounds like the same size of
-//! job as "add Ethernet" and is not. The e1000 was ~350 lines: map a BAR, set
-//! up two descriptor rings, poll them. For a modern wireless card:
+//! | | |
+//! |---|---|
+//! | `dev::radio` | the seam: 802.11 frames in and out, and the channel plan |
+//! | `net::softmac` | Ethernet over 802.11, sequence numbers, CCMP in software |
+//! | `net::mlme` | scan, authenticate, associate, four-way, install keys |
+//! | `net::ccmp` | the link cipher: masks, packet numbers, replay |
+//! | `crypto::ccm` | AES-CCM, against RFC 3610 |
+//! | `net::wpa2` | the handshake, both halves of it |
+//!
+//! All of it is chip independent and all of it is asserted at boot against a
+//! loopback radio and a fake access point -- `diag radio`, `diag softmac`,
+//! `diag ccmp`, `diag ccm`, `diag mlme` -- with nothing plugged in. So what a
+//! new part costs is one `impl Radio`: start it, tune it, move a frame, and
+//! say in `Caps` whether the host or the firmware runs everything else.
+//!
+//! ### What is missing is per part, and the registry names it per part
+//!
+//! `dev::registry` is where to look rather than here, because it is one table
+//! beside the ids it matches and this would be a second copy that drifts. The
+//! shape of the answers:
 //!
 //!   * **Firmware.** Intel's AX-series will not initialise without a signed
-//!     blob -- roughly a megabyte, loaded into the device over a bootstrap
-//!     protocol before it does anything. It is not redistributable, it is not
-//!     documented, and the loading sequence differs between families. That is
-//!     the single largest obstacle, and no amount of writing code avoids it.
-//!   * **A host command interface.** Not descriptor rings and registers but an
-//!     asynchronous command/response protocol with the firmware, with its own
-//!     versioned message formats.
-//!   * **802.11 itself.** Scanning, authentication, association, and the fact
-//!     that a wireless frame is not an Ethernet frame -- three or four address
-//!     fields depending on direction, plus fragmentation and aggregation.
-//!   * **WPA2/WPA3.** The four-way handshake, which needs PBKDF2-HMAC-SHA1 for
-//!     the pairwise master key, AES key wrap, and CCMP for the data path.
-//!     AUTARK will have most of those primitives once TLS exists, which is the
-//!     one part of this that gets cheaper by waiting.
+//!     blob -- roughly a megabyte, loaded over a bootstrap protocol before the
+//!     part does anything. Not redistributable, not documented, and the
+//!     sequence differs between families. It is the single largest obstacle
+//!     and no amount of writing code avoids it.
+//!   * **A host command interface.** For a FullMAC part, not descriptor rings
+//!     and registers but an asynchronous command and response protocol with
+//!     the firmware, in its own versioned message formats. Such a part
+//!     implements `Nic` directly and skips `softmac` entirely, which is what
+//!     `Caps::softmac` exists to say.
+//!   * **An undocumented bus.** This machine's own is CNVi: the MAC lives in
+//!     the chipset and the M.2 module is a radio on an interface Intel has not
+//!     published. That one is not a driver-sized problem.
 //!
-//! So the honest order is: identify the card, then decide whether its firmware
-//! situation makes a driver possible at all. An Intel AX201 is a large project
-//! with a blob problem. Some Realtek and Atheros parts are considerably more
-//! tractable. Until the GF63 boots and prints a vendor and device id, every
-//! sentence after this one would be a guess.
+//! `ath9k`-class Atheros parts are the tractable case and the registry says so
+//! on the row: no blob at all, and SoftMAC, so everything above them is
+//! already written and already checked.
 
-use crate::dev::pci;
 
 /// PCI class 0x02 is a network controller; subclass 0x80 is "other", which is
 /// where essentially every wireless card lands. Ethernet is subclass 0x00.
@@ -52,59 +65,23 @@ pub enum Probe {
     },
 }
 
-/// Name the vendor, and say what is known about the driver situation.
-///
-/// The strings are chosen to be useful rather than decorative: whether a
-/// driver is plausible depends almost entirely on whether the part needs
-/// signed firmware.
-fn describe(vendor: u16, device: u16) -> &'static str {
-    match vendor {
-        // Intel wireless is the likeliest thing in a 2022 MSI laptop, and the
-        // hardest case: everything from Wireless-AC onward needs a signed blob.
-        0x8086 => match device {
-            // Discrete M.2 cards on the PCIe bus.
-            0x2723 => "Intel Wi-Fi 6 AX200 (discrete)",
-            // CNVi: the MAC and baseband live in the PCH and the M.2 module
-            // carries only the radio. Confirmed present on the GF63 as
-            // 8086:51f0 at 00:14.3. Worth calling out rather than filing under
-            // "Intel wireless": a CNVi part is not a self-contained NIC, so
-            // there is no card to drive on its own -- the driver talks to the
-            // chipset over an interface Intel does not document, and the
-            // firmware blob is still required on top of that.
-            0x51f0 | 0x54f0 => "Intel Wi-Fi 6E, CNVi in the PCH (Alder Lake-P)",
-            0x02f0 | 0x4df0 | 0xa0f0 => "Intel Wi-Fi 6 AX201, CNVi in the PCH",
-            _ => "Intel wireless (firmware blob required)",
-        },
-        0x10ec => "Realtek wireless",
-        0x14e4 => "Broadcom wireless",
-        0x168c => "Qualcomm Atheros wireless",
-        0x17cb => "Qualcomm wireless",
-        0x1814 => "Ralink/MediaTek wireless",
-        0x14c3 => "MediaTek wireless",
-        _ => "unrecognised wireless controller",
-    }
-}
-
 pub fn probe(ecam: u64) -> Probe {
-    let mut found: Option<(u16, u16)> = None;
-    // Every other caller walks all 255 buses, and this one must too. A
-    // wireless card sits behind a PCIe root port, so its bus number is
-    // assigned by the firmware and is routinely well above 8 on a laptop --
-    // stopping early would report "no wireless controller" on a machine that
-    // has one, which is the single question this module exists to answer.
-    pci::scan(ecam, 255, |d| {
-        if d.class == CLASS_NETWORK && d.subclass == SUBCLASS_OTHER && found.is_none() {
-            found = Some((d.vendor, d.device));
-        }
-    });
-    match found {
-        None => Probe::None,
-        Some((vendor, device)) => Probe::Unsupported {
-            vendor,
-            device,
-            what: describe(vendor, device),
-        },
+    use crate::dev::registry::{self, Role};
+    if !registry::scanned() {
+        registry::scan_pci(ecam);
     }
+    // The first wireless part the registry knows about. It used to be the
+    // first PCI function of class 02:80, with a `describe` beside it holding a
+    // second copy of the same vendor table -- which is how a machine ends up
+    // with two files that disagree about what is fitted.
+    for n in registry::nodes() {
+        let Some(e) = n.entry else { continue };
+        if e.role != Role::Wireless {
+            continue;
+        }
+        return Probe::Unsupported { vendor: n.id.vendor, device: n.id.device, what: e.what };
+    }
+    Probe::None
 }
 
 /// Every piece of networking hardware on the machine, and what drives it.
@@ -130,6 +107,12 @@ pub struct Hardware {
     /// the honest answer for hardware we can see and cannot use, which is most
     /// of the wireless in this machine.
     pub driver: Option<&'static str>,
+    /// Why there is no driver, or what the driver there is cannot do yet.
+    ///
+    /// A driver name alone was not enough once the registry started telling
+    /// the two apart: `rtl8188eu` claims the dongle and cannot carry a frame,
+    /// so a row showing a driver and nothing else reads as a part that works.
+    pub gap: Option<&'static str>,
 }
 
 /// Ethernet parts this tree can actually drive, by id.
@@ -160,72 +143,102 @@ fn describe_ethernet(vendor: u16, device: u16) -> &'static str {
 
 /// Walk both buses and describe everything that carries packets.
 pub fn hardware() -> alloc::vec::Vec<Hardware> {
+    use crate::dev::registry::{self, Role, Support};
     let mut out = alloc::vec::Vec::new();
-    if let Some(ecam) = crate::net::ecam() {
-        pci::scan(ecam, 255, |d| {
-            if d.class != CLASS_NETWORK {
-                return;
-            }
-            let (bus, what, driver) = match d.subclass {
-                0x00 => (
-                    "PCI",
-                    alloc::string::String::from(describe_ethernet(d.vendor, d.device)),
-                    ethernet_driver(d.vendor, d.device),
-                ),
-                SUBCLASS_OTHER => (
-                    "PCI",
-                    alloc::string::String::from(describe(d.vendor, d.device)),
-                    None,
-                ),
-                // Token ring, FDDI, ATM and friends. Named rather than hidden:
-                // an unrecognised network device is still a fact about the
-                // machine, and hiding it is how a report starts lying by
-                // omission.
-                _ => (
-                    "PCI",
-                    alloc::format!("network controller, subclass {:02x}", d.subclass),
-                    None,
-                ),
-            };
-            out.push(Hardware { vendor: d.vendor, device: d.device, bus, what, driver });
-        });
-    }
-    // USB, from what the last enumeration recorded. Not enumerated here: doing
-    // so resets the controller and drops whatever link is on it.
-    if let Some((vendor, device)) = crate::dev::xhci::usb_ethernet() {
+    for n in registry::nodes() {
+        let role = n.entry.map(|e| e.role);
+        // Network-ish by role where a row claims it, and by PCI class where
+        // none does. The second half is what stops a card nobody has heard of
+        // dropping out of the report entirely: token ring, FDDI and whatever
+        // else class 0x02 covers are still facts about the machine, and hiding
+        // one is how a report starts lying by omission.
+        let networky = matches!(role, Some(Role::Ethernet) | Some(Role::Wireless))
+            || (n.id.bus == registry::Bus::Pci && n.id.class == CLASS_NETWORK);
+        if !networky {
+            continue;
+        }
         out.push(Hardware {
-            vendor,
-            device,
-            bus: "USB",
-            what: alloc::string::String::from("CDC ethernet adapter"),
-            driver: Some("usb-ecm"),
-        });
-    }
-    if let Some(Some((vendor, device, what))) = crate::dev::xhci::usb_wireless() {
-        out.push(Hardware {
-            vendor,
-            device,
-            bus: "USB",
-            what: alloc::string::String::from(what),
-            // Recognised, brought up, and unable to carry a frame. Naming the
-            // driver here would claim more than is true.
-            driver: None,
+            vendor: n.id.vendor,
+            device: n.id.device,
+            bus: n.id.bus.name(),
+            what: n.what(),
+            driver: n.entry.and_then(|e| e.support.driver()),
+            gap: n.entry.and_then(|e| match &e.support {
+                Support::Driver(_) => None,
+                Support::Partial(_, why) => Some(*why),
+                Support::Known(why) => Some(*why),
+            }),
         });
     }
     out
 }
 
-/// One network as a scan would report it.
+/// One network as a scan reports it.
 ///
-/// Nothing constructs this yet. It is here so the settings page is written
-/// against the shape a scan returns rather than against the absence of one,
-/// and so the day a driver can associate, the UI above it already works.
+/// The display shape of `mlme::Bss`, and `from_bss` is the one conversion so
+/// the two cannot drift into disagreeing about what a network is called.
 pub struct Network {
+    /// The network's name. **SSID and ESSID are the same field**; ESSID is the
+    /// older name for it, from when a distinction between independent and
+    /// infrastructure networks was still being drawn. Showing both would be
+    /// showing one thing twice under two labels, so this shows one.
     pub ssid: alloc::string::String,
+    /// The access point's own address, which is what BSSID means. This is the
+    /// one field that tells two access points carrying the same network apart,
+    /// so it is the thing to look at when a laptop keeps joining the far one.
+    pub bssid: crate::net::Mac,
+    pub channel: u8,
     /// dBm, as the radio reports it. Negative, closer to zero is stronger.
     pub rssi: i16,
     /// False for an open network, which the UI has to say out loud.
     pub secured: bool,
+    /// An RSN element was present, so WPA2 or later. Without it, `secured`
+    /// means WEP, which is a different thing wearing the same word.
+    pub rsn: bool,
+}
+
+impl Network {
+    pub fn from_bss(b: &crate::net::mlme::Bss) -> Network {
+        Network {
+            ssid: b.ssid.clone(),
+            bssid: b.bssid,
+            channel: b.channel,
+            rssi: b.rssi as i16,
+            secured: b.secured,
+            rsn: b.rsn,
+        }
+    }
+
+    /// What the security actually is, in the three words that differ.
+    ///
+    /// **"Secured" is not one state.** An open network and a WEP network are
+    /// both things this machine can join and neither is protected; WEP has
+    /// been broken since 2001 and a list that calls it secured is telling the
+    /// operator the opposite of what is true.
+    pub fn security(&self) -> &'static str {
+        match (self.secured, self.rsn) {
+            (false, _) => "open",
+            (true, false) => "WEP (broken)",
+            (true, true) => "WPA2-CCMP",
+        }
+    }
+
+    pub fn band(&self) -> &'static str {
+        match crate::dev::radio::band_of(self.channel) {
+            Some(crate::dev::radio::Band::G24) => "2.4",
+            Some(crate::dev::radio::Band::G5) => "5",
+            None => "?",
+        }
+    }
+
+    /// `02:00:00:00:00:aa`, which is how everybody writes one.
+    pub fn ap(&self) -> alloc::string::String {
+        let b = &self.bssid;
+        alloc::format!(
+            "{:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
+            b[0], b[1], b[2], b[3], b[4], b[5]
+        )
+    }
 }
 
 /// Signal as a count out of four, the way every operator already reads it.
@@ -282,6 +295,15 @@ pub fn adapter() -> Adapter {
 /// one who sees why there is no list can act on it. Every arm is a real
 /// answer, and none of them is an empty list standing in for a missing driver.
 pub fn scan() -> Result<alloc::vec::Vec<Network>, &'static str> {
+    // A radio that is actually installed answers for itself, and an empty list
+    // from one is a real answer -- "nothing in range" -- rather than the
+    // missing-driver case this function's other arms exist to name. The
+    // difference matters because the two need opposite next steps, and a page
+    // that showed one empty list for both is what this module opens by
+    // refusing to do.
+    if let Some(w) = crate::net::wlan() {
+        return Ok(w.networks());
+    }
     match adapter() {
         // The driver powers this chip on and loads its MAC registers, and the
         // PHY, AGC and radio tables are transcribed. What is missing is the
@@ -323,8 +345,24 @@ pub fn report() {
         Some(Probe::Unsupported { vendor, device, what }) => {
             kprintln!("  {}", what);
             kprintln!("  pci {:04x}:{:04x}", vendor, device);
-            kprintln!("  no driver. see the note at the top of net/wifi.rs for");
-            kprintln!("  what one costs -- firmware is the deciding factor.");
+            // The reason comes off the registry row rather than out of a
+            // sentence here, so there is one place that says why a part is
+            // undriven and it is the place that matches the ids.
+            for h in hardware() {
+                if h.vendor == vendor && h.device == device {
+                    if let Some(gap) = h.gap {
+                        kprintln!("  no driver: {}", gap);
+                    }
+                }
+            }
         }
     }
+
+    // What is missing is the part, and saying so is the point of these lines.
+    // An operator told only "no wireless" cannot tell a machine with no stack
+    // from a machine with no radio, and those want completely different next
+    // steps -- one is months of work and the other is a dongle.
+    kprintln!("  everything above the radio is written and checked with no");
+    kprintln!("  hardware at all: diag radio, softmac, ccmp, ccm, mlme.");
+    kprintln!("  a new part is one impl of dev::radio::Radio.");
 }

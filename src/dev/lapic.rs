@@ -122,12 +122,54 @@ pub fn timer_hz() -> u64 {
     unsafe { *TIMER_HZ.get() }
 }
 
-extern "x86-interrupt" fn timer_isr(_frame: idt::InterruptStackFrame) {
-    TICKS.fetch_add(1, Ordering::Relaxed);
+extern "x86-interrupt" fn timer_isr(frame: idt::InterruptStackFrame) {
+    // Only the bootstrap processor advances the clock.
+    //
+    // Every core runs this handler, and that is deliberate -- `init_this_core`
+    // says why the vector registrations are global. But `TICKS` is one counter,
+    // so incrementing it on each core made it advance at N x TIMER_HZ, and
+    // every duration derived from it was wrong by the core count.
+    //
+    // The one that mattered was `tcp::wait_until`, which builds its deadline as
+    // `ticks() + ms * TIMER_HZ / 1000`: every network timeout in the kernel was
+    // short by the core count, so a 15 s TLS deadline was 3.75 s under the
+    // tooling's default `-smp 4` and would be under a second on the GF63's
+    // sixteen logical processors. `uptime` was wrong the other way, and the
+    // model selftest's tokens/sec under-reported by the same factor.
+    //
+    // Measured before the fix: a 4-core guest reported 55.58 s of uptime during
+    // a 25 s run -- longer than the whole invocation, QEMU startup included.
+    //
+    // `armed()` is checked because per-core storage comes up after the timer
+    // does, and before it is armed there is only one core running anyway.
+    let now = if !cpu::percpu::armed() || cpu::percpu::cpu_id() == 0 {
+        TICKS.fetch_add(1, Ordering::Relaxed) + 1
+    } else {
+        TICKS.load(Ordering::Relaxed)
+    };
     // EOI before scheduling, not after: the switch below may not return for a
     // long time, and leaving the interrupt in service would block every
     // further interrupt at this priority in the meantime.
     eoi();
+
+    // A guest that never makes a syscall owns the machine, and there is no key
+    // to press because the guest is what is running. The timer is the only
+    // thing that still gets a turn, so it is where the deadline lives.
+    //
+    // **Only from ring 3**, which is the whole of the safety argument: the
+    // saved CS says the guest itself was executing rather than the kernel
+    // working on its behalf, so there is no lock held and no half-finished
+    // allocation to abandon. An interrupt arriving during a syscall simply
+    // lets the deadline pass and catches it on the next tick outside one.
+    if frame.cs & 3 == 3 && crate::linux::syscall::overran(now) {
+        unsafe { crate::linux::syscall::kill_overrun() }
+    }
+    // Scheduled input, for the same reason the deadline above lives here: a
+    // running guest owns the machine and the timer is the only thing that
+    // still gets a turn. Unlike the deadline this runs whatever the saved CS
+    // says, because a guest blocked in a read is sitting in the kernel and
+    // that is precisely when it is waiting to be fed.
+    crate::linux::input::service(now);
     crate::task::tick();
 }
 

@@ -191,6 +191,20 @@ extern "C" fn autark_ap_main() -> ! {
     // of the reason this file exists.
     crate::cpu::enable_simd_this_core();
 
+    // `CR0.WP` and `EFER.NXE` are per-core for the same reason, and were not
+    // carried over. The trampoline sets `EFER.LME` and stops, so this core read
+    // bit 63 of a page table entry as *reserved* while the bootstrap processor
+    // read it as no-execute -- one map, two cores, and a `#PF` on the one that
+    // walked an entry the other had written. See `cpu::adopt_page_rights`.
+    let (wp, nx) = crate::cpu::adopt_page_rights();
+    if !wp || (!nx && crate::cpu::nx_supported()) {
+        // Said rather than assumed: a core running with different page rights
+        // from its neighbours is a different machine, and the failure it
+        // produces looks like memory corruption somewhere else entirely.
+        crate::kprintln!("[smp] core {} could not adopt page rights (wp={} nx={})",
+            this_cpu(), wp as u8, nx as u8);
+    }
+
     ONLINE.fetch_add(1, Ordering::SeqCst);
 
     // Descriptor tables, then the interrupt table, then this core's own
@@ -300,8 +314,8 @@ unsafe fn mwait() {
 // One job at a time, claimed dynamically rather than divided up front.
 //
 // Static division would be the obvious thing and it is wrong on this laptop:
-// an i5-12450H has four performance cores and four efficiency cores, and an
-// equal split finishes when the slowest core finishes. Handing out small
+// the GF63's i7-12650H has six performance cores and four efficiency cores,
+// and an equal split finishes when the slowest core finishes. Handing out small
 // chunks from a shared cursor lets a P-core take three while an E-core takes
 // one, which is the same total work in less wall time and needs no knowledge
 // of which core is which.

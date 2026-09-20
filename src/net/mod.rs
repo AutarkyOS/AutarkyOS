@@ -20,6 +20,42 @@
 //! connection could re-enter its own control block through that path while an
 //! earlier borrow was still live. Queueing breaks the cycle at the one place
 //! it can form.
+//!
+//! ### Why one task at a time drives the stack
+//!
+//! That queueing argument is about re-entering *along one call chain*, and it
+//! is complete for that. It says nothing about two tasks, and both of the
+//! stack's roots hand out `&'static mut` from a `Racy`: `ifaces()` and
+//! `tcp::table()`. `Racy` is not a lock and says so.
+//!
+//! Nothing has hit this because exactly one thing has ever driven TCP -- the
+//! shell's idle loop, or whichever task is parked inside a blocking call. Two
+//! of them is a real failure with two shapes. `poll` advances the driver's
+//! receive ring, so two callers consume descriptors concurrently and `rx_cur`
+//! desynchronises. And `pump` reaps finished connections with `table()[h] =
+//! None`, dropping a `Tcb` and its buffers -- so a preemption inside `at()`'s
+//! closure, with `&mut Tcb` live, lets another task free what the first is
+//! about to write through.
+//!
+//! `StackGuard` is the answer, and it is deliberately **not** a lock: there is
+//! nothing to wait for, and waiting here would be a task spinning on a task it
+//! has preempted. A refused poll is a poll ten milliseconds later, which is
+//! what the idle loop was already doing.
+//!
+//! It records the task rather than a flag, for the reason `ai::with_engine`
+//! gives about its own: `pump` reaches `send_ipv4` -> `resolve` -> `poll`, so
+//! the stack legitimately nests within one call chain, and a guard that
+//! refused its own holder would turn ARP resolution inside `pump` into a
+//! silent early return.
+//!
+//! **That admission is safe only because nothing enters the stack from an
+//! interrupt.** Receive is polled here and always has been -- `tcp`'s header
+//! says so -- and the timer ISR reaches `linux::input::service` and
+//! `task::tick` and nothing in `net`. An interrupt handler that called `poll`
+//! would be admitted as a nested call, because `task::current()` still names
+//! the task it interrupted, and it would re-enter the stack with a `&mut Tcb`
+//! live underneath it. So the day anything here becomes interrupt-driven, this
+//! guard needs to mask interrupts rather than merely record a task.
 
 use crate::gfx::console::{self, LTCYAN, LTGRAY, LTGREEN, LTRED, YELLOW};
 use crate::kprintln;
@@ -27,6 +63,57 @@ use crate::sync::Racy;
 use alloc::boxed::Box;
 use alloc::vec;
 use alloc::vec::Vec;
+use core::sync::atomic::{AtomicUsize, Ordering};
+
+const NOBODY: usize = usize::MAX;
+static IN_STACK: AtomicUsize = AtomicUsize::new(NOBODY);
+
+/// Held for as long as one task is inside `poll` or `pump`.
+///
+/// `take` answers `None` only when a *different* task holds it. The holder's
+/// own nested calls get a guard that releases nothing on drop, so the outermost
+/// one owns the release.
+pub(crate) struct StackGuard {
+    outermost: bool,
+}
+
+impl StackGuard {
+    pub(crate) fn take() -> Option<Self> {
+        let me = crate::task::current();
+        match IN_STACK.compare_exchange(NOBODY, me, Ordering::AcqRel, Ordering::Acquire) {
+            Ok(_) => Some(StackGuard { outermost: true }),
+            // Ours already: `pump` resolving an ARP entry through `poll`.
+            Err(h) if h == me => Some(StackGuard { outermost: false }),
+            Err(_) => None,
+        }
+    }
+}
+
+impl Drop for StackGuard {
+    fn drop(&mut self) {
+        if self.outermost {
+            IN_STACK.store(NOBODY, Ordering::Release);
+        }
+    }
+}
+
+/// Which task is inside the stack, for the selftest. `None` when nobody is.
+pub(crate) fn stack_holder() -> Option<usize> {
+    match IN_STACK.load(Ordering::Acquire) {
+        NOBODY => None,
+        h => Some(h),
+    }
+}
+
+/// Name a foreign holder, for the selftest.
+///
+/// Single-core and cooperatively scheduled, so there is no way to have a second
+/// task ask while this one holds. What can be done is to put somebody else's id
+/// in the record and confirm the refusal, which is the branch that matters --
+/// the same trick `ai::mod`'s claim check uses on `HOLDER`.
+pub(crate) fn force_stack_holder(h: Option<usize>) {
+    IN_STACK.store(h.unwrap_or(NOBODY), Ordering::Release);
+}
 
 pub type Mac = [u8; 6];
 pub type Ipv4 = [u8; 4];
@@ -45,9 +132,20 @@ pub(crate) const PROTO_UDP: u8 = 17;
 const ICMP_ECHO_REQUEST: u8 = 8;
 const ICMP_ECHO_REPLY: u8 = 0;
 
+pub mod ccmp;
+pub mod hostile;
+pub mod mlme;
+pub mod rehearsal;
+pub mod softmac;
 pub mod css;
 pub mod dhcp;
 pub mod dns;
+pub mod decoy;
+pub mod enumerate;
+pub mod fingerprint;
+pub mod honeypot;
+pub mod reach;
+pub mod recon;
 pub mod html;
 pub mod ieee80211;
 pub mod iface;
@@ -56,11 +154,12 @@ pub mod tls;
 pub mod ws;
 pub mod trust;
 pub mod udp;
+pub mod vulnid;
 pub mod wifi;
 pub mod wpa2;
 pub mod x509;
 
-use iface::{Interface, Kind, Loopback, Nic};
+use iface::{Interface, Kind, Loopback, Nic, Wlan};
 
 pub const UNSPECIFIED: Ipv4 = [0, 0, 0, 0];
 pub const BROADCAST_IP: Ipv4 = [255, 255, 255, 255];
@@ -102,6 +201,132 @@ pub fn ecam() -> Option<u64> {
 pub fn index_of(name: &str) -> Option<usize> {
     ifaces().iter().position(|i| i.name == name)
 }
+
+// --- wireless ------------------------------------------------------------
+
+/// Make a radio into `wlan0`.
+///
+/// **This is the whole of what a wireless driver has to do here**, and saying
+/// so is the point of the function existing rather than each driver assembling
+/// its own stack: write `impl Radio`, call this, and everything above --
+/// 802.11 framing, sequence numbers, CCMP, the association state machine, the
+/// four-way handshake -- is already written, already shared, and already
+/// checked at boot with no hardware.
+///
+/// A FullMAC part does **not** come through here. Its firmware has already run
+/// the MLME, so it implements `Nic` directly and is installed like the wired
+/// card; `Caps::softmac` is how a part says which of the two it is.
+pub fn attach_radio<R: crate::dev::radio::Radio + 'static>(radio: R) -> bool {
+    if !radio.caps().softmac {
+        return false;
+    }
+    let sta = mlme::Station::new(radio);
+    let w = &mut ifaces()[WLAN0];
+    w.nic = Some(alloc::boxed::Box::new(sta));
+    // Administratively up, and `usable()` still reads the link -- an
+    // unassociated station is a driver that is present and a network that is
+    // not, which are different facts and reported separately.
+    w.up = true;
+    true
+}
+
+/// The wireless half of `wlan0`, if there is one.
+pub fn wlan() -> Option<&'static mut dyn Wlan> {
+    ifaces()[WLAN0].nic.as_mut()?.wireless()
+}
+
+/// What the wireless part calls itself, for anything that shows an adapter.
+pub fn wlan_name() -> Option<&'static str> {
+    Some(wlan()?.radio_name())
+}
+
+/// The network `wlan0` is on, by name.
+pub fn wlan_ssid() -> Option<alloc::string::String> {
+    wlan()?.ssid()
+}
+
+/// The access point `wlan0` is on.
+pub fn wlan_ap() -> Option<Mac> {
+    wlan()?.joined_ap()
+}
+
+/// Milliseconds since boot, for the state machine that takes a clock.
+///
+/// `rdtsc` and not `ticks()`, which is what this tree's own note says to use
+/// for a duration -- the tick counter is wall-clock-ish and a deadline is a
+/// duration. The fallback exists because an uncalibrated TSC reads zero for
+/// the frequency, and dividing by it is a state machine whose deadlines are
+/// never met and whose retries are never reached: a link that fails by never
+/// failing, which is the worst shape available.
+pub fn now_ms() -> u64 {
+    let mhz = crate::time::tsc_mhz();
+    if mhz == 0 {
+        return crate::dev::lapic::ticks() * 1000 / crate::TIMER_HZ as u64;
+    }
+    crate::time::rdtsc() / (mhz * 1000)
+}
+
+/// One turn of the wireless state machine, from wherever the idle loop is.
+///
+/// Beside `tcp::service` and for the same reason it is there: there are no
+/// receive interrupts in this kernel, so a protocol advances when somebody
+/// gives it a slice. Cheap when there is no radio, which is every machine
+/// this has run on so far.
+/// One turn of the wireless state machine, and nothing else.
+///
+/// **Two tasks call this**, so it is claimed rather than merely careful:
+/// `wlan()` hands out `&mut dyn Wlan`, and two of those at once is undefined
+/// behaviour whatever they then do. The shell's idle loop calls it as often as
+/// it goes round; the clock task calls it ten times a second so a scan keeps
+/// moving while the shell is busy inside a long command -- which is not a
+/// testing convenience, it is a scan that otherwise stalls for as long as
+/// anything else is running.
+///
+/// It draws nothing. That is the whole reason it is separate from
+/// `wifi_service`: `desk::draw` writes the compositor's back buffer through a
+/// `&mut` and runs on the shell's task, and calling it from the clock task
+/// would be the second writer that `paint_clock` takes a claim to avoid.
+pub fn wifi_poll() {
+    if WIFI_BUSY.swap(true, core::sync::atomic::Ordering::Acquire) {
+        return;
+    }
+    let now = now_ms();
+    if let Some(w) = wlan() {
+        w.poll_mlme(now);
+    }
+    WIFI_BUSY.store(false, core::sync::atomic::Ordering::Release);
+}
+
+/// The same, plus a repaint when what is in the air has changed.
+///
+/// **Only from the shell's idle loop**, because of the draw. A scan takes
+/// seconds and happens between keystrokes, so a window showing one has nothing
+/// to repaint on: the desktop draws when something happens and out here
+/// nothing does, which reads as a Rescan button that did nothing until you
+/// click something else.
+///
+/// On *change* rather than on a timer. A frame is about two milliseconds and a
+/// scan settles after a few seconds, so the whole of one costs a handful of
+/// frames. The state name is a `&'static str` from one table, so comparing the
+/// pointer is comparing the state.
+pub fn wifi_service() {
+    wifi_poll();
+    let Some(w) = wlan() else { return };
+    let (state, secure) = w.status();
+    let seen = w.networks().len();
+    let now_key = (state.as_ptr() as usize, seen, secure as usize);
+    let last = unsafe { &mut *WIFI_SEEN.get() };
+    if *last != now_key {
+        *last = now_key;
+        crate::gfx::desk::draw();
+    }
+}
+
+/// What the last `wifi_service` saw, so a repaint happens on change only.
+static WIFI_SEEN: Racy<(usize, usize, usize)> = Racy::new((0, 0, 0));
+/// Held across a poll, because the shell and the clock both reach for it.
+static WIFI_BUSY: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
 
 // --- routing -------------------------------------------------------------
 
@@ -216,31 +441,86 @@ pub fn init(ecam: u64, roots: Option<&[u8]>) {
         lo.up = true;
     }
 
-    // Try each driver in turn and take the first that answers. The e1000 is
-    // first only because it is what QEMU emulates, so the common development
-    // case costs one probe; on the GF63 it misses and the Realtek answers.
-    let driver: Option<(Box<dyn Nic>, &str)> = match crate::dev::e1000::probe(ecam) {
-        Ok(n) => Some((Box::new(n), "e1000")),
-        Err(e1000_err) => match crate::dev::rtl8168::probe(ecam) {
-            Ok(n) => Some((Box::new(n), "rtl8168")),
-            // USB last, and only when no PCI card answered. Bringing up the
-            // xHCI controller resets it, so a machine with a working wired card
-            // should not have its USB bus reset during boot for nothing -- and
-            // `usb` on the shell resets it again, which would take the
-            // interface out from under this driver.
-            Err(rtl_err) => match crate::dev::xhci::probe_net(ecam) {
-                Ok(n) => Some((Box::new(n), "usb-ecm")),
-                Err(usb_err) => {
-                    kprintln!("  eth0   no supported NIC");
-                    kprintln!(
-                        "         e1000 {:?}, rtl8168 {:?}, usb {}",
-                        e1000_err, rtl_err, usb_err
-                    );
-                    None
-                }
-            },
-        },
-    };
+    // Which drivers to try, and in what order, is a question about the machine
+    // rather than about this file. It was a nested match -- e1000, else
+    // rtl8168, else USB -- which is a preference list written for one laptop:
+    // on a machine carrying only the Realtek it paid for a full Intel sweep to
+    // learn nothing, and on a machine carrying neither it said "no supported
+    // NIC" without ever saying what *was* there.
+    //
+    // The registry sweeps once and answers both. `drivers_for` is in bus
+    // order, so a machine with two cards tries the one the firmware enumerated
+    // first, which is as good a rule as any and is at least a fact.
+    crate::dev::registry::scan_pci(ecam);
+    let (all, driven, partial, known) = crate::dev::registry::tally();
+    kprintln!(
+        "  bus    {} device(s): {} driven, {} partly, {} with no driver ('devices')",
+        all, driven, partial, known
+    );
+
+    let mut refused: Vec<(&str, alloc::string::String)> = Vec::new();
+    let mut driver: Option<(Box<dyn Nic>, &str)> = None;
+    for name in crate::dev::registry::drivers_for(crate::dev::registry::Role::Ethernet) {
+        // Dispatch by name rather than by function pointer, because a `Nic` is
+        // built by four probes with four error types and no common signature
+        // to store. The registry decides *whether*; this decides *how*.
+        let built: Result<Box<dyn Nic>, alloc::string::String> = match name {
+            "e1000" => crate::dev::e1000::probe(ecam)
+                .map(|d| Box::new(d) as Box<dyn Nic>)
+                .map_err(|e| alloc::format!("{:?}", e)),
+            "rtl8168" => crate::dev::rtl8168::probe(ecam)
+                .map(|d| Box::new(d) as Box<dyn Nic>)
+                .map_err(|e| alloc::format!("{:?}", e)),
+            // Anything the table names and this match does not is a row added
+            // without its arm. Said out loud rather than skipped, because the
+            // silent version is a driver that exists and is never tried.
+            _ => Err(alloc::string::String::from("no probe wired to this name")),
+        };
+        match built {
+            Ok(nic) => {
+                driver = Some((nic, name));
+                break;
+            }
+            Err(why) => refused.push((name, why)),
+        }
+    }
+
+    // USB last, and only when no PCI card answered. Bringing up the xHCI
+    // controller resets it, so a machine with a working wired card should not
+    // have its USB bus reset during boot for nothing -- and `usb` on the shell
+    // resets it again, which would take the interface out from under this
+    // driver.
+    if driver.is_none() {
+        match crate::dev::xhci::probe_net(ecam) {
+            Ok(nic) => {
+                let what = nic.protocol();
+                driver = Some((Box::new(nic), what));
+            }
+            // Named for what was looked for rather than what was found,
+            // because on this arm nothing was.
+            Err(usb_err) => refused.push(("usb-ethernet", alloc::format!("{}", usb_err))),
+        }
+    }
+
+    if driver.is_none() {
+        kprintln!("  eth0   no supported NIC");
+        for (name, why) in &refused {
+            kprintln!("         {:<9} {}", name, why);
+        }
+        // The registry knows about parts nothing here drives, and this is the
+        // moment somebody wants to hear it: "no NIC" beside "there is a
+        // Broadcom in this machine and it wants a firmware blob" is a very
+        // different message from "no NIC" alone.
+        for (node, gap) in crate::dev::registry::gaps() {
+            if matches!(
+                node.entry.map(|e| e.role),
+                Some(crate::dev::registry::Role::Ethernet)
+                    | Some(crate::dev::registry::Role::Wireless)
+            ) {
+                kprintln!("         {} -- {}", node.what(), gap);
+            }
+        }
+    }
 
     match driver {
         None => {}
@@ -440,7 +720,14 @@ pub enum Event {
 }
 
 /// Take one frame from whichever interface has one.
+///
+/// Answers `Event::None` when another task is already inside the stack, which
+/// is indistinguishable from "no frame was waiting" to every caller -- they all
+/// poll in a loop. See `StackGuard`.
 pub fn poll() -> Event {
+    let Some(_guard) = StackGuard::take() else {
+        return Event::None;
+    };
     for n in 0..ifaces().len() {
         let frame = {
             let i = &mut ifaces()[n];
@@ -588,6 +875,27 @@ fn resolve(n: usize, target: Ipv4) -> Option<Mac> {
         core::hint::spin_loop();
     }
     None
+}
+
+/// Is a host on our own subnet answering ARP? The liveness gate `recon` uses.
+///
+/// ARP rather than a TCP probe or an ICMP echo, because on a local segment it
+/// is the question with the fewest ways to lie: a host with every port closed
+/// and ICMP filtered still must answer ARP to receive any IP traffic at all, so
+/// a silent ARP is a genuinely absent host and the scanner can skip it without
+/// paying a per-port timeout to discover the same thing fifteen times.
+///
+/// Off-subnet targets are refused rather than resolved. `resolve` answers an
+/// off-link address with the *gateway's* MAC, which is correct for sending and
+/// catastrophic for liveness -- it would report every address on the internet
+/// as alive because the gateway always answers. `recon` is a local tool and
+/// this is the line that keeps it one.
+pub fn alive(target: Ipv4) -> bool {
+    let Some(n) = route(target) else { return false };
+    if !ifaces()[n].on_subnet(target) {
+        return false;
+    }
+    resolve(n, target).is_some()
 }
 
 pub(crate) fn send_ipv4(dst: Ipv4, proto: u8, payload: &[u8]) -> bool {
@@ -773,14 +1081,32 @@ pub fn report_hardware(heading: bool) {
         kprintln!("  USB is listed only after an enumeration ('usb' to run one)");
     }
     for h in &hw {
-        match h.driver {
-            Some(d) => {
+        // Three states and three colours, because there are three: driven,
+        // driven as far as it goes, and named with no driver at all. Green for
+        // a part that is carrying traffic and yellow for everything else --
+        // the middle case used to print green, which said the dongle worked.
+        match (h.driver, h.gap) {
+            (Some(d), None) => {
                 console::set_color(LTGREEN);
                 kprintln!("  {}  {:04x}:{:04x}  {}  -- {}", h.bus, h.vendor, h.device, h.what, d);
             }
-            None => {
+            (Some(d), Some(why)) => {
                 console::set_color(YELLOW);
-                kprintln!("  {}  {:04x}:{:04x}  {}  -- no driver", h.bus, h.vendor, h.device, h.what);
+                kprintln!(
+                    "  {}  {:04x}:{:04x}  {}  -- {}, {}",
+                    h.bus, h.vendor, h.device, h.what, d, why
+                );
+            }
+            (None, why) => {
+                console::set_color(YELLOW);
+                kprintln!(
+                    "  {}  {:04x}:{:04x}  {}  -- {}",
+                    h.bus,
+                    h.vendor,
+                    h.device,
+                    h.what,
+                    why.unwrap_or("no driver")
+                );
             }
         }
         console::set_color(LTGRAY);

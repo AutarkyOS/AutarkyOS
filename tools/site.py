@@ -242,11 +242,18 @@ def masthead_html(p):
     already implies: the institute is the publisher, AUTARK is the thing
     published.
 
-    Drawn on white because the artwork is black on transparent and was made
-    for a light ground. Recolouring somebody's mark to fit a band we chose is
-    the wrong way round; the band moves instead. The amber has not gone
-    anywhere -- it is the tab strip's borders, every section bar, every link
-    and the footer.
+    Drawn on a light band because the artwork is black on transparent and was
+    made for a light ground. Recolouring somebody's mark to fit a band we
+    chose is the wrong way round; the band moves instead. In dark mode the
+    stylesheet inverts the file rather than loading a second one, which for
+    black on transparent is exactly a white version of the same artwork and
+    cannot drift from it.
+
+    The orange did not go anywhere when the site took the desktop's palette:
+    it is every section bar, every heading rule and every link. What changed
+    is what surrounds it -- the tab strip and the footer are the deep water
+    the desktop sits in, because `gfx::theme` puts warmth on the surfaces the
+    machine speaks through and keeps the room around them cool.
     """
     home = p or "./"
     return "\n".join([
@@ -259,12 +266,21 @@ def masthead_html(p):
     ])
 
 
+# A directory that is not its own tab, and the tab it belongs under. The
+# wallet is reached from one link at the foot of the token page and belongs
+# with it, so it takes the Token tab rather than a ninth of its own -- a tab
+# per page is how a strip of eight becomes a strip of twenty. Without this the
+# page renders with nothing active, which reads as "you are nowhere".
+UNDER = {"wallet/": "token/"}
+
+
 def section_of(relpath):
     """Which tab a page belongs under, from its own path."""
     rl = relpath.replace("\\", "/")
     if "/" not in rl:
         return "./"                       # index.html, credits.html, 404.html
-    return rl.split("/", 1)[0] + "/"
+    top = rl.split("/", 1)[0] + "/"
+    return UNDER.get(top, top)
 
 
 def nav_html(p, relpath):
@@ -303,7 +319,17 @@ def stats_rows(releases):
         ("Registered", first),
         ("Releases", "%d" % len(releases)),
         ("Downloads", "%d" % total),
-        ("Source", "108 files, ~50,000 lines"),
+        # Counted rather than remembered, and it is worth saying how: this is
+        # every `.rs` under `src/`, which on the last count was 198 files and
+        # 131,869 lines. Re-measure before moving it --
+        #
+        #     find src -name '*.rs' | wc -l
+        #     find src -name '*.rs' -exec cat {} + | wc -l
+        #
+        # because the figure this replaced had been "108 files, ~50,000 lines"
+        # for long enough to be wrong by ninety files, and CLAUDE.md's own
+        # number was stale in the same direction by twenty-eight.
+        ("Source", "198 files, ~132,000 lines"),
     ]
 
 
@@ -550,6 +576,33 @@ def archive_tree(rel):
     ])
 
 
+def inline_md(text):
+    """The two Markdown spellings that actually reach the news column.
+
+    Release notes are written in Markdown and this column reproduces their
+    first paragraph, so `**bold**` and backticked code were arriving on the
+    front page as literal asterisks and backticks.
+
+    **Escaped first, converted second**, and that order is the whole safety
+    argument. `html.escape` has already turned any `<` into `&lt;`, so the only
+    tags in the result are the ones introduced here out of `*` and backtick
+    characters, which escaping does not touch.
+
+    Deliberately only these two. Measured across all fourteen published
+    releases: three bold spans, three code spans, and no links, italics or
+    underscore emphasis at all. Handling links would mean validating their
+    targets, which is real injection surface bought for a construct nothing
+    has ever used.
+
+    One known edge: the 320-character truncation above can cut a pair in half,
+    and a lone marker simply fails to match and renders as itself. That is the
+    same thing it did before and is not worth machinery.
+    """
+    text = re.sub(r"`([^`]+)`", r"<code>\1</code>", text)
+    text = re.sub(r"\*\*([^*]+)\*\*", r"<strong>\1</strong>", text)
+    return text
+
+
 def news_items(releases, limit=None):
     """Dated entries, newest first. The body is the release's own summary line.
 
@@ -578,7 +631,8 @@ def news_items(releases, limit=None):
             '</div>' % (
                 html.escape(date),
                 html.escape(rel.get("name") or ("AUTARK " + ver)),
-                html.escape(first) or "No summary was recorded for this release.",
+                inline_md(html.escape(first))
+                or "No summary was recorded for this release.",
                 a(rel["html_url"], "Release notes"),
                 "%d image%s" % (imgs, "" if imgs == 1 else "s"),
             ))

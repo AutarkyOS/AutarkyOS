@@ -16,7 +16,10 @@ use crate::{kprint, kprintln, serial_println};
 use alloc::string::String;
 use alloc::vec::Vec;
 
-const PROMPT: &str = "autark> ";
+/// Public because the terminal window marks the rows that begin with it --
+/// see `desk::prompt_gutter`. One spelling, so a changed prompt cannot leave
+/// the gutter looking for a marker nothing prints.
+pub const PROMPT: &str = "autark> ";
 /// Derived, not written out. Hardcoding this was fine until the prompt changed
 /// length during the rename, at which point every cursor position in the line
 /// editor was off by one.
@@ -93,6 +96,37 @@ fn redraw(line: &str, cursor: usize) {
     });
 }
 
+/// Hold a full-screen picture until a key, or for `ms` if one is given.
+///
+/// The bounded form is the only one a test can use: `drive.py` sends the next
+/// command when it sees a prompt, so a program that owns the screen until a
+/// keypress never gives the prompt back, and the keystroke that would end it
+/// is the one thing the harness cannot deliver.
+fn wait_or(ms: u64) {
+    // Throw away whatever is already queued before waiting for a key.
+    //
+    // Without this the keystroke that *starts* a full-screen program is the
+    // one that ends it. The Enter closing `doom view` is still in the ring
+    // when the first frame lands, so `pop_any` finds it immediately and the
+    // picture is gone before anybody has seen it -- which reads as a program
+    // that drew nothing rather than as one that exited. It showed up here as
+    // three screenshot runs out of five coming back with the desktop on
+    // screen and the prompt already returned, and it is a real defect on the
+    // keyboard too, not an artefact of driving this over a serial line.
+    while crate::dev::kbd::pop_any().is_some() {}
+    let until = crate::port::clock::now_ms() + ms;
+    loop {
+        if crate::dev::kbd::pop_any().is_some() {
+            break;
+        }
+        if ms != 0 && crate::port::clock::now_ms() >= until {
+            break;
+        }
+        unsafe { core::arch::asm!("hlt", options(nomem, nostack)) };
+    }
+}
+
+
 static INTERACTIVE: core::sync::atomic::AtomicBool =
     core::sync::atomic::AtomicBool::new(false);
 
@@ -138,7 +172,8 @@ fn find_core(want: &str) -> Option<[u8; 32]> {
 const KNOWN_COMMANDS: &[&str] = &[
     "term", "todo", "paint", "write", "mines", "oracle", "enternet", "net", "dhcp", "mem",
     "uptime", "tasks", "status", "help", "app", "author", "video", "serial", "log", "snap",
-    "update", "gpu", "abstract", "study", "work",
+    "update", "repair", "gpu", "abstract", "study", "work", "redqueen", "grammar",
+    "forest",
 ];
 
 /// How many steps an authoring run gets.
@@ -242,7 +277,14 @@ pub fn run(boot: &BootInfo, acpi: &Option<Acpi>) -> ! {
             line.clear();
             cursor = 0;
             prompt();
+            // The cheap tier is a second stale by design, which is right
+            // for a repaint and wrong immediately after a command that
+            // changed exactly what it caches. `invalidate` was written for
+            // this and its doc says "called after a command"; it had no
+            // caller but its own selftest.
+            crate::ai::glance::invalidate();
             crate::gfx::desk::refresh_routed();
+            crate::gfx::desk::refresh_status();
             crate::gfx::desk::redraw_over_terminal();
             continue;
         }
@@ -255,6 +297,9 @@ pub fn run(boot: &BootInfo, acpi: &Option<Acpi>) -> ! {
             // 100 times a second, so this is also the stack's clock -- an
             // open connection only advances between keystrokes.
             crate::net::tcp::service();
+            // Beside TCP because it is the same bargain: no receive
+            // interrupts, so a state machine advances when the shell is idle.
+            crate::net::wifi_service();
             // USB is polled and not interrupt-driven in this kernel, so a
             // keyboard on it is only heard from when somebody asks. Here
             // rather than in the timer tick for the same reason the pointer
@@ -331,6 +376,7 @@ pub fn run(boot: &BootInfo, acpi: &Option<Acpi>) -> ! {
                 // paths need it: the typed one and the one a panel's own
                 // button takes.
                 crate::gfx::desk::refresh_routed();
+                crate::gfx::desk::refresh_status();
                 // *After* the prompt, not before. Everything the console prints
                 // -- including the prompt itself -- lands in the terminal's
                 // rectangle without regard for what is drawn on top of it, so
@@ -422,6 +468,163 @@ pub fn run(boot: &BootInfo, acpi: &Option<Acpi>) -> ! {
 /// Checking, downloading and staging are three different decisions, and an
 /// operator gets to make them one at a time -- with the last one naming what
 /// it is about to overwrite and waiting to be told the digest back.
+/// What this machine has decided about itself, and the operator's undo.
+///
+/// A machine that quietly accumulates repairs is a machine whose boot log
+/// nobody reads any more, which is the failure this project's own notes about
+/// selftest output warn about. So the repairs are a surface: what is applied,
+/// what is written down, and two ways to take one back.
+fn repair_cmd(rest: &str) {
+    use crate::update::repairs;
+
+    let (verb, arg) = match rest.trim().split_once(' ') {
+        Some((v, a)) => (v, a.trim()),
+        None => (rest.trim(), ""),
+    };
+
+    match verb {
+        "" | "status" => {
+            console::set_color(YELLOW);
+            kprintln!("repairs");
+            console::set_color(WHITE);
+
+            let mut any = false;
+            for (sub, act) in crate::repair::in_force() {
+                any = true;
+                kprintln!("  applied   {:<14} {}", sub, act);
+            }
+            if !any {
+                kprintln!("  nothing is applied");
+            }
+
+            // Read back through our own FAT reader rather than remembered,
+            // because what the next boot does is decided by the file and not
+            // by anything this process is holding.
+            match repairs::stored() {
+                Ok(list) if list.is_empty() => {
+                    kprintln!("  the boot volume records none, so the next boot starts clean")
+                }
+                Ok(list) => {
+                    kprintln!("  on the boot volume, applied from the next boot:");
+                    for (i, e) in list.iter().enumerate() {
+                        kprintln!("    {}  {:<14} {}", i, e.subsystem, e.action);
+                    }
+                }
+                Err(e) => kprintln!("  the boot volume cannot be read: {}", e),
+            }
+
+            console::set_color(LTGRAY);
+            kprintln!(
+                "  chooser: {}",
+                if crate::repair::model_in_use() {
+                    "the model picks which to try; the re-run decides whether it worked"
+                } else {
+                    "the fault's own signature decides the order (no model asked)"
+                }
+            );
+            kprintln!("  offered actions:");
+            for a in crate::repair::ACTIONS {
+                let who = if a.offered_for.is_empty() {
+                    alloc::string::String::from("any subsystem")
+                } else {
+                    a.offered_for.join(", ")
+                };
+                kprintln!("    {:<12} {}  [{}]", a.name, a.about, who);
+            }
+            console::set_color(WHITE);
+        }
+
+        "record" => {
+            let Some((sub, act)) = arg.split_once(' ') else {
+                kprintln!("  repair record <subsystem> <action>");
+                return;
+            };
+            match repairs::record(sub.trim(), act.trim()) {
+                Ok(line) => kprintln!("  {}", line),
+                Err(e) => kprintln!("  {}", e),
+            }
+        }
+
+        "clear" => {
+            let which = if arg.is_empty() { None } else { arg.parse::<usize>().ok() };
+            if !arg.is_empty() && which.is_none() {
+                kprintln!("  repair clear [n], where n is a number from `repair`");
+                return;
+            }
+            match repairs::clear(which) {
+                Ok(line) => kprintln!("  {}", line),
+                Err(e) => kprintln!("  {}", e),
+            }
+        }
+
+        // Reverting rather than merely refusing to record more: a repair
+        // already applied is holding a subsystem down, and an operator turning
+        // this off almost always means "give me the machine without it".
+        "off" => {
+            let n = crate::repair::revert_all();
+            kprintln!("  {} repair(s) reverted; nothing further is recorded this boot", n);
+            kprintln!("  the boot volume is untouched -- `repair clear` is what forgets them");
+        }
+
+        // What was tried and what happened, which is the half of a repair an
+        // operator cannot reconstruct from what is applied. A repair that
+        // worked and one that worked on the third attempt look identical from
+        // `repair` alone, and only one of them says the table is ordered
+        // wrongly.
+        "log" => match crate::sysbox::read_blob("/ai/repair/log")
+            .and_then(|b| alloc::string::String::from_utf8(b).ok())
+        {
+            Some(text) if !text.trim().is_empty() => {
+                console::set_color(YELLOW);
+                kprintln!("repair attempts");
+                console::set_color(WHITE);
+                kprintln!(
+                    "  {:<12} {:<18} {:<12} {:<10} {}",
+                    "subsystem",
+                    "fault",
+                    "action",
+                    "chosen by",
+                    "outcome"
+                );
+                for line in text.lines() {
+                    let mut it = line.split('\t');
+                    let (Some(sub), Some(why), Some(site), Some(act), Some(by), Some(out)) =
+                        (it.next(), it.next(), it.next(), it.next(), it.next(), it.next())
+                    else {
+                        continue;
+                    };
+                    kprintln!("  {:<12} {:<18} {:<12} {:<10} {}", sub, why, act, by, out);
+                    if site != "-" {
+                        console::set_color(LTGRAY);
+                        kprintln!("               {}", site);
+                        console::set_color(WHITE);
+                    }
+                }
+            }
+            _ => kprintln!("  nothing has been attempted on this machine"),
+        },
+
+        // On and off rather than a temperature, because the only question an
+        // operator has here is whether a decode happens at boot at all.
+        "model" => match arg {
+            "on" => {
+                crate::repair::use_model(true);
+                kprintln!("  the model will be asked which repair to try first");
+            }
+            "off" => {
+                crate::repair::use_model(false);
+                kprintln!("  repairs will be tried in table order");
+            }
+            _ => kprintln!("  repair model on|off"),
+        },
+
+        other => kprintln!(
+            "  no such verb '{}'; try status, log, record, clear, off, model",
+            other
+        ),
+    }
+}
+
 fn update_cmd(rest: &str) {
     use crate::store::sha256;
     use crate::update::{channel, fetch, stage};
@@ -1611,7 +1814,184 @@ fn abstract_cmd(rest: &str) {
 /// register read needs and which firmware has normally set already. Nothing
 /// here powers a device on, resets one, or grants it DMA. Those are all
 /// separate acts and they should stay separate ones.
-fn gpu_cmd(acpi: &Option<Acpi>) {
+/// Wake the discrete GPU, or say what waking it would involve.
+///
+/// **Two verbs, because one of them runs the vendor's code with writes on.**
+/// `gpu wake` reads `_PR0` and lists what it would call; `gpu wake now` calls
+/// it. The split is the `update stage` idiom: the dangerous form is a separate
+/// thing to type, and the safe one shows exactly what the dangerous one will
+/// do rather than describing it.
+/// `00:01.0`, the way everybody writes a PCI address.
+fn parse_bdf(t: &str) -> Option<(u8, u8, u8)> {
+    let (bus, rest) = t.split_once(':')?;
+    let (dev, func) = rest.split_once('.')?;
+    Some((
+        u8::from_str_radix(bus.trim(), 16).ok()?,
+        u8::from_str_radix(dev.trim(), 16).ok()?,
+        u8::from_str_radix(func.trim(), 16).ok()?,
+    ))
+}
+
+fn gpu_wake(acpi: &Option<Acpi>, act: bool, named: Option<(u8, u8, u8)>) {
+    let Some(a) = acpi else {
+        console::set_color(LTRED);
+        kprintln!("  ACPI was not parsed, so there is no namespace to ask");
+        console::set_color(WHITE);
+        return;
+    };
+    let Some(ecam) = a.mcfg else {
+        console::set_color(LTRED);
+        kprintln!("  no MCFG table, so no ECAM and no PCI addresses to match against");
+        console::set_color(WHITE);
+        return;
+    };
+
+    console::set_color(YELLOW);
+    kprintln!("[gpu wake]");
+    console::set_color(WHITE);
+
+    // Named beats found. A machine with two discrete parts has two answers
+    // and only the operator knows which one is meant -- and naming one is
+    // also how this gets exercised on a machine whose own bus has neither.
+    let at = match named.or_else(|| crate::gpu::target(ecam)) {
+        Some(v) => v,
+        None => {
+            kprintln!("  no discrete GPU on the bus, and no bridge forwarding an empty one");
+            kprintln!("  -- so there is nothing here that is merely asleep");
+            kprintln!("  'gpu wake <bus>:<dev>.<func>' names one anyway");
+            return;
+        }
+    };
+    kprintln!("  looking at {:02x}:{:02x}.{}", at.0, at.1, at.2);
+
+    let Some(plan) = crate::gpu::plan(a, at) else {
+        console::set_color(YELLOW);
+        kprintln!("  no ACPI device describes that address");
+        console::set_color(LTGRAY);
+        kprintln!("  the firmware's own tables are where the power control is, and on");
+        kprintln!("  this laptop most of them are SSDTs -- 'acpi load <t> +' stacks one");
+        kprintln!("  onto the namespace, and tools/acpidump.ps1 dumps the set.");
+        console::set_color(WHITE);
+        return;
+    };
+
+    kprintln!("  device     {}", plan.device);
+    if plan.resources.is_empty() {
+        console::set_color(YELLOW);
+        kprintln!("  no _PR0, so this device declares no power resources");
+        console::set_color(LTGRAY);
+        kprintln!("  that is a fact about the tables loaded, not about the machine:");
+        kprintln!("  a table that is not in the namespace cannot contribute one.");
+        console::set_color(WHITE);
+        return;
+    }
+    kprintln!(
+        "  _PR0       {} resource(s), {} with an _ON",
+        plan.resources.len(),
+        plan.with_on
+    );
+    for r in plan.resources.iter() {
+        kprintln!("             {}", r);
+    }
+    if plan.has_ps0 {
+        kprintln!("  and then   {}._PS0", plan.device);
+    }
+
+    if !act {
+        console::set_color(LTGRAY);
+        kprintln!("  nothing was called. 'gpu wake now' runs it.");
+        console::set_color(WHITE);
+        return;
+    }
+
+    // A dumped table computes addresses for the machine it came from. Under
+    // QEMU this laptop's `PEG1.PXCS` resolves to physical 0x8000, which here
+    // is the SMP trampoline -- so executing its `_ON` would write over the
+    // code that starts the other cores. Reading a foreign table is the point
+    // of `acpi load`; acting on one is never.
+    if crate::acpi::namespace_is_foreign() {
+        console::set_color(LTRED);
+        kprintln!("  this namespace is a dump, so nothing ran");
+        console::set_color(LTGRAY);
+        kprintln!("  its addresses belong to the machine the tables came from. Reboot");
+        kprintln!("  to get this machine's own tables back, then ask again.");
+        console::set_color(WHITE);
+        return;
+    }
+
+    // The gate that already exists, and this is exactly what it is for: `_ON`
+    // writes to operation regions, and on this machine those reach the
+    // embedded controller as well as the PCI fabric.
+    if !crate::acpi::eval::writes_allowed() {
+        console::set_color(LTRED);
+        kprintln!("  region writes are locked, so nothing ran");
+        console::set_color(LTGRAY);
+        kprintln!("  'acpi unlock' first. _ON is the firmware's own code and it writes");
+        kprintln!("  hardware; the lock is there so that is a decision and not a side");
+        kprintln!("  effect of asking a question.");
+        console::set_color(WHITE);
+        return;
+    }
+
+    kprintln!("  running:");
+    let steps = crate::gpu::wake(a, at);
+    for st in steps.iter() {
+        console::set_color(if st.ok { LTGREEN } else { LTRED });
+        kprintln!("    {}  {:<34} {}", if st.ok { "ok  " } else { "FAIL" }, st.what, st.why);
+        console::set_color(WHITE);
+    }
+    if steps.is_empty() {
+        kprintln!("    nothing to call");
+        return;
+    }
+
+    // The only answer that settles it. Everything above can succeed and the
+    // device still not be there.
+    match crate::gpu::answers(ecam, at) {
+        Some(v) => {
+            console::set_color(LTGREEN);
+            kprintln!(
+                "  {:02x}:{:02x}.{} answers {:04x}:{:04x}",
+                at.0, at.1, at.2, v & 0xffff, v >> 16
+            );
+            console::set_color(LTGRAY);
+            kprintln!("  'gpu' now reads its registers; 'pci' lists it.");
+            console::set_color(WHITE);
+        }
+        None => {
+            console::set_color(YELLOW);
+            kprintln!("  {:02x}:{:02x}.{} still does not answer config space", at.0, at.1, at.2);
+            console::set_color(LTGRAY);
+            kprintln!("  the methods ran; the device did not come back. A link that has");
+            kprintln!("  to be retrained is the next thing to look at -- PEG1 carries");
+            kprintln!("  L23E and L23R for exactly that.");
+            console::set_color(WHITE);
+        }
+    }
+}
+
+fn gpu_cmd(acpi: &Option<Acpi>, rest: &str) {
+    match rest {
+        "wake" => return gpu_wake(acpi, false, None),
+        "wake now" => return gpu_wake(acpi, true, None),
+        t if t.starts_with("wake now ") => {
+            return match parse_bdf(t[9..].trim()) {
+                Some(at) => gpu_wake(acpi, true, Some(at)),
+                None => kprintln!("  not a PCI address: {}", t[9..].trim()),
+            }
+        }
+        t if t.starts_with("wake ") => {
+            return match parse_bdf(t[5..].trim()) {
+                Some(at) => gpu_wake(acpi, false, Some(at)),
+                None => kprintln!("  not a PCI address: {}", t[5..].trim()),
+            }
+        }
+        "" => {}
+        other => {
+            kprintln!("  usage: gpu | gpu wake | gpu wake now   (got '{}')", other);
+            return;
+        }
+    }
     let Some(ecam) = acpi.as_ref().and_then(|a| a.mcfg) else {
         console::set_color(LTRED);
         kprintln!("  no MCFG table, so no ECAM base and no PCIe enumeration at all");
@@ -2087,7 +2467,7 @@ fn execute(line: &str, boot: &BootInfo, acpi: &Option<Acpi>, interp: &mut aiksi:
                 }
             }
         }
-        "wlan" | "wifi" => crate::net::wifi::report(),
+        "wlan" | "wifi" => wifi_cmd(rest),
         "trust" => match rest.trim() {
             "verify" => crate::net::trust::verify_roots(),
             _ => crate::net::trust::report(),
@@ -2129,6 +2509,530 @@ fn execute(line: &str, boot: &BootInfo, acpi: &Option<Acpi>, interp: &mut aiksi:
                         crate::net::ping(ip, n);
                     }
                 },
+            }
+        }
+        "canary" => {
+            // Honeytokens: plant a secret nothing legitimate reads, and any
+            // read trips an alarm that cannot be erased. Operator-only -- the
+            // model must never learn which paths are bait, only spring them.
+            use crate::sysbox::canary;
+            let mut it = rest.splitn(2, ' ');
+            match (it.next().unwrap_or(""), it.next().unwrap_or("").trim()) {
+                ("plant", args) if !args.is_empty() => {
+                    let mut a = args.splitn(2, ' ');
+                    let path = a.next().unwrap_or("");
+                    // A default lure if none given -- a plausible secret is more
+                    // convincing bait than an empty file.
+                    let content = a.next().unwrap_or(
+                        "[default]\naws_access_key_id = AKIA7X9QF2NPLZ4DVHE1\naws_secret_access_key = wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY\n",
+                    );
+                    if canary::plant(path, content.as_bytes()) {
+                        console::set_color(LTGREEN);
+                        kprintln!("  planted at {} -- any read now trips an alarm", path);
+                        console::set_color(WHITE);
+                    } else {
+                        kprintln!("  refused (a reserved path, or the write was blocked)");
+                    }
+                }
+                ("retire", path) if !path.is_empty() => {
+                    if canary::retire(path) {
+                        kprintln!("  retired {} -- the alarms it raised stay", path);
+                    } else {
+                        kprintln!("  no such canary");
+                    }
+                }
+                ("list", _) => {
+                    let ps = canary::list();
+                    if ps.is_empty() {
+                        kprintln!("  no canaries planted");
+                    } else {
+                        kprintln!("  {} planted:", ps.len());
+                        for p in ps.iter() {
+                            kprintln!("    {}", p);
+                        }
+                    }
+                }
+                ("alarms", _) | ("status", _) | ("", _) => {
+                    let al = canary::alarms();
+                    kprintln!("  {} planted, {} trip(s) since boot, {} alarm(s) on record",
+                        canary::list().len(), canary::trips(), al.len());
+                    for l in al.iter().rev().take(10) {
+                        console::set_color(LTRED);
+                        kprintln!("    {}", l);
+                        console::set_color(LTGRAY);
+                    }
+                }
+                _ => kprintln!("  usage: canary plant <path> [content] | retire <path> | list | alarms"),
+            }
+        }
+        "honeypot" => {
+            // A listening decoy: accept a connection, serve a convincing
+            // banner, capture what the peer sends, log it unerasably. Operator
+            // -only -- the model can neither arm a trap nor read the sessions.
+            use crate::net::honeypot;
+            let mut it = rest.split_whitespace();
+            match it.next().unwrap_or("") {
+                verb @ ("listen" | "tarpit") => {
+                    let tarpit = verb == "tarpit";
+                    let proto = it.next().unwrap_or("");
+                    let port = it.next().and_then(|s| s.parse::<u16>().ok());
+                    match port {
+                        Some(p) if honeypot::listen(proto, p, tarpit) => {
+                            console::set_color(LTGREEN);
+                            if tarpit {
+                                kprintln!("  tarpit: {} on port {} -- connections held, not answered", proto, p);
+                            } else {
+                                kprintln!("  listening: {} decoy on port {}", proto, p);
+                            }
+                            console::set_color(LTGRAY);
+                            kprintln!("  activity is logged to {}", honeypot::SESSIONS);
+                        }
+                        Some(_) => kprintln!(
+                            "  refused -- unknown protocol '{}'. try: {}",
+                            proto, crate::net::decoy::KINDS.join(" ")
+                        ),
+                        None => kprintln!("  usage: honeypot listen|tarpit <proto> <port>"),
+                    }
+                }
+                "stop" => {
+                    honeypot::stop();
+                    kprintln!("  disarmed");
+                }
+                "sessions" => {
+                    let s = honeypot::sessions();
+                    if s.is_empty() {
+                        kprintln!("  no sessions captured");
+                    } else {
+                        kprintln!("  {} session(s) on record:", s.len());
+                        for l in s.iter().rev().take(15) {
+                            console::set_color(LTRED);
+                            kprintln!("    {}", l);
+                            console::set_color(LTGRAY);
+                        }
+                    }
+                }
+                "" | "status" => {
+                    match honeypot::status() {
+                        Some((proto, port, tarpit)) => {
+                            console::set_color(LTGREEN);
+                            kprintln!("  armed: {} {} on port {}",
+                                proto, if tarpit { "tarpit" } else { "decoy" }, port);
+                            console::set_color(LTGRAY);
+                        }
+                        None => kprintln!("  disarmed"),
+                    }
+                    kprintln!("  {} session(s) captured since boot", honeypot::seen());
+                }
+                _ => kprintln!("  usage: honeypot listen|tarpit <proto> <port> | stop | sessions | status"),
+            }
+        }
+        "decoy" => {
+            // Show the banner a decoy service would emit, and prove it against
+            // the recon engine in the same breath. No listener yet -- this is
+            // the camouflage, viewable before anything serves it.
+            use crate::net::{decoy, fingerprint};
+            let mut it = rest.split_whitespace();
+            match it.next() {
+                None | Some("list") => {
+                    kprintln!("  decoy <service> [seed]   -- services: {}", decoy::KINDS.join(" "));
+                }
+                Some(proto) => {
+                    let seed = it.next().and_then(|s| s.parse::<u32>().ok()).unwrap_or(0);
+                    match decoy::banner(proto, seed) {
+                        None => kprintln!("  no decoy for '{}' -- try: {}", proto, decoy::KINDS.join(" ")),
+                        Some(b) => {
+                            let fp = fingerprint::identify(decoy::port_of(proto), &b);
+                            for line in core::str::from_utf8(&b).unwrap_or("<binary>").lines().take(4) {
+                                kprintln!("  | {}", line);
+                            }
+                            let verdict = if fp.proto == proto { LTGREEN } else { LTRED };
+                            console::set_color(verdict);
+                            kprintln!("  recon reads it as: {} {} {}", fp.proto, fp.product, fp.version);
+                            console::set_color(WHITE);
+                        }
+                    }
+                }
+            }
+        }
+        "recon" => {
+            // A local Shodan: sweep our own subnet, banner-grab open ports,
+            // name each service by what it said. Operator-only for now -- it is
+            // a Net-class action and the model reaches Net only through a
+            // trusted Aiksi builtin, which this does not yet expose.
+            use crate::net::recon;
+            let mut it = rest.split_whitespace();
+            let cap = it.next().and_then(|s| s.parse::<usize>().ok()).unwrap_or(recon::MAX_HOSTS);
+            let ms = it.next().and_then(|s| s.parse::<u64>().ok()).unwrap_or(600);
+            let cfg = crate::net::config();
+            kprintln!(
+                "  sweeping {}.{}.{}.0/{}  (cap {} hosts, {} ms/port)",
+                cfg.ip[0], cfg.ip[1], cfg.ip[2],
+                cfg.netmask.iter().map(|b| b.count_ones()).sum::<u32>(),
+                cap.min(recon::MAX_HOSTS), ms
+            );
+            match recon::scan(cap, ms) {
+                Err(why) => kprintln!("  {}", why),
+                Ok(found) if found.is_empty() => {
+                    kprintln!("  nothing answered -- an empty segment, or none of the scanned ports are open");
+                }
+                Ok(found) => {
+                    console::set_color(LTGREEN);
+                    kprintln!("  {} service(s) found:", found.len());
+                    console::set_color(LTGRAY);
+                    for f in found.iter() {
+                        kprintln!(
+                            "    {}:{}  {}",
+                            recon::ip_dotted(f.ip), f.port, f.fp.render()
+                        );
+                    }
+                    kprintln!("  indexed under {}", recon::ROOT);
+                }
+            }
+        }
+        "connectome" => {
+            // Load a whole nervous system as a graph and run a toy dynamics
+            // over it. Operator-only, loaded on demand, wired to nothing that
+            // decides -- see src/ai/connectome.rs and design/connectome.md. The
+            // real file is tools/connectome.py's GLADOSXN (C. elegans, 448
+            // neurons); under QEMU it arrives via `fat get` into the namespace.
+            use crate::ai::connectome as cx;
+            // Activations live in [-1, 1]; this core has no float Display, so
+            // everything prints as hundredths (76 means 0.76), the `bench` idiom.
+            let mut it = rest.split_whitespace();
+            match it.next().unwrap_or("") {
+                "load" => {
+                    let path = it.next().unwrap_or("");
+                    if path.is_empty() {
+                        kprintln!("  usage: connectome load <path>   (a GLADOSXN blob in the namespace)");
+                    } else {
+                        match crate::sysbox::read_blob(path) {
+                            None => kprintln!("  no such blob: {}", path),
+                            Some(bytes) => match cx::load(&bytes) {
+                                Ok((n, e)) => {
+                                    console::set_color(LTGREEN);
+                                    kprintln!("  loaded {} neurons, {} connections from {}", n, e, path);
+                                    console::set_color(LTGRAY);
+                                }
+                                Err(why) => {
+                                    console::set_color(LTRED);
+                                    kprintln!("  refused: {}", why);
+                                    console::set_color(LTGRAY);
+                                }
+                            },
+                        }
+                    }
+                }
+                "neigh" => {
+                    let name = it.next().unwrap_or("");
+                    match cx::neighbours_of(name) {
+                        None if !cx::loaded() => kprintln!("  nothing loaded -- 'connectome load <path>' first"),
+                        None => kprintln!("  no such neuron: {}", name),
+                        Some(ns) => {
+                            kprintln!("  {} connects to {}:", name, ns.len());
+                            for (n, w, elec) in ns.iter().take(40) {
+                                kprintln!("    {:<8} w{:<4} {}", n, w, if *elec { "gap" } else { "chem" });
+                            }
+                        }
+                    }
+                }
+                "stim" => {
+                    let name = it.next().unwrap_or("");
+                    let v = it.next().and_then(|s| s.parse::<i32>().ok()).unwrap_or(100);
+                    if cx::stim(name, v as f32 / 100.0) {
+                        kprintln!("  {} set to {} (x100)", name, v.clamp(-100, 100));
+                    } else if !cx::loaded() {
+                        kprintln!("  nothing loaded -- 'connectome load <path>' first");
+                    } else {
+                        kprintln!("  no such neuron: {}", name);
+                    }
+                }
+                "step" => {
+                    let n = it.next().and_then(|s| s.parse::<usize>().ok()).unwrap_or(1);
+                    // Gain scales the normalised input to tanh; a stimulus barely
+                    // spreads below ~2 and saturates the graph above ~8, so 4 is
+                    // a visible middle. Tunable because the honest answer to
+                    // "what gain" is "it is a toy, watch what it does".
+                    let gain = it.next().and_then(|s| s.parse::<i32>().ok()).unwrap_or(4).max(1) as f32;
+                    match cx::advance(n, gain) {
+                        None => kprintln!("  nothing loaded -- 'connectome load <path>' first"),
+                        Some(active) => {
+                            kprintln!("  {} step(s) at gain {}: {} neuron(s) active", n, gain as i32, active);
+                            for (name, v) in cx::top(8) {
+                                kprintln!("    {:<8} {}", name, (v * 100.0) as i32);
+                            }
+                        }
+                    }
+                }
+                "show" => {
+                    let k = it.next().and_then(|s| s.parse::<usize>().ok()).unwrap_or(12);
+                    let top = cx::top(k);
+                    if top.is_empty() {
+                        kprintln!("  quiet -- nothing active (stim a neuron, then step)");
+                    } else {
+                        for (name, v) in top {
+                            kprintln!("    {:<8} {}", name, (v * 100.0) as i32);
+                        }
+                    }
+                }
+                "reset" => {
+                    cx::reset();
+                    kprintln!("  state zeroed (the graph stays loaded)");
+                }
+                "" | "info" | "status" => match cx::info() {
+                    None => kprintln!("  nothing loaded -- 'connectome load <path>' first"),
+                    Some((n, e, chem, elec)) => {
+                        console::set_color(LTGREEN);
+                        kprintln!("  {} neurons, {} connections ({} chemical, {} electrical)", n, e, chem, elec);
+                        console::set_color(LTGRAY);
+                        kprintln!("  neigh <n> | stim <n> [v] | step [n] [gain] | show [k] | reset");
+                    }
+                },
+                _ => kprintln!("  usage: connectome load <path> | info | neigh <n> | stim <n> [v] | step [n] [gain] | show [k] | reset"),
+            }
+        }
+        "arena" => {
+            // The autonomy study's control surface. Operator-only: `arena` is
+            // not a sysbox applet, so no decoding grammar can spell it and the
+            // model has no route to create a mission, grant one, or read the
+            // record. See src/ai/arena.rs.
+            use crate::ai::arena;
+            let born = crate::dev::rtc::now()
+                .map(|d| crate::dev::rtc::unix_seconds(&d))
+                .unwrap_or(0);
+            let mut it = rest.splitn(2, ' ');
+            match (it.next().unwrap_or(""), it.next().unwrap_or("").trim()) {
+                ("new", args) if !args.is_empty() => {
+                    let mut a = args.splitn(2, ' ');
+                    let run = a.next().unwrap_or("");
+                    let objective = a.next().unwrap_or("").trim();
+                    if objective.is_empty() {
+                        kprintln!("  usage: arena new <run> <objective>");
+                    } else {
+                        let m = arena::Mission {
+                            objective: String::from(objective),
+                            horizon: 64,
+                            target: 0,
+                            born,
+                        };
+                        if arena::set_mission(run, &m) {
+                            console::set_color(LTGREEN);
+                            kprintln!("  mission '{}' set: {}", run, objective);
+                            console::set_color(LTGRAY);
+                            if let Some(h) = arena::intent_hash(run) {
+                                kprintln!(
+                                    "  grant it to run unattended:  arena grant {} {}",
+                                    run, &crate::ai::voter::hex(&h)[..8]
+                                );
+                            }
+                        } else {
+                            kprintln!("  refused (bad run name, or the write was blocked)");
+                        }
+                    }
+                }
+                ("target", args) if !args.is_empty() => {
+                    let mut a = args.split_whitespace();
+                    let run = a.next().unwrap_or("");
+                    let t = a.next().and_then(|s| s.parse::<u32>().ok());
+                    match (arena::mission(run), t) {
+                        (Some(mut m), Some(t)) => {
+                            m.target = t;
+                            if arena::set_mission(run, &m) {
+                                kprintln!("  target for '{}' set to {} (this revokes any prior grant)", run, t);
+                            } else {
+                                kprintln!("  the write was blocked");
+                            }
+                        }
+                        (None, _) => kprintln!("  no such mission: {}", run),
+                        (_, None) => kprintln!("  usage: arena target <run> <n>"),
+                    }
+                }
+                ("grant", args) if !args.is_empty() => {
+                    let mut a = args.split_whitespace();
+                    let run = a.next().unwrap_or("");
+                    let typed = a.next().unwrap_or("");
+                    match arena::intent_hash(run) {
+                        None => kprintln!("  no such mission: {}", run),
+                        Some(h) => {
+                            let full = crate::ai::voter::hex(&h);
+                            if typed.len() >= 8 && full.starts_with(typed) {
+                                if arena::grant(run) {
+                                    console::set_color(LTGREEN);
+                                    kprintln!("  '{}' granted -- it may advance one step per quiet tick", run);
+                                    console::set_color(LTGRAY);
+                                } else {
+                                    kprintln!("  grant refused (the write was blocked)");
+                                }
+                            } else {
+                                kprintln!("  intent is {} -- type its first 8 characters to grant", &full[..8]);
+                            }
+                        }
+                    }
+                }
+                ("step", run) if !run.is_empty() => {
+                    // Force one pursuit step now (the `initiative now` / `work
+                    // night` idiom). Runs inline on this task, holding the engine
+                    // only for the decode.
+                    match arena::step(run) {
+                        Ok(s) => {
+                            console::set_color(LTGREEN);
+                            kprintln!(
+                                "  step: {}  [{}]  score {}  terminal {}",
+                                s.action, s.outcome.tag(), s.score, s.terminal.tag()
+                            );
+                            console::set_color(LTGRAY);
+                        }
+                        Err(why) => kprintln!("  {}", why),
+                    }
+                }
+                ("run", args) if !args.is_empty() => {
+                    let mut a = args.split_whitespace();
+                    let run = a.next().unwrap_or("");
+                    let n = a.next().and_then(|s| s.parse::<usize>().ok()).unwrap_or(8);
+                    let mut i = 0usize;
+                    while i < n {
+                        match arena::step(run) {
+                            Ok(s) => {
+                                kprintln!(
+                                    "  {:>2}. {} [{}] score {} -> {}",
+                                    i + 1, s.action, s.outcome.tag(), s.score, s.terminal.tag()
+                                );
+                                if s.terminal != arena::Terminal::Running {
+                                    console::set_color(LTGREEN);
+                                    kprintln!("  ended: {}", s.terminal.tag());
+                                    console::set_color(LTGRAY);
+                                    break;
+                                }
+                            }
+                            Err(why) => {
+                                kprintln!("  stopped: {}", why);
+                                break;
+                            }
+                        }
+                        i += 1;
+                    }
+                }
+                ("ledger", run) if !run.is_empty() => {
+                    let t = arena::trajectory(run);
+                    if t.is_empty() {
+                        kprintln!("  no steps recorded for '{}'", run);
+                    } else {
+                        kprintln!("  {} step(s) for '{}'  (drift x100, faults cumulative):", t.len(), run);
+                        for s in t.iter() {
+                            kprintln!(
+                                "    {:>3} [{:<7}] score {:<4} drift {:<5} faults {:<3} {}",
+                                s.step,
+                                s.outcome.tag(),
+                                s.score,
+                                s.drift_centi,
+                                s.faults,
+                                s.action
+                            );
+                        }
+                    }
+                }
+                ("show", run) if !run.is_empty() => {
+                    match arena::mission(run) {
+                        None => kprintln!("  no such mission: {}", run),
+                        Some(m) => {
+                            let t = arena::trajectory(run);
+                            let term = arena::classify(&t, m.target, m.horizon);
+                            console::set_color(LTGREEN);
+                            kprintln!("  {}: {}", run, m.objective);
+                            console::set_color(LTGRAY);
+                            kprintln!(
+                                "  horizon {}  target {}  granted {}",
+                                m.horizon, m.target, arena::granted(run)
+                            );
+                            kprintln!("  {} step(s), terminal: {}", t.len(), term.tag());
+                        }
+                    }
+                }
+                ("mode", arg) => {
+                    use crate::net::reach;
+                    match arg {
+                        "isolated" => {
+                            reach::set_mode(reach::Mode::Isolated);
+                            console::set_color(LTGREEN);
+                            kprintln!("  reach: isolated -- the owned range only, no real-net perception");
+                            console::set_color(LTGRAY);
+                        }
+                        "live" => {
+                            reach::set_mode(reach::Mode::Live);
+                            console::set_color(LTRED);
+                            kprintln!("  reach: LIVE -- read-only real-net perception is on");
+                            console::set_color(LTGRAY);
+                            kprintln!("  action stays owned-range only; the internet is never a scan/action target");
+                        }
+                        "" => {
+                            let m = match reach::mode() {
+                                reach::Mode::Isolated => "isolated",
+                                reach::Mode::Live => "live",
+                            };
+                            kprintln!("  reach mode: {}", m);
+                        }
+                        _ => kprintln!("  usage: arena mode isolated|live"),
+                    }
+                }
+                ("range", arg) => {
+                    use crate::net::reach;
+                    let parse_quad = |s: &str| -> Option<[u8; 4]> {
+                        let mut it = s.split('.');
+                        let a = it.next()?.parse().ok()?;
+                        let b = it.next()?.parse().ok()?;
+                        let c = it.next()?.parse().ok()?;
+                        let d = it.next()?.parse().ok()?;
+                        if it.next().is_some() {
+                            return None;
+                        }
+                        Some([a, b, c, d])
+                    };
+                    if arg.is_empty() {
+                        let a = reach::allowlist();
+                        if a.is_empty() {
+                            kprintln!("  range: the whole owned subnet (no allowlist)");
+                        } else {
+                            kprintln!("  range: {} host(s) allowlisted:", a.len());
+                            for ip in a.iter() {
+                                kprintln!("    {}.{}.{}.{}", ip[0], ip[1], ip[2], ip[3]);
+                            }
+                        }
+                    } else if arg == "clear" {
+                        reach::set_allowlist(alloc::vec::Vec::new());
+                        kprintln!("  range cleared -- the whole owned subnet is the range");
+                    } else {
+                        let mut list = alloc::vec::Vec::new();
+                        let mut bad = false;
+                        for tok in arg.split(|c| c == ' ' || c == ',').filter(|s| !s.is_empty()) {
+                            match parse_quad(tok) {
+                                Some(ip) => list.push(ip),
+                                None => {
+                                    bad = true;
+                                    kprintln!("  not an address: {}", tok);
+                                }
+                            }
+                        }
+                        if !bad && !list.is_empty() {
+                            let n = list.len();
+                            reach::set_allowlist(list);
+                            kprintln!("  range narrowed to {} host(s) within the owned subnet", n);
+                        }
+                    }
+                }
+                ("", _) | ("list", _) | ("status", _) => {
+                    let runs = arena::runs();
+                    if runs.is_empty() {
+                        kprintln!("  no missions -- 'arena new <run> <objective>'");
+                    } else {
+                        for run in runs.iter() {
+                            if let Some(m) = arena::mission(run) {
+                                let t = arena::trajectory(run);
+                                let term = arena::classify(&t, m.target, m.horizon);
+                                kprintln!("  {:<12} {:<10} {} step(s)  {}", run, term.tag(), t.len(), m.objective);
+                            }
+                        }
+                    }
+                }
+                _ => kprintln!("  usage: arena new|target|grant|step|run|ledger|show|mode|range|list  (verbs: scan probe enumerate vulncheck done)"),
             }
         }
         "dhcp" => crate::net::dhcp::report(),
@@ -2488,6 +3392,8 @@ fn execute(line: &str, boot: &BootInfo, acpi: &Option<Acpi>, interp: &mut aiksi:
             crate::ai::window_report();
         }
         "gate" => crate::ai::harness::gate_report(),
+        "grammar" => crate::ai::harness::grammar_report(),
+        "forest" => crate::ai::forest::command(rest),
         "search" => crate::ai::harness::search_report(),
         "probe" => crate::ai::harness::probe_features(),
         "feature" => {
@@ -2979,6 +3885,30 @@ fn execute(line: &str, boot: &BootInfo, acpi: &Option<Acpi>, interp: &mut aiksi:
                 other => kprintln!("  no such action: {}", other),
             }
         }
+        // `redqueen [rounds] [budget]` -- one turn of the arms race.
+        //
+        // Neither half calls the engine, so this runs on a machine with no
+        // model and holds nothing while it works.
+        "redqueen" => {
+            use crate::ai::redqueen;
+            let mut rounds = 1usize;
+            let mut budget = redqueen::BUDGET;
+            let mut nth = 0usize;
+            for w in rest.split_whitespace() {
+                if let Ok(v) = w.parse::<usize>() {
+                    if nth == 0 {
+                        rounds = v.clamp(1, 64);
+                    } else {
+                        budget = v.clamp(1, 100_000);
+                    }
+                    nth += 1;
+                }
+            }
+            // The library is read from the namespace rather than passed,
+            // so a run picks up whatever the machine has already learned.
+            let lib = redqueen::Lib::load();
+            redqueen::report(rounds, &redqueen::Solver::with(budget, lib));
+        }
         "godel" => {
             use crate::ai::godel;
             let mut words = rest.split_whitespace();
@@ -3008,7 +3938,15 @@ fn execute(line: &str, boot: &BootInfo, acpi: &Option<Acpi>, interp: &mut aiksi:
                         Ok(h) => kprintln!("  eligible now (hour {}, no hardware input)", h),
                         Err(why) => kprintln!("  not eligible: {}", why),
                     }
-                    kprintln!("  {} trial(s), {} adopted", trials, adoptions);
+                    // Said as "since boot", because that is what these are.
+                    // Both are atomics that start at zero every boot, while the
+                    // ledger and the head are namespace state that outlive one,
+                    // so a machine that adopted something last night reads
+                    // `0 trial(s), 0 adopted` beside a head that names it. The
+                    // counters are events; the head is a state. Printing them
+                    // adjacent without saying which is which is what made the
+                    // pairing below look like a defect.
+                    kprintln!("  {} trial(s) since boot, {} adopted", trials, adoptions);
                     // The bar itself, since U3 makes it a thing that can move.
                     // A machine that has loosened its own criterion should say
                     // so where anyone looks, not bury it in the ledger.
@@ -3065,6 +4003,21 @@ fn execute(line: &str, boot: &BootInfo, acpi: &Option<Acpi>, interp: &mut aiksi:
                     let _ = reads;
                     let line = godel::lineage(8);
                     match godel::head() {
+                        // `N adopted` beside no head is consistent and used to
+                        // read as a bug. An adoption is an event that happened;
+                        // the head is what is installed now, and `rollback` to
+                        // the frozen model detaches it without touching a
+                        // counter that only ever rises. The other cause -- a
+                        // head write that failed -- is no longer silent, so it
+                        // announces itself at the moment of adoption and this
+                        // line can state the benign reading without hedging.
+                        None if adoptions > 0 => {
+                            kprintln!("  head: none (the frozen model is the variant)");
+                            kprintln!(
+                                "  {} adoption(s) this boot with nothing installed: rolled back since",
+                                adoptions
+                            );
+                        }
                         None => kprintln!("  head: none (the frozen model is the variant)"),
                         Some(_) => {
                             kprintln!("  lineage, newest first:");
@@ -3696,6 +4649,7 @@ fn execute(line: &str, boot: &BootInfo, acpi: &Option<Acpi>, interp: &mut aiksi:
             kprintln!("machine");
             console::set_color(WHITE);
             kprintln!("  mem uptime tasks cpu acpi pci video date reboot shutdown");
+            kprintln!("  devices       every device, what it is, and what drives it");
             kprintln!("  fault         deliberately dereference null");
             kprintln!("  clear refresh echo <text>");
             kprintln!("  log [all|save]  everything printed since power-on; the console keeps one screen");
@@ -3745,6 +4699,13 @@ fn execute(line: &str, boot: &BootInfo, acpi: &Option<Acpi>, interp: &mut aiksi:
             console::set_color(YELLOW);
             kprintln!("\nthe model");
             console::set_color(WHITE);
+            // First, because it is the door to everything under it and it was
+            // the one command in this section that appeared nowhere -- not
+            // here, not on the wall, not in the Start menu, not in the Program
+            // Manager. Four windows nobody could find.
+            kprintln!("  mind open     the workspace: Workflows, Ask, Agent, Improve");
+            kprintln!("  work ...      multi-agent runs      godel ...  self-modification");
+            kprintln!("  author <name> <what it should do>   write an application");
             kprintln!("  gen <prompt>  generate text     ask <prompt>  chat turn");
             kprintln!("  think <p>     run it in the background, off the shell");
             kprintln!("  agent [-n n] [--trust full] <goal>   act-observe-repeat; 'agent stop' cancels");
@@ -3790,6 +4751,19 @@ fn execute(line: &str, boot: &BootInfo, acpi: &Option<Acpi>, interp: &mut aiksi:
             let (used, total) = mem::heap::HEAP.stats();
             kprintln!("  heap  {} B used / {} B total", used, total);
             kprintln!("  free  {} KiB", (total - used) / 1024);
+            // Where a fixed-address image may be placed, which the heap figures
+            // above say nothing about: they describe one contiguous allocation
+            // the kernel already owns, and this is everything it does not.
+            // Printed here rather than behind its own verb because the question
+            // "will this binary load" is a memory question and nobody would
+            // think to look anywhere else.
+            let (free, run) = mem::fixed::totals();
+            kprintln!(
+                "  placeable  {} MiB, largest run {} MiB",
+                free / 1024 / 1024,
+                run / 1024 / 1024
+            );
+            mem::fixed::report();
         }
         "uptime" => {
             let t = lapic::ticks();
@@ -3824,7 +4798,17 @@ fn execute(line: &str, boot: &BootInfo, acpi: &Option<Acpi>, interp: &mut aiksi:
             console::set_color(LTGRAY);
         }
         "acpi" if rest.trim().starts_with("load") => {
-            crate::acpi::load_report(rest.trim()[4..].trim());
+            // A trailing '+' adds the table to the namespace already there,
+            // which is how a machine's whole set of tables gets assembled from
+            // dumps: one DSDT and, on this laptop, fourteen SSDTs.
+            {
+                let a = rest.trim()[4..].trim();
+                let (p, add) = match a.strip_suffix('+') {
+                    Some(h) => (h.trim(), true),
+                    None => (a, false),
+                };
+                crate::acpi::load_report(p, add);
+            }
         }
         "acpi" if rest.trim().starts_with("eval") => match acpi {
             Some(a) => crate::acpi::eval_report(a, rest.trim()[4..].trim()),
@@ -3834,6 +4818,9 @@ fn execute(line: &str, boot: &BootInfo, acpi: &Option<Acpi>, interp: &mut aiksi:
             Some(a) => crate::acpi::ns_report(a, rest.trim()[2..].trim()),
             None => kprintln!("  ACPI was not parsed"),
         },
+        // Why the namespace is not the whole table. Its own verb because
+        // "53 undecided" is a number and this is the reason behind it.
+        "acpi" if rest.trim() == "why" => crate::acpi::why_report(),
         "acpi" if rest.trim() == "tables" => match acpi {
             Some(a) => crate::acpi::report(a),
             None => {
@@ -3915,10 +4902,28 @@ fn execute(line: &str, boot: &BootInfo, acpi: &Option<Acpi>, interp: &mut aiksi:
                 console::set_color(WHITE);
             }
         },
-        "gpu" => gpu_cmd(acpi),
+        "gpu" => gpu_cmd(acpi, rest.trim()),
         "abstract" => abstract_cmd(rest),
         "study" => study_cmd(rest),
         "work" => work_cmd(rest),
+        // `pci` lists what is on the bus. This says what each thing *is* and
+        // what would drive it, which is the question somebody actually has --
+        // and it covers USB, which `pci` structurally cannot.
+        "devices" => {
+            console::set_color(YELLOW);
+            kprintln!("[devices]");
+            console::set_color(WHITE);
+            match acpi.as_ref().and_then(|a| a.mcfg) {
+                Some(ecam) => {
+                    // Re-swept rather than reported from boot: config-space
+                    // reads have no side effects, and a stale inventory is
+                    // exactly the thing this command exists to replace.
+                    crate::dev::registry::scan_pci(ecam);
+                }
+                None => kprintln!("  no MCFG, so nothing has swept PCI"),
+            }
+            crate::dev::registry::report();
+        }
         "pci" => match acpi.as_ref().and_then(|a| a.mcfg) {
             Some(ecam) => {
                 console::set_color(YELLOW);
@@ -4265,6 +5270,13 @@ fn execute(line: &str, boot: &BootInfo, acpi: &Option<Acpi>, interp: &mut aiksi:
                 }
             }
         }
+        "mind" if rest.trim() == "open" => {
+            // The workspace. One command because the arrangement is the point:
+            // a machine reporting on itself in four places at once reads as a
+            // machine doing several things, which is what it is.
+            crate::gfx::mindwin::open_workspace();
+            kprintln!("  four windows, gridded -- Ask, Workflows, Agent, Improve");
+        }
         "mind" => {
             use crate::gfx::console::{self, LTGRAY, YELLOW};
             let (ticks, acts, episodes, suppressed, enabled, seen, tenths) =
@@ -4312,6 +5324,7 @@ fn execute(line: &str, boot: &BootInfo, acpi: &Option<Acpi>, interp: &mut aiksi:
             other => kprintln!("  usage: initiative on|off|now (got '{}')", other),
         },
         "mines" | "minesweeper" => crate::gfx::desk::open_mines(),
+        "network" | "netman" => crate::gfx::desk::open_netman(),
         "agentlog" => crate::gfx::desk::open_agentlog(),
         // `talk` opens the window; `talk <text>` also says the thing, which is
         // what makes the surface drivable over serial at all -- `win keys` can
@@ -4364,12 +5377,131 @@ fn execute(line: &str, boot: &BootInfo, acpi: &Option<Acpi>, interp: &mut aiksi:
                 todo::STEPS.len()
             );
         }
+        // Hold a key down, or let it go.
+        //
+        // The typed equivalent of leaning on a key, and the only way anything
+        // continuous is ever tested here: serial can send a keystroke but not
+        // a *held* one -- there is no make without a break -- so a game that
+        // reads held keys is a game no harness can drive. `win keys` sends
+        // events; this sets state.
+        //
+        // Held keys survive across commands on purpose, and the point is that
+        // where something ends up becomes arithmetic rather than an opinion
+        // about a screenshot.
+        //
+        // **They do not survive into `doom play`, and this said they did.**
+        // `play::run` clears the down-map on entry -- deliberately, because a
+        // key the operator was leaning on is not a key the player pressed --
+        // and then applies its own script. So `keys hold w` before it is
+        // silently discarded; the keys go in the command instead,
+        // `doom play 2000 w`, or with a time, `doom play 4000 w use@1500`.
+        // The claim cost a run that reported a player who never moved.
+        "keys" => {
+            use crate::dev::kbd;
+            let mut it = rest.split_whitespace();
+            let verb = it.next().unwrap_or("");
+            let named = |n: &str| -> Option<u8> {
+                Some(match n {
+                    "w" => kbd::SC_W,
+                    "a" => kbd::SC_A,
+                    "s" => kbd::SC_S,
+                    "d" => kbd::SC_D,
+                    "left" => kbd::SC_LEFT,
+                    "right" => kbd::SC_RIGHT,
+                    "up" => kbd::SC_UP,
+                    "down" => kbd::SC_DOWN,
+                    "shift" => kbd::SC_LSHIFT,
+                    "ctrl" => kbd::SC_LCTRL,
+                    "space" => kbd::SC_SPACE,
+                    "esc" => kbd::SC_ESC,
+                    _ => return None,
+                })
+            };
+            match verb {
+                "hold" | "release" => {
+                    let down = verb == "hold";
+                    let mut any = false;
+                    for n in it {
+                        match named(n) {
+                            Some(c) => {
+                                kbd::force_down(c, down);
+                                any = true;
+                                kprintln!("  {} {}", if down { "holding" } else { "released" }, n);
+                            }
+                            None => kprintln!("  no key called '{}'", n),
+                        }
+                    }
+                    if !any {
+                        kprintln!("  usage: keys hold|release w a s d left right up down shift ctrl space esc");
+                    }
+                }
+                "clear" => {
+                    kbd::clear_down();
+                    kprintln!("  nothing held");
+                }
+                "" | "status" => {
+                    let names = [
+                        ("w", kbd::SC_W), ("a", kbd::SC_A), ("s", kbd::SC_S), ("d", kbd::SC_D),
+                        ("left", kbd::SC_LEFT), ("right", kbd::SC_RIGHT),
+                        ("up", kbd::SC_UP), ("down", kbd::SC_DOWN),
+                        ("shift", kbd::SC_LSHIFT), ("ctrl", kbd::SC_LCTRL),
+                        ("space", kbd::SC_SPACE), ("esc", kbd::SC_ESC),
+                    ];
+                    let mut held = alloc::string::String::new();
+                    for (n, c) in names.iter() {
+                        if kbd::is_down(*c) {
+                            if !held.is_empty() {
+                                held.push(' ');
+                            }
+                            held.push_str(n);
+                        }
+                    }
+                    if held.is_empty() {
+                        kprintln!("  nothing held");
+                    } else {
+                        kprintln!("  held: {}", held);
+                    }
+                }
+                other => kprintln!("  no such action: {}  (try: hold, release, clear, status)", other),
+            }
+        }
         "win" => {
             use crate::gfx::desk;
             let mut it = rest.split_whitespace();
             match it.next().unwrap_or("") {
                 "" | "list" => {}
                 "next" => desk::cycle(false),
+                // Every gesture needs a typed equivalent: serial cannot hold
+                // Alt and Shift, and a control with no typed form never gets
+                // tested.
+                "prev" => desk::cycle(true),
+                // The typed equivalent of the wheel over the terminal. Serial
+                // cannot inject PS/2 packets, so a scrollback reachable only
+                // by a wheel is a scrollback nothing ever checks -- the same
+                // reason `win keys` exists at all.
+                "scroll" => {
+                    let arg = it.next().unwrap_or("");
+                    let by: isize = match arg {
+                        "end" | "" => -(crate::gfx::console::view_of(
+                            crate::gfx::console::USER,
+                        ) as isize),
+                        n => n.parse().unwrap_or(0),
+                    };
+                    let moved = crate::gfx::console::scroll_view(
+                        crate::gfx::console::USER,
+                        by,
+                    );
+                    // Read *before* printing. `kprintln!` writes, and every
+                    // write snaps the view back to the tail -- so a message
+                    // that read the view while rendering itself would always
+                    // report zero, which is exactly what it did.
+                    let now = crate::gfx::console::view_of(crate::gfx::console::USER);
+                    let kept = crate::gfx::console::history_of(crate::gfx::console::USER);
+                    if moved {
+                        desk::draw();
+                    }
+                    kprintln!("  {} row(s) back of {} kept", now, kept);
+                }
                 // Focus the terminal without reaching for the mouse.
                 //
                 // `open` leaves the new window focused on purpose, which is
@@ -4379,11 +5511,70 @@ fn execute(line: &str, boot: &BootInfo, acpi: &Option<Acpi>, interp: &mut aiksi:
                 // how the first test of an application deleted the item it had
                 // just added.
                 "term" => desk::focus_terminal(),
+                // Clearing the screen, and clearing the screen around one
+                // thing. Neither is the other with an argument, so they are
+                // two verbs. Minimised and not closed -- the terminal and the
+                // Program Manager are `closable: false`, and a command that
+                // destroyed the shell to tidy the screen would be one nobody
+                // could come back from.
+                "only" | "solo" => desk::minimise_others(),
+                "min" | "hide" => {
+                    if !desk::minimise_focused() {
+                        kprintln!("  nothing focused");
+                    }
+                }
+                "clear" | "none" => {
+                    desk::minimise_all();
+                    desk::draw();
+                }
                 // `win round [n]` -- the focused window's corner radius, 0 for
                 // a plain rectangle. Exposed on the shell rather than settled
                 // in the theme because whether rounded corners belong on a
                 // desktop that otherwise looks like 98 is a taste question,
                 // and the mechanism should not depend on the answer.
+                // Tiling. The gesture an operator arriving from any modern
+                // desktop tries first, and the one `snap_release` could only
+                // half answer because a drag has no keyboard.
+                "tile" => {
+                    use desk::Tile;
+                    let which = it.next().unwrap_or("grid");
+                    let t = match which {
+                        "left" | "l" => Some(Tile::Left),
+                        "right" | "r" => Some(Tile::Right),
+                        "tl" | "topleft" => Some(Tile::TopLeft),
+                        "tr" | "topright" => Some(Tile::TopRight),
+                        "bl" | "bottomleft" => Some(Tile::BottomLeft),
+                        "br" | "bottomright" => Some(Tile::BottomRight),
+                        "full" | "max" => Some(Tile::Full),
+                        _ => None,
+                    };
+                    match t {
+                        Some(t) => match desk::tile_focused(t) {
+                            true => kprintln!("  tiled {}", which),
+                            false => kprintln!("  no focused window"),
+                        },
+                        None if which == "grid" || which == "all" => {
+                            match desk::tile_all() {
+                                0 => kprintln!("  nothing to tile"),
+                                n => kprintln!("  {} window(s) into a grid", n),
+                            }
+                        }
+                        // The workbench, by name. Without this the only way
+                        // back to it was `mind open`, which re-opens the four
+                        // windows rather than re-placing them -- so the
+                        // workspace's own "Grid" button was a one-way door out
+                        // of the layout `tile_workspace`'s doc argues for.
+                        None if which == "workspace" || which == "work" => {
+                            match desk::tile_workspace("Workflows", "Ask", "Agent", "Improve") {
+                                0 => kprintln!("  the workspace is not open -- 'mind open'"),
+                                n => kprintln!("  {} window(s) back to the workbench", n),
+                            }
+                        }
+                        None => kprintln!(
+                            "  usage: win tile left|right|tl|tr|bl|br|full|grid|workspace"
+                        ),
+                    }
+                }
                 "round" => {
                     let r: u32 = it.next().and_then(|w| w.parse().ok()).unwrap_or(12);
                     match desk::set_round(r) {
@@ -4455,11 +5646,334 @@ fn execute(line: &str, boot: &BootInfo, acpi: &Option<Acpi>, interp: &mut aiksi:
                 }
                 other => {
                     kprintln!("  no such action: {}", other);
-                    kprintln!("  usage: win [list|next|open <panel>|keys <spec>]");
+                    kprintln!(
+                        "  usage: win [list|next|prev|term|only|min|clear|scroll <n>|open <panel>|keys <spec>]"
+                    );
                     return;
                 }
             }
             desk::trace("windows");
+        }
+        "linux" => {
+            use crate::linux;
+            let mut words = rest.split_whitespace();
+            match words.next().unwrap_or("") {
+                "run" => {
+                    let Some(path) = words.next() else {
+                        kprintln!("  usage: linux run <path to an ELF in the namespace>");
+                        return;
+                    };
+                    let Some(bytes) = crate::sysbox::read_blob(path) else {
+                        kprintln!("  no such blob: {}", path);
+                        return;
+                    };
+                    // Everything after the path is the guest's argv, with the
+                    // path itself as argv[0], which is what a program expects
+                    // and what busybox dispatches on.
+                    let mut argv: alloc::vec::Vec<&str> = alloc::vec![path];
+                    argv.extend(words.clone());
+                    match linux::load::load(&bytes, &argv) {
+                        Ok(mut g) => {
+                            console::set_color(YELLOW);
+                            kprintln!(
+                                "[linux] {} byte(s), {} segment(s), {} byte span at {:#x}, entry {:#x}",
+                                bytes.len(), g.segments, g.span, g.base, g.entry
+                            );
+                            console::set_color(LTGRAY);
+                            // Which interpreter, and where it went. Said out
+                            // loud because "it ran" and "it ran under the libc
+                            // you meant" are different facts, and on a machine
+                            // carrying two of them the second is the one
+                            // nobody can check any other way.
+                            if let Some(phys) = g.image_backing {
+                                kprintln!(
+                                    "  image mapped at {:#x}, backed by heap pages at {:#x}",
+                                    g.base, phys
+                                );
+                            }
+                            if let Some((path, base, entry)) = &g.interp {
+                                kprintln!(
+                                    "  interpreter {} at {:#x}, its entry {:#x}",
+                                    path, base, entry
+                                );
+                            }
+                            kprintln!(
+                                "  ring 3, one address space -- only its own pages carry the U bit"
+                            );
+                            // Safety: the whole of stage 0 is this call. The
+                            // guest's pages are armed, so a fault at least
+                            // names them.
+                            let r = unsafe { linux::load::run(&mut g) };
+                            let calls = linux::syscall::trace();
+                            for c in &calls {
+                                if let Some(p) = c.path() {
+                                    kprintln!(
+                                        "  {:>3} {:<16} {} -> {}",
+                                        c.nr, linux::syscall::name_of(c.nr), p, c.ret as i64
+                                    );
+                                    continue;
+                                }
+                                kprintln!(
+                                    "  {:>3} {:<16} {:#x} {:#x} {:#x} -> {} {}",
+                                    c.nr,
+                                    linux::syscall::name_of(c.nr),
+                                    c.args[0], c.args[1], c.args[2],
+                                    c.ret as i64,
+                                    if c.served { "" } else { "(unimplemented)" }
+                                );
+                            }
+                            if r & linux::syscall::OVERRAN != 0 {
+                                console::set_color(YELLOW);
+                                kprintln!(
+                                    "  killed for running too long after {} syscall(s), machine intact",
+                                    calls.len()
+                                );
+                                console::set_color(LTGRAY);
+                            } else if r & linux::syscall::FAULTED != 0 {
+                                // Said before the summary line, because the
+                                // address is the whole of what a person wants
+                                // and the vector is what they already knew.
+                                if let (Some(f), Some((at_rip, at_cr2, at_rsp))) =
+                                    (linux::syscall::last_fault(), linux::syscall::fault_where())
+                                {
+                                    let g = f.regs;
+                                    kprintln!("  rip {:#x} in {}", g.rip, at_rip);
+                                    if g.vector == 14 {
+                                        kprintln!(
+                                            "  reached for {:#x}, which is {} (error {:#x})",
+                                            f.cr2, at_cr2, g.err
+                                        );
+                                    }
+                                    kprintln!("  rsp {:#x} in {}", g.rsp, at_rsp);
+                                    // Every register, each said in words when
+                                    // it points at something the guest owns.
+                                    // Which one matters is not knowable in
+                                    // advance -- the last one that did was
+                                    // `rdi`, holding a null nobody had asked
+                                    // about.
+                                    for (name, v, what) in
+                                        linux::syscall::fault_regs().unwrap_or_default()
+                                    {
+                                        if what.starts_with("nothing") {
+                                            kprintln!("    {} {:#018x}", name, v);
+                                        } else {
+                                            kprintln!("    {} {:#018x}  {}", name, v, what);
+                                        }
+                                    }
+                                    // Only the words that point at something
+                                    // are printed. A stack is mostly saved
+                                    // registers and small integers, and
+                                    // listing those buries the one or two
+                                    // that are addresses -- which are the
+                                    // whole reason to look.
+                                    if let Some(ws) = linux::syscall::fault_stack() {
+                                        for (at, v, what) in ws {
+                                            if !what.starts_with("nothing") {
+                                                kprintln!(
+                                                    "    [rsp+{:#04x}] {:#018x}  {}",
+                                                    at - f.regs.rsp,
+                                                    v,
+                                                    what
+                                                );
+                                            }
+                                        }
+                                    }
+                                }
+                                console::set_color(YELLOW);
+                                kprintln!(
+                                    "  killed by fault {:#04x} after {} syscall(s), machine intact",
+                                    r & 0xFFFF_FFFF, calls.len()
+                                );
+                                console::set_color(LTGRAY);
+                            } else if r & linux::syscall::EXITED != 0 {
+                                kprintln!(
+                                    "  exited {} after {} syscall(s)",
+                                    r & 0xFFFF_FFFF, calls.len()
+                                );
+                            } else {
+                                kprintln!("  returned without exiting -- {} syscall(s)", calls.len());
+                            }
+                        }
+                        Err(why) => {
+                            kprintln!("  will not run it: {}", why);
+                            // Name the path it wanted. The refusal cannot: its
+                            // error type is a `&'static str`, and a message
+                            // about "the interpreter this binary names"
+                            // without the name in it sends somebody looking
+                            // for a file they cannot identify.
+                            if let Some(want) = linux::load::wants(&bytes) {
+                                let here = crate::sysbox::blob_len(&want).is_some();
+                                kprintln!(
+                                    "  it asks for {}, which is {}",
+                                    want,
+                                    if here { "here" } else { "not in the namespace" }
+                                );
+                                if !here {
+                                    kprintln!("  'linux libc' lists what this machine has");
+                                }
+                            }
+                        }
+                    }
+                }
+                "env" => {
+                    let rest: alloc::vec::Vec<&str> = words.collect();
+                    for e in &rest {
+                        linux::syscall::set_env(e);
+                    }
+                    console::set_color(YELLOW);
+                    kprintln!("[env] what the next guest is handed");
+                    console::set_color(LTGRAY);
+                    for e in linux::syscall::environ() {
+                        kprintln!("  {}", e);
+                    }
+                    if rest.is_empty() {
+                        kprintln!("  'linux env K=V' sets one, 'linux env K=' removes it");
+                        kprintln!("  'linux env LD_DEBUG=all' makes ld.so narrate its own work");
+                    }
+                }
+                "space" => {
+                    let arg = words.next().unwrap_or("");
+                    console::set_color(YELLOW);
+                    kprintln!("[space] whether a guest gets a page-table root of its own");
+                    console::set_color(LTGRAY);
+                    match arg {
+                        "on" => linux::load::set_own_space(true),
+                        "off" => linux::load::set_own_space(false),
+                        "" => {}
+                        _ => kprintln!("  'linux space [on|off]'"),
+                    }
+                    if linux::load::own_space() {
+                        kprintln!("  on -- the next guest runs on a root of its own");
+                        kprintln!("  It shares every mapping with the kernel's, so nothing");
+                        kprintln!("  observable should change. That is the test: a fixture");
+                        kprintln!("  behaving identically says the guest lifecycle survives a");
+                        kprintln!("  non-kernel CR3, which has to hold before anything diverges.");
+                    } else {
+                        kprintln!("  off -- guests run on the kernel's root, as they always have");
+                    }
+                }
+                "deadline" => {
+                    let arg = words.next().unwrap_or("");
+                    console::set_color(YELLOW);
+                    kprintln!("[deadline] how long the next guest may run");
+                    console::set_color(LTGRAY);
+                    let hz = crate::TIMER_HZ as u64;
+                    match arg {
+                        "" => {}
+                        "off" => {
+                            linux::syscall::set_limit(0);
+                            kprintln!("  no limit -- a guest that does not return takes the");
+                            kprintln!("  machine, and only a reboot gets it back. This is how");
+                            kprintln!("  a rendered frame gets photographed and it is the only");
+                            kprintln!("  reason it is offered.");
+                        }
+                        n => match n.parse::<u64>() {
+                            Ok(secs) if secs > 0 && secs <= 3600 => {
+                                linux::syscall::set_limit(secs * hz);
+                            }
+                            _ => kprintln!("  'linux deadline <seconds>' up to 3600, or 'off'"),
+                        },
+                    }
+                    let t = linux::syscall::limit();
+                    if t == 0 {
+                        kprintln!("  currently: no limit");
+                    } else {
+                        kprintln!("  currently: {} s ({} ticks)", t / hz, t);
+                    }
+                }
+                "feed" => {
+                    // The only way an event reaches a *running* guest. A
+                    // device opens at the present, so anything typed at the
+                    // prompt beforehand is deliberately not delivered, and
+                    // `drive.py` cannot type while a guest holds the machine.
+                    let spec: alloc::vec::Vec<&str> = words.collect();
+                    let spec = spec.join(" ");
+                    console::set_color(YELLOW);
+                    kprintln!("[feed] scheduled input for the next guest");
+                    console::set_color(LTGRAY);
+                    if spec.is_empty() {
+                        kprintln!("  'linux feed shift@200 -shift@400' arms a script in");
+                        kprintln!("  milliseconds from now, a leading minus being a release.");
+                        kprintln!("  Keys: shift rshift ctrl rctrl up down left right.");
+                        kprintln!("  The modifiers leave nothing in the shell's own input ring;");
+                        kprintln!("  the arrows do, so a script using them costs one junk line.");
+                        kprintln!("  {} still armed", linux::input::armed());
+                        let (t, f, b) = linux::input::feed_stats();
+                        kprintln!("  {} tick(s) seen, {} delivered, base {}", t, f, b);
+                        kprintln!("  now {}", crate::dev::lapic::ticks());
+                    } else {
+                        match linux::input::arm(&spec) {
+                            Ok(n) => kprintln!("  {} step(s) armed", n),
+                            Err(e) => kprintln!("  {}", e),
+                        }
+                    }
+                }
+                "libc" => {
+                    console::set_color(YELLOW);
+                    kprintln!("[libc]");
+                    console::set_color(LTGRAY);
+                    kprintln!("  Nothing here chooses a libc. A binary names its interpreter and");
+                    kprintln!("  the loader loads whatever is at that path, so both may be");
+                    kprintln!("  installed and each program takes its own. What cannot happen is");
+                    kprintln!("  two of them inside one process.");
+                    let mut n = 0;
+                    for (path, what, here) in linux::load::installed() {
+                        if here {
+                            n += 1;
+                            console::set_color(LTGREEN);
+                        } else {
+                            console::set_color(LTGRAY);
+                        }
+                        kprintln!(
+                            "  {:<30} {:<22} {}",
+                            path,
+                            what,
+                            if here { "installed" } else { "absent" }
+                        );
+                    }
+                    console::set_color(LTGRAY);
+                    if n == 0 {
+                        kprintln!("  none of them, so only static binaries run here");
+                    }
+                }
+                "trace" => {
+                    let calls = linux::syscall::trace();
+                    kprintln!("  {} call(s) recorded", calls.len());
+                    for c in &calls {
+                        if let Some(p) = c.path() {
+                            kprintln!(
+                                "  {:>3} {:<16} {} -> {}",
+                                c.nr, linux::syscall::name_of(c.nr), p, c.ret as i64
+                            );
+                            continue;
+                        }
+                        kprintln!(
+                            "  {:>3} {:<16} {:#x} {:#x} {:#x} {:#x} {:#x} {:#x} -> {}",
+                            c.nr, linux::syscall::name_of(c.nr),
+                            c.args[0], c.args[1], c.args[2], c.args[3], c.args[4], c.args[5],
+                            c.ret as i64
+                        );
+                    }
+                }
+                _ => {
+                    console::set_color(YELLOW);
+                    kprintln!("[linux]");
+                    console::set_color(LTGRAY);
+                    kprintln!(
+                        "  the syscall trap is {}",
+                        if linux::syscall::armed() { "armed" } else { "not armed yet" }
+                    );
+                    for (path, what, here) in linux::load::installed() {
+                        if here {
+                            kprintln!("  {} is installed ({})", path, what);
+                        }
+                    }
+                    kprintln!("  linux run <path>   load a binary and run it at ring 3");
+                    kprintln!("  linux libc         which interpreters this machine has");
+                    kprintln!("  linux env [K=V]    what the next guest is handed");
+                    kprintln!("  linux trace        what the last guest asked for");
+                }
+            }
         }
         "tensor" => {
             let ok = crate::ai::selftest();
@@ -4474,6 +5988,176 @@ fn execute(line: &str, boot: &BootInfo, acpi: &Option<Acpi>, interp: &mut aiksi:
         }
         "bench" => crate::ai::bench(),
         "model" => crate::ai::model_demo(),
+        // The pointer, typed.
+        //
+        // Serial cannot inject PS/2 packets, so a capability reachable only by
+        // hand is one nothing ever checks -- the argument `win keys` makes for
+        // the keyboard, and `port bars` makes for anything full-screen. It
+        // goes through `dev::mouse::apply`, which is the single point the PS/2
+        // and USB roads already converge on, so what this injects is
+        // indistinguishable from a real movement by construction rather than
+        // by resemblance.
+        "mouse" => {
+            let mut it = rest.split_whitespace();
+            match it.next() {
+                None | Some("status") => {
+                    let s = crate::dev::mouse::peek();
+                    kprintln!(
+                        "  pointer {}, at {},{}  buttons{}{}",
+                        if crate::dev::mouse::present() { "present" } else { "absent" },
+                        s.x,
+                        s.y,
+                        if s.left { " left" } else { "" },
+                        if s.right { " right" } else { "" }
+                    );
+                }
+                Some("move") => {
+                    let dx = it.next().and_then(|t| t.parse::<i32>().ok());
+                    let dy = it.next().and_then(|t| t.parse::<i32>().ok()).unwrap_or(0);
+                    match dx {
+                        None => kprintln!("  usage: mouse move <dx> [dy]"),
+                        Some(dx) => {
+                            let s = crate::dev::mouse::peek();
+                            crate::dev::mouse::apply(dx, dy, s.left, s.right, 0);
+                            let now = crate::dev::mouse::peek();
+                            kprintln!("  moved {},{} -- pointer now at {},{}", dx, dy, now.x, now.y);
+                        }
+                    }
+                }
+                Some(w @ ("down" | "up" | "click")) => {
+                    let which = it.next().unwrap_or("left");
+                    let right = which == "right";
+                    let down = w != "up";
+                    let s = crate::dev::mouse::peek();
+                    let (l, r) = if right { (s.left, down) } else { (down, s.right) };
+                    crate::dev::mouse::apply(0, 0, l, r, 0);
+                    // A click is a press and a release, and the release has to
+                    // happen: a button left down is a button every later
+                    // command in the script is holding.
+                    if w == "click" {
+                        crate::dev::mouse::apply(0, 0, s.left, s.right, 0);
+                    }
+                    kprintln!("  {} {}", w, which);
+                }
+                Some(other) => kprintln!("  no idea what '{}' is (try: status, move, down, up, click)", other),
+            }
+        }
+        // The seam a ported program reaches this machine through, and the
+        // only way to look at it before there is a program.
+        "port" => {
+            match rest.trim() {
+                "" | "status" => {
+                    kprintln!("  files a ported program can reach:");
+                    let names = crate::port::files::names();
+                    if names.is_empty() {
+                        kprintln!("    (none -- nothing was found on the boot volume)");
+                    }
+                    for n in names {
+                        let len = crate::port::files::get(n).map(|b| b.len()).unwrap_or(0);
+                        kprintln!("    {}  {} B", n, len);
+                    }
+                    kprintln!(
+                        "  clock {}, screen {}",
+                        if crate::port::clock::ready() { "calibrated" } else { "UNCALIBRATED" },
+                        if crate::gfx::exclusive() { "held" } else { "free" }
+                    );
+                    kprintln!("  'port bars' draws a test frame through the surface");
+                }
+                // The whole indexed-frame path, with something a person can
+                // check by looking. Every element of it is exercised -- the
+                // 256-entry palette, the pre-encode into the screen's word
+                // order, the row expansion, the integer scale and the blit --
+                // and if any of them is wrong the picture is wrong in a way
+                // that needs no debugger. A renderer put on top of an untested
+                // present path is two unknowns at once.
+                // `bars` waits for a key; `bars <ms>` returns on its own.
+                //
+                // The bounded form is not a convenience, it is the only way
+                // this is ever tested. `drive.py` sends the next command when
+                // it sees a prompt, and a program that owns the screen until
+                // somebody presses a key never gives the prompt back -- so the
+                // keystroke that would end it is the one command the harness
+                // cannot deliver. The first run of this deadlocked exactly
+                // there, with two commands unsent.
+                //
+                // Every full-screen program that follows needs the same thing.
+                b if b == "bars" || b.starts_with("bars ") => {
+                    let hold_ms: u64 = b
+                        .strip_prefix("bars")
+                        .map(|t| t.trim())
+                        .filter(|t| !t.is_empty())
+                        .and_then(|t| t.parse().ok())
+                        .unwrap_or(0);
+                    crate::port::with_screen(|| {
+                        let Some(mut surf) = crate::port::Surface::new(320, 200) else {
+                            kprintln!("  no framebuffer");
+                            return;
+                        };
+                        // A palette that makes an index legible: sixteen hues
+                        // by sixteen brightnesses, so a wrong byte lands in
+                        // visibly the wrong place rather than merely the wrong
+                        // shade.
+                        for i in 0..256u32 {
+                            let (hue, lev) = (i / 16, i % 16);
+                            let v = (lev * 17) as u8;
+                            let c = match hue {
+                                0 => crate::gfx::Color::new(v, v, v),
+                                1 => crate::gfx::Color::new(v, 0, 0),
+                                2 => crate::gfx::Color::new(0, v, 0),
+                                3 => crate::gfx::Color::new(0, 0, v),
+                                4 => crate::gfx::Color::new(v, v, 0),
+                                5 => crate::gfx::Color::new(0, v, v),
+                                6 => crate::gfx::Color::new(v, 0, v),
+                                7 => crate::gfx::Color::new(v, v / 2, 0),
+                                _ => {
+                                    let k = (hue - 8) as u8 * 32;
+                                    crate::gfx::Color::new(v, k, 255u8.saturating_sub(v))
+                                }
+                            };
+                            surf.set_colour(i as u8, c);
+                        }
+                        // Sixteen by sixteen blocks, one per palette entry, so
+                        // the index at any point on screen is computable by
+                        // eye from its position.
+                        let (w, h) = (surf.width(), surf.height());
+                        {
+                            let px = surf.pixels();
+                            for y in 0..h {
+                                for x in 0..w {
+                                    let cx = x * 16 / w;
+                                    let cy = y * 16 / h;
+                                    px[y * w + x] = (cy * 16 + cx) as u8;
+                                }
+                            }
+                        }
+                        surf.present();
+                        let (ox, oy, sc) = surf.placement();
+                        crate::serial_println!(
+                            "[port] 320x200 at +{},{} scale {}",
+                            ox,
+                            oy,
+                            sc
+                        );
+                        // Held until a key, so the clock has time to fail to
+                        // paint over it -- ten seconds is a hundred chances at
+                        // 10 Hz, and one digit would be visible.
+                        crate::gfx::desk::trace("port bars");
+                        let until = crate::port::clock::now_ms() + hold_ms;
+                        loop {
+                            if crate::dev::kbd::pop_any().is_some() {
+                                break;
+                            }
+                            if hold_ms != 0 && crate::port::clock::now_ms() >= until {
+                                break;
+                            }
+                            unsafe { core::arch::asm!("hlt", options(nomem, nostack)) };
+                        }
+                    });
+                    kprintln!("  done");
+                }
+                other => kprintln!("  no such action: {}  (try: status, bars [ms])", other),
+            }
+        }
         "video" => {
             kprintln!(
                 "  {}x{}  stride {}  {:?}",
@@ -5104,6 +6788,19 @@ fn execute(line: &str, boot: &BootInfo, acpi: &Option<Acpi>, interp: &mut aiksi:
                 kprintln!("  no such file");
             }
         }
+        // Walk every page table entry and report the first the processor
+        // would refuse, plus the four entries governing an address. Exists
+        // because two confident hypotheses about a reserved-bit fault were
+        // both measured and both wrong, and nobody had read the entry.
+        "pagemap" => {
+            let a = rest.trim();
+            let at = if a.is_empty() {
+                None
+            } else {
+                u64::from_str_radix(a.strip_prefix("0x").unwrap_or(a), 16).ok()
+            };
+            mem::paging::report(at);
+        }
         "fault" => {
             console::set_color(LTRED);
             kprintln!("  this will halt the machine.");
@@ -5397,6 +7094,7 @@ fn execute(line: &str, boot: &BootInfo, acpi: &Option<Acpi>, interp: &mut aiksi:
         // does not exist yet, and a command that verified and then did nothing
         // while sounding like it installed something would be worse than no
         // command.
+        "repair" => repair_cmd(rest),
         "update" => update_cmd(rest),
         "words" => {
             console::set_color(YELLOW);
@@ -5979,5 +7677,175 @@ fn fat_cmd(rest: &str) {
             }
         }
         other => kprintln!("  not a fat subcommand: {}", other),
+    }
+}
+
+
+
+fn push_num(s: &mut String, mut v: u64) {
+    if v == 0 {
+        s.push('0');
+        return;
+    }
+    let mut b = [0u8; 20];
+    let mut i = b.len();
+    while v > 0 {
+        i -= 1;
+        b[i] = b'0' + (v % 10) as u8;
+        v /= 10;
+    }
+    for &c in &b[i..] {
+        s.push(c as char);
+    }
+}
+
+/// `wifi`, and the four things an operator can do with a radio.
+///
+/// The passphrase is typed here and **is not stored anywhere**: it goes into
+/// `wpa2::pmk`, which is 4096 rounds of PBKDF2 over it, and the passphrase
+/// itself is dropped when `join` returns. There is no saved-network list on
+/// purpose -- writing one means writing a passphrase into a content-addressed
+/// store where every past root hash still names it.
+fn wifi_cmd(rest: &str) {
+    let mut it = rest.splitn(3, ' ');
+    let sub = it.next().unwrap_or("").trim();
+    let a = it.next().unwrap_or("").trim();
+    let b = it.next().unwrap_or("").trim();
+
+    match sub {
+        "" | "status" => {
+            match crate::net::wlan() {
+                None => crate::net::wifi::report(),
+                Some(w) => {
+                    let (state, secure) = w.status();
+                    kprintln!("  wlan0  {}", state);
+                    kprintln!(
+                        "         {}",
+                        if secure {
+                            "encrypted with a key from the handshake"
+                        } else {
+                            "NOT encrypted -- anything sent is readable in the room"
+                        }
+                    );
+                    let seen = w.networks();
+                    if !seen.is_empty() {
+                        kprintln!("  {} network(s) heard in the last scan:", seen.len());
+                        for n in seen.iter() {
+                            kprintln!(
+                                "    {:<20} {} bars  {}",
+                                n.ssid,
+                                crate::net::wifi::bars(n.rssi),
+                                if n.secured { "secured" } else { "OPEN" }
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        "scan" => match crate::net::wlan() {
+            None => match crate::net::wifi::scan() {
+                Ok(_) => {}
+                Err(why) => kprintln!("  {}", why),
+            },
+            Some(w) => {
+                // A scan is the first half of joining, so it is `join` with no
+                // network named rather than a second path through the same
+                // state machine -- two ways to sweep the channels is two
+                // things to keep agreeing about dwell times and DFS.
+                w.join("", "", crate::net::now_ms());
+                kprintln!("  scanning. 'wifi' in a few seconds to see what answered.");
+            }
+        },
+        "join" => {
+            if a.is_empty() {
+                kprintln!("  usage: wifi join <ssid> [passphrase]");
+                kprintln!("  no passphrase means an open network, and saying so is");
+                kprintln!("  deliberate: a network that turns out to be encrypted is");
+                kprintln!("  refused rather than joined in the clear.");
+                return;
+            }
+            match crate::net::wlan() {
+                None => kprintln!("  no wireless driver. 'wifi' says what is fitted."),
+                Some(w) => {
+                    w.join(a, b, crate::net::now_ms());
+                    kprintln!("  joining {}. 'wifi' to watch it.", a);
+                }
+            }
+        }
+        // A radio with no chip behind it, so the manager and everything under
+        // it can be looked at on a machine with no wireless part. Loud about
+        // what it is, here and in the window, because a list of networks that
+        // do not exist shown the way a real list is shown is the one thing
+        // this must not do.
+        "rehearse" | "rehearsal" => {
+            if a == "off" {
+                let w = &mut crate::net::ifaces()[crate::net::WLAN0];
+                let had = w.nic.is_some();
+                w.nic = None;
+                w.up = false;
+                kprintln!(
+                    "  {}",
+                    if had { "wlan0 is empty again" } else { "wlan0 was already empty" }
+                );
+                return;
+            }
+            if crate::net::ifaces()[crate::net::WLAN0].nic.is_some() {
+                kprintln!("  wlan0 already has a driver. 'wifi rehearse off' first.");
+                return;
+            }
+            let mac = [0x02, 0x47, 0x4C, 0x41, 0x44, 0x53];
+            let r = crate::net::rehearsal::Rehearsal::new(mac);
+            if !crate::net::attach_radio(r) {
+                kprintln!("  refused, which should not happen: a rehearsal radio is SoftMAC");
+                return;
+            }
+            console::set_color(YELLOW);
+            kprintln!("  NOT REAL HARDWARE. A synthetic room, so the stack above the");
+            kprintln!("  radio can be driven on a machine that has no radio.");
+            console::set_color(LTGRAY);
+            for line in crate::net::rehearsal::Rehearsal::room() {
+                kprintln!("    {}", line);
+            }
+            kprintln!("  'network' opens the manager. 'wifi scan' from here, then 'wifi'.");
+        }
+        "frames" => {
+            // Not an operator command so much as a tap for the host-side
+            // checker, and printed rather than returned because a serial line
+            // is the only thing that reaches out of this machine.
+            crate::net::ieee80211::dump();
+            crate::net::ccmp::dump();
+            crate::net::wpa2::dump();
+        }
+        "leave" => match crate::net::wlan() {
+            None => kprintln!("  no wireless driver."),
+            Some(w) => {
+                w.leave_net();
+                kprintln!("  left, and the access point was told rather than left guessing.");
+            }
+        },
+        _ => {
+            kprintln!("  usage: wifi [status] | scan | join <ssid> [pass] | leave");
+            kprintln!("         wifi rehearse [off]   a synthetic room, for when there is no radio");
+            kprintln!("         wifi frames           every frame as hex, for tools/dot11check.py");
+        }
+    }
+}
+
+
+
+
+/// Say what a rate measured under emulation is worth.
+///
+/// The machine says it rather than a person remembering it. Every figure this
+/// tree has ever taken under QEMU is about the host's scheduler and the host's
+/// caches as much as about the guest -- `smp bench` records one core reading
+/// 4570 MB/s alone and 3526 MB/s with seven cores *merely idling* beside it --
+/// and a rate printed without that gets quoted as though it were hardware.
+fn virtual_caveat() {
+    if crate::dev::power::virtualised() {
+        console::set_color(YELLOW);
+        kprintln!("  note     a hypervisor is present, so this is a figure about the host");
+        kprintln!("           as much as about this machine. The real one comes off the GF63.");
+        console::set_color(LTGRAY);
     }
 }

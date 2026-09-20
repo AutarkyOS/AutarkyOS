@@ -250,6 +250,23 @@ impl<T> Spin<T> {
     ///
     /// Only correct for state no interrupt handler touches. Where a handler
     /// does, use `lock_irq`.
+    /// Release a lock whose holder is never coming back.
+    ///
+    /// **For one caller: a guard that has just caught a fault.** Recovery
+    /// abandons whatever the closure was doing, and if it was inside a
+    /// `kprintln!` it abandoned the console locks held. The next acquire then
+    /// spins to `PATIENCE` and panics -- turning a *recovered* fault into a
+    /// fatal one, which is the opposite of the point.
+    ///
+    /// # Safety
+    /// The caller is asserting that no live borrow of the protected value
+    /// exists. That is true exactly when the code that took the lock has been
+    /// longjmped out of and cannot resume. Anywhere else this hands out a
+    /// second `&mut` to something already borrowed.
+    pub unsafe fn force_unlock(&self) {
+        self.locked.store(false, core::sync::atomic::Ordering::Release);
+    }
+
     pub fn lock(&self) -> Guard<'_, T> {
         self.acquire();
         Guard { lock: self, restore: false }

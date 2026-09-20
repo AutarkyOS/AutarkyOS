@@ -23,6 +23,7 @@ size cap; guest RAM still has to cover the weights, so raise --memory.
 """
 
 import codecs
+import os
 import socket
 import subprocess
 import sys
@@ -30,8 +31,16 @@ import time
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
-PORT = 45454
-MONITOR_PORT = 45455
+# Overridable, because these are the one piece of global state a drive run has.
+# Two checkouts of this kernel on one machine -- a fork beside its parent, which
+# is exactly how this distribution gets developed -- both bind these ports, and
+# the second run does not fail cleanly: QEMU cannot bind the monitor and exits,
+# while `-serial ...,wait=on` leaves the *first* project's QEMU listening, so
+# drive.py connects to it and captures a boot log from somebody else's kernel.
+# That reads as this tree's binary having mysteriously reverted, and it cost a
+# session to work out. Set AUTARK_PORT (the monitor takes the next number).
+PORT = int(os.environ.get("AUTARK_PORT", "45454"))
+MONITOR_PORT = PORT + 1
 PROMPT = b"autark> "
 
 
@@ -145,6 +154,23 @@ def capture(dest):
         print("[drive] screendump produced nothing", file=sys.stderr)
         return
 
+    w, h = ppm_to_png(ppm, dest)
+    print(f"[drive] screenshot {dest} ({w}x{h})")
+
+
+def ppm_to_png(ppm, dest):
+    """Convert one QEMU screendump, and answer its size.
+
+    Split out of `capture` because the recorder needs it too, and two copies
+    of a hand-rolled PNG writer is exactly the kind of thing that ends with
+    one of them subtly wrong.
+    """
+    import binascii
+    import struct as _s
+    import zlib
+
+    ppm = Path(ppm)
+    dest = Path(dest)
     raw = ppm.read_bytes()
     # P6 header: magic, width height, maxval -- each possibly separated by any
     # whitespace, with # comments allowed between them.
@@ -186,7 +212,88 @@ def capture(dest):
     # delete the PNG it had just written, and reported success doing it.
     if ppm != dest:
         ppm.unlink(missing_ok=True)
-    print(f"[drive] screenshot {dest} ({w}x{h})")
+    return w, h
+
+
+def record(dest_dir, frames, gap):
+    """Dump a numbered PNG sequence while the guest carries on running.
+
+    A timelapse and not a screen recording, and the distinction is forced by
+    the mechanism: `screendump` is a monitor round-trip that writes a 3 MB PPM,
+    so a few frames a second is the ceiling and anything the machine does in
+    under a second is invisible to it. That is fine for what this is for --
+    the machine writing an application takes minutes, and 120 frames four
+    seconds apart is the whole run in five seconds at 24fps.
+
+    One connection for the whole sequence rather than one per frame: the
+    per-frame cost is otherwise two socket handshakes and `capture`'s 3.5s of
+    conservative sleeping, which is most of the interval.
+    """
+    dest_dir = Path(dest_dir)
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    ppm = dest_dir / "_frame.ppm"
+    try:
+        mon = socket.create_connection(("127.0.0.1", MONITOR_PORT), timeout=5)
+    except OSError as e:
+        print(f"[drive] no monitor: {e}", file=sys.stderr)
+        return
+    kept = 0
+    with mon:
+        mon.settimeout(2.0)
+        try:
+            mon.recv(4096)
+        except OSError:
+            pass
+        for i in range(frames):
+            t0 = time.time()
+            ppm.unlink(missing_ok=True)
+            mon.sendall(f"screendump {ppm.as_posix()}\n".encode())
+            # Waited for by watching the file settle rather than by sleeping a
+            # fixed amount: the dump is asynchronous, and a fixed sleep is
+            # either a torn frame or most of the interval spent idle.
+            #
+            # **And not by waiting for the monitor prompt either**, which was
+            # tried, looks obviously right, and is wrong: QEMU answers `(qemu)`
+            # before the file is flushed and closed, so the converter gets half
+            # a frame and the next iteration cannot even delete it -- on
+            # Windows that is `WinError 32`, the file still being open. The
+            # comment above already said the dump was asynchronous. It was
+            # read as a description of the sleep rather than as the reason for
+            # it, and the correction cost a fifteen-minute run.
+            #
+            # The poll is 30 ms rather than 80 because at four seconds between
+            # frames the difference was invisible and at a tenth of a second it
+            # is most of the budget.
+            size, stable, deadline = -1, 0, time.time() + 5.0
+            while time.time() < deadline:
+                time.sleep(0.03)
+                now = ppm.stat().st_size if ppm.exists() else -1
+                if now == size and now > 0:
+                    stable += 1
+                    if stable >= 2:
+                        break
+                else:
+                    stable = 0
+                size = now
+            try:
+                mon.recv(4096)
+            except OSError:
+                pass
+            if not ppm.exists() or ppm.stat().st_size == 0:
+                continue
+            try:
+                ppm_to_png(ppm, dest_dir / f"f{i:04d}.png")
+            except Exception as e:  # a torn frame is a dropped frame
+                print(f"[drive] frame {i} unreadable: {e}", file=sys.stderr)
+                continue
+            kept += 1
+            if kept % 10 == 0:
+                print(f"[drive] recorded {kept}/{frames}")
+            left = gap - (time.time() - t0)
+            if left > 0:
+                time.sleep(left)
+    ppm.unlink(missing_ok=True)
+    print(f"[drive] recorded {kept} frame(s) into {dest_dir}")
 
 
 # One decoder for the whole session rather than one per socket read.
@@ -206,6 +313,35 @@ def emit(chunk):
     sys.stdout.flush()
 
 
+def ports_held():
+    """Which of the two fixed ports something else already owns.
+
+    Asked *before* launching, because afterwards the failure is invisible. The
+    serial chardev is `server=on,wait=on`, so a second QEMU cannot bind the
+    port and exits -- and the `create_connection` below then succeeds anyway,
+    against the **stale** QEMU that still owns it. What that looks like is a
+    log with no boot output at all followed by a timeout with every command
+    unsent, which reads exactly like a guest that died early.
+
+    The existing `sock is None` guard cannot catch it: a socket was connected,
+    just to the wrong machine. This has cost two sessions, and the second one
+    spent two ten-minute runs on it.
+    """
+    held = []
+    for what, port in (("serial", PORT), ("monitor", MONITOR_PORT)):
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        # Deliberately no SO_REUSEADDR. On Windows it permits binding a port
+        # another process is listening on, which is the opposite of the
+        # question being asked here.
+        try:
+            s.bind(("127.0.0.1", port))
+        except OSError:
+            held.append(f"{what} on {port}")
+        finally:
+            s.close()
+    return held
+
+
 def main():
     # The default cp1252 stdout refuses characters the guest can now print,
     # which kills the session mid-run when output is redirected to a file.
@@ -218,10 +354,25 @@ def main():
         i = argv.index("--screenshot")
         shot = Path(argv[i + 1])
         del argv[i:i + 2]
+
     if "--timeout" in argv:
         i = argv.index("--timeout")
         timeout = int(argv[i + 1])
         del argv[i:i + 2]
+    # Forward a host port into the guest's user-mode network, so a listener
+    # inside the guest -- the honeypot -- can be reached from the host. Repeat
+    # the flag for several. Form: --hostfwd 2222:2222 means host 127.0.0.1:2222
+    # -> guest :2222. This is the only way to drive a passive-open path under
+    # QEMU: the recon *scanner* has no hosts to find behind the NAT, but a
+    # *listener* the host connects into is exactly what user-mode forwarding is
+    # for.
+    hostfwds = []
+    while "--hostfwd" in argv:
+        i = argv.index("--hostfwd")
+        spec = argv[i + 1]
+        del argv[i:i + 2]
+        hp, gp = spec.split(":")
+        hostfwds.append(f"hostfwd=tcp:127.0.0.1:{hp}-:{gp}")
     # A real, writable ESP on a real block device.
     #
     # VVFAT's read-write mode cannot create or delete files, so anything that
@@ -229,6 +380,9 @@ def main():
     # correctly and silently fails to change anything. This boots a raw FAT32
     # image instead, and the guest's writes stay in it across runs, which is
     # what makes the two-boot apply/prove flow observable.
+    esp_on_nvme = "--esp-on-nvme" in argv
+    if esp_on_nvme:
+        argv.remove("--esp-on-nvme")
     esp_image = None
     if "--esp-image" in argv:
         i = argv.index("--esp-image")
@@ -278,6 +432,47 @@ def main():
         i = argv.index("--qemu-extra")
         import shlex
         qemu_extra = shlex.split(argv[i + 1])
+        del argv[i:i + 2]
+    # 1920x1080 instead of whatever mode OVMF picks on its own, which is
+    # 1280x800. A flag and not the default: every figure `video bench` has ever
+    # recorded is at the default mode, and the graphics path is span fills and
+    # a memcmp, so it scales with pixel count -- changing the default would
+    # silently invalidate every one of them.
+    #
+    # `-vga none` first is not optional. `-global VGA.xres=` on the default
+    # device does not set the mode, it breaks it: OVMF then cannot publish a
+    # GOP at all, and the kernel boots with no framebuffer and no message.
+    hd = "--hd" in argv
+    if hd:
+        argv.remove("--hd")
+
+    rec_dir, rec_frames, rec_gap = None, 120, 4.0
+    # When to start, measured from the moment the last command was *sent*.
+    #
+    # Zero means the old behaviour: wait for the prompt to come back. That is
+    # right for a command that returns immediately and leaves the machine
+    # working -- `initiative now`, `author` -- and useless for one that holds
+    # the screen until it is finished, because by then the thing worth
+    # filming is over. `edit` is the second kind.
+    #
+    # Measured from the send and not from the first frame, so it has to cover
+    # whatever the command spends before it draws.
+    rec_after = 0.0
+    if "--record" in argv:
+        i = argv.index("--record")
+        rec_dir = argv[i + 1]
+        del argv[i:i + 2]
+    if "--record-n" in argv:
+        i = argv.index("--record-n")
+        rec_frames = int(argv[i + 1])
+        del argv[i:i + 2]
+    if "--record-after" in argv:
+        i = argv.index("--record-after")
+        rec_after = float(argv[i + 1])
+        del argv[i:i + 2]
+    if "--record-gap" in argv:
+        i = argv.index("--record-gap")
+        rec_gap = float(argv[i + 1])
         del argv[i:i + 2]
     mouse = []
     while "--mouse" in argv:
@@ -373,6 +568,34 @@ def main():
         built = ROOT / "target/x86_64-unknown-uefi/debug/autark.efi"
     if not built.exists():
         raise SystemExit(f"no build artifact under {ROOT / 'target'}; run cargo build first")
+
+    # Freshness guard. drive.py stages whatever binary exists, and a *failed*
+    # build leaves the previous one in place -- so a broken change boots as if
+    # nothing happened, and the run tests stale code silently. This bit twice:
+    # a completion notification read as success, the drive launched, and the
+    # guest ran the last good binary while the log looked like the new one. A
+    # loud warning is enough (not a refusal -- driving an old binary on purpose
+    # is legitimate); the point is that a stale artifact can never again pass
+    # for a fresh one without a line saying so.
+    newest_src, newest_path = 0.0, None
+    for base in ("src", "Cargo.toml", "Cargo.lock", "x86_64-glados.json"):
+        p = ROOT / base
+        if p.is_file():
+            m = p.stat().st_mtime
+            if m > newest_src:
+                newest_src, newest_path = m, p
+        elif p.is_dir():
+            for f in p.rglob("*.rs"):
+                m = f.stat().st_mtime
+                if m > newest_src:
+                    newest_src, newest_path = m, f
+    if newest_src > built.stat().st_mtime:
+        rel = newest_path.relative_to(ROOT) if newest_path else "a source file"
+        print(f"\n[drive] WARNING: {rel} is newer than {built.name} "
+              f"({newest_src - built.stat().st_mtime:.0f}s) -- the build may have "
+              f"failed and this is a STALE binary. Rebuild --release, or ignore "
+              f"if you meant to drive the old one.\n", flush=True)
+
     boot = esp / "EFI/BOOT"
     boot.mkdir(parents=True, exist_ok=True)
     (boot / "BOOTX64.EFI").write_bytes(built.read_bytes())
@@ -472,6 +695,18 @@ def main():
     # classifier is far above it.
     smp = [] if any(a == "-smp" or a.startswith("-smp=") for a in qemu_extra) else ["-smp", "4"]
 
+    # The NVMe test disk `fat` and the corpus-bundle path scan. run.ps1 creates
+    # it on first boot; drive.py referenced it and did not, so a checkout driven
+    # before it was ever run by hand died with "cannot find nvme.img" -- QEMU
+    # refusing to open a drive that was never provisioned. Create it here too,
+    # same 64 MiB empty raw image, so either entry point works from cold.
+    nvme = ROOT / ".qemu/nvme.img"
+    if not nvme.exists():
+        nvme.parent.mkdir(parents=True, exist_ok=True)
+        with open(nvme, "wb") as f:
+            f.truncate(64 * 1024 * 1024)
+        print(f"[drive] created {nvme} (64 MiB)")
+
     args = [
         find_qemu(),
         "-machine", "q35",
@@ -489,9 +724,17 @@ def main():
         # which is the only way to test that the image tools/mkiso.py produces
         # is actually bootable rather than merely well-formed.
         *(["-cdrom", str(iso)] if iso else
+          [] if esp_on_nvme else
           ["-drive", f"format=raw,file={esp_image}"] if esp_image is not None else
           ["-drive", f"format=raw,file=fat:rw:{esp}"]),
-        "-drive", f"file={ROOT / '.qemu/nvme.img'},if=none,id=nvm0,format=raw",
+        # --esp-on-nvme puts the boot volume on the NVMe controller, which is
+        # where it lives on the GF63: one disk, with the ESP as a partition of
+        # it. The default topology has the ESP on its own drive, so the kernel's
+        # own block layer -- which reads NVMe and nothing else -- cannot see the
+        # volume it booted from, and anything that writes the ESP from a running
+        # machine is untestable. OVMF enumerates NVMe as a boot device, so
+        # nothing else has to change.
+        "-drive", f"file={esp_image if esp_on_nvme else ROOT / '.qemu/nvme.img'},if=none,id=nvm0,format=raw",
         "-device", "nvme,serial=GLADOSQEMU0001,drive=nvm0",
         # A USB controller to develop against. QEMU emulates xHCI faithfully
         # enough to bring up rings and enumerate, which is the whole reason the
@@ -500,7 +743,7 @@ def main():
         # Something to enumerate. usb-net is also the eventual goal: a USB
         # network device is what the dongle will look like once its driver
         # exists, so proving enumeration against one is not a detour.
-        "-netdev", "user,id=usbnet",
+        "-netdev", ",".join(["user", "id=usbnet"] + hostfwds),
         "-device", "usb-net,bus=xhci.0,netdev=usbnet",
         "-serial", f"tcp:127.0.0.1:{PORT},server=on,wait=on",
         # The monitor is how a screenshot happens. The serial transcript proves
@@ -509,8 +752,20 @@ def main():
         # nobody has tested.
         "-monitor", f"tcp:127.0.0.1:{MONITOR_PORT},server=on,wait=off",
         "-display", "none",
+        *(["-vga", "none", "-device", "VGA,xres=1920,yres=1080"] if hd else []),
         "-no-reboot",
     ]
+
+    held = ports_held()
+    if held:
+        raise SystemExit(
+            "[drive] " + " and ".join(held) + " already in use.\n"
+            "        Another drive.py, or a QEMU one left behind, still owns "
+            "it.\n"
+            "        Stop that first: this run would otherwise connect to "
+            "*that* guest's\n"
+            "        serial and time out with every command unsent."
+        )
 
     proc = subprocess.Popen(args, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
     sock = None
@@ -651,6 +906,15 @@ def main():
                     # recovery. Capped, and reset by any fresh output.
                     pending = {"line": line, "at": time.time(),
                                "retries": 0, "mark": len(buf)}
+                    # A recording that must start *during* a command rather
+                    # than after it. Blocking, deliberately: the guest is busy
+                    # holding the screen and there is nothing on the serial
+                    # line to miss, and a recorder racing the reader for the
+                    # monitor would tear frames.
+                    if rec_dir and rec_after > 0 and not queue:
+                        time.sleep(rec_after)
+                        record(rec_dir, rec_frames, rec_gap)
+                        rec_dir = None
                     time.sleep(0.2)
                 else:
                     idle_prompts += 1
@@ -676,6 +940,8 @@ def main():
                                     break
                                 if extra:
                                     emit(extra)
+                        if rec_dir:
+                            record(rec_dir, rec_frames, rec_gap)
                         if shot:
                             capture(shot)
                             shot = None

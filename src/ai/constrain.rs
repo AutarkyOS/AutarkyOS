@@ -44,6 +44,17 @@ impl Alphabet {
         Self { pieces }
     }
 
+    /// Build one from literal pieces, so a check can run with no model.
+    ///
+    /// Everything in this module is a pure function of (alternatives,
+    /// vocabulary), and the vocabulary was reachable only through a loaded
+    /// `Tokenizer` -- which put every claim about grammar behaviour behind a
+    /// checkpoint and a forward pass. A synthetic vocabulary is how `costs`
+    /// below gets asserted at boot the way `update::decide` is.
+    pub fn from_pieces<'a>(pieces: impl Iterator<Item = &'a [u8]>) -> Self {
+        Self { pieces: pieces.map(|p| p.to_vec()).collect() }
+    }
+
     pub fn piece(&self, id: usize) -> &[u8] {
         self.pieces.get(id).map(|v| v.as_slice()).unwrap_or(&[])
     }
@@ -220,3 +231,126 @@ pub fn step_bound(g: &Grammar) -> usize {
 
 /// Leading whitespace tokens tolerated before a decode is called stuck.
 pub const MAX_LEADING_SPACES: usize = 4;
+
+/// What it costs the decoder to *say* one alternative.
+///
+/// This exists because of a measurement `repair` made on a two-row table. The
+/// model picked `retry` five times out of six wherever `retry` sat in the
+/// list, and reversing the order changed the answer once -- which rules out
+/// position and leaves the name itself. `retry` is one common English token
+/// and `skip-hwp` is several uncommon pieces, so under a constrained grammar
+/// the cheapest first-token path wins and **a name carries probability mass
+/// that has nothing to do with what it names**.
+///
+/// That is a claim about constrained decoding rather than about repairs, and
+/// the applet grammar is the same machinery over twenty-three rows. Nothing
+/// had ever asked whether the same asymmetry sits in the action space, so this
+/// measures it instead of assuming either way.
+///
+/// It is deliberately **structure only**. Every field here is a property of
+/// (name, vocabulary) and none of them needs a forward pass, so this says what
+/// is *available* to the decoder and never what the decoder does with it. The
+/// half that needs a model -- whether cheap names are actually over-picked --
+/// is a separate measurement and must not be inferred from these numbers.
+pub struct Cost {
+    /// Index into the grammar's alternatives.
+    pub alt: usize,
+    /// Fewest tokens whose bytes concatenate to the whole alternative,
+    /// terminator included. `None` when no path spells it at all, which is a
+    /// name the decoder can never finish.
+    pub min_tokens: Option<usize>,
+    /// A single token spells the name body exactly, terminator aside.
+    ///
+    /// Separate from `min_tokens` because the terminator is a constant every
+    /// alternative pays, so it cannot bias one against another -- while "is
+    /// this name one lexical unit to the tokenizer" is exactly the property
+    /// that separated `retry` from `skip-hwp`.
+    pub body_one_token: bool,
+    /// Distinct vocabulary entries admitted at step 0 that advance toward this
+    /// alternative.
+    ///
+    /// **This is branching and must not be read as "easier".** It was added
+    /// meaning "how much opening mass can flow this way", and the measurement
+    /// showed it mostly counts *prefixes*: a longer name has more of its own
+    /// prefixes in the vocabulary, so `remember` scores 10 against `mv`'s 3
+    /// without being any cheaper to reach -- both cost two tokens. More entry
+    /// points spread the same mass over more first choices rather than
+    /// attracting more of it. Separating the two needs logits, which this
+    /// deliberately does not have.
+    pub first_step: usize,
+}
+
+/// Fewest tokens spelling `alt` end to end, or `None` if nothing does.
+///
+/// A forward dynamic program over byte positions: `best[i]` is the cheapest
+/// way to have produced the first `i` bytes. Every admitted piece is non-empty
+/// so each relaxation strictly advances, which is what makes one forward sweep
+/// enough.
+///
+/// The `i == 0` case mirrors `Cursor::trim_lead` rather than re-deriving it:
+/// byte-level BPE packs the leading space *into* the word, so " ls" is a
+/// single token that spells `ls` from the start and nowhere else. Missing that
+/// would report every name as costing one token more than it does, which is
+/// the exact failure mode `trim_lead`'s own doc records.
+fn min_path(alt: &[u8], alphabet: &Alphabet) -> Option<usize> {
+    let n = alt.len();
+    let mut best: Vec<Option<usize>> = alloc::vec![None; n + 1];
+    best[0] = Some(0);
+    for i in 0..n {
+        let Some(cost) = best[i] else { continue };
+        for id in 0..alphabet.len() {
+            let raw = alphabet.piece(id);
+            let piece = if i == 0 && raw.first() == Some(&b' ') { &raw[1..] } else { raw };
+            // An empty or whitespace-only piece is legal to sample at step 0
+            // and advances nothing, so it can never be on a shortest path.
+            if piece.is_empty() || piece.iter().all(|b| *b == b' ') {
+                continue;
+            }
+            if !alt[i..].starts_with(piece) {
+                continue;
+            }
+            let j = i + piece.len();
+            if best[j].map_or(true, |b| b > cost + 1) {
+                best[j] = Some(cost + 1);
+            }
+        }
+    }
+    best[n]
+}
+
+/// Measure every alternative in a grammar against a vocabulary.
+///
+/// `first_step` goes through `Cursor::advances_toward` rather than repeating
+/// its prefix arithmetic, because a second implementation of "does this token
+/// move toward that alternative" is exactly the pair that stops agreeing.
+pub fn costs(grammar: &Grammar, alphabet: &Alphabet) -> Vec<Cost> {
+    let mut out = Vec::new();
+    for (alt, bytes) in grammar.alternatives.iter().enumerate() {
+        let body = &bytes[..bytes.len().saturating_sub(1)];
+        let mut body_one_token = false;
+        let mut first_step = 0usize;
+        let cursor = Cursor::new(grammar);
+        for id in 0..alphabet.len() {
+            let raw = alphabet.piece(id);
+            let trimmed = if raw.first() == Some(&b' ') { &raw[1..] } else { raw };
+            if !trimmed.is_empty() && trimmed == body {
+                body_one_token = true;
+            }
+            if cursor.advances_toward(alphabet, id, alt) {
+                first_step += 1;
+            }
+        }
+        out.push(Cost {
+            alt,
+            min_tokens: min_path(bytes, alphabet),
+            body_one_token,
+            first_step,
+        });
+    }
+    out
+}
+
+/// The alternatives, for a caller that wants to name what `costs` measured.
+pub fn alternatives(g: &Grammar) -> &[Vec<u8>] {
+    &g.alternatives
+}

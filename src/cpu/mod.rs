@@ -5,6 +5,7 @@
 //! Processor state we own: descriptor tables, control registers, I/O ports.
 
 pub mod code;
+pub mod symbols;
 pub mod percpu;
 pub mod recover;
 pub mod gdt;
@@ -105,6 +106,252 @@ pub fn without_interrupts<R>(f: impl FnOnce() -> R) -> R {
 /// The `xchg` dance around `rbx` is not optional: LLVM reserves that register
 /// internally, so `out("ebx")` is rejected outright. We stash it, run cpuid,
 /// then swap the result out and the original back.
+/// # Safety
+/// Clearing a bit the kernel depends on -- paging, protected mode -- is the
+/// last thing this machine does.
+pub unsafe fn write_cr0(v: u64) {
+    unsafe { asm!("mov cr0, {}", in(reg) v, options(nostack, preserves_flags)) };
+}
+
+/// Drop one page's translation from the TLB.
+///
+/// # Safety
+/// Harmless on any address. Wrong only by omission: a permission change
+/// without this leaves the old translation cached and the change silently
+/// unenforced for as long as the entry survives.
+pub unsafe fn invlpg(at: u64) {
+    unsafe { asm!("invlpg [{}]", in(reg) at, options(nostack, preserves_flags)) };
+}
+
+/// `CR0.WP`. Whether ring 0 respects the read-only bit in a page table entry.
+const CR0_WP: u64 = 1 << 16;
+/// `EFER.NXE`. Whether bit 63 of a page table entry means no-execute.
+const EFER_NXE: u64 = 1 << 11;
+const IA32_EFER: u32 = 0xC000_0080;
+
+/// Make read-only mean read-only, even here.
+///
+/// **Without `CR0.WP`, a write from ring 0 ignores the R/W bit entirely.**
+/// Every instruction in this kernel runs at ring 0, and so does every guest
+/// binary, so a page marked read-only without this is a page marked read-only
+/// in a comment. Turning it on costs nothing today, because the identity map
+/// makes everything writable, and it is what any future read-only page rests
+/// on.
+///
+/// It also catches a class of kernel bug for free, once anything is marked
+/// read-only: writing through a stale pointer into constant data becomes a
+/// fault at the write instead of a wrong answer somewhere later.
+pub fn enable_wp() {
+    unsafe { write_cr0(read_cr0() | CR0_WP) };
+}
+
+pub fn wp_on() -> bool {
+    read_cr0() & CR0_WP != 0
+}
+
+/// The machine's physical address width, from `CPUID.80000008H:EAX[7:0]`.
+///
+/// Asked rather than assumed because it is what decides which bits of a page
+/// table entry are *reserved*, and a check against the wrong width either
+/// waves corruption through or invents it. Answers 36 when the leaf is absent,
+/// which is the architectural minimum and the conservative direction: it
+/// reserves more bits rather than fewer.
+pub fn phys_addr_bits() -> u32 {
+    if cpuid(0x8000_0000, 0)[0] < 0x8000_0008 {
+        return 36;
+    }
+    let bits = cpuid(0x8000_0008, 0)[0] & 0xFF;
+    if (36..=52).contains(&bits) { bits } else { 36 }
+}
+
+/// Whether this part can map a whole gigabyte with one entry.
+/// CPUID.80000001H:EDX[26].
+pub fn gib_pages_supported() -> bool {
+    cpuid(0x8000_0001, 0)[3] & (1 << 26) != 0
+}
+
+/// Whether this part implements no-execute at all. CPUID.80000001H:EDX[20].
+pub fn nx_supported() -> bool {
+    cpuid(0x8000_0001, 0)[3] & (1 << 20) != 0
+}
+
+/// Give this core the same page-rights configuration the bootstrap one has.
+///
+/// **`CR0.WP` and `EFER.NXE` are per-core, exactly as `CR4` and `XCR0` are,
+/// and only the second pair was ever carried over.** The trampoline sets
+/// `EFER.LME` to reach long mode and nothing else, so an application processor
+/// ran with `NXE` off while the bootstrap processor ran with it on -- and bit
+/// 63 of a page table entry is *no-execute* under one and *reserved* under the
+/// other. The same table, read by two cores, one of which faults.
+///
+/// It cost a release gate to find, through two wrong hypotheses. Nothing
+/// showed it while the map was built from 2 MiB pages that never carried the
+/// bit; `diag paging` is the only thing in the tree that writes `NX` into a
+/// 4 KiB entry, and it frees those pages back to the heap, so the next thing
+/// to allocate sixteen megabytes and read it from four cores was `diag smp`.
+/// The audit found nothing because it runs on the bootstrap processor, where
+/// the entry is perfectly legal.
+///
+/// Answers what it managed, so a caller can report a core that is not the same
+/// machine as the others rather than assuming it is.
+pub fn adopt_page_rights() -> (bool, bool) {
+    enable_wp();
+    (wp_on(), enable_nx())
+}
+
+/// Make bit 63 of a page table entry mean no-execute.
+///
+/// Gated on CPUID for the reason `dev::power` gates its MSRs: writing a
+/// reserved bit of `EFER` raises #GP, and every vector but `#BP` here is
+/// fatal. Answers whether it is on afterwards.
+///
+/// Safe to turn on at any point, and this is worth stating because it looks
+/// like it should not be: enabling `NXE` changes the meaning of bit 63 in
+/// every entry that already exists, and nothing in this kernel has ever set
+/// it. So the map means exactly what it meant a moment earlier.
+pub fn enable_nx() -> bool {
+    if !nx_supported() {
+        return false;
+    }
+    unsafe {
+        let efer = rdmsr(IA32_EFER);
+        wrmsr(IA32_EFER, efer | EFER_NXE);
+        rdmsr(IA32_EFER) & EFER_NXE != 0
+    }
+}
+
+pub fn nx_on() -> bool {
+    unsafe { rdmsr(IA32_EFER) & EFER_NXE != 0 }
+}
+
+/// Bytes of the largest cache this processor has, or `None` if it will not say.
+///
+/// **The last-level cache is a resource the miner spends and nothing here
+/// could previously measure.** yespower's working set is two to sixteen
+/// megabytes by construction, so how many jobs run concurrently before they
+/// steal from each other is a property of this number and of nothing else --
+/// and `design/mining.md` planned against 12 MB for a year because somebody
+/// wrote down the wrong processor. The machine is an i7-12650H with 24 MB, so
+/// the budget was half what it should have been.
+///
+/// Read rather than tabulated, for the reason `mem::fixed` gives about the
+/// memory map: a constant here would be a claim about one laptop, asserted in
+/// a kernel meant to boot on another.
+///
+/// CPUID leaf 4 enumerates caches in sub-leaves until it reports type 0. Size
+/// is `ways * partitions * line_size * sets`, each field stored one less than
+/// its value. The largest is taken rather than the one labelled level 3,
+/// because a part with no L3 and a large L2 has a last-level cache all the
+/// same and that is the quantity being asked for.
+pub fn last_level_cache() -> Option<usize> {
+    // Leaf 4 is Intel's. AMD reports the same shape at 0x8000_001D but only
+    // when leaf 0x8000_0001 ECX bit 22 says so, and this has no AMD to test
+    // against -- so it answers `None` there rather than reading a leaf that
+    // may not exist. A refused answer makes the caller fall back to a bound it
+    // can defend; a wrong one silently halves or doubles the budget.
+    if cpuid(0, 0)[0] < 4 {
+        return None;
+    }
+    let mut largest = 0usize;
+    for sub in 0..16 {
+        let r = cpuid(4, sub);
+        let kind = r[0] & 0x1f;
+        if kind == 0 {
+            break;
+        }
+        // 1 data, 2 instruction, 3 unified. An instruction cache is not a
+        // place a miner's working set can live.
+        if kind == 2 {
+            continue;
+        }
+        let line = (r[1] & 0xfff) as usize + 1;
+        let parts = ((r[1] >> 12) & 0x3ff) as usize + 1;
+        let ways = ((r[1] >> 22) & 0x3ff) as usize + 1;
+        let sets = r[2] as usize + 1;
+        let size = line * parts * ways * sets;
+        if size > largest {
+            largest = size;
+        }
+    }
+    if largest == 0 {
+        None
+    } else {
+        Some(largest)
+    }
+}
+
+/// What the hypervisor calls itself, or `None` on bare metal.
+///
+/// **The bit says whether, this says which**, and until now only the bit was
+/// read. `dev::power` has consulted CPUID.1:ECX[31] since it was written, which
+/// is enough to decline an MSR and not enough to tell a QEMU from a VirtualBox
+/// -- so every report from a guest said "hypervisor yes" and left the reader to
+/// ask which one, on a project whose whole install story is about to be "boot
+/// it in a VM".
+///
+/// Leaf `0x40000000` is the convention every hypervisor follows: `eax` is the
+/// highest leaf in the hypervisor range and `ebx:ecx:edx` are twelve bytes of
+/// vendor string. It is **only meaningful when the present bit is set** -- on
+/// bare metal `0x40000000` is above the supported range and the processor
+/// answers with the highest basic leaf instead, which would read as a vendor
+/// string made of whatever that leaf happens to contain.
+///
+/// The string is what the hypervisor chose to say about itself. It can be
+/// configured, and on some it can be hidden entirely, so this is evidence and
+/// never proof -- which is exactly the standing this tree already gives the
+/// present bit it sits beside.
+pub fn hypervisor() -> Option<[u8; 12]> {
+    if cpuid(1, 0)[2] & (1 << 31) == 0 {
+        return None;
+    }
+    let r = cpuid(0x4000_0000, 0);
+    let mut v = [0u8; 12];
+    v[0..4].copy_from_slice(&r[1].to_le_bytes());
+    v[4..8].copy_from_slice(&r[2].to_le_bytes());
+    v[8..12].copy_from_slice(&r[3].to_le_bytes());
+    Some(v)
+}
+
+/// The hypervisor's own name, matched against the strings in the field.
+///
+/// Answers the raw string when nothing matches rather than "unknown", because
+/// a twelve-byte name nobody here recognises is the single most useful thing a
+/// bug report from an unfamiliar setup can carry.
+pub fn hypervisor_name() -> Option<alloc::string::String> {
+    use alloc::string::{String, ToString};
+    let v = hypervisor()?;
+    // Spelled exactly as each one reports it. QEMU answers `TCGTCGTCGTCG` only
+    // when it is interpreting; accelerated by KVM it answers `KVMKVMKVM` and
+    // accelerated by WHPX it answers as Hyper-V, because in both cases the
+    // thing the guest is actually running on is the accelerator rather than
+    // QEMU. So this names the *hypervisor* and not the program that launched
+    // it, which is the honest answer and is not always the one somebody
+    // expects to read.
+    let known: &[(&[u8], &str)] = &[
+        (b"KVMKVMKVM   ", "KVM (QEMU accelerated)"),
+        (b"TCGTCGTCGTCG", "QEMU, interpreting (TCG)"),
+        (b"Microsoft Hv", "Hyper-V or WHPX"),
+        (b"VMwareVMware", "VMware"),
+        (b"VBoxVBoxVBox", "VirtualBox"),
+        (b"XenVMMXenVMM", "Xen"),
+        (b"prl hyperv  ", "Parallels"),
+        (b"bhyve bhyve ", "bhyve"),
+        (b"ACRNACRNACRN", "ACRN"),
+    ];
+    for (sig, name) in known {
+        if v.starts_with(sig) || &v[..] == *sig {
+            return Some(name.to_string());
+        }
+    }
+    let mut raw = String::new();
+    for b in v {
+        if b.is_ascii_graphic() || b == b' ' {
+            raw.push(b as char);
+        }
+    }
+    Some(raw)
+}
+
 pub fn cpuid(leaf: u32, sub: u32) -> [u32; 4] {
     let eax: u32;
     let ebx_slot: u64;

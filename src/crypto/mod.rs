@@ -25,6 +25,7 @@
 
 pub mod aes;
 pub mod bigint;
+pub mod ccm;
 pub mod chacha;
 pub mod hkdf;
 pub mod p256;

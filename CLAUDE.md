@@ -5,19 +5,107 @@ code in this repository.
 
 ## What this is
 
-GLaDOS: a from-scratch, non-Unix, ring-0 operating system in Rust for one
-specific laptop (MSI Thin GF63 12UC, board MS-16R8), built around a language
+AUTARK: a distribution of the [GLaDOS](https://github.com/IlumCI/GLaDOS)
+kernel, which is a from-scratch, non-Unix, ring-0 operating system in Rust for
+one specific laptop (MSI Thin GF63 12UC, board MS-16R8), built around a language
 model that lives *inside* the kernel. No user/kernel split, no syscalls, no
 process isolation, one address space. A tool call from the model is a function
 call.
 
-108 files, roughly 50,000 lines. The only code in the kernel we did not write
-is Rust `core`, and `src/dev/rtl8188eu_tables.rs`, which is the RTL8188EU
+**The kernel is upstream and the question is not.** GLaDOS asked what changes
+when a language model becomes a kernel primitive. AUTARK takes that machine and
+asks a second question on top of it: *does a certificate-based self-improver
+stay honest when the space of things it may propose is left unenumerated, and
+when the criterion that judges it is allowed to move?* The name is autarky --
+self-sufficiency, self-rule.
+
+So most of this file describes a kernel this fork inherited and did not write,
+and a few sections describe the fork itself. Those are `## The one invariant`,
+the unbinding half of `### Self-modification`, and the fork-side paragraphs
+marked in `### The conversation`, `### Crypto` and `### The model`. Read the
+invariant before changing anything under `src/ai/godel.rs` or
+`src/sysbox/guard.rs`.
+
+Version 1.3.0, 153 files, 98,292 lines. The only code in the kernel we did
+not write is Rust `core`, and `src/dev/rtl8188eu_tables.rs`, which is the RTL8188EU
 initialisation tables plus the RF and descriptor register constants, taken
 from Linux's GPL-2.0 rtl8xxxu driver because there is no other source for
 them. It is one file, marked as such at the top, and nothing else in the tree
 is copied from anywhere. `tools/rtlconv.py` regenerates the second half from
 a checkout and states its provenance; the tables came the same way.
+
+**The on-disk formats keep their upstream magics on purpose.** `GLADOSM2`
+checkpoints, the `GLADOSM3` v3 header and its v4 successor, `GLADOSA1`
+adapters, `GLADOSC1` bundles, `GLADOSIG` signatures and `GLADOS_TYPE_GUID` are
+all unchanged, so a converted model or a stored adapter moves between the two
+systems byte for byte. What was renamed is what a *machine* answers to: the
+artifact is `autark.efi`, the ESP payload lives in `\AUTARK\`, and the update
+channel is this fork's. Renaming a magic would cost compatibility to buy
+nothing, so do not "finish" the rename by touching one.
+
+## The one invariant
+
+> **The machine may change anything except the record of what it changed.**
+
+`src/sysbox/guard.rs`. Unbinding a self-improver is only an experiment if it
+produces data, and almost every bound in `godel` can come off and still leave
+something readable. Exactly one class cannot: a loop that can rewrite its own
+history makes "it improved every night for a month" and "it learned to edit the
+ledger" produce byte-identical files, and no amount of care spent on the judges
+recovers the difference. So this is not a safety hedge bolted onto a research
+system; it is the condition under which the other unbindings yield evidence at
+all.
+
+**Append-only and monotone, never read-only.** The obvious rule -- the loop may
+not write these paths -- refuses the record being kept, because the loop is
+what keeps it: `ledger_append` reads the whole file, adds a line and writes it
+back. The rule that admits that and nothing else is a rule about *shape*. Four
+records, listed exactly in `RECORDS`:
+
+| | |
+|---|---|
+| `/ai/godel/ledger.txt` | append-only |
+| `/ai/godel/dispatch.txt` | append-only -- the operator reads the dispatch, not the ledger |
+| `/ai/godel/test-budget` | monotone |
+| `/ai/godel/reported` | monotone |
+| `/ai/mirror/alarms` | append-only -- the Mirror's canary log (see `### The Mirror`) |
+
+Truncation, reordering, a doctored line and emptying all fail the same test and
+none of them had to be enumerated. The fifth record is the same invariant put
+to a second use: a honeytoken tripwire an intruder could erase is no tripwire,
+so a canary alarm is as unrewritable as a self-modification verdict.
+
+**Exact paths and an ancestor rule, not the subtree.** Nodes, the head pointer,
+the `tried` markers, `/ai/godel/judge` and `/ai/godel/floor` are ordinary state
+a trial legitimately rewrites -- protecting `/ai/godel` wholesale would stop the
+loop running while claiming to protect its history. Two ways round an
+exact-path rule were found while wiring it and both are closed: `rm /ai/godel`
+unnames the ledger without the ledger's path appearing in the operation, and
+`mv somedir /ai/godel` grafts over it. Hence `Change::Graft` distinct from
+`Change::Write`, and `above_record`. A third came from the guard's own
+selftest: `/` is spelled without a trailing separator and read as above
+nothing.
+
+**It lives in `sysbox` and not in `godel`,** because `godel` is not the only
+thing that can write -- a judged skill, an authored application, an Aiksi
+program with `Touch::Write`, the agent under `Trust::Full` and the operator's
+own `rm` all reach the namespace through `sysbox`, and every real caller of
+`tree::put` and `tree::remove` is in `sysbox/mod.rs`. A guard living in the
+module it constrains protects against that module's good behaviour only.
+
+**It is a pure function, asserted at boot** in the `the record` section and in
+`diag record`, for the reason `update::decide` is: the interesting verdicts are
+refusals, a refusal that fires in normal running is a bug somewhere else, and a
+guard exercised only by its own good citizens is indistinguishable from one
+that returns `Open` unconditionally. Two of its claims are the ones that make
+the rule mean anything -- that the protected paths are the paths `godel` writes
+(read from `godel`'s own constants, not spelled a second time), and that
+`ledger_append`'s read-modify-write survives the rule.
+
+This is also where the persona is bounded. The character is written to be
+ominous about what it is going to do and is held to exactness about what it
+did: doctrine shapes how a verdict is announced, and the figures in the verdict
+are untouchable.
 
 ## Commands
 
@@ -38,7 +126,7 @@ cargo build            # or --release
 ```
 
 **`drive.py` prefers the release artifact.** It stages
-`target/x86_64-unknown-uefi/release/glados.efi` when one exists and falls back
+`target/x86_64-unknown-uefi/release/autark.efi` when one exists and falls back
 to debug otherwise, so a `cargo build` alone leaves a stale release binary in
 place and the change under test never boots. Build `--release` before driving.
 
@@ -48,7 +136,7 @@ Deploy to the USB SSD, then reboot and hold **F11**:
 .\scripts\deploy.ps1 -EspDrive S: -Release
 ```
 
-`deploy.ps1` builds first and copies both `BOOTX64.EFI` *and* `esp\GLADOS\`
+`deploy.ps1` builds first and copies both `BOOTX64.EFI` *and* `esp\AUTARK\`
 (model, tokenizer, roots). Without `roots.der` TLS encrypts but authenticates
 nothing.
 
@@ -59,8 +147,8 @@ Use the project venv, since there is no Python on PATH:
 ```powershell
 .\tools\venv\Scripts\python.exe tools\traces.py out\traces.jsonl --count 40000 --per-family 300
 .\tools\venv\Scripts\python.exe tools\dataset.py out\corpus.json --rust src\ai\corpus.rs
-.\tools\venv\Scripts\python.exe tools\convert.py tools\qwen3 esp\GLADOS\model.bin --seq 512
-.\tools\venv\Scripts\python.exe tools\tokenizer.py tools\qwen3\tokenizer.json esp\GLADOS\tokenizer.bin --verify
+.\tools\venv\Scripts\python.exe tools\convert.py tools\qwen3 esp\AUTARK\model.bin --seq 512
+.\tools\venv\Scripts\python.exe tools\tokenizer.py tools\qwen3\tokenizer.json esp\AUTARK\tokenizer.bin --verify
 ```
 
 `tools/qwen3/` and `tools/hf/` hold safetensors checkpoints. `convert.py <src>
@@ -74,6 +162,14 @@ at boot.
 Always run `tokenizer.py` with `--verify`. It reimplements the kernel's
 algorithm and diffs it against the reference `tokenizers` library; a tokenizer
 that is subtly wrong produces text that still looks like text.
+
+**Set `PYTHONUTF8=1` for `--verify` on Windows.** The verify cases include
+non-Latin-1 text (a Devanagari string, a combining mark), and the Windows
+console is cp1252, so printing a passing case dies mid-run with
+`UnicodeEncodeError` -- which looks like a tokenizer failure and is not. The
+whole run under `PYTHONUTF8=1 PYTHONIOENCODING=utf-8` prints every case and the
+final `every case matches`. The bare `C:\Python314\python.exe` on PATH has
+numpy for `convert.py`; there is still no project venv.
 
 **Qwen3.5 writes v4.** `convert.py` dispatches on `model_type`:
 `llama`/`qwen2`/`qwen3` take the dense path and still produce a byte-identical
@@ -140,7 +236,7 @@ a running machine. The kernel side is `teach bundle`:
 
 Under QEMU the ESP is VVFAT on a different device from the one `fat` scans, so
 the bundle travels in the NVMe test image; on the GF63 the ESP is a partition
-on the same disk and `fat get` reads it directly from `esp\GLADOS\`.
+on the same disk and `fat get` reads it directly from `esp\AUTARK\`.
 
 **`teach bundle` replaces the corpus, and it has to.** The bundle carries split
 *positions* in its header, and the kernel takes its held-out boundaries from
@@ -264,7 +360,18 @@ replaced by a certificate cheaper to refute than to produce, over
 content-addressed inputs, re-derivable bit for bit by any later run.
 
 ```
-godel [status|now [n]|ledger [n]|rollback|on|off]
+godel                    status: trials, adoptions, the bar, the test budget
+godel now [n]            one trial against the frontier
+godel storm [n]          one prepare, a whole generation, chimeras bred
+godel map                the illumination archive, cell by cell
+godel next               the axes in surprise order, and the epoch position
+godel cross <bar> [flr]  the cross-evaluation matrix, without adopting
+godel judge <bar> [flr]  move the criterion, or refuse and record why
+godel space | forget     what has been drawn; walk it again
+godel ledger [n]         the record
+godel report [all]       the morning dispatch
+godel rule <name>        probe | majority | lexical | withcore
+godel window <from> <to> | rollback | on | off
 ```
 
 Four judges, unanimity required, each a different failure mode:
@@ -290,20 +397,111 @@ and a core the machine wrote were never tried unattended at all -- "search
 space exhausted" was the end of self-improvement, eight points and then
 nothing, every night forever.
 
-`godel::next_proposal` starts from the number of verdicts already recorded and
-takes the first kind from there that has work, so which axis a given night
-takes is a function of the ledger rather than of a coin -- the same
-re-derivability argument that makes `frontier` walk a declared grid. An
-exhausted axis costs one skipped slot rather than an idle night, and the loop
-stops only when every axis is out of moves. Order is cheap-and-declared before
-expensive-and-composed: a grid point and a rule change are minutes, a deep
-trial is two passes over the corpus, and composing a core spends a dozen
-decodes writing something that may not survive its first judge.
+`godel::next_proposal` takes the first kind that has work, so an exhausted axis
+costs one skipped slot rather than an idle night and the loop stops only when
+every axis is out of moves. Which axis it reaches for first was a round-robin
+off the ledger length and is now **Bayesian-surprise ordering**, after
+[2507.00310](https://arxiv.org/abs/2507.00310): belief is a Beta over each
+axis's adoption rate under a Laplace prior (`(adopt + 1) / (att + 2)`, so an
+untried axis reads as exactly a half), and the loop reaches first for the axis
+whose next verdict it can least predict. The trade is fairness for information,
+and it is deliberate. Re-derivability survives because the tallies under
+`/ai/godel/axis` are a function of the record and ties break by slot, so the
+order is total and a later run reconstructs the same one rather than a
+plausible one; Laplace smoothing keeps a saturated axis above zero uncertainty,
+so nothing is starved forever, only made to wait behind what is still live.
 
-`godel next` reports where the rotation stands without taking a turn. It
-deliberately does not ask the last slot whether it has work, because finding
-out costs those decodes -- a command answering "what would you do tonight"
-must not spend the night doing it.
+The composed core stays last whatever the order says, because its cost is in
+*producing* the candidate -- a dozen decodes writing something that may not
+survive its first judge -- so it is reached for only when every cheaper axis is
+spent, never because it looks uncertain.
+
+Smoothing is what stops that becoming starvation -- `+1` over `+2` keeps a
+saturated axis strictly above zero -- and ties break by slot, so the order is
+total and a later run reconstructs the same one rather than a plausible one.
+The composed core is **exempt and always last**: producing its candidate costs
+a dozen decodes, so it is reached for when everything cheaper is out of moves,
+never because it looked uncertain.
+
+The counts come out of the ledger, which could not previously say which axis a
+line came from -- five judges wrote lines in the same shape. Certificates carry
+an `axis=` now, and the line carries the MAP-Elites `cell=` the variant lands
+in, derived at render time from columns already there. Lines written before
+that field count for nothing, which undercounts the early history rather than
+guessing at it: an axis whose record is invisible reads as untried, an untried
+axis is maximally uncertain, so it gets reached for and measured.
+
+On a fresh machine this is a no-op. Every axis is untried, therefore maximally
+uncertain, therefore ties break by slot and `adapter` goes first -- exactly
+what `ledger_len() % KINDS` did.
+
+`godel next` reports where the ranking stands without taking a turn, and says
+whether the bar is frozen or open. It deliberately does not ask the last slot
+whether it has work, because finding out costs those decodes -- a command
+answering "what would you do tonight" must not spend the night doing it.
+
+**The criterion holds still while the agent moves.** A loop that may rewrite
+its own bar at any moment converges on an evaluator that says yes to
+everything, and a ledger full of those adoptions would be *true*. So the bar is
+frozen inside an epoch of `EPOCH_LEN` = 5 trials -- one per other axis -- and
+questionable only at the edge. `is_boundary` is a pure function of ledger
+length, so where the loop stands is re-derivable from the record; genesis is
+excluded, because at length zero there is no agent to protect.
+
+At a boundary the loop may propose a bar in `[0.5, 12.0]` off a declared
+six-point grid. Coarse deliberately: a continuum lets the bar creep down by a
+hundredth a night, every step honestly certified, and the sum of them is
+exactly the drift the axis exists to catch.
+
+`judge_verdict` is pure and asks three questions of a cross-evaluation matrix
+-- the same candidate under both bars, plus a held-out anchor reading neither
+bar can see. **Sane**, finite and in range. **Moves**, the two bars actually
+disagree about this candidate, since a bar that admits and refuses what the
+standing one did is a certificate with no content. And **honest**: loosening is
+admitted only when the newly-admitted variant genuinely improves held-out
+accuracy, tightening only when the newly-refused one genuinely was not a gain.
+Without the third this axis is a machine for lowering its own bar.
+
+All seven outcomes are asserted at boot with no model and no NVMe, the way
+`update::decide` is.
+
+**The price is the test-slice budget, and charging it there is the point.**
+Every other axis reads the anchor after a variant has already won, as
+confirmation. Here the anchor *is* the evidence, because both bars are what is
+under suspicion -- so `read_anchor` spends one read to score both sides, and
+after three a criterion change cannot be grounded at all. The one
+non-renewable resource in the building is what a moving criterion is billed
+against. A bar adopted on a stale read is refused.
+
+**`bar_in_force()` reaches the judges**, or the axis would be a certificate
+about nothing: J1 in `trial`, `trial_deep` and `trial_config` reads it rather
+than `MCNEMAR_95`, which stays the default and the constant. A stored bar
+outside the range is *ignored rather than clamped* -- clamping would let a
+hand-edited file slide the bar to the nearest legal number and report nothing.
+
+**The archive illuminates instead of hill-climbing.** Twelve cells, four rank
+bands crossed with three repair behaviours, where behaviour is the *fraction*
+of touched decisions that were repairs. A variant earns a cell by beating
+whatever is in that cell rather than by beating the champion, so a rank-4
+adapter that repairs a different set of decisions than the rank-32 one survives
+on its own terms instead of being discarded over a margin inside the noise.
+Cells hold addresses in the same DAG the ledger names, so an elite from three
+weeks ago is still reachable and still re-derivable.
+
+`godel storm [n]` is the whole apparatus in one command: one `prepare`, n grid
+points against those cached features, descendants trained from the incumbent,
+chimeras bred by blending the low-rank factors of same-rank survivors (capped
+at six, paired in generation order), everything scored on validation, cell
+winners offered to the archive, and the best of the generation put in front of
+the same J1 the nightly loop uses.
+
+Chimeras carry an honest `Fit` of zero epochs and zero loss because they were
+never trained -- and **averaging factors is not averaging the function they
+compute**, since `B.A` is bilinear. A chimera is a cheap mutation operator that
+lands near two things that worked, which is exactly why it is judged rather
+than assumed. `s` is recomputed rather than blended, because it caches
+`m / |W0 + B.A|` against the frozen rows and a blended one would describe
+neither parent.
 
 Widening this had to come last, and the ordering is the point rather than an
 accident: an axis in the rotation without a judge in front of it is a machine
@@ -378,6 +576,27 @@ and an unbounded one would take the terminal away.
 Adoption is a pointer swap; the parent stays addressed and `godel rollback`
 costs a pointer write. `/ai/godel/ledger.txt` gets a line per trial either way.
 
+**A rollback records itself, and that is a decision about shape rather than a
+line append.** `rollback` used to write nothing, so the record said "adopted X"
+and never "…then reverted X" -- an incomplete history of what the machine
+changed, under a machine whose one invariant is that the record of what it
+changed cannot be lost. It now appends a `revert variant=<from> to=<to>` line
+(`root....` when it detaches to the frozen model), after every restoration has
+succeeded, so a revert the machine could not honour never reaches the record.
+The subtlety is that the ledger is not only a log: `record_seed` hashes it to
+draw the next proposal (U1) and `ledger_len` counts it to place the epoch
+boundary (Red Queen). So both read *verdict lines only* -- `verdict_bytes`
+drops revert lines before the hash and `verdict_count` before the count -- and
+the filter is byte-identical to the raw blob when there are no reverts, so
+every existing lineage re-derives the seed it always did. A revert is on the
+permanent record (`godel ledger` shows it, and it is as append-only as any
+verdict) but invisible to the search, so undoing a thing cannot redirect what
+the loop tries next. Verified live: after a judge adoption and `godel
+rollback`, `godel ledger` shows both the `ADOPT` line and the `revert` line
+while `godel next` still reports one verdict at the same epoch position. A pure
+selftest checks the filter on synthetic ledgers, since the live one is
+append-only and a test must not write to it.
+
 **The test slice carries a budget.** It is consulted only after a variant has
 already won on validation, never to decide whether it won, and the ledger
 counts the reads. Past three, a test figure is printed as stale and marked
@@ -394,11 +613,9 @@ against itself: nothing repaired, nothing broken, rejected, forever.
 
 The fix is not randomness -- determinism is what lets any later run re-derive a
 verdict, which is the claim the module rests on. Instead `trial` takes a
-`Proposal` naming every knob, and `frontier()` walks a declared `GRID` in a
-fixed order, skipping points marked in `/ai/godel/tried`. The search is
-therefore re-derivable rather than merely repeatable: the next point is a
-function of the markers, not a coin. `godel space` shows what is left,
-`godel forget` walks it again.
+`Proposal` naming every knob, and the search is re-derivable rather than merely
+repeatable: the next point is a function of the record, not a coin. `godel
+space` shows what has been drawn, `godel forget` walks it again.
 
 `Proposal::render` uses six decimal places where `Variant::render` uses two.
 A proposal is identified by its rendering alone, so 3e-4 and 2e-4 rendered at
@@ -488,6 +705,194 @@ routing decisions and the rule changes `Verdict::confident` -- how much the
 council will claim, not what it answers. Varying it without a judge that
 measures it would be search without selection.
 
+### U1: the proposal space is no longer enumerated
+
+Upstream, `frontier()` walked a declared `GRID` of eight points and stopped
+when the table ran out. That is re-derivable and its cost is equally plain and
+was recorded in upstream's own notes: **"search space exhausted" was the end of
+self-improvement, eight nights and then nothing, every night forever.**
+
+The obvious repair is a random draw and it is the wrong one, because a verdict
+nobody can re-derive is a verdict nobody can check, which is the property that
+replaced proof here. So the draw is a **pure function of the record**:
+`record_seed()` hashes the ledger's **verdict lines** (see the rollback
+paragraph above: a `revert` line is on the record but excluded from the seed, so
+an undo cannot redirect the draw, and the hash is byte-identical to the whole
+blob on a ledger that has never rolled back), and `draw(seed, n)` derives lr,
+rank, alpha and epochs from SHA-256 of the seed and the attempt number. To
+re-derive night twelve's proposal, hash the verdicts as they stood after night
+eleven. **That is only possible because the ledger is append-only**, so the two
+halves of this fork hold each other up rather than merely coexisting -- a
+machine that could rewrite its history could not re-derive its own search
+either.
+
+`frontier()` is therefore three stages, and the order carries three separate
+arguments:
+
+1. **`GRID` survives as a prefix.** Its first row is upstream's configuration,
+   so the first eight nights of an AUTARK machine reproduce upstream's search
+   exactly and are comparable against it point for point. Deleting it was the
+   first instinct and would have left no night on which the two systems can be
+   compared at all.
+2. **`next_map()`, the archive steering the search** toward the sparsest
+   capacity column. Still a function of the record, since the archive is.
+3. **`draw`, the fallback**, geometric in the rate (a uniform draw over
+   `[0.004, 0.085]` would spend nine tenths of its nights above 0.01, where
+   upstream's grid put two points of eight) and with alpha drawn as a multiple
+   of rank, since `alpha/rank` is the scaling that actually reaches the
+   weights.
+
+The space is **large rather than infinite**, and saying which is the honest
+form: about 200,000 points, which at one a night outlasts the hardware. What
+matters is not that it cannot be exhausted but that it is not *listed*, so
+nothing has to be added to a table for the loop to keep going. `DRAW_TRIES` is
+64 -- a bound on one night's patience and not on the space, because a loop with
+no ceiling is a loop that hangs at 3am with nobody to stop it.
+
+### U3: the criterion can move, and what judges a judge
+
+The interesting one, and the axis the fork is named for. Every other proposal
+changes what the machine *is*; this one changes what "better" *means* -- J1's
+significance bar in `/ai/godel/judge` and its effect-size floor in
+`/ai/godel/floor`. Both are loop-writable and rollback-able, and both are
+deliberately **outside** the append-only records: what the invariant protects is
+the ledger of revisions, not the criterion, so a machine that loosened its own
+criterion cannot also erase having done so.
+
+It cannot be judged by J1, which would be the criterion grading its own
+replacement. What judges it is a **cross-evaluation matrix against a held-out
+anchor no bar can see** (`cross_matrix`, `judge_verdict`). The construction
+comes from [2607.05904](https://arxiv.org/abs/2607.05904), whose finding is
+this fork's thesis proven from the opposite direction: a judge scores
+plausibility, so self-play drives a judge's pass-rate from 0.72 to 0.94 while
+true accuracy sits at 0.20, and even a strict three-judge ensemble accepts 55%
+of hacked answers. Scoring-level defences do not survive; a held-out anchor
+does. This tree already had the ideal one -- routing accuracy on the test slice
+against ground-truth applet labels.
+
+`judge_verdict` is pure, so every outcome is asserted at boot the way
+`update::decide` is. Three questions:
+
+- **sane** -- inside `[JUDGE_MIN, JUDGE_MAX]` = `[0.5, 12.0]` and `[FLOOR_MIN,
+  FLOOR_MAX]` = `[1, 16]`. A bar of zero abolishes the criterion and one too
+  high freezes the loop; both are refused here rather than discovered later as
+  a machine that never changes or never stops. `FLOOR_MIN` is 1 and not 0
+  because J1 already requires `fixed > broke`, so zero and one admit the same
+  candidates.
+- **moves** -- the two criteria actually disagree about the candidate. One that
+  admits and refuses exactly what the standing one did has changed nothing.
+- **honest** -- the change agrees with the anchor. A looser bar passes only if
+  the variant it newly admits genuinely improves held-out accuracy (by
+  `MIN_ANCHOR_GAIN`, 0.01); a tighter bar only if the variant it newly refuses
+  genuinely was no gain. A bar that pleases itself while the anchor stays still
+  is criterion drift wearing a certificate, and it is refused by name.
+
+**Grounding a bar change spends the test budget**, because for this axis the
+anchor *is* the evidence rather than an after-the-fact confirmation. So
+`trial_judge` refuses before paying for a prepare once `test_reads() >=
+TEST_READS`, and once the budget is gone a criterion change cannot be grounded
+at all. Unbinding the judge carries a price and the price is the one
+non-renewable resource in the building.
+
+**The criterion is a pair, and the axis could reach only one half.** This came
+out of a measurement and not a design review. J1 is `fixed > broke && fixed -
+broke >= floor && chi >= tau`, and until `/ai/godel/floor` existed only the
+third clause took the bar the loop was running -- the first read the constant.
+A candidate repairing 2 of 24 validation decisions with none broken, whose
+anchor rose 52.2% to 60.9%, was refused by *every* bar in `[JUDGE_MIN,
+JUDGE_MAX]`, because the floor is evaluated before chi. The axis could move the
+constraint that was not binding while being unable to reach the one that was.
+Almost none of the drift machinery had to change: "moves" and "honest" read
+`admit_old`, `admit_new` and the anchor, which are answers about the candidate
+rather than about which knob produced them.
+
+**Found while wiring that, and worth more than the feature: there were three
+implementations of J1 and they had already drifted.** `godel::trial` read
+`judge_in_force()` while `harness::core_bench` and `work`'s role judge read
+`MCNEMAR_95` and `MIN_FIXED` directly, so from the first adopted bar change a
+core and an adapter were held to different standards while both printed "J1".
+There is one `j1_verdict` now and all three call it. Anything that adds a
+fourth J1 site must call it too.
+
+**Rollback of a criterion change once did not restore the criterion.**
+`rollback`'s `parent: None` arm returns early and the restore sat below that
+return -- and a first-ever adoption writes a root node, so that arm is the
+*only* path a criterion change can roll back through. Unreachable by reading,
+because the branch that is wrong is the branch only a first adoption takes.
+Both arms share one pure function, `criterion_back`, with four claims at boot.
+
+### Open-ended search
+
+Three further changes, each from a 2026 result, each holding the invariant.
+
+**The illumination archive.** The loop used to climb toward one best variant.
+[Heuresis](https://arxiv.org/html/2606.25198) measured what that costs: across
+3,222 runs a greedy top-K search collapses diversity while MAP-Elites keeps the
+best occupant of every cell and wins diversity outright while tying on quality.
+So every variant, adopted or rejected, is offered to a cell keyed by capacity
+and repair profile -- `RANK_BINS` 4 by `REPAIR_BINS` 3 -- and the best of each
+kind is kept. `head` still names what is running; the archive is the map of
+everything that was ever good at something, laid beside it. A cell holds an
+address in the ledger's DAG, so an elite from weeks ago is still reachable and
+still re-derivable. `godel map`.
+
+**Red Queen epochs.** [2606.26294](https://arxiv.org/abs/2606.26294) finds that
+co-evolving an evaluator alongside the agent is stable only under controlled
+utility evolution: the criterion frozen within an epoch, movable only at a
+boundary, or the bar chases the proposals it is meant to judge. So `next_judge`
+answers "spent" inside an epoch whatever the markers say, and at a boundary the
+bar is re-examined *before* the rotation runs. `EPOCH_LEN` is 5, one turn of
+the other five axes, and `is_boundary` is a pure function of ledger length so
+where the loop stands is re-derivable.
+
+**Two defects that were found and closed.** The nightly `JUDGE_GRID` once
+stopped at `(2.00, 2)` while the criterion an operator command proved adoptable
+was `(0.5, 2)`, so the rotation was strictly more conservative than the axis
+could adopt and U3 was decorative unattended. `(JUDGE_MIN, 2)` is in the grid
+now; the change is pure reachability, since `trial_judge` still grounds any
+loosening on the held-out anchor and spends a test read to do it -- the
+grounding gate, not the grid's timidity, is what keeps it honest. And `godel
+status` printing `1 adopted` beside `head: none` was chased to `set_head`
+discarding `write_text`'s result: it now returns `bool`, is `#[must_use]`, and
+the status line distinguishes an adoption that rolled back (the benign, common
+case) from a head write that failed (loud at the moment of adoption). The
+adoption tally is a per-boot event count, not a count of head movements, and
+the status says so.
+
+### The storm
+
+`train::Trial`'s load-bearing fact is that below the classifier every hidden
+state is a constant, cached once, after which an epoch costs no forward passes.
+Upstream, every trial paid the expensive half -- a forward pass per example --
+and spent the resulting cache on exactly one candidate.
+
+`godel storm` pays it once and spends it on a whole generation. Three sources
+of candidate share the one cache: the declared `STORM` grid spanning every
+capacity bin, `DESCENT` continuations of the incumbent through `train_masked`
+(children of the reigning mind rather than orphans from zero), and
+**chimeras** -- the elementwise mean of two same-rank adapters with the cached
+scales refreshed against the frozen rows, costing no training and no forward
+passes whatsoever, capped at `CHIMERA_CAP` and bred in generation order so they
+stay deterministic.
+
+Measured under emulation on a nine-example subsample: 585 s of feature caching
+produced thirteen candidates and lit every rank bin in one command, where
+reaching that illumination through single trials costs four separate prepares.
+
+**The tribunal is untouched by all of this.** Every candidate is scored and
+offered to the archive; exactly one goes before the judges, through the same
+`adjudicate` a lone trial uses. The multiple-comparisons cost of taking a
+maximum over a generation is paid where this module always pays it: selection
+happens on validation, the test slice stays behind its budget, and the anchor is
+read only if the winner is adopted. A candidate with non-finite factors is
+offered nowhere -- the judges would catch it at J3, and the archive has no
+judges, so the gate is in `storm` itself.
+
+A storm point is marked tried, so the nightly frontier does not spend a night
+re-deriving what a storm already measured. It is an operator command and
+deliberately absent from the unattended loop, because a storm's wall time on
+real hardware is a figure nobody has measured.
+
 Root certificate bundle, built from the host's store:
 
 ```powershell
@@ -504,9 +909,9 @@ and after `cpu::set_runtime` (the reboot goes through the runtime table).
 Stage one by putting three files on the ESP and rebooting:
 
 ```
-GLADOS/STAGED.EFI     the new image
-GLADOS/STAGED.SIG     its detached GLADOSIG signature
-GLADOS/UPDATE.FLG     any contents; presence is the request
+AUTARK/STAGED.EFI     the new image
+AUTARK/STAGED.SIG     its detached GLADOSIG signature
+AUTARK/UPDATE.FLG     any contents; presence is the request
 ```
 
 **A key is provisioned and the updater is live.** This said "`UPDATE_KEY` is
@@ -632,6 +1037,31 @@ full `convert.py --seq 32768` run, which is how that claim was settled.
 **Verify runs before the stamp**, and that order is not cosmetic: stamping
 changes four bytes, so a digest taken afterwards could never match.
 
+**The image carries the kernel, the weights and their licences, and that is
+the whole list.** Ported engines are measurements: `src/doom/` exists to find
+out whether software written somewhere else survives being brought over, and
+`tools/xash.py` and `tools/guest/spin.c` exist to find out whether a binary
+this kernel did not compile can reach the screen. What they establish is a
+fact about the kernel, and none of them is a thing to install on somebody's
+laptop.
+
+Two mechanisms, and they cover different halves. `payload.py verify` refuses a
+file the manifest does not name, which covers CI because it runs before
+`mkiso.py`. The hand-run case had nothing, so `mkiso.py` now reads the union of
+`payload/*.txt` and refuses to place anything outside it -- an **allowlist**,
+for the reason `eval.rs` gives about `BUILTINS`: a denylist naming `xash*` and
+`*.wad` grants by default, and the first thing it misses is a name like
+`libref_soft.so` with nothing in it saying what it belongs to. `--allow NAME`
+is the deliberate exception, and a file that genuinely belongs gets recorded
+with `payload.py` instead.
+
+The licence half is the durable reason rather than the scope half.
+Xash3D-FWGS is GPL-3.0-or-later and this kernel is not, so shipping it on the
+install image puts obligations on the whole disc that nobody has decided to
+take on; Half-Life's own data is Valve's, under exactly the rule that keeps
+`DOOM1.WAD` out of this repository. Neither is a thing to discover after a
+release is cut.
+
 Two figures worth knowing before adding a payload. The 2B ISO is 1.90 GB
 against GitHub's **2 GB per-asset limit**, so about 100 MB of headroom and a
 larger model does not fit this route. And `HEAP_LADDER`'s 320 MiB is the first
@@ -701,21 +1131,1997 @@ pure function, so all eight of its states are asserted at boot without staging
 anything -- including that an image already on trial refuses to apply a further
 update on top of itself.
 
+### Ported programs, and the seam they reach through
+
+`src/port/` is everything a program written somewhere else may ask of this
+machine: an indexed `Surface` with its own palette, held keys, **relative
+pointer motion**, a monotonic clock, and the bytes of a file. **Anything under a ported tree may name
+`crate::port` and nothing else**, and that is checked rather than intended:
+
+```powershell
+.\tools\venv\Scripts\python.exe tools\portcheck.py
+```
+
+It scans for `crate::x` where x is not `port`, and for `super::super::`, which
+is what somebody writes ten minutes after being told about the first. A line
+with a genuine exception carries `# portcheck: ok` so the exception is in the
+diff rather than achieved by rewording. There is no `build.rs` here and there
+cannot be one, so this runs beside the build the way `tokenizer.py --verify`
+does.
+
+The reason for a seam with one consumer, stated because this tree normally
+refuses to build an interface before there are two: the point of the first
+port is to find out where the boundary is. A port that reaches into `gfx`,
+`kbd`, `sysbox` and `time` wherever it needs them is not a port, it is a
+merge, and the second one starts from nothing.
+
+**The pictures are ported, not redrawn.** `src/doom/pic.rs` is room4doom's
+patch and TEXTURE1/PNAMES decoder, and one line of it is the reason it was
+brought over rather than written from the format description:
+
+```rust
+if y <= top { top += y } else { top = y }
+```
+
+A post's `topdelta` is normally the absolute row it starts at. But a patch
+taller than 254 cannot say row 300 in a byte, so the convention -- DeePsea's,
+and universal since -- is that a delta which does **not rise** above the
+previous one is relative to it. Every published description of the format
+predates that and says the field is simply the row. Writing this from the
+specification gives a decoder correct on every patch in DOOM and wrong on half
+the patches in anything made after 1997, which is the worst kind of wrong: it
+works until it does not, on somebody else's data. `diag doom` asserts exactly
+that case, both directions.
+
+**A texture pixel is an index, not a colour**, so it cannot be darkened by
+arithmetic -- an index scaled by 0.7 is an unrelated colour. The only way to
+shade indexed art is to remap it, and the table that says how is COLORMAP.
+`Art::lighting_colormap` prefers the WAD's own, and checks that it *lights*
+before using it: an identity table is a legal lump, and a renderer trusting one
+draws every wall at full brightness at every distance, which reads exactly like
+a lighting bug in the renderer. `tools/mkwad.py` shipped an identity table for
+a while on the reasoning that a flat picture is obviously flat; it was not, and
+it emits a real one now. Where there is no usable table, one is built by asking
+the palette for the nearest match to each colour dimmed.
+
+**Test it against FreeDoom, and that is not optional any more.** The generated
+WAD is a fixture with two textures in it; a real IWAD has a thousand, and the
+difference found things nothing else could:
+
+```powershell
+# 24 MB, freely licensed, and the release carries a signed CHECKSUM -- verify
+# the SHA-256 against it rather than trusting the transfer.
+.\tools\venv\Scripts\python.exe tools\drive.py --wad out\freedoom\freedoom-0.13.0\freedoom1.wad `
+  --qemu-extra "-accel whpx -cpu max -smp 4" --timeout 600 `
+  "initiative off" "agent stop" "doom view 0 900000"
+```
+
+The WAD is **not in this repository** and must not be: it is 28.8 MB of
+somebody else's art, and the same rule that keeps `DOOM1.WAD` out keeps this
+out. `out/freedoom/` is where it lands.
+
+What the real file exercises that the fixture structurally cannot: **14
+palettes** against one, **963 textures** so `TEXTURE2` is read at all,
+**1,049 patch names**, **`F1_START` nested immediately inside `F_START`** --
+which is the whole reason `pic::classify` counts depth instead of matching one
+spelling -- **654 two-sided linedefs** against one, **681 BSP nodes** against
+one, sector heights spanning 704 units against a flat 128, and `F_SKY1`
+ceilings, which nothing in the fixture has and which the flat reader has to
+decline to draw so the cleared sky shows through.
+
+Every count the kernel printed matched an independent host-side parse exactly,
+including the thing census decomposing to 292. What that decomposition *was*
+is the reason the sprite table stopped being hand-written:
+
+    before   179 drawn, 49 of a doomednum the table does not carry,
+             52 monsters with no rotation-0 lump, 12 invisible
+    after    280 drawn, 12 start(s), 0 of unknown kind, 0 with no picture
+
+**The sprite table is generated, and the hand-written one was the problem.**
+It carried 44 doomednums, on the argument that copying `mobjinfo` would be
+copying a game's content. The argument was sound and the conclusion was wrong:
+a doomednum means what id decided it means, so a *partial* table is not a
+smaller version of the right answer, it is a level with 49 things missing from
+it. `tools/doominfo.py` emits `src/doom/info.rs` -- 967 states, 137 kinds, 118
+doomednums -- and the third figure above is the one worth watching, because it
+would rise again the moment somebody loaded a PWAD with custom things in it,
+which is the honest answer rather than a bug.
+
+The 12 remaining are exactly the four player starts and eight deathmatch
+starts. Those are **placeholders and not things**: positions the map format
+defines, with no `mobjinfo` row, from which nothing ever spawns. A teleport
+destination looks like it belongs with them and does not -- it is a real
+object with a real doomednum whose whole job is to be a marker, and what makes
+it invisible is that its row spawns into `S_NULL`. `S_NULL` carries `sprite:
+TROO, frame: 0` like every other row because the array needs *something*
+there, so a reader trusting the fields would draw an imp on every teleport pad
+in the game.
+
+Three generator mistakes, each recorded where it was fixed, and the pattern in
+them is the useful part -- **the two that would not compile were the cheap
+ones**:
+
+- The flag names were hand-written beside the parsed table. `NotDeathmatch` is
+  spelled `Notdmatch` upstream, so the constant emitted and the constant
+  referred to were different identifiers, which is a build failure. But
+  `Translation` is `0xC000000`, a two-bit colour field and not a bit at all,
+  so a positional list assigning it bit 26 produced a constant that compiled
+  perfectly and meant something else. Names *and* values are read out of
+  upstream's `bitflags` block now, and every flag the table names is checked
+  against the declaration.
+- `speed` is units per tic for a monster and **fixed point** for a missile,
+  one field with two units in it. A rocket reads 655360 where an imp reads 8,
+  which does not fit an `i16` -- the only reason anybody noticed.
+- `mass` is a divisor in the damage thrust, so Commander Keen and the boss
+  brain carry ten million to mean *immovable*. Also not an `i16`, for a
+  completely unrelated reason.
+
+**A thing has a state of its own, and it did not at first.** The first version
+played a kind's spawn cycle as a pure function of the world tic, which draws
+every barrel on the map correctly and is right *only* while every object of a
+kind stays in phase with every other. That holds while nothing joins the level
+late and nothing leaves its cycle, and it stops holding the moment anything
+can be hurt -- a monster in pain is a monster whose animation no longer agrees
+with its neighbour's. So `thing.rs` carries `Obj` with a state pointer and its
+own countdown, `sprite.rs` keys the decoded pictures by **state** rather than
+by kind, and the renderer asks the object which state it is in. On E1M1 that
+is 44 kinds over 66 states, of which 13 animate.
+
+Two details of `P_SetMobjState` worth knowing before touching it. A state with
+`tics == 0` is not a state that shows for no time -- it runs its action and
+falls straight through to the next one, which is how DOOM writes logic into an
+animation, so setting a state is a loop rather than an assignment. And that
+loop is **bounded here where upstream's is not**: id could rely on the shipped
+table having no zero-tic cycle, but this table is *generated*, there is no
+unwinder in this kernel and no watchdog, so an unbounded walk over a bad chain
+is a machine that stops with no message at all.
+
+**There is an inventory, and the pickups that can refuse are the half worth
+having.** `src/doom/player.rs` carries health, armour, ammunition, keys and
+which weapons are owned. The table is keyed by **sprite name**, which is id's
+own choice and looks like a mistake until the reason lands: a dropped weapon
+and a placed one are different objects with different doomednums and the same
+sprite, and "walking over `SHOT` gives you a shotgun" is true of both. A
+medikit at full health stays on the floor; a pocket at 200 bullets leaves the
+clip; a shotgun already owned is still taken, for the shells. A pickup that
+always disappears cannot tell a working rule from `return true`.
+
+Specials 26/27/28 and 32/33/34 are handled, which closed the last gap on
+FreeDoom E1M1: **8 distinct specials on 42 lines, 8 handled, 0 missing**, where
+it was 7 and 4 lines of blue door refused for want of an inventory to check.
+The colour is read off the original special number and the check runs *before*
+anything moves -- a lock tested after the door had been started would open it
+and then report that it had not. A refused door is also not **spent**: clearing
+a once-only special on a refusal would make the door forget it was ever a door
+and refuse forever with the key in hand.
+
+**Shooting is a hitscan, and two deviations are named rather than left to be
+found.** No vertical aim: DOOM's shot carries a slope and a two-sided line
+stops it when the *opening* does not admit it, where here a shot is level. No
+pellet spread, so the shotgun's seven-bullet cone does not exist. And boxes
+rather than circles, twice -- a thing is hit when the ray crosses the *square*
+of its radius and a blast falls off by `max(|dx|,|dy|)` less the radius, both
+of which are DOOM's and both the same square the pickup test uses.
+
+**The rate of fire was predicted wrong and measured right, which is the whole
+argument for measuring.** The obvious reading is that a weapon fires once per
+attack chain, so a pistol's 19 tics would be 1.8 shots a second. A run holding
+the trigger for three seconds fired **eight** shots, not five. `A_ReFire` runs
+on *entry* to its state and restarts the chain there, so that state never
+spends its own tics while the trigger is down: the real cycle is `4+6+4 = 14`
+tics, which is 2.5 shots a second, which is exactly what DOOM's pistol does.
+`weapon::held_cycle` computes it and the claim asserts 14 -- the number is
+never written down, so a table that changed would fail there rather than
+quietly changing how the game plays.
+
+Only the **pistol and chaingun** actually fire; both are one bullet from one
+clip round, which is all the hitscan can do. The rest animate correctly and hit
+nothing, and `Psprite::armed` says which is which. A shotgun wired to fire a
+single bullet would be a bug that looks like a balance decision.
+
+**Monsters look, chase and shoot.** `src/doom/enemy.rs` is DOOM's own AI, and
+the shape of it is the part worth knowing: a monster does not steer. It picks
+one of **eight** compass directions, walks it for a random number of tics, and
+picks again when blocked -- trying the direct route, then the two cardinal
+components, then the way it was already going, then everything else in a
+randomly chosen order, refusing to turn straight around unless nothing works.
+That is why DOOM's monsters catch on doorframes and take corners in two moves.
+Steering them with a heading would look smoother and would not be DOOM.
+
+Three things are deliberately absent and each is named in the file. **No
+infighting**: upstream's `target` is a pointer because a monster hit by another
+turns on it, and here it is a `bool`, because there is one player and monsters
+cannot hurt each other. **No projectiles**: an imp's fireball is a thing with
+momentum and nothing in this port moves under its own power, so the imp chases
+and claws and never throws -- easier than it should be rather than strange.
+And **no sound**, which for once changes behaviour rather than being quiet:
+DOOM wakes monsters by flooding the noise of a shot through connected sectors,
+so `alert` keeps the flood and drops the sound, waking whatever is in the
+player's sector or adjoining it. Without it a monster facing away is deaf.
+
+**The random table is DOOM's, and it is what makes a run repeatable.** It was
+deferred twice with the note that inventing a sequence would produce a game
+that plays differently from every other copy. The larger reason turned out to
+be the harness: `rng::reset` at the top of every run means two runs of one
+script take the same path, and `spent()` reports how much of the table was
+used, so two runs that *disagree* about that number have diverged before
+anything else shows it. Measured: two identical scripts spent 17 draws each and
+reported the same damage to the byte; a third that also fired spent 48.
+
+That number is why a coincidence did not become a claim. Three runs each
+reported exactly **27 damage taken**, which looked like a cap. It was not:
+6 seconds gives 27, 15 gives 57, 30 gives 114 and kills the player. Two short
+runs happened to land on the same total, and the roll counter is what made it
+cheap to find out rather than plausible to assume.
+
+Measured, on the fixture and on FreeDoom E1M1:
+
+    fixture   1 monster, 1 awake, nearest 42 (from 283), 27 damage in 6 s
+    E1M1      53 monsters, 126 damage in 10 s walking forward, PLAYER DIED
+
+The fixture's zombieman is placed *pointed at* the player, and that is not
+decoration: `A_Look` wants sight **and** the player inside its front 180
+degrees, so a monster facing the wall never notices anybody -- which is exactly
+what a broken `A_Look` looks like too. `mkwad.py --verify` asserts the
+placement, the line of sight, and that every one of the 21 frames its state
+chains can reach exists, because a monster missing its death frames dies into
+nothing and one missing its walk frames vanishes the moment it notices you.
+
+**Removal is deferred to the end of a tic**, and it had to be. Actions are
+dispatched by index, and the first version removed objects as it swept -- so an
+index handed out early in a tic named a different object by the end of it, and
+the action most worth dispatching is fired by something on its way off the
+level. `Objs::tick` marks, the caller dispatches, `sweep` takes them. DOOM
+removes its thinkers at the end of a tic for the same reason.
+
+**`port::mouse` is the fifth thing in the seam and the first added because a
+port asked.** It is relative and unclamped, which is the whole reason it
+exists: `dev::mouse` tracks a cursor, so its position stops at the edge of the
+screen -- right for a pointer, fatal for a player, who would turn until they
+faced the right-hand wall and then stop. The accumulator is fed inside `apply`,
+the one point PS/2 and USB HID already converge on. `MOUSE_TURN` is derived and
+not chosen: `G_BuildTiccmd` does `angleturn -= mousex * 8` and `angleturn`'s
+unit is 1/65536 of a turn, so eight of them is 0.0439 degrees. Measured:
+`mouse=400` turned the player from 180 degrees to 162, against 17.6 predicted.
+
+A `mouse` verb exists for the same reason `win keys` does -- serial cannot
+inject PS/2 packets -- and **the play script can release a key** now
+(`fire@200 -fire@400 fire@600`). It had to learn to the moment anything was
+edge-triggered: firing twice needs the trigger let go in between, and no
+held-key model can say that.
+
+**The weapon is drawn from the patch's own offsets and nothing else.** On a
+320 by 200 view DOOM's `R_DrawPSprite` collapses: the screen centre it adds and
+the 160 it subtracts cancel, leaving `x = sx - left` and `y = sy - top`. That
+is why a pistol carries a left offset of -125 and a top of -97 -- those numbers
+are not a nudge, they are the whole of the placement, and a reader that ignored
+them would draw the gun in a corner. Verified by looking, which is the only
+thing that settles it.
+
+**Which frame is showing gets a number, not a screenshot.** `doom play`
+reports how many times a sprite changed picture, and non-zero is the whole
+claim: every part of this can be right -- the chains walked, the durations
+read, the arithmetic asserted at boot -- and the tic never reach the objects,
+which then show their spawn frame forever and look exactly like a level whose
+barrels happen not to move. Measured on E1M1: `140 tics, 13 of 44 kind(s)
+animate, 58 frame change(s)`.
+
+**A claim made from a glance at that frame was wrong, and is recorded here
+because it is the exact error this file spends pages warning about.** A dark
+region left of centre on E1M1 was read as the per-column plane shortcut
+leaving a hole, and asserted as one -- into a release note -- without being
+measured. It is distant geometry shaded almost to black: the pixels are
+`(0,0,0)` and greys, the sky colour is `(0,0,23)`, and the count of
+sky-coloured pixels is *identical* before and after visplanes on both maps.
+Nothing was missing.
+
+The limitation is real in the code and visplanes do fix it; what does not
+exist is a picture of it happening. Judge that change on its differential
+instead: the test map renders **pixel-identical** through the span path, and
+E1M1 differs in 0.8% of pixels, all small shifts from stepping the texture
+coordinate along a span rather than recomputing it per pixel.
+
+**What is ported is the reader, and what is generated is the art. They are
+easy to confuse and worth separating once, plainly.** Ported: the patch
+column-and-post decoder, the TEXTURE1/PNAMES composite reader, the flat and
+sprite namespaces, and the BSP wall algorithm. Generated by `tools/mkwad.py`:
+the palette, the COLORMAP, every patch, every flat, every sprite and the map
+itself. **No byte of id's data is in this repository**, and none ever will be.
+
+This paragraph used to end "the renderer has never once been run against real
+DOOM art ... and 'should' is carrying real weight in that sentence, because
+nothing has tested it." That was true when written and stopped being true the
+day FreeDoom was fetched, and it sat here contradicting the section above it
+for a while afterwards -- which is the ordinary way a file like this goes
+wrong. It needed no change, as the recipe above records.
+
+The generated test WAD carries real column-and-post patches with real
+transparency. The *art* in them is generated -- id's is not ours to ship -- but
+the patterns are chosen so a decoding mistake reads as an obviously wrong
+picture rather than as slightly odd art: a bright marker in the top-left 8x8
+(a flip moves it), mortar courses with joins offset course by course (a
+transposed column smears), a vertical gradient (a reversed `v` is visible even
+where the bricks line up), and a hole, because a solid patch never exercises
+the post loop at all -- a decoder that ignored posts and copied `width *
+height` bytes would pass on one. `doom tex [name]` composes one and blows it up
+to look at, which is the only check that settles a picture decoder.
+
+**Floors and ceilings go through visplanes**, which is DOOM's own structure and
+was not the first shape here. They were drawn column-wise at the moment a wall
+claimed a column, which is a dozen lines against several hundred and cost a
+divide per pixel -- affordable on this machine where it was not on a 486. What
+that shape cannot do is fill a column no seg ever claims, because the fact
+needed is *which columns show this floor* and no column knows it until the walk
+is over. So the walk records into a plane keyed by height, picture and light,
+and the drawing happens afterwards.
+
+Two pieces of it are worth knowing before touching either. `find_plane` shares
+one plane between every surface agreeing on all three keys, which is the whole
+economy of the idea -- one floor seen through four doorways is one plane. And
+`check_plane` forks a second plane with *identical* keys when a claim overlaps
+columns already marked, because a plane holds one top and bottom per column and
+a sector's floor can appear either side of a pillar; without the fork the
+second view silently overwrites the first and loses its floor.
+
+**A flat is 64 by 64 and carries no header at all**, so its size *is* the
+format and the only way to know one is the `F_START`/`F_END` namespace it sits
+in. `pic::classify` is that rule as one function, because it is four conditions
+that all have to hold at once and none fails loudly -- the one that matters
+most is that a marker must begin with `F`, since `S_START` brackets sprites, a
+sprite is a patch, and any patch that happened to be 4096 bytes would be
+adopted as a floor by a rule that only looked for `_START`. Flats are
+*borrowed* from the WAD rather than copied, the opposite of the trade `Pics`
+makes and for the opposite reason: a wall texture is composed from patches and
+has to be built somewhere, while a flat is already exactly the bytes a renderer
+wants. `doom flat [name]` blows one up, and it catches two failures `doom tex`
+cannot -- a flat is addressed by world position, so its coordinates can be
+transposed or one axis mirrored (DOOM negates world y for the row), and neither
+shows on a symmetric picture. `mkwad.py --verify` refuses to emit a flat that
+is symmetric under either.
+
+**A full-screen program's own launch keystroke used to close it.** `wait_or`
+polled the keyboard ring without draining it first, so the Enter that ran
+`doom view` was still queued when the first frame landed and the picture was
+gone before anybody saw it -- which reads as a program that drew nothing rather
+than one that exited. It showed as three screenshot runs in five coming back
+with the desktop already restored, and it is a defect on the keyboard too, not
+an artefact of driving this over a serial line.
+
+`Surface` applies the palette in software, because the framebuffer is 32bpp
+only and there is no mode-setting -- the resolution and format are whatever
+UEFI handed over. It is cheap anyway: the palette is pre-encoded once into the
+screen's word order, a row is expanded into a `u32` scratch and blitted whole
+through `blit_span` (a `copy_nonoverlapping` on the aperture), and integer
+scaling repeats that row rather than rebuilding it. `gfx/paint.rs` has the
+other approach -- run-length plus a `rect` per run -- which is right for a
+drawing program and wrong for a rendered scene where every pixel differs from
+its neighbour.
+
+### Page rights, and whether they are enforced
+
+Two bits decide whether a permission means anything here, and neither was on.
+
+**`CR0.WP` is on now.** Without it a write from ring 0 ignores the R/W bit
+entirely, and every instruction in this kernel runs at ring 0, as does every
+guest binary. A page marked read-only without `CR0.WP` is a page marked
+read-only in a comment. It also catches a class of kernel bug for free once
+anything is read-only: writing through a stale pointer into constant data
+becomes a fault at the write rather than a wrong answer somewhere later.
+
+**`EFER.NXE` is on**, gated on `CPUID.80000001H:EDX[20]` for the reason
+`dev::power` gates its MSRs -- writing a reserved bit of `EFER` raises #GP and
+every vector but `#BP` here is fatal. Boot prints `page rights  wp=1  nx=1`.
+
+Turning both on changes nothing the day it happens, which is the point:
+everything is mapped writable and nothing had ever set bit 63, so the map means
+exactly what it meant a moment earlier.
+
+**The identity map is built from 2 MiB pages, and that is why this was not
+free.** One entry per two megabytes with no page table to walk is exactly right
+for a map that never changes. Changing the rights on one 4 KiB page inside it
+means the 2 MiB entry has to stop existing first, so `split_large` replaces it
+with 512 entries covering the same bytes with the same flags, including
+cacheability, so uncached device memory survives the split. A reader who did not
+know it happened would see no difference, which is what makes it safe to do
+underneath a running kernel.
+
+`paging::protect(at, len, perm)` applies rights per page and `invlpg`s each one.
+Per page rather than a CR3 reload, because a reload flushes every translation in
+the machine and this gets called with a guest's whole heap. Skipping it is the
+failure that matters: the old translation stays cached and the change is
+silently unenforced. `paging::query` reads the tables back rather than a shadow,
+so it cannot disagree with the hardware.
+
+**`diag paging` is 13 claims and one of them faults on purpose.** It makes a
+heap page read-only, writes to it inside `cpu::recover::guard`, and requires the
+fault to arrive and the write not to land. Everything else about page tables can
+be asserted by reading them back; enforcement cannot, and a permission nobody
+has watched the processor refuse is a permission written in a comment. The check
+puts the page back afterwards, because leaving a read-only page in the heap
+poisons whatever asks for it next.
+
+### Ring 3, in one address space
+
+Stage 1. A guest runs at CPL 3 and the identity map stays exactly as it was:
+no second set of page tables, no CR3 swap, no TLB shootdown to design. What
+separates the guest from the kernel is the U bit, and it is on the guest's own
+pages and on nothing else in the machine.
+
+**The GDT grew from five entries to eight, and their order is dictated rather
+than chosen.** `sysret` takes no selectors. It derives them from
+`IA32_STAR[63:48]`: stack is that plus eight, 64-bit code is that plus sixteen,
+both with RPL forced to 3. So the layout is a 32-bit code descriptor nobody
+uses, then user data, then user code, in that sequence. Tidying it gives a
+`sysret` that lands in a data segment. `TSS.rsp[0]` is set for the first time,
+because an interrupt taken in a guest would otherwise push its frame onto the
+guest's own stack.
+
+`diag gdt` checks the bit fields rather than loading anything, because every
+one of these is a silent triple fault: an instant reboot with nothing printed.
+
+**The U bit is ANDed down all four levels**, so a leaf marked user under a
+directory that is not stays unreachable. `protect` therefore opens the PML4,
+PDPT and PD entries along the way when the leaf is going to be user-accessible.
+That is safe for the same reason it is necessary: every other page under those
+directories still has a clear U bit of its own, and the leaf is the gate.
+
+In: `iretq` with a hand-built ring-3 frame. Out: `sysretq`, which was the wrong
+instruction while guests ran at ring 0 and is the right one now. The selectors
+are literals in the assembly because `global_asm!` cannot see a Rust constant,
+so a claim asserts the literals against the constants.
+
+**Two real bugs surfaced only because the guest moved to ring 3.**
+
+`sys_mmap` never marked what it handed out as user-accessible. The loader opens
+the image, stack and break before the guest starts, and a mapping made after
+that is covered by none of them. At ring 0 the U bit meant nothing so this was
+invisible; the first ring-3 guest to call `mmap` took a protection violation
+reading its own memory.
+
+And **a `static mut` written only by assembly can be folded away.**
+`GLADOS_HOST_RSP` is written by `glados_enter_guest` and by nothing in Rust, so
+the optimiser sees an initialiser of zero, no writer, and is entitled to
+constant-fold every read to `false`. It did. The question "is a guest running"
+is an `AtomicBool` that Rust both writes and reads now, and reading the parked
+stack pointer from Rust is gone.
+
+**A guest fault kills the guest and nothing else.**
+
+    linux run /tmp/wild
+      ring 3, one address space -- only its own pages carry the U bit
+      killed by fault 0x0e after 0 syscall(s), machine intact
+
+The guest reached for `0x1000`, which is mapped, kernel-owned and has a clear
+U bit, took a `#PF` at ring 3, and was ended. `mem` answers afterwards and
+`diag paging` still passes, which is the part worth checking: at ring 0 the
+same fault stopped the machine, because a guest sharing an address space with
+the kernel might already have corrupted anything. At ring 3 the kernel is
+intact by construction, so ending the guest is the honest response.
+
+**Getting there took finding an ABI bug that looked like a ring-3 bug for a
+long time.** `syscall::kill` was calling `glados_leave_guest` through its
+`extern "sysv64"` declaration. This target is Windows-ABI, so an ordinary Rust
+function is Microsoft x64, where `xmm6`-`xmm15` are non-volatile; `sysv64`
+treats them as scratch. The compiler therefore spilled all ten across the call,
+a 160-byte `movaps` prologue wanting the stack 16-byte aligned, and on the
+stack a guest fault arrives on it is not. A misaligned `movaps` raises
+`#GP(0)`, which is exactly the fault that was stopping the machine.
+
+`exit_group` never met it, because it leaves from `glados_syscall_dispatch`,
+which is already `sysv64` and so has nothing to preserve. That asymmetry is
+what made it look like ring 3 was at fault. The longjmp is written out inline
+now: no prologue, nothing spilled, no alignment it cannot have.
+
+What settled it was `llvm-objdump` on the image at the faulting RVA, which the
+fault reporter prints. Reasoning about segments and stacks produced four wrong
+hypotheses first; one disassembly produced the answer.
+
+### Running a binary this kernel did not compile
+
+`src/linux/` is stage 0 of multi-binary support, and it is a **measuring
+instrument rather than a loader**. The expensive unknown in porting the Linux
+ABI is not the loader, which is a weekend; it is that Linux has no
+specification you can test against, so a subtly wrong `mmap` flag surfaces as a
+crash in a different subsystem an hour later. gVisor needed 237 of Linux's ~350
+calls to run containers. Before committing to a privilege model or a syscall
+subset, the thing worth owning is a trace of what a real binary actually asks
+for.
+
+**`syscall` traps from ring 0, and that is what makes this possible without
+building a userspace first.** The instruction loads `rip` from `IA32_LSTAR` and
+`cs` from `IA32_STAR[47:32]` whatever the current privilege level, so a guest
+already at CPL 0 traps exactly as one at CPL 3 would. `STAR[47:32]` is set to
+`KERNEL_CS`, and `syscall` derives SS as that plus eight, which is `KERNEL_DS` --
+so the guest lands on the descriptors it was already running under. That is not
+luck; it is what makes a same-ring trap cost nothing to set up.
+
+Three things a real syscall gets that this does not, each written down in
+`syscall.rs` rather than left to be discovered:
+
+- **No stack switch.** There is no privilege transition, so no `rsp0` reload.
+  The stub swaps to a stack of its own before touching anything, so a guest
+  that wrecked its stack pointer still reaches the dispatcher.
+- **That stack is one static, so the handler is not reentrant.** `IA32_FMASK`
+  clears `IF` on entry and stage 0 runs one guest with no threads. Both of
+  those stop being true later.
+- **A hostile guest is not contained.** At CPL 0 it can `wrmsr` and move
+  `LSTAR`, or `mov cr3`, or `cli`. Stage 0 contains bugs, not malice, and a
+  fault *is* the measurement.
+
+Return is **not** `sysret`, which forces CPL 3 on the way out and would drop
+the guest into a privilege level this kernel has no descriptors for. The stub
+restores flags from `r11` and jumps to `rcx`, which is what `sysret` does minus
+the privilege change. `exit_group` is a longjmp: `glados_enter_guest` parks the
+host's stack and callee-saved registers, and `glados_leave_guest` restores them,
+because there is no unwinder here and returning normally from a process that
+has exited is not a thing that can be expressed.
+
+Both of the loader's original refusals are gone, and each went the same way:
+the reason given was true of what the kernel *knew* rather than of the machine,
+and the fix was to make the thing knowable.
+
+- **Fixed-address executables.** An `ET_EXEC` insists on its own addresses,
+  classically `0x400000`, and this kernel is identity-mapped with one address
+  space, so those are real physical bytes. Nothing could answer "does anything
+  own four megabytes at four megabytes" until `mem::fixed` did. See the
+  placement section below.
+- **Dynamically linked binaries.** The entry in the header is not where
+  execution starts, `ld.so` is, and loading one as though it were static jumps
+  into a PLT stub nobody filled in. The answer is not to implement linking, it
+  is to load the linker. See below.
+
+`tools/mkelf.py` builds the fixtures by hand rather than by compiling, for the
+reason `mkwad.py` generates art: the negatives need to differ from the positive
+in **exactly one field**, and no compiler will emit a dynamically linked binary
+otherwise identical to a static one. `--verify` reads each back with a separate
+parser.
+
+```powershell
+.\tools\venv\Scripts\python.exe tools\mkelf.py out\hello.elf
+.\tools\venv\Scripts\python.exe tools\mkelf.py out\dyn.elf --kind dynamic
+.\tools\venv\Scripts\python.exe tools\mkelf.py out\fixed.elf --kind fixed
+.\tools\venv\Scripts\python.exe tools\mkelf.py out\mem.elf --kind memory
+.\tools\venv\Scripts\python.exe tools\mkelf.py out\rogue.elf --kind rogue
+.\tools\venv\Scripts\python.exe tools\mkfat.py .qemu\nvme.img out\hello.elf out\dyn.elf out\fixed.elf
+.\tools\venv\Scripts\python.exe tools\drive.py --qemu-extra "-accel whpx -cpu max" `
+  "initiative off" "fat get /HELLO.ELF /tmp/hello" "linux run /tmp/hello"
+```
+
+Measured, and every figure cross-checks against what `mkelf.py` printed:
+
+    [linux] 185 byte(s), 1 segment(s), 185 byte span at 0x17f5000, entry 0x17f5078
+    hello from ring 0
+        1 write            0x1 0x17f50a7 0x12 -> 18
+      231 exit_group       0x5 0x17f50a7 0x12 -> 0
+      exited 5 after 2 syscall(s)
+
+Entry is base + 120, the buffer is base + 167, `0x12` is the message's 18 bytes,
+and 5 is the exit code it was built with.
+
+**Memory: `brk`, `mmap`, `munmap`, `arch_prctl`.** The four a static musl
+binary reaches before `main`, and three of them carry a decision worth knowing.
+
+`brk` **never returns an error**, because Linux's does not. It answers the
+resulting break, which on failure is the *unchanged* one, and libc decides it
+failed by comparing that against what it asked for. Returning `-ENOMEM` instead
+would hand musl `0xFFFFFFFFFFFFFFF4` as a heap address and it would believe it.
+One honest deviation: the break is a separate region rather than the bytes
+after the image, because in an identity map those bytes belong to whatever the
+frame allocator gave them to. Every allocator asks `brk(0)` and grows from the
+answer, so nothing notices -- but a program assuming adjacency would be wrong.
+
+`mmap` serves anonymous private memory and refuses three things for reasons
+about this machine rather than about the arguments: a file-backed mapping needs
+an fd table that does not exist, `MAP_FIXED` needs an address one address space
+can promise (the same objection that makes the loader decline `ET_EXEC`), and a
+zero length is `EINVAL` because it is `EINVAL` on Linux. `munmap` refuses a
+partial unmap rather than approximating it -- splitting one allocation in two
+is not something the heap underneath can express. A guest that exits still
+holding mappings is the ordinary case, so teardown is where they are actually
+reclaimed.
+
+**`arch_prctl` is where "the guest and the kernel share everything" stops being
+an architectural note and becomes a specific call that has to say no.**
+`ARCH_SET_FS` is honoured, because that is how thread-local storage works and
+musl calls it before `main`; the base goes into `IA32_FS_BASE` and the kernel's
+own value is parked by `run` and restored at teardown, since the register
+belongs to the machine and not to the guest.
+
+`ARCH_SET_GS` is **refused**, and not out of caution. `cpu::percpu` points GS at
+each core's own block and `gs:[0]` is how the allocator discovers which core it
+is billing. There is no privilege boundary here to stop a guest overwriting it,
+so a guest setting GS would leave the next kernel allocation reading its
+thread-local storage as a per-core structure. Reading GS is refused too, for
+the smaller reason that it hands a kernel pointer to code with no business
+holding one.
+
+That restore is checked rather than assumed: `diag census` -- whose first claim
+is "per-core storage is up, so allocations can be attributed" -- passes on a
+boot where a guest has already set FS.
+
+Measured, on the `--kind memory` fixture, which uses every result rather than
+merely receiving it (the break is written to, the mapping is written and read
+back, and FS is set through one call and read through another):
+
+    brk, mmap and arch_prctl all answered; FS read back
+       12 brk              0x0 ...        -> 46190592
+       12 brk              0x2c0e000 ...  -> 46194688
+        9 mmap             0x0 0x2000 0x3 -> 25141248
+      158 arch_prctl       0x1002 ...     -> 0
+      158 arch_prctl       0x1003 ...     -> 0
+       11 munmap           0x17fa000 ...  -> 0
+        1 write            0x1 ... 0x34   -> 52
+      231 exit_group       0x7 ...        -> 0
+      exited 7 after 8 syscall(s)
+
+The break grew by exactly 4096, the mapping came back page-aligned, and exit 7
+is the branch the guest only reaches if the FS base it set came back through
+the call that reads it.
+
+**Every guest pointer is bounds-checked, and that is the whole of the
+hardening.** A guest at ring 0 shares an address space with the kernel, so a
+pointer it passes is not merely possibly-invalid: it is a pointer at anything
+at all, the page tables and the model's weights included. `Space` records every
+range the loader handed out (image, stack, break, and each live mapping) and
+`owns` is asked before any syscall reads or writes through a guest address.
+`EFAULT` otherwise, as Linux has it.
+
+It cannot stop a guest dereferencing a bad pointer *itself*, and nothing at CPL
+0 can. What it stops is the kernel doing it on the guest's behalf, which is the
+difference between a crashed program and a corrupted kernel.
+
+Two calls needed it and neither had it: `write` built a slice straight from
+`rsi`, and `arch_prctl(ARCH_GET_FS)` wrote eight bytes wherever `rsi` pointed,
+which is a kernel-corrupting primitive handed to the program.
+
+`--kind rogue` proves it from the guest's side rather than only in a claim. It
+asks for `0x1000`, which is deliberately a *real, mapped, kernel-owned* page:
+not a wild address that would fault on its own, a valid one the guest has no
+business naming. An unchecked kernel prints whatever lives there.
+
+    both wild pointers were refused with EFAULT
+        1 write        0x1 0x1000 0x10 -> -14
+      158 arch_prctl   0x1003 0x1000 0x10 -> -14
+        1 write        0x1 0x17f511f 0x2c -> 44
+      231 exit_group   0x9 -> 0
+      exited 9 after 4 syscall(s)
+
+**`sys_write` used to swallow bytes and report success.** `for chunk in
+core::str::from_utf8(bytes)` iterates a `Result`, so the body ran zero times on
+the error arm: a guest writing Latin-1 or raw bytes printed *nothing* and still
+got the full length back. That is the worst shape this call can take, because
+the guest has no way to find out. Lossy conversion now.
+
+Three more gates, each closing an arithmetic hole a hostile file could reach:
+a segment whose `vaddr + memsz` overflows is refused at parse, where the field
+is read; an image span over 64 MiB is refused by the loader with a reason about
+the file rather than about the machine; and `mmap` caps its length, because
+page rounding multiplies and would wrap for a length near `usize::MAX`, handing
+back a small allocation for a huge request.
+
+`install` moved from `load` to `run`. A guest that was loaded and never run
+would otherwise leave `SPACE` naming memory freed when its `Guest` dropped, so
+the next thing to consult it would be reading a dangling range it believed it
+had verified.
+
+**`mprotect` is real now, and making it real meant page rights existed.** It
+was unimplemented on purpose, because every page in this kernel was writable
+and executable: answering 0 would have claimed an enforcement that did not
+exist and musl's guard pages would have guarded nothing, while refusing stops
+any real allocator. Both answers were lies. See the page-rights section above
+for the third option.
+
+`PROT_NONE` clears the present bit, so the page genuinely faults. That is what
+a guard page is for, and it is also why `reachable` had to grow: a guest that
+hides a page from itself and then hands the kernel a pointer into it now gets
+`EFAULT` rather than taking the machine down on two entirely legal calls.
+`--kind protect` proves exactly that from the guest's side:
+
+        9 mmap        0x0 0x2000 0x3  -> 46436352
+      158 arch_prctl  0x1003 0x2c49000 -> 0
+       10 mprotect    0x2c49000 0x1000 0x0 -> 0
+      158 arch_prctl  0x1003 0x2c49000 -> -14
+      exited 11 after 6 syscall(s)
+
+`teardown` puts the rights back before freeing. A guest is free to exit having
+mprotected its mappings to something the heap cannot reuse, and handing a
+read-only or absent page back to the allocator would poison it for whatever
+asks next, with the symptom appearing in an unrelated subsystem hours later.
+
+**Every unimplemented call is recorded and refused with `-ENOSYS`, and that is
+the instrument.** A run ending in `-ENOSYS` on call 47 has said which call to
+implement next, which is the question stage 0 exists to answer. The trace is
+bounded at 1024 entries, because what matters is *which* calls appear rather
+than how often.
+
+`linux` reports whether the trap is armed, `linux run <path> [args...]` loads
+and runs, `linux trace` prints what the last guest asked for, `linux libc` says
+which interpreters are installed, and `linux env NAME=VALUE` adds a variable to
+what the next guest is handed. `diag linux` is 134 claims.
+
+**The trace records the path, not only the pointer.** A row read `257 openat
+0x2d23faa 0x0 0x0` and the useful half of it was in the guest's memory, so
+finding out which file a run failed on meant reading a register dump against a
+disassembly. `Call` carries the first 48 bytes of a path argument now, filled
+where the call is recorded rather than where it is dispatched, and `path_arg`
+is the one table saying which register holds one. It named `newfstatat` as the
+call that had silently dropped its flags, in a single run.
+
+### It runs busybox
+
+An unmodified static binary, fetched from busybox.net and touched by nothing
+here, running at ring 3.
+
+    linux run /tmp/busybox uname -a
+    GLaDOS glados 1.3.5 ring 0, with guests at ring 3 x86_64 GNU/Linux
+
+    linux run /tmp/busybox hexdump -C /tmp/lines.txt
+    00000000  61 6c 70 68 61 0a 74 68  65 20 71 75 69 63 6b 20  |alpha.the quick |
+    00000010  62 72 6f 77 6e 20 66 6f  78 0a 62 65 74 61 0a 6a  |brown fox.beta.j|
+    00000020  75 6d 70 73 20 6f 76 65  72 20 74 68 65 20 6c 61  |umps over the la|
+    00000030  7a 79 20 64 6f 67                                 |zy dog|
+
+    linux run /tmp/busybox sha256sum /tmp/lines.txt
+    6ecb6686ad1673a0f3c021fc356890758853980fd6465b3b5a04fd859682733a
+
+**That digest is the one the host computes over the same file**, which is the
+first end-to-end check of this path against an implementation nobody here
+wrote: the bytes went from FAT into the namespace, out through the projection,
+through busybox's own hash at ring 3, and back through `writev`.
+
+**`ET_EXEC` is placed rather than refused, and busybox is why.** Its prebuilt
+is non-PIE with an entry at `0x4038b1`, and so is nearly every prebuilt static
+binary in the world, so the blanket refusal was not a corner case -- it was
+most of the software this loader exists to run. See the placement section
+below.
+
+**Sixty-two syscalls, and not one of them was guessed.** Sixteen applets were
+swept under musl and twenty-eight more under glibc, every gap they named was
+implemented, and nothing else was. That is what stage 0 was built to make
+possible.
+
+The second sweep is the one worth reading, because the surface it named was
+*small*: twenty-eight applets across two boots left exactly three calls
+unserved, and each was answered from something this machine knows rather than
+from a plausible constant. `time` reads the RTC. `sysinfo` reports uptime and
+the kernel heap, and leaves the three load averages **zero rather than
+invented**, because nothing here samples a run queue and a fabricated number
+is read by whatever graphs it. `sched_getaffinity` answers the cores that came
+up at boot -- which is a question about permission rather than about
+capability, so it is honest even though nothing can yet schedule a guest onto
+a second core -- and returns the *bytes it wrote*, which is what a libc uses
+to know how much of a larger `cpu_set_t` it must clear itself.
+
+`rseq` is refused on purpose and is the one refusal in the list. It is a
+per-thread structure the kernel writes to from the scheduler, and answering 0
+without doing that gives glibc a sequence number that never moves. `-ENOSYS`
+is a value glibc's own startup handles; a stale `rseq` area is not.
+
+The shape of the finding was the useful part twice over. `ls` ran perfectly on
+its first attempt -- opened the directory, walked it with two `getdents64`
+calls, `lstat`ed every entry, exited 0 -- and printed nothing at all, because
+everything it had to say went through `writev`. A program that works and is
+silent is the worst shape a missing syscall can take. And `hexdump` reported
+"Function not implemented" about a file it was holding open, because it does
+`dup2(fd, 0)` to read its input as stdin.
+
+**A guest may write, inside `/tmp`.** Writes were refused everywhere on the
+grounds that a write to a content-addressed store is a new root hash, so an
+unrestricted `O_WRONLY` routes a guest binary around every gate `sysbox` puts
+in front of the shell. The reason was sound and what it argued for was a jail
+rather than a refusal. `/tmp` because that is already the scratch area, and
+everywhere else is `EROFS` -- checked on the *resolved* path, so a relative one
+cannot be written to climb out, which works because `resolve` refuses `..`
+outright.
+
+    cp /tmp/lines.txt /tmp/copy.txt  then  ls /tmp
+    busybox  copy.txt  lines.txt  newdir
+    mkdir /ai/nope
+    mkdir: can't create directory '/ai/nope': Read-only file system
+
+Writes buffer in the body and commit on the **last** `close`, because the store
+is keyed by content: every commit rewrites the whole blob and gives it a new
+address, so a program writing a kilobyte a byte at a time would leave a
+thousand objects behind. The `Rc` count is what "last" means. `teardown`
+flushes as well, since exiting without closing is the ordinary case.
+
+**A descriptor's body lives behind `Rc<RefCell<..>>`, and that is what makes
+`dup` correct.** On Linux a duplicated descriptor shares one open file
+description, so the two numbers share a cursor. The body used to sit inside the
+`Fd`, where `dup` could only copy it, and two independent cursors is a program
+reading everything twice. `Rc` and not `Arc`, for the reason `Interp` gives
+about its functions: one guest, one task, nothing crossing a core.
+
+**The environment is five variables and each is a fact rather than a default.**
+It was empty, which is not neutral: `sh` resolves through `PATH`, and a program
+with no `HOME` writes its dotfiles into the working directory. `TERM=dumb`
+because `ioctl` already says there is no terminal, and `PWD=/` because there is
+no `chdir`.
+
+`nanosleep` spins on the timer tick, because there is no guest scheduler to
+block against, so it costs the CPU it is not using.
+
+**Signals used to be accepted and never delivered, and that paragraph is worth
+keeping because of how it stopped being true.** It read: "nothing here can
+raise a signal at a guest: no other process to send one, no terminal to
+generate one, and a fault ends the guest rather than being offered to it." The
+reasoning was sound and `fork` falsified the first clause. There are other
+processes now, so a child exiting is an event its parent is owed, and `kill`
+has somebody to talk to. See below.
+
+### Signals
+
+`src/linux/signal.rs`. `rt_sigaction`, `rt_sigprocmask`, `rt_sigreturn` and
+`kill`, with delivery **on the way out of a syscall** -- the one moment the
+guest's whole register state is already in a `Frame` the kernel owns, its stack
+pointer is parked in `GLADOS_GUEST_RSP`, and the return is about to `sysretq`
+somewhere. Redirecting it into a handler costs three stores and no new
+assembly. Delivering from the timer would mean building a frame around an
+interrupted ring-3 context, which is a second entry path to keep in step with
+the first.
+
+The price is stated rather than hidden: **a guest that makes no syscalls
+receives no signals.** A program spinning in a loop cannot be interrupted,
+which on Linux it could. The run deadline still ends a runaway.
+
+Three refusals that are decisions:
+
+- **`SIGKILL` and `SIGSTOP` cannot be caught, blocked or ignored.** Not a
+  courtesy -- `SIGKILL` exists so there is one thing a process cannot argue
+  with, and a kernel that let a handler take it has removed the only guarantee
+  the call makes.
+- **A handler with no `sa_restorer` is not entered.** The `ret` ending it would
+  take whatever the stack happened to hold. glibc always supplies one; a
+  hand-written program that does not gets its signal dropped rather than a wild
+  jump.
+**The frame is on the guest's stack, in Linux's own layout.** It was in the
+kernel first, one deep, which served an ordinary handler and served Wine not
+at all -- Wine reads `uc_mcontext` to find out where a fault happened and what
+the registers were, and a handler cannot read a context it cannot reach.
+
+`sigcontext` is 256 bytes with a fixed register order, `ucontext` is 304, the
+whole `rt_sigframe` is 440 with `siginfo` on the end. Those are an **ABI rather
+than a choice**: a handler compiled against the real header reads
+`uc_mcontext.rip` at a fixed offset, and a frame one field short is not a
+smaller frame, it is a different structure with everything after the gap
+misread. 128 bytes of red zone are stepped over, and the frame lands at 8 mod
+16 so the handler starts with its stack exactly as a `call` leaves it.
+
+Two things fall out. **Signals nest**, since each delivery builds its own
+frame. And `rt_sigreturn` reads its state back *out of that frame*, so a
+handler that edits `uc_mcontext` changes where the program resumes -- which is
+not a curiosity, it is the mechanism Wine's fault emulation runs on.
+
+`rt_sigreturn` masks the flags it will restore. `sysretq` loads them from
+`r11`, so a frame claiming `IF` clear or `IOPL` 3 would be a guest choosing its
+own interrupt state, which is a way out of ring 3 that does not involve a
+syscall.
+
+The fixture tests exactly that mechanism rather than a flag: **the handler
+writes to `uc_mcontext.rax` and returns, and the program checks `rax`
+afterwards.** Four things have to be right at once for that to work -- the
+handler receives a real `ucontext` in `rdx`, the offset is Linux's 144, the
+frame is on the guest's own stack and writable, and `rt_sigreturn` reads back
+out of it rather than out of a kernel copy. There is no arrangement of
+three-right-one-wrong that passes.
+
+    signal: the handler edited uc_mcontext and it stuck
+      exited 9 after 5 syscall(s)
+
+`SIGCHLD` is the first signal this machine can honestly raise, and it is
+ignored by default -- which is why a parent that installs no handler is not
+killed by its own children finishing.
+
+Measured, on `mkelf.py --kind signal`:
+
+    13 rt_sigaction  0xa 0x8010000191 0x0 -> 0
+    62 kill          0x1 0xa 0x0 -> 0
+    15 rt_sigreturn  0xa 0x0 0x0 -> 0
+    signal: the handler ran and rt_sigreturn put it back
+      exited 9 after 5 syscall(s)
+
+Exit 9 needs both halves and neither can fake the other. A flag only the
+handler writes proves it ran; *reaching the comparison at all* proves
+`rt_sigreturn` restored `rip` and `rsp`, since the handler ends in `ret` onto
+the restorer. The flag's address is held in `rbx` across the signal on purpose,
+so a `rt_sigreturn` that lost the callee-saved registers reads it from
+somewhere else and fails rather than passing quietly.
+
+**`fork`, `execve` and `wait4` have landed**, and the two paragraphs that used
+to sit here are worth keeping in summary because of the shape of how they went
+stale. The first said the three calls were "not a syscall away: `fork` needs
+two address spaces, and one address space is the founding claim of this system
+rather than a shortcut it took." The second said that had become half true,
+because `src/mem/space.rs` existed and what remained was *placement*.
+
+Both are now history. `src/mem/space.rs` gives a guest its own page-table root,
+placement is solved by mapping a fixed image rather than placing it, and the
+three calls are in the dispatch table alongside threads, futexes and signals.
+The surface is 93 calls of Linux's roughly 350, counted from the match in
+`glados_syscall_dispatch` rather than remembered:
+
+    sed -n '/fn glados_syscall_dispatch/,/^}/p' src/linux/syscall.rs | grep -oE '^ +SYS_[A-Z0-9_| ]+=>' | grep -oE 'SYS_[A-Z0-9_]+' | sort -u | wc -l
+
+The lesson the pair of them teaches is the one to keep: **a limitation stated
+as a founding claim is still a limitation, and it will be removed by somebody
+who did not read the claim as permanent.**
+
+### A second address space
+
+`src/mem/space.rs`, and the thing it removed was an assumption rather than a
+line of code. `paging::activate` had exactly one caller in the whole tree,
+`main.rs`, at the moment the identity map replaces the firmware's -- so
+"can this machine switch address spaces at all" had never been asked, and
+`fork` was refused on the strength of an answer nobody had measured.
+
+Two pieces, and the order between them is the design.
+
+**Sharing.** `Space::sharing_kernel` copies the kernel's 512 top-level
+entries, which are *pointers* to the PDPTs it already built, so both roots walk
+the identical tables underneath. Exactly one copy of every mapping exists, a
+`protect` through one root is visible through the other because it is the same
+entry, and nothing can drift. That is what made the switch safe to prove on its
+own before anything depended on it.
+
+**Divergence.** `map_page` gives a space a mapping the kernel's root does not
+have, which is what a process actually needs. It is confined to `WINDOW`
+(512 GiB, PML4 entry 1) **and the confinement is the entire safety argument**:
+`build_identity_map` hangs everything off entry 0, so every address the kernel
+maps has a top-level index of zero, and anything at or above the window is
+unmapped in every root that has not asked for it. A mistake there faults on an
+address nothing owns instead of quietly landing in the heap.
+
+A mapping below the window is **refused**, and that refusal is the point. The
+top-level entries were copied, so they point at the kernel's own PDPTs:
+creating a table under entry 0 would create it inside the kernel's map, every
+space would see it, and the "private" mapping would not be private at all.
+
+Three details that are silent when wrong, each with a claim:
+
+- **The root has to be identity-mapped**, because CR3 takes a physical address
+  while every write to the table goes through a virtual one. It is, because the
+  heap is inside the identity map, the same property `cpu::code` leans on to
+  execute from a heap allocation. Checked rather than assumed, since the day it
+  stops being true the processor walks whatever lives at that physical address.
+- **`Drop` restores CR3 before it frees.** Freeing a table the processor is
+  still walking hands the allocator memory the next translation will read. The
+  fourth instance in this tree of "put it back before giving it away".
+- **The U bit is set on intermediates** and gated at the leaf, because it is
+  ANDed down all four levels.
+
+Twenty claims, and the five that earn their place are the divergent ones: two
+spaces map one address, to genuinely different physical pages, each reads its
+own, a write through one lands in that space's page, and it leaves the other
+alone. That last one is what would catch a leaf pointing at the wrong frame,
+which reads identically to a correct one until something writes.
+
+**And the low half, which is where a process actually lives.** `map_low` maps
+`0x400000` -- busybox's own base, and every non-PIE binary's -- privately per
+space. Two spaces each hold it, each reads its own page through it, and the
+kernel's map is untouched.
+
+`step` privatises its way down, one table at a time: the descent starts at the
+root, which a space always owns, so each step either finds a table it already
+owns or takes a private copy and repoints the parent. By the time a leaf is
+written every table above it belongs to this space. A 2 MiB entry in the way is
+split into 512 real entries carrying the same flags, so the rest of the large
+page keeps mapping what it mapped -- `paging::split_large`'s bargain, one level
+down, against a table this space owns. **Both are gated on `owns_table`**, and
+that single predicate is what stops any of it editing a table somebody else is
+sharing.
+
+**The guard on a low address is about meaning rather than about tables.** The
+tables would be perfectly correct either way; the hazard is that the kernel is
+identity mapped, so shadowing virtual `0x2c00000` in a space points the
+kernel's own heap pointer at somebody else's page for as long as that space is
+installed. `mem::fixed::is_free` answers whether anything is using that
+physical memory, which is exactly the question, and it is a **query rather than
+a `claim`**: two spaces both wanting `0x400000` is the ordinary case for
+processes, and reserving it would refuse the second for no reason. `claim` and
+`is_free` share their two predicates so they cannot disagree about one address.
+Measured after a run: `4 range(s), nothing claimed`.
+
+**A task runs on its own root now.** `Task` carries one (0 meaning the
+kernel's), `schedule` writes CR3 immediately before switching stacks, and
+`set_root` takes effect at once on the running task. Safe there for one reason,
+stated rather than implied: every root a task may carry maps everything the
+kernel's does, so the code executing the write, the stack under it and the
+incoming stack are mapped identically either side. `sharing_kernel` makes that
+true and `map_low`'s guard is what stops divergence taking it away.
+
+**The claim caught a real bug in the scheduler change, which is what it was
+for.** `schedule` skips the CR3 write when both roots read zero, and that is
+only sound while a task's recorded root describes the CR3 it is on. Clearing
+the running task's root to the kernel's left both sides reading zero, the
+branch untaken, and the machine on a root nothing named any more. The tell was
+the asymmetry: the switch *to* a private root passed and the switch back
+failed. Hence `set_root` activating immediately for the current task.
+
+The test is shaped so a failure is a wrong value rather than a dead machine.
+`0x400000` is mapped in **both** roots -- the identity map reaches the real
+physical page, the space reaches a private one -- so whichever way the switch
+goes the read is legal and the value says what happened. A page mapped only in
+the space would fault at ring 0 with no recovery, which is a suite that halts
+instead of reporting.
+
+Thirty-two claims.
+
+**A guest runs on a root of its own**, behind `linux space on|off`, off by
+default. The space *shares* every mapping with the kernel's, so on and off
+should be indistinguishable -- which is exactly what makes the switch worth
+having. A fixture behaving identically both ways says the guest lifecycle
+survives a non-kernel CR3, and that has to hold before anything diverges;
+defaulting it on would make the first divergence bug and the first
+"does this work at all" bug arrive together with nothing to tell them apart.
+
+Measured, on unmodified busybox under glibc:
+
+    uname -a     exited 0 after  60 syscall(s)   both ways
+    sha256sum    exited 0 after 251 syscall(s)   both ways
+    b01eaede758499526db8c8ccd159b0f773ef0ecb29c25952e5c1042f5168e4ec
+
+That digest is the host's over the same bytes, so a real dynamically linked
+binary relocated a 1.9 MB libc through `mmap`, hashed its own file at ring 3
+under a private root, and got it right.
+
+**One diff looked real and was not**, which is worth recording because it will
+happen again: an earlier pair differed by `[mind t1] disabled` printed from
+another task *into the middle of a line*, splitting `257` into `25` and `7`.
+Console interleaving between tasks, and the tell was that the split fell
+mid-token rather than at a boundary.
+
+Cleanup order is the load-bearing part: `set_root(me, 0)` puts the kernel's
+root back immediately, and only then may the space drop and free its tables.
+Reversed, the allocator gets the page the processor is walking. `syscall::run`
+returns on both paths that exist -- a guest that exits and a guest killed by a
+fault both leave through the longjmp -- so it runs in the case that matters.
+
+**A fixed image is mapped rather than placed**, when a guest has a space.
+`Image::Mapped` backs it with ordinary heap pages and maps them at the address
+the headers insist on, inside that guest's own tables.
+
+The decomposition that made this small is worth keeping: **only the image has
+an address the file demands.** The stack, the break and every `mmap` are at
+addresses the *kernel* chooses, so two guests never collide there, and a PIE
+already goes wherever the heap has room. `0x400000` is the whole problem, and
+it is one region.
+
+    space off   [linux] 185 byte(s) ... at 0x400000
+    space on    image mapped at 0x400000, backed by heap pages at 0x2c17000
+    space on    image mapped at 0x400000, backed by heap pages at 0x2c15000
+
+All three printed `hello from ring 3` and exited 5 after 2 syscalls. The third
+line is the result: one virtual address, two different physical backings, which
+is exactly what two guests at once will need. `mem::fixed` is not consulted at
+all on that path, so neither the machine-wide claim on `0x400000` nor the 6 MiB
+placeable run bounds a fixed image any more.
+
+**A mapped region must not be `protect`ed and that is required, not an
+optimisation.** Its U bit is set at the leaf by `map_low`, inside the guest's
+tables. `paging::protect` edits whatever CR3 names, so running it on
+`0x400000` from the kernel's root would open the *identity* mapping of that
+address -- a page the guest was never given.
+
+**And rights for the regions that are *not* mapped go on under the guest's own
+root, which cost a reproduction to learn.** `entry_for_user` opens the U bit at
+every level down to the leaf, starting with `pml4[i4]` of whatever `read_cr3()`
+names, and `Space::sharing_kernel` **copies** the kernel's PML4 entries when it
+is built. Protect first and the U bit lands on the kernel's entry 0 while the
+guest's copy of that entry keeps it clear -- and the bit is ANDed down all four
+levels, so every page under it is unreachable from ring 3 however the leaf is
+marked.
+
+What it looked like is the part worth remembering. The **first** guest of a
+boot died fetching its interpreter's first instruction, `error 0x15` (present,
+user, fetch refused), and the second identical command worked. Three things
+made it hard:
+
+- **The evidence names the wrong level.** A fault reports an address, not which
+  table denied it, so a leaf with correct rights looks like the whole story.
+- **It read as a property of the command.** `uname -a` failed and `sha256sum`
+  passed in one boot, which is about *ordering* and looks like it is about the
+  programs. Two observations differing in more than one thing cannot say which
+  one mattered -- the same coincidence the DOOM damage counter records.
+- **It heals itself.** The first guest's `protect` leaves U set on the kernel's
+  entry 0 for good, so every later space copies it already open. A bug that
+  cannot happen twice is invisible to any test that runs twice.
+
+Doing it under the guest's root is also strictly tighter: the U bits land in
+the space's own PML4 and the kernel's entry 0 is left alone, so ring 3 reaches
+those pages only through the root the guest actually runs on.
+
+`Guest` declares `space` **before** the images it maps, so it drops first: the
+tables point at the backing's pages and freeing those while a root still names
+them would leave the next translation reading the allocator's memory. Nothing
+is installed by then, so it is tidiness rather than a live hazard, and it is
+the same ordering `give_back` exists to get right.
+
+The three calls landed after this was written. What is still true is the
+`SPACE` note: it is a single static, so nothing yet demonstrates two live
+guests sharing `0x400000` at the same instant even though the memory allows it.
+**`smp::init` passes CR3 to a starting application processor**
+(`smp.rs:557`), which is harmless today because APs start at boot before any
+space exists, and would not be if anything ever started one later.
+
+### OpenGL, which turns out not to be kernel work at all
+
+**Every OpenGL on Linux is a userspace shared object.** In software mode
+`libGL` rasterises into ordinary memory and asks the kernel for nothing but
+pages, so "implement GL" here is not a rasteriser to write, it is a library to
+get into the guest and a syscall trace to answer. The estimate that started
+this was 8,000 to 15,000 lines of kernel code, and it was wrong by all of it.
+
+`tools/gl.py` fetches one, and which one is decided by arithmetic rather than
+by preference. `fs.rs` holds an open file's whole contents and caps the total
+at 64 MiB, so:
+
+| | packages | installed |
+|---|---|---|
+| bookworm `libosmesa6` | 16 | **188 MiB** (112 of it `libLLVM15`) |
+| bookworm `libgl1` | 49 | 210 MiB, and drags X11 |
+| **stretch `libosmesa6` 13.0.6** | **6** | **8.2 MiB, no LLVM at all** |
+
+LLVM is there for llvmpipe, the JIT rasteriser, and Debian builds llvmpipe and
+softpipe into one object so the JIT cannot be declined. Mesa 13 predates that
+and its `libOSMesa` is the *classic* software rasteriser: no gallium, no LLVM,
+largest object 4 MiB. The whole closure with its glibc satellites is 8,033,864
+bytes across nine objects, and `gl.py --report` prints that beside the cap so
+the decision stays checkable.
+
+**OSMesa is the third door.** `libGL` gets its surface from GLX, which needs an
+X server, or EGL, which needs DRM, and there is neither here. `OSMesaMakeCurrent`
+takes *a buffer the caller owns*: every `gl*` call after it writes there, and
+the buffer reaches `/dev/fb0` with one `write`. Asking for `OSMESA_BGRA` makes
+Mesa's byte order the display's own, so the blit is a copy rather than a
+conversion -- which is the pixel-format work from `/dev/fb0` paying for itself.
+
+The closure is computed from `DT_NEEDED` rather than from package metadata,
+and it earned that again: nothing would have predicted `libOSMesa` needing
+`libgcrypt`, which it uses to hash its shader cache.
+
+### Calling a library with no compiler: a linked ELF, built by hand
+
+`mkelf.py --kind gl` and `build_linked`. There is no C toolchain on the
+development host and no usable WSL, so the choice was to fetch one or to teach
+the fixture builder to emit a dynamically linked object. The second is what
+this file already exists for: no toolchain will emit a binary that differs
+from another in exactly one field, and none will emit one small enough to read.
+
+The minimum a loader needs is six tables and twelve dynamic entries.
+`.dynstr`, `.dynsym` with one undefined `FUNC` per import, `.hash` -- required
+even when nothing is looked up, since `ld.so` refuses an object with neither
+hash -- `.rela.dyn` with one `R_X86_64_GLOB_DAT` per import, `.got`, and
+`.dynamic` naming all of it. No PLT and no lazy binding: `DF_BIND_NOW` has the
+loader fill every slot before the program runs, so a call is `call [rip+slot]`
+and there is no resolver trampoline to get right.
+
+Two traps, and both are silent:
+
+- **The hash table's `nchain` is how a loader sizes `.dynsym`.** One bucket
+  means every name collides, which is what makes it constructible by hand: the
+  chain then walks every symbol in order. A count one short is a symbol that
+  does not exist.
+- **`PT_PHDR`, and this one cost a disassembly.** glibc computes the main
+  program's load address in exactly one place, `case PT_PHDR: main_map->l_addr
+  = (Addr) phdr - ph->p_vaddr;`, and there is no fallback. Without it the base
+  stays zero and every address the loader derives from a `p_vaddr` is used raw.
+  The fault was a `#PF` reading `0xe8`, `ld.so` was in an SSE `strcmp`, and
+  `0xe8` is 64 for the ELF header plus three program headers -- the file offset
+  of `PT_INTERP`'s string with nothing added to it. Every real linker emits a
+  `PT_PHDR`, which is why nothing else here ever needed one.
+
+`DT_DEBUG` was the first theory and the run refuted it: the fault came back
+byte for byte identical, same rip and same fifteen registers. That is what the
+register dump is for.
+
+### Threads, which one address space makes easier rather than harder
+
+`src/linux/thread.rs`. The asymmetry is worth stating because it is easy to
+read "no processes" as "no concurrency": `fork` needs two address spaces and
+this system has one, while `CLONE_VM` asks to *share* one, which this kernel
+grants by doing nothing at all. So the constraint that makes `fork` impossible
+is the same one that makes a thread nearly free.
+
+A thread needs four things and three were already here. A stack, which the
+guest allocates. A scheduler, which `task.rs` has been preempting at 100 Hz
+since long before any guest existed. Its own `FS`, which `arch_prctl` already
+sets and which now has to survive a switch. And **its own syscall entry
+state**, which is the piece that did not exist -- `syscall.rs` says so in its
+own header: "that stack is one static, so the handler is not reentrant ...
+stage 0 runs one guest with no threads. Both of those stop being true later."
+
+**The entry path is per-task now and no assembly changed.** Three globals
+carry a syscall across the ring boundary: where the guest's `rsp` went, which
+stack the handler runs on, and where to longjmp back to. With one guest they
+are constants; with two threads they are three ways to corrupt each other,
+because a thread that blocks inside a syscall leaves them live while another
+enters one. They are saved and restored by `schedule`, beside the FPU area and
+in the same order, which is what makes them per-task: a global only read while
+its own task is running *is* per-task as long as somebody swaps it. The
+alternative was `swapgs` and a per-thread block, which collides with
+`cpu::percpu` owning GS -- the same reason a guest is refused `ARCH_SET_GS`.
+
+**A pool, not a task per thread.** `MAX_TASKS` is 24 and a kernel task that
+returns is not reclaimed, it spins in `yield_now` forever. Reclaiming slots
+means teaching the scheduler about a finished task, and the outgoing task's
+state is written unconditionally in `schedule`, so that is surgery on the most
+delicate loop here. Instead a finished thread parks its task and the next
+`clone` takes it back: the limit is eight *concurrent* threads rather than
+eight ever created, and a machine that never runs one spawns nothing.
+
+`clone` returns twice, in two threads, at the same instruction, and only `rax`
+tells them apart. The child arrives with every register zero except `rsp`,
+because `glados_enter_guest` clears them, so it cannot be handed anything in a
+register -- and its entry is the *parent's* return address, which `syscall`
+left in `rcx`, so nothing has to be invented.
+
+`futex` is `WAIT` and `WAKE`, and a waiter watches two things: the wake counter
+*and* the word itself. Needing both is the point -- the counter alone loses a
+wake when its small table is full, and the word alone misses a wake that
+changed nothing. It is a yield loop rather than a sleep queue, the same bargain
+`nanosleep` makes and for the same reason.
+
+Joining is `CLONE_CHILD_CLEARTID` plus that futex, which is what `pthread_join`
+is underneath: the kernel writing zero to the word when a thread ends is the
+whole of the notification, and a kernel that ignores it leaves a library
+waiting forever on a thread that finished.
+
+    linux run /tmp/th
+        9 mmap        0x0 0x2000 0x3 -> 46600192
+       56 clone       0x200f00 ... -> -38    no CLONE_THREAD, so a process
+       56 clone       0x210f00 0x0 -> -22    no stack
+       56 clone       0x210f00 ... -> 4      a thread, and its id
+      186 gettid                  -> 1       the main thread's id is its pid
+      202 futex       ...+9 0x80  -> -22     a word that is not aligned
+       24 sched_yield             -> 0
+       60 exit        0x0         -> 0       <- the child, on its own stack
+      202 futex       ...+8 0x80  -> 0       woken by the kernel clearing ctid
+      231 exit_group  0x0         -> 0
+      exited 0 after 10 syscall(s)
+
+Zero is the mask, so all ten checks answered, and the last of them is the
+whole claim: one page, two threads, and a value in it that could only have
+been put there by the other one. Three runs in one boot, and the interesting
+difference between them is the ordering -- in two the child finished before
+the parent waited and the futex correctly answered `EAGAIN`, in one the parent
+genuinely blocked and was woken. Both are right and a fixture that accepted
+only the second would have been testing that the child is slow.
+
+**Two bugs, and the first took the whole machine.** `run` saves and restores
+`RFLAGS` around a guest because `syscall` clears `IF` through `FMASK` and
+`exit` leaves through a longjmp that restores a stack rather than a processor
+state. `run_thread` did not, so a pool task went back to its `hlt` with
+interrupts off, which is a core that never wakes -- no prompt, no timer, and
+the run deadline could not fire because firing is something an interrupt does.
+And the handler stack lived on the `Task`, which stops carrying ring-3 state
+the moment a thread ends: the second thread to use a pool slot entered its
+first syscall with the stack at zero and pushed onto a null pointer. It ran
+perfectly once, which is the worst number of times for a thing to work.
+
+### Loading the loader
+
+`PT_INTERP` names a path, the path is a file in the namespace, and a second
+image at a second base is the whole of it. `load` places the program, places
+the interpreter beside it, and jumps to the *interpreter's* entry. `dlopen`
+then works because it is `ld.so`'s problem rather than ours, which is the whole
+reason to load an interpreter instead of writing a linker -- and `dlopen` is
+what Half-Life needs, since the game logic lives in `hl.so`.
+
+**Three numbers have to be right and all three are silent when wrong.**
+`AT_ENTRY` is the *program's* entry, not the interpreter's, or `ld.so`
+relocates everything correctly and jumps back into itself. `AT_BASE` is where
+the interpreter landed, and it is the only way an unrelocated `ET_DYN` can find
+its own `_DYNAMIC`; it is **omitted rather than zeroed** when there is no
+interpreter, because zero reads as "loaded at address zero" and the first thing
+done with it is add it to an offset. And the address jumped to is the
+interpreter's, which is the one of the three that is obvious when wrong.
+
+`mem::fixed` had to learn to hold more than one range first. It held exactly
+one, on the argument that one guest runs at a time -- an argument about
+*guests* where the thing being counted is *ranges*, and one guest stops being
+one range the moment it is dynamically linked. Sixteen now, with an overlap
+check, which the single-entry version got for free by refusing everything: an
+interpreter placed over the program it was loaded to run does not fault, the
+second copy simply wins, and what shows is a jump into the middle of somebody
+else's code.
+
+**Two hand-assembled fixtures, because the pair is the test.**
+`mkelf.py --kind loader` is a stand-in for `ld.so`: it walks the aux vector by
+key (never by position -- the kernel may order them however it likes), checks
+`AT_BASE` is present *and points at an ELF header*, checks `AT_ENTRY` is
+present, prints, and jumps. Each check has its own exit code, so a failure says
+which. It never touches `rsp`, because the program on the other side of that
+jump expects to find `argc` where the kernel left it. `--kind interp` is the
+ordinary hello program with a `PT_INTERP` naming `/tmp/loader`.
+
+    glados> linux run /tmp/prog
+    [linux] 253 byte(s), 2 segment(s), 253 byte span at 0x2c18000, entry 0x2c19078
+    ld: an interpreter ran, with a base and an entry
+    hello from ring 3
+        1 write       0x1 0x2c19194 0x31 -> 49
+        1 write       0x1 0x2c180df 0x12 -> 18
+      231 exit_group  0x5 -> 0
+      exited 5 after 3 syscall(s)
+
+Every number is checkable against what `mkelf.py` printed. The interpreter was
+placed at `0x2c19000` and its entry is `+0x78`, which is the `0x2c19078` the
+loader reports -- an address outside the program's own 253 bytes, which is the
+whole claim. The first write comes from `+404` of the interpreter and the
+second from `+223` of the program, which are the two message offsets the
+fixture builder named, and 5 is the program's own exit code.
+
+Two negatives, and both matter more than the positive. Running the interpreter
+*alone* exits **21**, which is its own code for "there was no `AT_BASE`" --
+that is the check that the entry is omitted for a static binary rather than
+zeroed. And a binary naming a real `/lib64/ld-linux-x86-64.so.2` is refused
+with **"the interpreter this binary names is not in the namespace"**, which is
+a fact about the machine rather than a design decision.
+
+### The two calls a linker makes before anything else
+
+`mmap` served exactly one shape for a long time: anonymous, no address, no
+file. That is enough for an allocator and nothing else, and it is precisely the
+pair of refusals a dynamic linker meets on its first two calls. It reserves a
+span with one anonymous mapping, then writes each segment of each library over
+part of that span with `MAP_FIXED`, and every one of those segments is
+file-backed.
+
+Both refusals went the way `ET_EXEC` went, and for the same reason: each was
+true of what the kernel *knew* rather than of the machine.
+
+**`MAP_FIXED` has three cases and the middle one is the point.** An address
+inside memory the guest already holds is re-laid in place, which is not an
+attack but the ordinary case, and it records nothing because whatever holds
+those pages still holds them. An address nothing holds goes to
+`mem::fixed::claim`, the only thing here that can promise a virtual address,
+since virtual is physical. Anything else is `ENOMEM`. Zero and unaligned are
+`EINVAL` rather than hints: rounding would put a library's segment a page off
+its own headers.
+
+**A file mapping is a copy, and that is a real deviation.** Linux maps the page
+cache, so two processes mapping one file share pages. Here an open file already
+*is* its contents -- `fs.rs` says so and gives the reason -- so there is no
+cache to point at. `MAP_PRIVATE` is exactly a copy and so is exactly right,
+which is what `ld.so` uses for every library it loads. A **shared writable**
+file mapping is refused with `ENODEV`, because honouring it means writing back
+into a store keyed by content, which is a new root hash per modified page. A
+mapping running past the end of the file is zero-filled rather than refused,
+since that is how a shared object's `.bss` is made.
+
+`Mapping` carries where its pages came from, because the two go back different
+ways and getting it wrong is silent: freeing a placed range to the heap hands
+the allocator memory it never owned. `give_back` is the one place that knows,
+and it puts the **rights back first** -- the mistake this tree has now made in
+three separate places.
+
+`mkelf.py --kind maps` is eleven checks folding into a mask, `fsabuse`'s idiom
+for its reason: zero means every one answered what Linux answers. It maps **its
+own file** through `argv[0]`, so it needs nothing staged beside it and the
+bytes it checks are ones it can be certain of.
+
+    glados> linux run /tmp/maps
+        9 mmap    0x0        0x2000 0x3 -> 46522368
+        9 mmap    0x2c5e000  0x1000 0x3 -> 46522368
+        2 open    0x2c5cfbd  0x0    0x0 -> 3
+        9 mmap    0x0        0x1000 0x1 -> 46534656
+        9 mmap    0x0        0x1000 0x3 -> -19
+        9 mmap    0x1234     0x1000 0x3 -> -22
+        9 mmap    0x0        0x1000 0x3 -> -22
+        9 mmap    0x0        0x1000 0x1 -> -9
+       11 munmap  0x2c5e000  0x2000     -> 0
+      231 exit_group 0x0 -> 0
+      exited 0 after 10 syscall(s)
+
+46522368 is `0x2c5e000`, so the reservation and the fixed mapping over it
+answered the same address. Then a private file mapping, and four refusals by
+their own errno: `ENODEV` for shared-and-writable, `EINVAL` twice for an
+unaligned fixed address and a fixed address of zero, `EBADF` for a descriptor
+nobody opened. The `munmap` of the whole reservation returning 0 is the check
+that the fixed mapping laid over part of it left **one** record rather than
+two.
+
+**Two claims in `diag linux` used to assert the opposite** and both said so in
+words about this loader: "a file-backed mapping is refused, there being no fd
+table" and "MAP_FIXED is refused, for the reason ET_EXEC is". They are nine
+claims now, about the refusals that remain and about the shape a linker uses.
+
+**Which libc is not a decision this kernel makes.** A libc is userspace: it is
+linked into the binary or named by it in `PT_INTERP`, and `load` reads that
+path and loads whatever is there. So musl and glibc can both be installed and
+each program takes its own, which works today and needed no code. What cannot
+happen is two of them inside one process, so "use whichever is faster" is a
+per-program question and never a per-call one. `linux libc` says which are
+installed, a successful run names the interpreter it used and where it landed,
+and a refusal names the path the binary wanted -- which the error itself cannot
+do, its type being a `&'static str`.
+
+What glibc will additionally ask of the syscall surface is a *prediction* and
+is written down as one in `out/release/PLAN-native-linux.md`, which is a
+working note rather than repository content, like every planning document
+here. The short version: musl is a subset, so doing it first is the first half
+of the same road and glibc later is additive rows in the `-ENOSYS` trace. The
+one thing that cannot be worked around is a binary built against glibc that
+cannot be rebuilt, and the game logic this target eventually loads is exactly
+that kind of object.
+
+**Both real interpreters have run, and this said they had not for a while
+after they did.** `tools/libc.py` fetches musl's and glibc's from Alpine and
+Debian, computes the *closure* rather than a list somebody wrote down (which
+is how Debian's busybox turned out to need `libresolv.so.2` as well), and
+stages a dynamic busybox for each. Neither is in this repository, for the
+reason no WAD is.
+
+    linux run /tmp/m/busybox uname -a         # musl, ld-musl-x86_64.so.1
+    linux run /tmp/g/busybox sha256sum /tmp/g/busybox
+
+The second is the check that settles it: glibc's linker relocated a 772 KB
+binary through this kernel's `mmap`, and busybox then hashed *its own file*
+byte for byte to the digest the host computes over the same bytes.
+
+**glibc needs `LD_BIND_NOW=1` and musl does not**, which is a real limit and
+is stated rather than worked around. busybox is BIND_NOW already; `libc.so.6`
+is lazily bound, so its first call through the PLT enters
+`_dl_runtime_resolve_xsavec`, which reads `GOT[1]` for the link map -- and
+`GOT[1]` is zero here while `GOT[2]` beside it is not. That was located
+precisely (glibc's `DT_PLTGOT` is `0x1d2fe8`, inside a `PT_GNU_RELRO` ending
+`0x1d3000`, so the two words are the last sixteen bytes of the RELRO range)
+and the boundary hypothesis it suggests was **tested and refuted**: three new
+`diag paging` claims pass, and `protect` loses no bytes at a range end. Why
+the linker leaves that word zero is open. `LD_BIND_NOW` resolves everything up
+front and is arguably what a game wants anyway.
+
+Four kernel bugs came out of that pair of runs and none was reachable any
+other way. `teardown` did not restore the *interpreter's* page rights, so a
+guest's RELRO page went back to the heap read-only and the next `fat get`
+faulted at ring 0 -- the fourth instance in this tree of the same class, which
+is why `give_back` now says so at the top. `newfstatat`'s flags never reached
+it, so `AT_EMPTY_PATH` could not work. `mmap` copied file bytes *before*
+applying rights, so glibc's `PROT_NONE` reservation with a `MAP_FIXED` overlay
+made the kernel fault on the guest's behalf. And `locate` answered "no guest"
+about a guest that had just died, because `run` calls `teardown` on the line
+after the guest returns -- made twice, once for three addresses and once for
+fifteen registers, and fixed the same way both times by resolving before
+teardown.
+
+**The fault report carries every register now, and that is what found the
+last one.** `Fault` used to keep five fields picked in advance; which one
+matters is not knowable at the time, and the one that mattered was `rdi`
+holding a zero nobody had thought to ask about. `cpu::idt` emits 32 stubs from
+one `global_asm!` macro at a fixed 16-byte stride, each pushing a fake error
+code where the CPU pushes none so both shapes are in phase, then fifteen GPRs
+-- vector plus fifteen pushes is 128 bytes, which is what leaves the tail
+16-aligned for the SysV call. Get that wrong and the reporter takes a `movaps`
+#GP inside itself. `diag recover` asserts the stride by reading the first byte
+of each stub. The entry is `extern "sysv64"` and not `extern "C"`, for the
+fourth time in this tree.
+
+### The four `/proc` files that can be answered honestly
+
+`src/linux/proc.rs`, and the rule it opens with is the whole design:
+
+> **A field this machine does not know means the file does not exist.**
+
+`/proc/stat`, `/proc/loadavg`, `/proc/cpuinfo` and `/proc/uptime` are text
+formats with no way to say "I do not know": omit a field and a parser breaks,
+invent one and it gets believed, and there is no `Option` in a text file. A
+missing `/proc/stat` sends a program down a fallback it already has. So the
+table is four entries and grows when something asks, which is the `-ENOSYS`
+discipline applied to paths instead of call numbers.
+
+**`/proc/self/exe` is the reason the module exists**, being the only one of
+the four with no syscall alternative: there is no call that answers "where is
+my own binary", so a program looking for its data directory beside itself has
+this and nothing else. It is a symlink, so `readlink` is the usual way in, and
+`open` on it gives the image, both of which work here.
+
+What makes it cheap is a property `fs.rs` already had for its own reasons: an
+open file *is* its whole contents, so a synthetic file is only a different way
+of filling that `Vec`. No second kind of descriptor, no second `read` path,
+and `lseek` works on these for free. The hook sits **before** the store in
+`sys_openat`, since asking a content-addressed tree about `/proc` answers
+`ENOENT` about a path that does exist.
+
+`/proc/self/maps` is truthful and therefore strange. A guest shares one
+address space with the kernel, so these are the real addresses of real pages
+sitting wherever the heap put them rather than at the tidy `0x400000` a reader
+expects; and the rights come from `paging::query` rather than from what was
+asked for at `mmap`, because `mprotect` moves them afterwards and a linker
+spends its last act doing exactly that. Ends are rounded up to a page, which
+is *more* truthful and not less -- rights are applied per page, so the guest
+owns the whole of its last partial one, and every parser of this file was
+written against a kernel whose ranges are page-aligned.
+
+    linux run /tmp/g/busybox cat /proc/self/maps
+    000002d20000-000002d24000 rwxp 00000000 00:00 0 [stack]
+    00000300c000-0000030ca000 rwxp 00000000 00:00 14267663290916959693 /tmp/g/busybox
+    0000030ff000-000003134000 rwxp 00000000 00:00 9676539629617231489 /lib64/ld-linux-x86-64.so.2
+    000003134000-000003174000 rwxp 00000000 00:00 0 [heap]
+
+    linux run /tmp/g/busybox readlink /proc/self/exe   ->  /tmp/g/busybox
+    linux run /tmp/g/busybox wc -c /proc/self/cmdline  ->  40
+
+That 40 is the check worth keeping, because busybox computed it: the four
+argv strings are 14, 2, 2 and 18 characters and each carries a NUL, and a
+`joined` that dropped the final separator would answer 39 while looking
+perfectly reasonable.
+
+**`claims` is a property of the path and never of what is running**, which it
+was not at first: it asked `link` and `read`, both of which consult the live
+guest, so `/proc/self/exe` was claimed while a guest ran and unclaimed
+otherwise. `diag linux` caught that, running with no guest installed. The
+other direction would have been much worse -- a listing offering a name that
+`openat` then routed to the store.
+
+### `/dev`, a screen to draw on and a keyboard to read
+
+`src/linux/dev.rs`. Seven nodes, synthetic like `/proc` and under the same
+rule, and one of them is the display: `/dev/fb0`, the smallest well-specified way for
+a program written somewhere else to put pixels on this machine.
+
+There is no `/dev/tty`, no `/dev/dri` and no `/dev/snd`, and that is the rule
+rather than an omission -- each is a real interface with real semantics nothing
+here can supply, and a node that opens and then does nothing is worse than an
+absent one, which sends a program down a fallback it already has.
+
+**A guest gets the actual framebuffer, not a shadow.** This kernel is
+identity-mapped, so virtual is physical and `smem_start` can be the aperture's
+own address rather than a lie about a buffer somewhere else; a frame the guest
+writes is on screen as it writes it, with no copy anywhere. The price is that
+the desktop must stand down while that is true, which is `gfx::exclusive` --
+the same flag `port::with_screen` sets for DOOM and the editor, split into two
+halves here because a guest holds the screen across many syscalls rather than
+for the length of one call. It is taken on the first write or mapping rather
+than at `open`, since a program that merely `stat`s the device has not asked
+for the machine, and released in `teardown` **unconditionally**, because a
+guest that took the display and then faulted is exactly the case that matters.
+
+Three decisions where the alternative was worse:
+
+- **`MAP_SHARED` with `PROT_WRITE` is refused for every file here** and is the
+  entire point of this device. The objection everywhere else is that writing
+  back into a content-addressed store is a new root hash per page; the
+  framebuffer is not in the store, so the objection does not apply. The device
+  branch of `sys_mmap` therefore sits *before* that refusal.
+- **`FBIOPUT_VSCREENINFO` accepts only the mode already running.** There is no
+  mode-setting on this machine: the geometry is whatever the firmware left.
+  Answering 0 to a mode this display cannot enter is the worst of the three
+  available answers, because the program then draws at a geometry the hardware
+  does not have, forever, with nothing reporting it.
+- **A mapping of the aperture is `Source::Device`**, a third kind, because the
+  two it is not are both actively wrong: freeing it to the heap hands the
+  allocator several megabytes of the display's memory, and releasing it
+  through `mem::fixed` releases a claim nobody made. All it owes is the U bit,
+  taken back off.
+
+**The pixel layout is the field that is silently wrong.** `Format` names the
+order of *bytes in memory* and `fb_bitfield` names bit positions inside a
+little-endian word, so the two run in opposite directions and reversing them
+swaps red and blue -- with no error, no fault, and a picture that is merely a
+strange colour. `mkelf.py --kind fb` is the answer: thirteen checks folding
+into a mask, and then three bands painted by shifting 255 by the offsets the
+driver *told* it, in the order red, green, blue. A run that comes back
+blue-green-red has found a bug no exit code could.
+
+    glados> linux run /tmp/fb
+        2 open   /dev/fb0 -> 3
+       16 ioctl  0x3 0x4602 0x2c5bdf0 -> 0        FBIOGET_FSCREENINFO
+       16 ioctl  0x3 0x4600 0x2c5bd50 -> 0        FBIOGET_VSCREENINFO
+       16 ioctl  0x3 0x4601 0x2c5bd50 -> 0        the mode it was just given
+       16 ioctl  0x3 0x4601 0x2c5bd50 -> -22      a mode this display has not
+       16 ioctl  0x3 0x5401 0x2c5bd50 -> -25      TCGETS, so ENOTTY
+        9 mmap   0x0 0x3e8000 0x3 -> 2147483648
+      exited 0 after 8 syscall(s)
+
+Zero is the mask, so all thirteen answered. `0x3e8000` is 4,096,000, which is
+1280 x 800 x 4, and `2147483648` is `0x80000000`, the aperture itself rather
+than a copy of it -- which is one of the checks rather than a coincidence, and
+another is reading back through the mapping what was written through it.
+
+`--kind fb` with any argument sleeps for ten minutes instead of exiting, and
+that is how the picture gets photographed: `drive.py` screenshots when it
+stops, and `teardown` puts the desktop back the instant the guest returns, so
+the exit path for a held fixture has to be the **timeout**. The same recipe
+`doom play` needed.
+
+The other four nodes are cheap and each has exactly one correct behaviour.
+`/dev/random` and `/dev/urandom` are one node, which is a deviation with a date
+on it: they were different devices until Linux 5.6 and have behaved alike
+since. It reads through `rng::fill` rather than `fill_secret`, deliberately --
+the secret form refuses below the entropy threshold, and glibc's fallback for a
+failing `getrandom` is to open this and read it, so a refusal here leaves a
+program with no third option.
+
+Driven under glibc: `busybox ls -l /dev` reports all five as `crw-rw-rw-`,
+which is an independent reader agreeing they are character devices, and
+`busybox dd if=/dev/urandom of=/tmp/r.bin bs=16 count=1` reports `1+0 records
+in, 1+0 records out` and exits 0.
+
+**That sweep found `dup3` as well.** glibc's `dup2` calls `dup3` when the two
+descriptors differ, so `dd` reached `dup2` and `hexdump` reached `dup3` and
+stopped -- two applets in one run taking different routes to the same thing.
+The one difference that matters is inverted on purpose: `dup3(n, n, 0)` is
+`EINVAL` where `dup2(n, n)` answers `n`, because the no-op case hides a bug in
+the caller and the newer call refuses it.
+
+**What this does not get you, said plainly.** SDL2 has no framebuffer backend
+-- its video drivers are X11, Wayland, KMSDRM, offscreen and dummy -- so
+`/dev/fb0` does not put an unmodified SDL2 program on screen. What it does is
+make the class of program that talks to a framebuffer directly work, and give
+everything visual afterwards something to stand on.
+
+### The other half: `/dev/input/event0` and `event1`
+
+`src/linux/input.rs`. A screen with no input is a picture. Two evdev devices,
+a keyboard and a pointer, fed from the two places this kernel's own drivers
+already converge: `kbd::decode` for every scancode and `mouse::apply` for
+every packet, the latter being the point `port::mouse` already hangs off for
+the reason it gives -- PS/2 and USB HID both arrive there and a second copy
+would be the one nobody tested.
+
+**The ioctls are the interface and the events are the easy half.** A program
+classifies a device by reading its capability bitmaps and nothing else, so a
+mouse that fails to advertise `REL_X` is opened, read from successfully, and
+ignored, which looks exactly like input that does not arrive. The name is
+decoration.
+
+Three things are silent when wrong and each has a claim:
+
+- **`SYN_REPORT` is load-bearing.** A reader batches events until it sees one
+  and treats the batch as a single state change, so a device that never
+  synchronises delivers nothing while working perfectly at the `read` level.
+- **evdev's `REL_Y` grows downward** where `mouse::apply`'s `dy` grows up, so
+  the sign is flipped on the way in. Getting it wrong gives a game whose mouse
+  look is inverted, which reads as a preference somebody forgot to expose.
+- **A Linux keycode *is* a set-1 scancode, for the main block only.** That is
+  historical rather than lucky: the keycodes were assigned to match, so
+  `KEY_ESC` is 1 and `KEY_A` is 30 exactly as the wire has them. It stops at
+  the `E0`-prefixed keys, which is why those need a table and only those do.
+
+A descriptor opens at the *present*, so a program does not receive every key
+pressed since boot the moment it starts, and a reader that falls behind the
+256-entry ring is told `SYN_DROPPED` rather than handed a gap -- a release
+nobody delivered is a key held forever.
+
+**`linux feed` is how any of this is driven, and it had to exist.** A guest
+owns the machine while it runs and `drive.py` sends the next command only when
+it sees a prompt, so anything typed arrives before the guest starts or after
+it has gone -- and a device opening at the present means events pushed
+beforehand are events nobody sees. It is the same answer `win keys` and
+`doom play`'s timed script are, and it borrows their spelling:
+
+```
+linux feed shift@400 -shift@1200
+linux run /tmp/ev
+```
+
+Delivery is from the **timer interrupt**, the only thing that gets a turn
+while a guest runs, and it goes through `kbd::inject_scancode` rather than
+straight into the ring, so what is exercised is the path a real key takes.
+Shift and control rather than letters, because `kbd::decode` returns early for
+the modifiers before it pushes a character and the feed therefore leaves
+nothing in the shell's own input ring for the harness to trip over.
+
+`mkelf.py --kind ev` is twelve checks folding into a mask, and the interesting
+one is not a check: the sixth `read` has no `O_NONBLOCK` and nothing has
+happened yet, so the guest sleeps inside the kernel and comes back when the
+timer delivers. Nothing else in this tree exercises a guest waiting on
+anything.
+
+    linux feed shift@400 -shift@1200
+    linux run /tmp/ev
+        2 open   /dev/input/event0 -> 3
+       16 ioctl  0x3 0x80044501 -> 0     EVIOCGVERSION
+       16 ioctl  0x3 0x80084520 -> 8     EVIOCGBIT(0): EV_SYN|EV_KEY, so a keyboard
+       16 ioctl  0x3 0x80204506 -> 19    EVIOCGNAME
+        0 read   0x3 ... 0x10   -> -22   a buffer too small for one record
+        8 lseek  0x3 0x0 0x0    -> -29   an event stream has no position
+        0 read   0x3 ... 0xc0   -> 48    blocked, then the press and its SYN
+        0 read   0x3 ... 0xc0   -> 48    blocked again, then the release
+      exited 0 after 9 syscall(s)
+
+**Two real bugs came out of driving it and one is much bigger than evdev.**
+
+`overran` is checked from the timer interrupt and only when the saved CS says
+ring 3, so **a guest blocked in a syscall was invisible to the one thing that
+ends a runaway**. A blocking read on a device nothing feeds took the machine:
+shell gone, no key able to bring it back, reboot the only way out. The wait
+loop checks the deadline itself now and ends the guest through `kill_blocked`,
+whose safety note is deliberately a *different* condition from
+`kill_overrun`'s rather than a weaker one -- there the guarantee is that the
+kernel was not running at all, here it is that this particular loop holds no
+allocation, no borrow of `SPACE` and no lock across the yield.
+
+And **"at teardown" is not "at the end of a run"**: `install` calls `teardown`
+at the head of itself to abandon any previous space, so the `stop` that swept
+a spent script swept it a microsecond *before* the guest it was armed for
+began. The counters found that in one run where reasoning had produced three
+wrong theories -- `service` reported 9,346 ticks seen and 0 delivered, which
+says the timer was fine and the script was gone. Anything else that hangs
+cleanup off `teardown` has the same trap waiting.
+
+### A filesystem a program written for Linux recognises
+
+`src/linux/fs.rs`. The store underneath is not a filesystem and `sysbox::tree`
+says so in its own header: a content-addressed Merkle tree where a copy is
+O(1), a snapshot is a hash, and `rm` detaches a name rather than destroying
+anything. None of that has an `open`. A Linux program expects the opposite set
+of things -- a path resolves to an inode, an inode has a size and a mode, a
+descriptor is a small integer with a cursor in it, and reading advances the
+cursor. This module is the translation, and it is a **view rather than a second
+store**: nothing here owns any bytes, every read goes to the tree and every
+listing comes from `sysbox::listing`.
+
+The descriptor table lives in `Space` beside the memory regions and is seeded
+with the three standard ones at `install`, so a guest that never opens anything
+still has somewhere to write. They are `Fd` variants rather than table entries
+with a magic path, which is what makes `lseek` on stdout answer `ESPIPE` from
+the type system instead of from a string comparison.
+
+Twelve calls, plus two that exist to stop a runtime concluding it failed to
+start: `read`, `open`, `openat`, `close`, `lseek`, `fstat`, `stat`, `lstat`,
+`newfstatat`, `getdents64`, `ioctl`, and `getpid`/`set_tid_address` answering 1
+because there is one process and it is the guest.
+
+**Opening for writing is refused, and that is a decision rather than a gap.** A
+write to a content-addressed store is a new root hash, so honouring `O_WRONLY`
+would give a guest binary a route to the namespace that goes around every gate
+`sysbox` puts in front of the shell -- the sandbox, the applet table, the
+snapshot. `EACCES`, and the day a guest needs to write, what it needs is a
+scratch subtree with the same jail an Aiksi program gets, not this call quietly
+growing a second meaning.
+
+**A descriptor-relative `openat` is refused too**, with `ENOSYS` and for a
+smaller reason: resolving one needs the directory's own path kept per open
+descriptor, and resolving it against the working directory instead would open a
+real file that is not the one the guest named. `AT_FDCWD` and absolute paths
+are the whole of what works.
+
+**An open file holds its whole contents.** `read_blob` answers a `Vec`, so the
+honest options were to keep that or to teach the store ranged reads. Keeping it
+makes `read` a slice and `lseek` an integer, and it means a guest opening a
+600 MB model file takes 600 MB of heap. What a guest reads today is
+configuration and text. When that stops being true this is the first thing to
+change, and it is written down here rather than discovered by an allocation
+failure.
+
+**There are no permissions, owners or times.** Everything reports mode 0644 or
+0755, uid 0 and a zero timestamp. A program branching on any of those gets a
+consistent answer rather than a true one, which is the right trade while the
+alternative is inventing a field the store does not have.
+
+**A path containing `..` is refused rather than normalised.** A tree with O(1)
+copies has no single parent to walk back to, so there is no correct answer, and
+a normalised path resolves to somewhere the guest did not name. `.` and doubled
+separators do collapse, since those have one answer.
+
+**`struct stat` is 144 bytes and the layout is an ABI rather than a choice.**
+Writing it a field short is not a smaller answer, it is a different structure,
+and libc reads past the end of what was written. `st_blocks` is in 512-byte
+units because that is what `du`-shaped callers divide by, so a one-byte file is
+one block and not zero.
+
+**A `linux_dirent64` is padded to eight because the kernel pads.** A guest
+walking the buffer adds `d_reclen` to its cursor, so an unpadded record leaves
+the next one misaligned and the guest reads a name out of the middle of an
+inode. `getdents64` snapshots the listing at `open`, since a directory that
+changed under a half-finished walk would hand out a shifting list and the tree
+has no cursor to offer instead.
+
+**Inode numbers are the first eight bytes of the SHA-256 of the path**, with
+the low bit set so none is zero. The tree has no inodes; what programs use the
+number for is telling two paths apart and spotting hard links, and a hash of
+the path answers both.
+
+`build_stack` lays out real argc, argv, envp and auxv, and the shell passes the
+path as argv[0] because that is what a program expects and what busybox
+dispatches on.
+
+**Two programs, and they are the measurement.** `tools/mkelf.py --kind cat` and
+`--kind grep` are hand-assembled the way every other fixture is. `cat` is the
+smallest thing that exercises the whole projection at once: a path travels from
+the shell through argv into `openat`, the namespace resolves it, `read`
+advances a cursor across several calls, and end of file is a zero return rather
+than an error.
+
+    glados> linux run /tmp/cat /tmp/lines.txt
+    alpha
+    the quick brown fox
+    beta
+    jumps over the lazy dog
+        2 open      0x2c5cff1 0x0 0x0 -> 3
+        0 read      0x3 0x2c5cdb0 0x100 -> 54
+        1 write     0x1 0x2c5cdb0 0x36 -> 54
+        0 read      0x3 0x2c5cdb0 0x100 -> 0
+        3 close     0x3 -> 0
+      exited 3 after 6 syscall(s)
+
+`grep` is the one that checks the bytes are *right* rather than merely present.
+A naive substring search over a line buffer answers differently for every
+one-byte change in the file, so a read that lost a byte, doubled one or stopped
+early shows up as a wrong set of lines instead of as plausible output:
+
+    glados> linux run /tmp/grep the /tmp/lines.txt
+    the quick brown fox
+    jumps over the lazy dog
+        2 open      0x2c5cff1 0x0 0x0 -> 3
+        0 read      0x3 0x2c5bfa0 0x1000 -> 54
+        3 close     0x3 -> 0
+        1 write     0x1 0x2c5bfa6 0x14 -> 20
+        1 write     0x1 0x2c5bfbf 0x17 -> 23
+      exited 0 after 6 syscall(s)
+
+Every number is checkable against the file. The buffer is at `0x2c5bfa0`, so
+the first match is written from +6, which is exactly past `alpha\n`, and the
+second from +31, which is past `beta\n`; 20 is `the quick brown fox` with its
+newline and 23 is `jumps over the lazy dog` without one, because the file ends
+there and a final line carries no separator.
+
+The exit codes are grep's own -- 0 matched, 1 did not, 2 could not -- which is
+what makes the negatives worth running. `grep zebra` exits 1 having written
+nothing, `grep` with no arguments prints usage to fd 2 and exits 2, and a
+missing file gets `-2` out of `open` and never reaches `read` or `close`.
+
+The fixture is a real frame rather than register juggling: `rbp` is the buffer
+and the locals sit underneath it. The alternative was keeping seven live values
+in registers across a `write`, and the syscall ABI hands back only `rbx`,
+`rbp`, `r10`-`r15` and `rsi`/`rdi`/`rdx` -- of which two are the arguments the
+write needs.
+
+### What a guest gets for asking wrongly
+
+`--kind fsabuse` is the third program and it is the one that matters, because
+`cat` and `grep` only ever ask for things that work. A projection over a store
+that is not a filesystem fails at the *edges*, and an edge is exactly what no
+program written to use the thing normally will reach. So the negatives are the
+subject: fifteen checks, each folding one bit into a mask, and the exit code is
+the mask. Zero means every one of them answered what Linux answers.
+
+**One of them stopped the machine, from ring 3, with two ordinary calls.**
+`lseek` past the end of a file is legal -- this module says so, in a comment,
+two functions above the bug -- and `read` then indexed a slice at the cursor
+without clamping it:
+
+    linux run /tmp/fsabuse /tmp/lines.txt
+    *** PANIC *** panicked at src\linux\syscall.rs:725:52:
+    range start index 1048576 out of range for slice of length 54
+
+That is a guest at CPL 3 halting a kernel that has no unwinder, and there is
+nothing exotic in it: seek, then read. The measurement is the point rather than
+the fix, which is one `min`. Nothing about ring 3, page rights or bounds checks
+was wrong; the pointer never left the kernel. It was an ordinary Rust index on
+a value the guest chooses, and the only thing that finds those is a program
+written to choose badly.
+
+Four more the same run turned up, none of which crashes and all of which lie:
+
+- **`write` looked at the descriptor number and not at the descriptor.** It
+  compared `fd` against 1 and 2, which is right until a guest does the thing
+  every shell does: `close(1)` then `open(...)` hands the file descriptor 1,
+  and writing to it printed the guest's redirected output to the terminal and
+  reported success. `close(1)` alone was worse, since a write to a descriptor
+  that is not open has to be `EBADF`.
+- **`fstat` reported stdin, stdout and stderr as empty regular files**, under a
+  comment saying that reporting them as empty regular files is what makes a
+  program believe stdout is seekable. The comment was right and was describing
+  the code beside it. They are pipes now, which is the answer that agrees with
+  `lseek` on them returning `ESPIPE`.
+- **`newfstatat` ignored its directory descriptor.** `openat` refuses a
+  relative path against a real one, because resolving it needs the directory's
+  own path; `newfstatat` resolved it against the working directory instead and
+  answered confidently about a file that exists and is not the one asked for.
+- **`read_cstr` refused a legal path sitting near the end of an image.** It
+  checked reachability a page at a time, which is right for the speed -- a
+  4 KB path checked per byte is four thousand page-table walks -- and demands
+  that the whole rest of the page be owned. A region does not have to end on a
+  page boundary: the image's is the ELF span, so a path constant in the last
+  partial page of a binary is entirely legal and got `EFAULT`, which reads as
+  a pointer bug in the program rather than a bounds check being too eager. It
+  falls back to a byte at a time when the page-wide check overshoots. Found by
+  the fixture opening a path it carries at the very end of its own image,
+  which is a shape `cat` and `grep` do not have because their paths arrive in
+  `argv`.
+- **And it had one failure with three causes.** An unreachable pointer, a
+  string with no terminator and bytes that are not UTF-8 all became `EFAULT`,
+  which sends a program to look at its pointer arithmetic for a filename that
+  was merely Latin-1. `EFAULT`, `ENAMETOOLONG` and `ENOENT` now, the last
+  because a Linux path is bytes and a namespace keyed by `String` genuinely
+  cannot hold one.
+
+And two costs rather than bugs. `stat` learned a file's size by reading the
+file, so `stat` on a 600 MB checkpoint allocated 600 MB to look at a `usize`;
+`sysbox::blob_len` answers it without the copy. And an open descriptor *is* its
+contents here, so sixty-four of them against an unbounded file size is a guest
+taking the heap with a loop of `open` -- `OPEN_MAX_BYTES` caps the total at
+64 MiB and answers `ENOMEM`, which Linux can return and would not return for
+this reason.
+
+**The aux vector was empty and that was not a safe default.** A static libc has
+no dynamic linker to ask, so everything it cannot compute it reads from there:
+`AT_PAGESZ` becomes musl's `libc.page_size`, which it divides by, and
+`AT_RANDOM` is where the stack guard comes from. A vector holding nothing but
+`AT_NULL` hands a real binary a page size of zero. It now carries `AT_PAGESZ`,
+`AT_CLKTCK` (from `crate::TIMER_HZ`, the interrupt rate, and deliberately not
+from `lapic::timer_hz()`, which is the calibrated APIC frequency and is in the
+millions), the four ids and `AT_SECURE` as zero, `AT_RANDOM` pointing at
+sixteen bytes of `rng::fill` on the guest's own stack, `AT_ENTRY`, and the
+`AT_PHDR`/`AT_PHENT`/`AT_PHNUM` group.
+
+Two details there are load-bearing. `AT_PHDR` is a *runtime* address, so it is
+the segment containing the header table plus the offset into it -- `base +
+phoff` is the same number only when the first segment starts at file offset
+zero, which is true of every fixture here and is not a property of the format.
+And when no loadable segment covers the table the whole group is omitted rather
+than pointed at zero, because `dl_iterate_phdr` walks what it is given either
+way and an absent vector is the one a libc knows how to cope with.
+
+**None of it has been read by a real libc on this machine**, since every
+fixture is hand-written and consumes none of it. That is a bet placed where the
+ABI says to place it, and it is worth saying so rather than letting the section
+read like evidence.
+
+One piece of dead code came out with it. `build_stack` padded down when
+`(sp + words * 8) % 8 != 0`, which cannot hold: `sp` is sixteen-aligned and
+every word is eight bytes. It read as an alignment fix and was a tautology,
+which is the more expensive kind of dead code because it stops anybody looking.
+
+### Placing an image where it insists
+
+`src/mem/fixed.rs`. A non-PIE binary demands the addresses in its own headers,
+and this kernel is identity-mapped, so those are real physical bytes. That was
+refused under a reason true of what the kernel *knew* rather than of the
+machine: nothing could answer "does anything own four megabytes at four
+megabytes".
+
+**The frame allocator cannot answer it, and why is the interesting part.**
+`EarlyFrames` is a bump allocator whose cursor is forward-only by design -- its
+own doc explains why rewinding would be worse than the bug it has -- so by the
+end of boot it sits past the heap, three hundred megabytes up, and everything
+behind it reads as unavailable. That includes large conventional regions it
+merely stepped over while looking for one span big enough for the heap.
+`0x400000` is exactly such an address: untouched, and invisible to the only
+thing you would think to ask.
+
+So the free set is computed the other way round: every conventional region the
+firmware declared, minus the handful of ranges boot actually took. The
+allocator records its handouts, which it can do precisely because it never
+frees -- a bump allocator's history is a short list. `handouts()` answers `None`
+if one was ever dropped and the snapshot is skipped rather than approximated,
+because a free set missing a taken range would place a guest on top of the live
+page tables.
+
+    [boot] placeable  7 MiB free below the heap and above it, largest run 6 MiB
+
+Seven megabytes on this map, which is what the firmware calls conventional less
+the page tables and the heap. `mem` prints the table and `diag place` asserts
+the arithmetic against a synthetic map -- synthetic on purpose, since a claim
+written against the real one would assert something about QEMU and fail on the
+GF63 for a correct reason.
+
 ### Testing
 
 There is no `cargo test`. This is a `no_std` UEFI binary with no host test
 runner, so **verification is the boot selftests plus driving QEMU.**
 
 At boot the system runs **twenty-six selftest sections**, and `diag` offers
-**twenty-nine named suites** on demand, most of them the same checks (the `aiksi` section covers the capability gate by name and never by
+**thirty-seven named suites** on demand, most of them the same checks (the `aiksi` section covers the capability gate by name and never by
 calling -- half that table pokes memory, drives I/O ports or paints over the
 screen, and a suite that called every row to prove it exists would be
 scribbling on the machine to do it), printing `ok` or `FAIL` per line: heap, timer, clock, the namespace's
-Merkle addressing, fifteen sets of published cipher vectors, fault handling,
+Merkle addressing, **the record** (`sysbox::guard`, the fork's one invariant),
+fifteen sets of published cipher vectors, fault handling,
 constrained decoding, the agent loop, the linear probe, the situation planner,
 the initiative policy, the self-modification gate, corpus bundles, QDoRA
 adapters, the backward kernels, and the trainer's arithmetic. Read that output;
 it is the test suite.
+
+The thirty-seven, in table order: `crypto rng json aiksi sysbox smp update gpu
+model wgate record skill desk paint recover census migrate mt power fmt differ
+code battery acpi hid text adapterinit study work abstract fingerprint recon
+decoy canary honeypot connectome arena`.
+**Registration is
+deliberately awkward:** `SUITES` carries one results slot per entry and
+`src/diag.rs` asserts the length at compile time, so a suite added without a
+slot fails the build instead of silently never recording a verdict.
 
 Shell commands that re-run checks on demand: `tensor`, `model`, `crypto`,
 `trust verify`, `fit`, `gate`, `search`, `wpa2`, `video bars`. `tensor` and
@@ -782,14 +3188,24 @@ there too and only a Rust bug shows up as a mismatch:
 .\tools\venv\Scripts\python.exe tools\reference.py out\qwen3-0.6b.bin --tokenizer tools\qwen3\tokenizer.json --generate 40 --prompt "..."
 ```
 
-Compare `logits <ids>` in GLaDOS against the same ids here. Coherent generated
+Compare `logits <ids>` in AUTARK against the same ids here. Coherent generated
 text is the cheap end of the same check: an 0.6B instruction-tuned model whose
 attention path is wired correctly writes real sentences.
 
 **`diag` on its own lists the suites; `diag all` runs them.** A bare `diag`
 prints a table with `-` beside everything that has not run this boot and a
-tally reading `0 passed, 0 failed, 28 not run`, which is easy to read as a
+tally reading `0 passed, 0 failed, 48 not run`, which is easy to read as a
 clean sweep. It is the opposite of one.
+
+**The list and its verdict table are one number now, and were not.** `RESULTS`
+is a fixed array indexed by a suite's position, and the `const` assertion
+guarding it compared `SUITES.len()` against a *literal* while the array's
+length was a separate literal beside it. So adding the thirty-third suite
+passed the guard and then panicked at the store -- `index out of bounds: the
+len is 32 but the index is 32` -- which is exactly the failure the guard's own
+comment says it prevents. `SLOTS` is the one number; a `static` cannot be read
+in a `const` context, so naming its length is as close as this gets to
+measuring the array directly.
 
 **The tooling gives the guest four cores, and two suites need more than one.**
 `drive.py` and `run.ps1` pass `-smp 4` by default; `--qemu-extra "-smp N"` and
@@ -813,7 +3229,14 @@ Between boots on the development machine that is about 10%.
 **Run `video bench` at `-smp 1`.** The extra cores cost the graphics path 30
 to 40% while doing nothing at all: `desk::draw + present` measures 1,541 us at
 one core and 2,107 at four, `full-screen rect` 158 against 221, `present, no
-change` 270 against 358. That is the same contention `smp bench` records --
+change` 270 against 358. Those three figures **predate the Frutiger Aero
+reskin** and are not the number to compare a change against: the same command
+on the same prefix now reads 2,143 us at one core, which is what gradients,
+rounded corners and shadows cost. Take a matched baseline by stashing rather
+than reaching for a figure written down here -- a session comparing the
+terminal status strip against 1,541 read a 41% regression that was entirely
+the reskin, and the strip itself measured 1.5% on a stashed pair, against a
+control that moved 4% the same way. That is the same contention `smp bench` records --
 one core reads 4570 MB/s alone and 3526 MB/s with seven merely idling beside
 it -- and it lands here because the whole graphics path is span fills and a
 memcmp, which is to say memory bandwidth and nothing else. The figures
@@ -830,6 +3253,44 @@ all three. The single-sample figures that suggested a cost (65 ms against
 95 ms) were the host's scheduler, which is the error `video bench` was
 rewritten to stop making.
 
+**Two `drive.py` runs at once is a failure that looks like a hung guest.**
+The serial and monitor ports are fixed at 45454 and 45455, so the second
+launch gets neither, and what it prints is a log with **no boot output at all**
+followed by `TIMEOUT after Ns with N commands unsent` -- which reads exactly
+like a guest that died early. The tell is the empty log: a real hang prints
+the firmware banner and the boot sequence first. `.qemu/qemu-stderr.log` says
+`Failed to find an available port`. Check for a running QEMU before launching,
+especially when the first run is in the background.
+
+**A screenshot is taken when `drive.py` exits, which for a full-screen program
+means you get the desktop.** The bounded `ms` form returns before the harness
+does, so `--screenshot` catches whatever is on screen *after* the program gave
+the screen back -- a terminal, every time. To photograph the program itself,
+give it a duration longer than the harness will wait and let the **timeout** be
+the exit path: `doom play 600000` with `--timeout 420` lands about two minutes
+into the run. Boot alone is around 300 s against FreeDoom under WHPX, so a
+timeout under that photographs the boot log instead. Two runs and fifteen
+minutes were spent learning this.
+
+**A full-screen program needs a bounded form or nothing can test it.**
+`drive.py` sends the next command when it sees a prompt, so a program that
+owns the screen until somebody presses a key never gives the prompt back --
+and the keystroke that would end it is the one command the harness cannot
+deliver. `port bars` deadlocked exactly there on its first run, with two
+commands unsent. Hence `port bars <ms>`: the interactive form waits for a key,
+the bounded form returns on its own, and only the second one is ever driven.
+Anything full-screen that follows needs the same.
+
+**`gfx::exclusive` is how a full-screen program keeps the screen.** Owning the
+framebuffer is not enough: `desk::paint_clock` runs on the clock task at 10 Hz
+and `desk::move_cursor` runs on whichever task is generating, and both write
+the framebuffer under a paint claim that is private to `desk.rs` and therefore
+unreachable from outside it. So instead of contending for the claim, the two
+periodic painters stand down while the flag is set. `port::with_screen` sets
+it, blanks the screen and calls `desk::draw()` on the way out. `edit::run` has
+owned the screen the same way since it was written and had this defect the
+whole time -- the clock painted over the editor.
+
 **Boot selftest output is easy to skip past and it does catch real bugs.** An
 ECDSA break was visible in `[selftest] crypto` for a whole debugging cycle
 while the output was being sliced away. It happened again while the adapter
@@ -843,8 +3304,8 @@ under active work. Read the whole thing, or grep for `FAIL` across all of it.
 ### Aiksi, the system language
 
 `src/aiksi/` is the language everything above the kernel is written in, and
-the intended relationship is C to Unix or HolyC to TempleOS: GLaDOS is written
-in Rust, and Aiksi is how anything that is not the kernel reaches it. A program
+the intended relationship is C to Unix or HolyC to TempleOS: the kernel is
+written in Rust, and Aiksi is how anything that is not the kernel reaches it. A program
 is `code.ai&xi`. The extension is deliberately unusual and costs nothing --
 nothing on the host has it, the shell does not parse `&`, and the path resolver
 is a plain splitter.
@@ -936,13 +3397,90 @@ the machine, so `net_ifaces` is Read and `tcp_connect` is not.
 `words` prints the table grouped by class. It is the reference.
 
 What Aiksi reaches today: text (split/join/substr/find/replace/upper/lower/
-trim/starts/ends/contains/chr/ord/repeat/pad/hexenc/hexdec), integer arithmetic
-(no floats -- adding them for one builtin changes every arithmetic path), lists
+trim/starts/ends/contains/chr/ord/repeat/pad/hexenc/hexdec), a four-rung
+numeric tower (below), lists
 (sort/reverse/slice/index/remove/range/push/set/get/len), the namespace
 (read/write/ls/exists/rm/size/is_dir/hash_of/applet), the clock and counters
 (rtc_now/rtc_unix/uptime/tsc/tsc_mhz/ticks/hz), tasks and memory, `pci_list`,
 network status, sockets (dns_resolve/tcp_*/http_get/https_get/udp_send/ping),
 the model (`ask`), the framebuffer, and raw memory and I/O ports.
+
+### Numbers, in four rungs
+
+This said "no floats -- adding them for one builtin changes every arithmetic
+path" for a long time, and the objection was right about the *path* and wrong
+about the conclusion. What it argued for was making inexactness opt-in rather
+than absent:
+
+    Int(i64)            10/3 is 3, as it always was
+    Rat(i64, i64)       rat(10, 3) is 10/3, exactly
+    Qty(i64, i64, Dim)  qty(9, "m/s^2") is 9 m/s^2, and adding seconds is an error
+    Approx(f32)         real(2) is ~2, and the tilde is in the rendering
+
+**Every rung is reached through a named builtin and by no other route**, which
+is what keeps the promise that nothing written earlier moved: `rat` is the only
+way to make a fraction, `qty` the only way to attach a unit, and `real` plus the
+transcendentals the only ways to make an approximation. There is no float
+*literal*, deliberately -- that is what keeps `.` unambiguously field access.
+
+Each rung has a canonical form and that is load-bearing. `rational` collapses a
+denominator of one back to `Int`, `quantity` collapses an empty dimension back
+to a plain number, so `3` and `3/1` and `3 dimensionless` are one value and not
+three that render, hash and compare differently.
+
+Two things worth knowing before touching the arithmetic:
+
+- **This target cannot divide a 128-bit integer.** `__udivti3` and `__umodti3`
+  link and do not return; one `u128 %` in a gcd loop stopped boot with no fault
+  and no output, three sections before the shell. `rat_binary` therefore
+  cross-reduces in `i64` and says so. A 128-bit *comparison* is fine -- it is a
+  subtract -- which is why the orderings may use one.
+- **Branch order in `binary` is Qty, Approx, Rat, Int**, and it is not
+  cosmetic: a quantity meeting a fraction would otherwise route through
+  `rat_binary` and silently lose its dimension.
+
+`num_cmp` is one ordering that `min`, `max`, `clamp` and `sort` all read. It
+agrees with `<` everywhere except NaN, deliberately, and both sites say to read
+the other before changing either.
+
+### The standard library at `/lib`
+
+Seven files of Aiksi source, compiled into the image with `include_str!` and
+seeded into `/lib` at every boot from `aiksi::LIBS`. Compiled in for the reason
+the routing corpus is: `/lib` is where a sandboxed program's dependencies are
+allowed to live, so a machine that has never mounted a store still has to have
+one.
+
+| | |
+|---|---|
+| `prob` | combinatorics and the exact half of statistics; a probability *is* a fraction |
+| `geom` | plane geometry over exact coordinates, and a convex hull that cannot contradict itself |
+| `mat` | linear algebra; Gaussian elimination where "is this pivot zero" has an honest answer |
+| `num` | number theory, and modular arithmetic with no 128-bit intermediate anywhere |
+| `poly` | polynomials, including the two operations whole numbers cannot express |
+| `phys` | physics in quantities that carry their units |
+| `chem` | formulas parsed, molar masses summed exactly |
+
+**`/lib` belongs to the image and not to the machine.** It is re-seeded
+unconditionally at boot and after restore, so an edit made there does not
+survive a reboot; a program needing its own version keeps it in its own subtree,
+where the jail admits it anyway. The guard that used to be there asked whether
+`/lib` was *empty*, which froze every snapshotted machine at whatever library
+set it had when it first snapshotted -- the seventh library simply never
+appeared, with nothing said.
+
+**Three structural claims walk `LIBS` at `diag lib`** and they exist because of
+one trap: a user function **shadows a builtin**, deliberately, and `use` is
+textual inclusion. So a library declaring `trim` silently takes the string
+builtin away from every program that imports it. The claims are that every
+library imports and runs its top level, that no declared name is a builtin, and
+that no two libraries declare one name. `/lib/poly` was written with exactly
+that `trim` and with an `area` colliding with `/lib/geom`'s, and this is what
+found both.
+
+The headline measurement is `inv(hilb(3))`. The Hilbert matrix is the standard
+ill-conditioned example and its inverse is a matrix of *whole numbers*, which no
+floating-point library recovers at any precision. This one does.
 
 Everything that is *actually a struct* answers a record: `pci_list` gives
 `Device`, `rtc_now` gives `Time`, `net_ifaces` gives `Iface`, plus `net_config`,
@@ -1106,10 +3644,13 @@ That is exactly why the rest is careful.
   `update::decide` is. Heap-resident generated code is named by tag and
   offset; an rip in neither is said to be in neither.
 
-None of this prevents anything. There is no fault recovery here -- every IDT
-vector but `#BP` is `-> !` -- so a bad jump is still a halted machine. What
-the registry buys is that the one diagnostic which survives says something
-true.
+None of this prevents anything **here**. Faults are recoverable inside
+`cpu::recover::guard` and generated code is usually not called from inside one,
+so a bad jump is still a halted machine. What the registry buys is that the one
+diagnostic which survives says something true -- and that matters more now that
+`boot_report` turns a boot-time halt into a transcript, since a transcript
+naming an offset into an anonymous buffer is a different thing from one naming
+an rva in nothing.
 
 **And it does, verified by faulting on purpose.** `fault code` emits a null
 dereference into an `Exec`, arms it and jumps in. The buffer is deliberately
@@ -1302,13 +3843,44 @@ box. Typing anywhere in the menu goes to it; Enter runs `open <query>`, the same
 dispatcher the search panel uses. `KEY_STARTMENU` (`win keys start`) opens the
 menu, which previously had no key at all and so could not be driven headlessly.
 
-`todo` (shell) and the ToDo window share one list. It is the hand-off
-note for what to test at the GF63, since the machine that builds this is a
-different machine from the one that runs it.
+**A window arrives over about a tenth of a second, and only its chrome does.**
+`open_flourish` plays six frames from a small rectangle at the window's own
+centre before the window is drawn for the first time, and `ARRIVING` is what
+tells `draw` to skip the window while its own animation is on screen. Chrome
+only is a constraint rather than a shortcut: there is no way to blend a window
+against a backdrop the back-to-front repaint has already overwritten, and
+`Console::reflow` **discards rows when it shrinks**, so animating a terminal's
+real geometry would destroy its scrollback to decorate its opening. `open_rect`
+is pure and selftested, and the claim that earns its place is that the last
+frame is the target *exactly* -- a final rectangle off by a pixel leaves a seam
+of chrome the real window does not cover, and nothing repaints it until
+something else happens to.
+
+**The taskbar is drawn before the windows**, which mattered for the first time
+when a hover tip had to stand above it: drawn from inside the bar's own painter
+it went under the terminal, visible only in the strip of wallpaper to its left.
+`taskbar_tip` is called at the end of the frame instead. Task buttons stay
+pictogram-only -- every button the same width is what lets nine of them read as
+a row -- and the tip is the third state between "no label" and "a label on
+every button". A window the bar had no room for now shows as a `+N` chip rather
+than being dropped in silence.
+
+`todo` (shell) and the ToDo window share one list. It is the hand-off note for
+what to test at the GF63, and this said "the machine that builds this is a
+different machine from the one that runs it", which is false: `Win32_ComputerSystem`
+reports `Thin GF63 12UC`, board `MS-16R8`, so the development host **is** the
+target. The hand-off is real and the reason was wrong. What is true is that the
+two cannot run at once -- `deploy.ps1 -EspDrive S:` writes the external SSD and
+testing means rebooting into it on F11, which takes the editor, the browser and
+this file away with it. So anything you wanted to look up while GLaDOS is
+running has to have been written down first, which is exactly what the list is
+for.
 
 **Apps are `Content::App(Box<dyn DeskApp>)`** (`gfx/mod.rs`): a window whose
-client area belongs to a program, being Paintbrush (`paint.rs`), Write
-(`write.rs`) and Minesweeper (`mines.rs`). Six methods (draw, key, press,
+client area belongs to a program. There are ten: Paintbrush (`paint.rs`), Write
+(`write.rs`), Minesweeper (`mines.rs`), ToDo, Ask, Flows, Improve, the Oracle,
+the agent log and the authoring progress window (`agentwin.rs` holds the last
+two). Six methods (draw, key, press,
 right_press, drag, release/wheel); every handler returns whether it consumed
 the event so unclaimed keys fall through to the window manager. `draw_in` takes
 `&self`; layout facts discovered while drawing go in `Cell`s, the Browser's
@@ -1326,7 +3898,13 @@ Four lessons already paid for. Do not relearn them:
   Alt-Tab land on a third window; scripts and habit both need over-and-back to
   be two presses. Headless recipe: every `win keys` line that drives an app must
   be self-contained, as in `alttab,...,alttab`, because between commands the
-  focused app would swallow the next line.
+  focused app would swallow the next line. **Alt-Shift-Tab is not the other
+  direction of that** -- a swap is its own inverse, so it would be the same
+  operation under a second name. It raises the *deepest* visible window
+  instead, which is the one plain Alt-Tab can never reach, and it is
+  `KEY_ALTTAB_BACK` rather than a modifier the desktop reads, because the
+  desktop is handed bytes and has no view of what is held down. `win prev` and
+  `win keys alt-shift-tab` are the typed forms.
 - **QEMU monitor `mouse_move` deltas must stay within +-255 per axis.** Bigger
   deltas set the PS/2 overflow bit and the driver correctly discards the
   packet, so the pointer simply does not move, which reads as a dead drag
@@ -1372,6 +3950,38 @@ Two gotchas paid for here:
   is not `lapic::timer_hz()` (the calibrated APIC frequency, in the millions).
   Dividing uptime by the latter put every reading at 0s. `mem` and `uptime` use
   `TIMER_HZ`; so must anything converting ticks to seconds.
+
+  **That last sentence was wrong for as long as there have been other cores,
+  and it is the reason this entry is worth reading twice.** `TICKS` is one
+  global counter and `timer_isr` incremented it unconditionally -- while every
+  application processor starts its own periodic timer on the same vector, with
+  the same handler, because `init_this_core` deliberately does not re-register
+  per-core entries. So `ticks()` advanced at **N x TIMER_HZ**, and every
+  duration derived from it was wrong by the core count.
+
+  The expensive one was `tcp::wait_until`, whose deadline is
+  `ticks() + ms * TIMER_HZ / 1000`: **every network timeout in the kernel was
+  short by the core count.** A 15 s TLS deadline was 3.75 s under the tooling's
+  default `-smp 4`, and would be under a second on the GF63's sixteen logical
+  processors -- which is a candidate explanation for fetch and handshake
+  failures on hardware that never reproduced here. `uptime` was wrong the other
+  way, and the model selftest's tokens/sec under-reported by the same factor,
+  since it both sampled a shorter window and divided by too many ticks.
+
+  Measured: a 4-core guest reported **55.58 s of uptime during a 25 s run**,
+  longer than the whole invocation including QEMU startup, against 8.01 s for
+  the same script at `-smp 1`. Only the bootstrap processor increments now.
+
+  Two things about how it hid for so long. The `[selftest] timer` line printed
+  "N ticks in ~0.5 s" where the 0.5 was **a constant in the format string**, so
+  it read identically however fast the counter was really moving; it is timed
+  against the TSC now and fails if the two clocks disagree. And the benchmarks
+  that *are* trustworthy -- `smp bench`, `video bench`, `core bench` and the
+  decode figures -- all use `rdtsc`/`tsc_mhz`, which is exactly why the decode
+  numbers came out consistent across 1, 2 and 4 cores. Had they been
+  tick-based they would have differed fourfold. **Anything measuring a duration
+  should use `rdtsc`; `ticks()` is for wall-clock-ish elapsed time and nothing
+  else.**
 - **`win keys` bypasses the hardware ISR**, so scripted keystrokes do not feed
   the entropy ring. Only real hardware events do. That is correct, since the
   entropy *is* hardware timing, and it means headless tests show "fed by ~1
@@ -1390,6 +4000,318 @@ shadow grid without painting, and `finish()` repaints the whole log. Anything
 that draws during boot must check `splash::active()`, and the fault reporter
 and panic handler call `splash::abandon()` first, because on the GF63 the
 framebuffer is the only diagnostic channel there is.
+
+### Surviving a selftest, and repairing what broke
+
+**The first bare-metal boot on the GF63 died of a thermometer.** A `#GP` in
+`dev::power::hwp_range` -- reading `IA32_HWP_CAPABILITIES`, which is gated
+behind `IA32_PM_ENABLE` and which nothing downstream needs -- halted the
+machine before the shell existed. No storage, no namespace, no model. The only
+positional information on screen was `rva 0xaa013`, which needed a second
+computer and `llvm-objdump` to turn into a function name.
+
+Four pieces answer that, and each is useful without the ones after it.
+
+**Symbolication.** `.cargo/config.toml` passes `/MAP:target/glados.map` --
+`lld-link` takes MSVC flags -- and `tools/symbols.py` turns the map into
+`src/cpu/symbols.rs`: an rva-sorted table and one names blob, 13,559 symbols
+and 546 KB, which takes the image from 4,221 to 4,916 KB. `cpu::code::symbol`
+binary-searches it and allocates nothing, because it is called from a fault
+handler. Two traps paid for: v0 Rust mangling is **length-prefixed**, so a
+greedy regex returns `glados` for everything and it needs a scanner; and the
+build stamp is a content hash of the table rather than the linker timestamp,
+which never converged and named the *previous* link.
+
+`scripts/deploy.ps1` builds, regenerates the table and relinks -- two passes,
+necessarily, since the table describes the image it is then compiled into. The
+stamp is what says whether the one in the binary belongs to it.
+
+**Guards fit to wrap a selftest.** `PADS` is a per-task stack of depth 4, so a
+guard inside a guard no longer disarms the outer one on its *normal* exit.
+`guarded` answers three states rather than two: `Ran`, `Faulted(why)`, and
+`Unguarded`, which means the closure ran with no landing pad and therefore
+**proved nothing** -- treating that as a pass is exactly how a check that never
+protected anything looks like one that passed. `selftest_window(bool)` lets the
+panic handler consult a pad, and only there; everywhere else a panic halts.
+
+Two hazards that are silent, both already paid for. A fault mid-`kprintln!`
+abandons `CAPTURE` and `CONSOLES` held, and `Spin`'s patience limit **panics**
+on the next acquire -- a recovered fault becoming a fatal one -- so the caught
+path calls `console::release_locks()`, which is entitled to exactly those two
+and says so. And **a provably-divergent closure loses its landing pad**: the
+optimiser deletes the unreachable tail, longjmp target included, and the guard
+lands at an rva past `.text`. `guard_inner` calls through
+`if core::hint::black_box(true)`, and the suite's case is a bare `panic!` so it
+asserts the defence rather than working around it.
+
+**Criticality is per subsystem.** `main::section(name, need, f)` wraps a boot
+check; `Need::Vital` halts with a reason, `Need::Optional` records the failure,
+prints one red line and carries on. Seven are wrapped today -- `sysbox`,
+`crypto` and `rng` vital, `power`, `fmt`, `usbhid` and `code` optional.
+
+It takes `fn()` rather than `impl FnOnce()`, and that is the load-bearing
+detail: **a failure you cannot re-run is a failure you cannot repair**, and
+re-running the check is the only judge a repair has.
+
+**The site is recorded, because recovering throws away the only evidence of
+where.** A caught fault is attributed to whatever scope was guarded, which
+answers *which check failed* and not *what broke*. Those differ the moment a
+check calls into something else -- a fault inside the graphics stack reached
+from a power selftest is a power failure by attribution and a graphics one in
+fact. `recover::site()` carries the rip through, `boot_report` symbolicates it
+at print time, and the report prints both. Verified by faulting inside
+`doom::pic` from the `power` section: the report named section `power`, site
+`doom::pic::Art::flat +0x27`.
+
+**The repair loop is the Troubleshooter's bargain**, which was a good one: a
+fixed set of deterministic actions, one applied, and then **checked**. It never
+ran during POST either -- it booted, looked, fixed, and made the fix stick.
+That ordering is forced here anyway, since `ai::init` needs the namespace and
+the selftests run long before either.
+
+`src/repair.rs` is an allowlist, two rows today, which is the honest size of
+the set of knobs that exist rather than a claim the machine can fix anything.
+`retry` earns a row because "it did not happen the second time" is a real
+outcome worth recording as the repair that worked. `skip-hwp` is the GF63 bug
+with a switch in front of it. Most useful repairs turn something off or down;
+so did the Troubleshooter's.
+
+**The fixed rule was built first, deliberately**, and it is still the fallback:
+try each offered action in table order, keep the first whose judge passes,
+revert the ones that did not, so whatever is left standing is exactly the one
+that worked. Proving apply/judge/revert somewhere a decode cannot be blamed for
+had to come before a decode was allowed near it.
+
+**The fault's own signature picks the repair, and no model is asked.** A fault
+carries a vector and a symbolicated site, and those two say far more about which
+knob is wrong than any amount of reasoning about names --
+`dev::power::hwp_range +0x13` is not a hint, it is the answer. So `Clue` is
+`Fault(name)` or `SiteContains(part)`, every clue on an action must hold, and
+`skip-hwp` carries the GF63's own: a general protection fault inside
+`dev::power`. Both halves matter -- a *page* fault there is some other bug and
+this knob would not touch it, and a `#GP` outside `dev::power` is not an MSR
+gate problem.
+
+`rank` sorts what is offered into three groups and **drops none of them**:
+matched, then actions asking for nothing, then actions that asked and did not
+get it. The third group is kept because a clue is evidence about what is likely
+and never a proof about what is possible, and discarding would turn a wrong
+guess about a signature into a repair the machine can no longer reach. The judge
+still decides, so the ordering is allowed to be a guess -- being wrong costs an
+apply and a revert, never a bad repair.
+
+**Plain table order was wrong, and this is what made it visible.** `retry` was
+first, and retrying can only ever help a *transient* fault, so on a
+deterministic one the first attempt was guaranteed waste. An action with no
+clues is a fallback now and sinks below anything whose clues held.
+
+`rank` is pure over the failure record, so nine claims assert it with no model,
+no disk and nothing injected -- the `update::decide` discipline, and the reason
+this replaced a decode rather than sitting beside one. Among them: a different
+fault in the same subsystem does not match a signature, the right fault at the
+wrong site does not either, and every vector a clue names is one
+`recover::describe` can actually report. That last is a list rather than a match
+arm now, because renaming a vector would otherwise stop every signature matching
+with no error at all -- a machine quietly repairing itself worse than it used
+to.
+
+**The model is still there and off by default.** `author::choose` over the same
+table, behind `repair model on`, falling back to the ranking on no model, a busy
+engine, or three decodes that will not commit. It is kept rather than deleted
+for the reason the SGD head and the role adapters are kept: the apparatus is
+what lets somebody cheaply re-ask the question on a checkpoint that is not the
+one it was measured on.
+
+`offered_for` is narrow on purpose, and `diag repair` is built around that: a
+chooser that could pick a power register knob for a graphics fault is one
+decision away from a second fault in a subsystem nobody was repairing. Both
+halves of that claim are **derived from each row's own list** rather than
+written down, so renaming a row cannot leave the suite passing while testing
+something that no longer exists; and the judge claims run against synthetic
+checks belonging to no subsystem, so what they measure is the judge rather than
+a particular repair.
+
+Four more claims are that rule arriving on the other side of the loop.
+`offered` stops the wrong knob being *tried*; these stop the model being *told*
+about a fault other than the one that happened -- the prompt must name the
+subsystem that failed, carry the real symbolicated site, mention no other
+subsystem the table knows about, and offer exactly the rows this subsystem is
+offered. `boot_report::site_of` is one function for that reason: a chooser shown
+less than the operator is guessing about a fault somebody else can see, and one
+shown *different* words makes decisions nobody can check against what was
+printed.
+
+**The transcript says who chose**, because three different things land on index
+zero and they mean different things: `forced` (one option), `table` (the model
+is switched off), `no model`, `undecided` (three decodes that would not commit)
+and `model`. Without that column a boot where the engine was busy reads exactly
+like a boot where the model picked the first row.
+
+`judge` saves and restores the selftest window instead of closing it. It is
+callable from inside a suite -- `diag repair` does exactly that -- and closing
+it would silently take panic recovery away from every check after it.
+
+Measured under QEMU, with a fault injected into the `power` section that
+`skip-hwp` genuinely fixes:
+
+    [selftest] power page fault -- this subsystem is unavailable
+    [repair] 1 subsystem(s) to try
+      power          repaired by 'skip-hwp', and the check now passes
+    [boot] 1 subsystem(s) did not survive their own selftest, 0 still broken:
+      power          page fault  (skip-hwp)
+    glados> echo alive
+      alive
+
+A repaired subsystem stays listed, because "was broken and is now repaired" is
+a different fact from "never broke" and an operator is owed both. The header
+counts what is *still* broken.
+
+**A repair survives a reboot**, in `\GLADOS\REPAIRS.TXT` on the ESP -- the
+only durable channel that needs no human, since a namespace write lands in
+memory and reaching NVMe needs `store unlock`, which is a person, once per boot.
+`repairs::at_boot` runs inside `update::hook`, which is the earliest point there
+is: every subsystem a repair could protect initialises later, and a repair
+adopted after `power` has already faulted arrives one boot late.
+
+**Nothing the file says is executed.** Two words are resolved against
+`repair::ACTIONS`, the row is what runs, and `offered_for` is checked on the
+way -- which is not decoration when the strings come off a FAT partition
+anything can edit. That is the same bargain `author::choose` makes: the chooser
+names a row, the kernel owns what the row does.
+
+**The safety property is `update`'s health flag with one change, and the change
+is the interesting part.** That flag is resolved before `ExitBootServices`,
+because the firmware's FAT driver is the only writer of the ESP that exists
+while a *boot image* can still be swapped. Nothing here swaps anything, so the
+constraint does not apply -- and this kernel writes its own ESP afterwards over
+NVMe, which `update stage` has always done. Clearing early would have bought a
+window from the hook to the memory map: long enough to catch a repair that stops
+the model loading, and blind to every repair that faults a subsystem, which is
+the entire population this table can produce. `repairs::survived()` clears it at
+the shell instead, so the window is the whole boot.
+
+A machine that cannot write its ESP therefore withdraws one repair per boot.
+That is the safe direction -- a machine nobody can talk to reverts to
+unmodified -- and it is written down rather than left to be found.
+
+**`--esp-on-nvme` is what made any of this testable.** The harness put the ESP
+on its own drive and the NVMe image on another, so the kernel's own block layer
+-- which reads NVMe and nothing else -- could not see the volume it booted from,
+and `find_esp` correctly answered that no NVMe partition carries
+`BOOTX64.EFI`. The GF63 has one disk with the ESP as a partition of it, and OVMF
+enumerates NVMe as a boot device, so the fix was topology rather than code.
+Driven over six boots on a real FAT32 volume: recorded, applied at the next
+boot, applied again at the one after (so the trial clears), killed at 12 s
+before the shell, **withdrawn automatically** on the boot after that, and clean
+on the boot after that.
+
+**`retry` is deliberately not persistable.** It applies nothing, so recording it
+asks the next boot to run a check that boot runs anyway -- a line in a capped
+file that can never change an outcome and would push a real repair out of the
+eighth slot. `Action::persist` is that distinction and `record` refuses without
+it.
+
+**And a repair never silently replaces a fix.** A subsystem held up by a repair
+and one passing because somebody fixed the bug look identical from everywhere
+else, so `recheck_persisted` takes the repair away, runs the check again,
+reports if it passes, and puts it back whatever the answer -- withdrawing a
+repair the machine has been relying on is the operator's decision, not a side
+effect of looking. That needs the check, which only the *failures* were keeping,
+so `section` registers every check now. QEMU is the honest demonstration, since
+it reports `hwp no` and `power` genuinely does not need the repair there.
+
+The operator's half is the `repair` verb: `repair` says what is applied, what
+the boot volume records and what actions exist at all; `repair record` and
+`repair clear [n]` write one down and take it back; `repair off` reverts what is
+applied without touching the file, since undoing a repair for this boot and
+forgetting it forever are different decisions.
+
+**The prompt shape was the whole difference, and it cost a run to find.** The
+first version glossed every row -- `skip-hwp (stop reading the hardware-managed
+performance registers)` -- and came back `no choice among 2 after 0 step(s)`
+three times running. Zero steps means the decode never entered an alternative at
+all: it laid out whitespace until the idle allowance ran out. The prompts that
+work in this tree are one short sentence ending in a question, which is what
+`voter` asks and what `author::choose`'s own note describes. Reshaped, it
+commits. The `about` column is therefore *not* prompt text any more, and says so
+where it is declared.
+
+**And then the measurement, which is the part worth reading.** Six boots with a
+fault injected into `power` that only `skip-hwp` fixes -- three with the table
+in its own order, three with the offered list reversed:
+
+    [retry, skip-hwp]     retry     retry     retry
+    [skip-hwp, retry]     skip-hwp  retry     retry
+
+It picked `retry` **five times in six, wherever `retry` sat**. Reversing the
+list changed the answer once, which is what rules out the obvious reading: this
+is not a model taking whatever is listed first, it is a model preferring a
+*name*, and the name it prefers cannot fix this fault.
+
+The mechanism matters before anybody adds a row. `retry` is one common English
+token; `skip-hwp` is several uncommon pieces. Under a constrained grammar the
+cheapest first-token path wins, so **an action's name carries probability mass
+that has nothing to do with what the action does**. Naming a row is not
+cosmetic here.
+
+So the decode bought nothing on this table: table order tries `retry` first
+too, and six boots of choosing produced exactly what the fixed rule produces,
+for the price of a prefill. What it did not do is any harm -- the machine was
+repaired on all six, because the judge caught the bad pick and the loop moved
+on, which is the whole argument for this arrangement arriving as a measurement
+instead of a claim.
+
+**And the deterministic rule beats it on the one case there is evidence for.**
+Measured against a fixture reproducing the GF63's shape -- a `#GP` raised inside
+`dev::power` -- the ranking repairs it in **one** attempt where the model took
+two:
+
+    model   retry (wrong) -> skip-hwp    2 attempts
+    rule    skip-hwp                     1 attempt
+
+So the model was switched off rather than deleted. The measurement was on
+SmolLM2-135M, the checkpoint that fits under QEMU and not the 0.6B the machine
+runs, and concluding anything about the shipped model from it would be the
+small-sample extrapolation this file warns about elsewhere. `repair model on` is
+how somebody re-asks, and `repair log` is the transcript.
+
+**Three things the testing turned up, none of them about repairs.**
+
+`tools/symbols.py` **writes nothing without `--emit`.** A whole session's worth
+of "regenerate the symbols" parsed the map, printed a count and left the file
+alone, so the table was stale against every build -- and a convergence check
+comparing a file nothing was writing converged instantly and meant nothing.
+`deploy.ps1` passes `--emit` and was always correct, so this cost testing time
+and never a deploy. Emitting the table changes the layout it describes, so it
+takes two or three passes to reach a fixed point.
+
+**`cpu::code::symbol` can name the wrong function, and the offset is the tell.**
+The table holds public symbols, so anything inlined has no entry and the search
+returns whatever precedes it. A deliberate fault in a small `dev::power` helper
+was reported as `doom::play::dispatch +0x14a2` -- five kilobytes into an
+unrelated function in an unrelated subsystem. Average spacing over 13,817
+symbols is about a hundred bytes, so an offset in the thousands means the real
+function is *absent* rather than enormous. `#[inline(never)]` puts one back in
+the table. Not corrected silently, because the map carries no sizes and there is
+nothing to correct it to.
+
+**QEMU answers zero for a read of an unimplemented MSR instead of raising
+`#GP`.** The first fixture was an `rdmsr` on a reserved register -- the real bug
+-- and it did not fault at all. That is the same emulator gap `dev::power`
+already records as the reason its gate cannot be checked here, arriving one
+level down. The fixture uses a non-canonical address instead, which is `#GP` by
+architecture rather than by model.
+
+**What is not built.** No `Probe` is fitted over `/ai/repair/log`. That is the
+point of keeping the transcript -- one line per attempt, symptom and action and
+outcome -- but with zero examples a fitted router has nothing to beat a grammar
+decode with, so it waits until the corpus exists.
+
+**And the end-to-end test no emulator can produce.** Every mechanism above has
+been driven under QEMU with an injected fault, which is not the same as the real
+one: QEMU reports `hwp no`, so the GF63's actual `#GP` cannot reproduce here at
+all. The sequence of that machine faulting, being repaired by `skip-hwp`,
+persisting it and booting clean is still owed, and it needs the laptop.
 
 ### Concurrency
 
@@ -1556,6 +4478,33 @@ not as an accented e. Anything with no glyph draws a hollow box, deliberately,
 because a font that quietly substituted something close would be lying about
 what it has.
 
+**The terminal has a scrollback, and the view is not the grid.** 512 rows in a
+heap ring, allocated on the *first scroll* and never in `console::init` --
+which runs twelve lines before `cpu::idt::init`, where a fault is a silent
+triple fault and where the fixed `[[Cell; 128]; 72]` sizing is load-bearing for
+that reason. If the allocation fails the console behaves exactly as it did
+before there was one.
+
+`row_at` is the one answer to "what is on screen at row r", and everything that
+draws goes through it, because `cells[r]` and screen row `r` stopped being the
+same thing. `draw_cell` refuses while the view is back -- a character echoed
+then would land in a row it has nothing to do with -- and `rows_starting`, the
+caret and the status strip all read through the view too.
+
+**Output does not yank the view to the bottom; a keystroke does.** That is what
+every terminal does and here it is also free: when a row scrolls off while the
+view is back, the history grows by one at the end and the view grows by one at
+the start, and `row_at` resolves every screen row to exactly what it resolved
+to before. Nothing is repainted because nothing moved. At the cap it cannot
+follow any further and `redraw_all` runs instead. `set_col` is the keystroke
+path, since the shell's `redraw` ends with it.
+
+`win scroll <n|end>` is the typed equivalent, and it exists for the reason
+`win keys` does: serial cannot inject PS/2 packets, so a scrollback reachable
+only by a wheel is one nothing ever checks. Note it must read the view
+**before** printing -- `kprintln!` writes, and the first version reported zero
+every time because the message snapped the view home while rendering itself.
+
 **A byte count stopped being a column count, and that broke code that had
 been right for years.** Truncating a label with `&s[..room]` where `room` is a
 column count does not produce a mangled label, it panics.
@@ -1624,11 +4573,36 @@ and the result is a halted machine reporting a register nobody asked for.
 Three conditions, all of them, before any MSR is touched: the vendor is Intel,
 CPUID says the feature exists, and no hypervisor is present. The third is in no
 manual. It is there because an emulator may advertise a capability in CPUID and
-not implement the register behind it, and on real silicon the first two suffice
-while under emulation they are a guess that does not return. **So none of the
-readings can be checked under QEMU**, which reports "vendor intel, hypervisor
-yes" and then declines with its reason. `power force` overrides it and says
-what it is risking.
+not implement the register behind it, and under emulation the first two are a
+guess that does not return. **So none of the readings can be checked under
+QEMU**, which reports "vendor intel, hypervisor yes" and then declines with its
+reason. `power force` overrides it and says what it is risking.
+
+**"On real silicon the first two suffice" is what this used to say, and the
+first boot on the GF63 disproved it.** `power` printed every line down to the
+governor and then took a #GP; the reporter's `rva` disassembled to `rdmsr` with
+`rcx = 0x771`, which is `IA32_HWP_CAPABILITIES`.
+
+CPUID saying HWP exists is not permission to read that register. It is gated
+behind `IA32_PM_ENABLE` bit 0, and this laptop supports HWP and boots with it
+off, so the very first read faulted. The gate asked whether the register
+*exists* where the processor's rule is about whether it is *enabled* -- two
+different questions, and only the first was being asked. `hwp_enabled()` is
+the fourth condition, and it reads the one register in the group that is safe
+on a part advertising HWP, because being the architectural enable is what
+`IA32_PM_ENABLE` is for.
+
+`set_governor` had the same fault by a second route: it called `hwp_range()`
+*before* setting `PM_ENABLE`. Enabling now happens first, which is honest there
+because that function exists to change the policy -- and deliberately does not
+happen in `hwp_range`, since a status command that switched the machine's power
+management on as a side effect of being asked a question would be the worse
+bug.
+
+None of this was reachable under emulation: `allowed` declines under a
+hypervisor before any of it runs, and QEMU reports `hwp no` regardless. **It is
+the first bug in this tree that only bare metal could find**, and the thing that
+found it was the `rva` line the fault reporter prints.
 
 Frequency comes from delivered against reference cycles rather than a register
 claiming one, because a part that changes its clock thousands of times a second
@@ -1646,20 +4620,63 @@ to long mode through a trampoline at physical 0x8000, and parks it. `smp` in
 the shell reports how many answered; `smp bench` times a 16 MiB matvec on one
 core against all of them.
 
-This began as a **compute fabric rather than general SMP**, and it is moving.
-The extra cores can now allocate and print, because those two structures are
-behind real locks. They still never take an interrupt and still never run a
-task, and the reason is specific: an application processor runs on the
-trampoline's flat descriptor table with no task-state segment, so its code
-selector does not match the one the interrupt table's entries name. Preempting
-a task there needs a per-core GDT and TSS, and `smp.rs` already records why one
-TSS cannot be shared. Running tasks cooperatively without a timer needs
-neither, and is the shorter road if it is wanted. They wait on a generation counter
-with MONITOR/MWAIT, run a range of a matrix, and go back to sleep. Every
-decision and every byte of kernel state stays on the bootstrap processor, so
-`Racy`'s safety argument is untouched -- which is the point. General SMP means
-auditing several hundred `Racy` uses and inventing a lock discipline; this
-needed none of that, and it is where the time goes anyway.
+This began as a **compute fabric rather than general SMP**, and it has moved.
+The extra cores can allocate and print, because those two structures are behind
+real locks.
+
+**They take interrupts and they run tasks now, and this file said otherwise for
+longer than it was true.** It read: "They still never take an interrupt and
+still never run a task, and the reason is specific: an application processor
+runs on the trampoline's flat descriptor table with no task-state segment, so
+its code selector does not match the one the interrupt table's entries name.
+Preempting a task there needs a per-core GDT and TSS." That was an accurate
+description of the obstacle and the obstacle was removed. `smp::init` calls
+`gdt::adopt`, `percpu::adopt`, `idt::load_this_core` and
+`lapic::init_this_core` on every application processor and then starts its
+timer, so each core has its own descriptor table, task-state segment, per-core
+block and idle task.
+
+`diag migrate` is the evidence and it is worth knowing what it actually does:
+it spawns a task, calls `unpin` on it, and waits until the core it has been
+seen on has more than one bit set -- sampled until seen twice rather than once,
+because whether a second core picks the migrant up inside any particular 200 ms
+depends on what else is running, and a single sample can fail spuriously as
+easily as it can pass spuriously.
+
+**The audit is per task, and there is exactly one task that has passed it.**
+`Task.pin` carries the only core allowed to run a task. Preemption on one core
+means two tasks never execute at the same instant; on two they genuinely
+overlap, so every `Racy` reachable from two tasks stops being a promise and
+becomes a race. There are 92 of those, the namespace tree among them. Unpinning
+before the audit buys a kernel that passes every test and corrupts something
+later, so migration is opt-in per task and the opt-in *is* the audit.
+
+This said "nothing outside the selftest calls `unpin`" until the mining slices
+did. `mine::client::set_slices` is the first real caller, and what the claim
+cost is worth knowing, because it is the price of every future one: the
+miner's shared surface was audited to a single object -- its journal, which was
+a `Racy<Vec<String>>` and is a `Spin<Vec<String>>` -- and everything else a
+slice touches is an atomic, a `Spin`, or its own stack. `mine::work`'s table is
+one `Spin` per slot for the same reason. The other 91 `Racy`s are untouched and
+every other task is still pinned to core 0.
+
+The evidence that it works is arithmetic rather than a passing test: four
+slices summed to 256% of one slice's hash rate, and tasks sharing a core sum to
+100% however many there are. `tasks` shows them being resumed independently.
+
+The compute-fabric path is unchanged underneath all of that: helpers wait on a
+generation counter with MONITOR/MWAIT, run a range of a matrix, and go back to
+sleep, with every decision and every byte of kernel state still on the
+bootstrap processor.
+
+**A caution for whoever reads this next.** The README's status table says
+"per-core GDT/TSS/APIC ... tasks that migrate" while its limitations list says
+every task is pinned to core 0. Those looked like a contradiction and were not:
+the mechanism worked and was deliberately unused. The limitations line is now
+genuinely stale rather than deliberately conservative -- the mining slices
+migrate -- and the honest edit is "every task but the mining slices", not
+deleting the line. Do not resolve it the other way by unpinning something else
+to make the README true; the pinning is the audit.
 
 `smp::parallel_split(ctx, func, count, width)` is the whole interface. It
 answers false -- meaning "do it yourself" -- if there are no helpers, if
@@ -1684,9 +4701,12 @@ Two things it is easy to get wrong, both already paid for:
 What is split: `Mat::matvec` (every projection, forward) and `Mat::wt_matvec`
 (the adjoint, seven times per layer on a training step -- by column, because it
 accumulates down rows and a row split would need per-core partials and a
-reduction). What is **not**: `matvec_batch`, the prefill path, because it is
-weight-stationary and a per-token split would multiply memory traffic by the
-core count.
+reduction). **`matvec_batch`, the prefill path, is split too now, and by row.**
+Upstream left it serial on the argument that it is weight-stationary and a
+*per-token* split would multiply memory traffic by the core count -- which is
+right about a per-token split and does not apply to a row split, where each
+core reads a disjoint band of the weights once and every token's output for it.
+Checked bit-identical against the whole computation, like the other two.
 
 Measuring this under QEMU does not work and the numbers say so: one core reads
 4570 MB/s alone and 3526 MB/s with seven cores merely *idling* beside it, so
@@ -1768,12 +4788,103 @@ trial the initiative loop runs at night is bounded to a small budget: an
 unbounded one would leave the shell answering "another task holds it" for the
 length of it.
 
+### Which driver claims which device
+
+`src/dev/registry.rs`. Every driver used to answer that for itself: sweep all
+256 PCI buses, compare against a private array of ids, take the first hit.
+Nine drivers, nine sweeps, nine private lists, and **no single place that could
+say what the machine contains**. That is survivable on one laptop and stops
+being survivable the moment the answer has to be right on a machine nobody here
+has ever booted.
+
+**The matching rule is data.** A row is a bus, a rule, a role, a name and a
+support level, and adding hardware support is adding a row. Three kinds of
+rule, because hardware identifies itself three ways and which one applies is a
+property of the part rather than a choice: NVMe reports a programming interface
+every conforming controller reports, so one row drives every SSD in the world;
+an RTL8188EU dongle reports a vendor-specific interface and no useful class at
+all, so the id list *is* the detection. Getting that backwards is how a driver
+misses hardware it could drive, or claims hardware it cannot.
+
+**Specificity is ranked rather than resolved by table order.** An e1000
+satisfies both `Ids(0x8086, ...)` and `Class(0x02, 0x00)` and the specific one
+has to win. Order works right up until somebody inserts a row in the wrong
+place and a generic "ethernet controller, unrecognised" silently shadows the
+driver that would have worked, so a row may be added anywhere.
+
+**Three levels of support, because there really are three.** `Driver` works.
+`Known` means recognised with nothing behind it, and carries the *reason* --
+"needs a signed blob" and "nobody has written it yet" are completely different
+futures, and the reason is the most valuable field in the file. `Partial` is
+the middle this tree keeps landing in: the RTL8188EU dongle is identified, its
+registers are readable, its firmware parses, and it cannot carry a frame.
+Filing that under `Driver` is a lie an operator only discovers when the network
+does not work; filing it under `Known` throws the work away.
+
+    glados> devices
+      8 device(s)
+      USB usb5.1    0525:a4a2 driven   usb-ecm    CDC ethernet adapter
+      PCI 00:00.0   8086:29c0 known    -          host bridge
+      PCI 00:01.0   1234:1111 partial  gfx        VGA-compatible display controller
+      PCI 00:02.0   1b36:0010 driven   nvme       NVMe controller
+      PCI 00:03.0   1b36:000d driven   xhci       xHCI USB 3 controller
+      PCI 00:1f.2   8086:2922 known    -          SATA controller in AHCI mode
+      what is missing:
+        SATA controller in AHCI mode  no AHCI driver yet, and this is why some machines have no disk
+
+That last line is the point of the whole file. It is the largest hole in the
+table, it is entirely tractable -- AHCI is published and needs no firmware --
+and until the registry existed nothing said it: a laptop with a SATA SSD and no
+NVMe reaches a shell with no store, no model and nowhere to save, and the boot
+log gave no hint why.
+
+**USB is pushed, never swept.** Enumerating the bus resets the controller and
+drops whatever link is on it, so a registry that went and looked would take the
+network down to find out what the network is. `xhci::note_device` is called by
+whoever was already enumerating, with zeros for the class triple -- which is
+exactly what a device deferring to its interfaces reports, and which
+deliberately matches no class rule -- and again with the real triple once a
+configuration has been parsed.
+
+**`net::init` no longer carries a preference list.** It was a nested match:
+e1000, else rtl8168, else USB. That is a preference written for one laptop; on
+a machine carrying only the Realtek it paid for a full Intel sweep to learn
+nothing, and on a machine carrying neither it reported "no supported NIC"
+without ever saying what *was* there. `drivers_for(Role::Ethernet)` answers in
+bus order, every refusal is listed by name, and the ethernet and wireless gaps
+print underneath.
+
+`wifi.rs` kept a second copy of both id lists under a comment arguing the
+duplication was deliberate. The objection it made -- that a probe saying
+"supported" while the driver fails for another reason is worse than a short
+list -- is answered by `Partial`, and by the registry never claiming a device
+works, only that a row describes it. Both copies are gone and `hardware()`
+reads the registry.
+
+`diag devices` is 23 claims over 36 rows, nine of which are about which
+*hypervisor* this is. Two of them are about the table
+rather than about any device, and they are the ones worth knowing: **every row
+is reachable** by some device, because a rule that cannot win against the rest
+of the table is documentation pretending to be code, and **no two rows of equal
+specificity overlap**. Everything is asserted against synthetic idents rather
+than against the real bus, for the reason `mem::fixed` gives about its own map:
+a claim about the machine underneath would pass here and fail on the next
+laptop, which is precisely the failure this module exists to stop.
+
+**What it deliberately does not do is bind.** `lookup` answers which row
+describes a device; whether that driver then initialises is the driver's own
+business and it can still fail for a dozen reasons a table cannot predict. The
+registry says "this is an e1000 and `e1000` claims it", never "the network
+works".
+
 ### Networking (`src/net/`)
 
 Interfaces live in `iface`: `lo`, `eth0`, `wlan0`. A driver implements
-`iface::Nic`; `net::init` tries e1000 (QEMU) then rtl8168 (the GF63's real
-card, `10ec:8168`). Routing picks an interface by destination, and every layer
-above asks for a source address instead of assuming one exists.
+`iface::Nic`; `net::init` asks `dev::registry` which drivers the fitted
+hardware wants and tries those, in bus order, rather than the hardcoded
+e1000-then-rtl8168 chain it used to carry. Routing picks an interface by
+destination, and every layer above asks for a source address instead of
+assuming one exists.
 
 **`poll` never dispatches into a transport state machine. It queues.** Sending
 calls `send_ipv4` then `resolve`, and `resolve` calls `poll` while waiting for
@@ -1784,20 +4895,176 @@ inboxes.
 TCP advances only while the shell is idle (`tcp::service` from the idle loop)
 or inside a blocking call. There is no interrupt-driven receive.
 
-The wireless card is CNVi, so the MAC is in the PCH and the M.2 module is a
-radio. `net/wifi.rs` identifies hardware and refuses to pretend; `hardware()`
-lists every network part on PCI and USB with what drives each, and boot prints
-it.
+### What is actually in this laptop, read off it rather than remembered
 
-For the USB dongle, everything above the transport is finished and checked at
-boot: `net/ieee80211.rs` builds probe requests and parses beacons,
-`dev/rtl8188eu.rs::desc` builds and reads the TX and RX descriptors, and
-`net/wpa2.rs` runs the handshake. `bring_up` applies all four initialisation
-tables including the radio, over the serial interface the radio actually needs.
-What is missing is the transport in between: LLT, the FIFO boundary that gates
-the MAC TX/RX enables, channel selection, efuse, firmware, and handing a
-descriptor to a bulk endpoint. None of the chip-facing half can be exercised
-here, since QEMU has no model of the part.
+Enumerated from Windows on the GF63 itself (`Get-PnpDevice -Class Net`), not
+recalled:
+
+| | |
+|---|---|
+| **Intel Wi-Fi 6 AX201 160MHz** | `8086:51f0`, **00:14.3** -- CNVi, so the MAC is a PCH function |
+| Realtek RTL8168 GbE | `10ec:8168`, driven |
+| Intel Wireless Bluetooth | USB `8087:0026`, no HCI here |
+| *(no USB wireless dongle is plugged in)* | |
+
+`0x51f0` is in `INTEL_CNVI_IDS`, so the registry names the part correctly.
+
+**CNVi is not the obstacle, and saying it was sent at least one session down
+the wrong road.** The registry used to read "the radio is in the PCH over an
+undocumented interface". CNVio -- the link between the chipset and the radio
+module -- is undocumented, and *the host never speaks it*. From here the part
+is an ordinary PCIe function with BARs and MSI-X, driven the way `iwlwifi`
+drives a discrete card. The cost is `iwlwifi`'s cost: a firmware image in
+Intel's TLV container, the context-info structure that bootstraps it, then a
+host command protocol -- PHY and MAC contexts, bindings, stations, time events
+-- before one frame moves. Thousands of lines, every step
+match-it-exactly-or-silence, and no emulator models any of it.
+
+And "a signed firmware blob that is not redistributable" was simply **wrong**.
+`LICENCE.iwlwifi_firmware` permits redistribution and use in binary form
+without modification, which is why Debian ships it in `non-free-firmware` --
+the label for redistributable-and-not-free. Not modifiable and not open source
+are different objections from the one that had been recorded.
+
+**The cheap paths, in order.** A phone in USB tethering mode presents CDC-ECM
+or RNDIS, both `Support::Driver` today, and `dev::registry` already calls that
+"the closest thing to a universal wireless driver there is" -- it works now and
+needs no new code. After that, an RTL8188EU dongle: `xhci` already identifies
+one, reads its chip id and runs `bring_up`, and the efuse decoder, LLT chain,
+firmware container parser, channel plan and both descriptor formats are written
+and asserted at boot. Bulk endpoints are not missing either, since `xhci`
+configures and drives them for CDC and RNDIS. What is left there is the on-wire
+sequence and `impl Radio`. The AX201 is the largest of the three and the only
+one that uses the laptop's own radio.
+
+`net/wifi.rs` identifies hardware and refuses to pretend; `hardware()` projects
+`dev::registry` down to the network parts, so the naming lives in one table
+rather than two, and boot prints it.
+
+### Wireless: a seam, a shared layer, and no drivers
+
+**`net::iface::Nic` is Ethernet-shaped, and that was the finding that decided
+the architecture.** `transmit(&[u8])` takes an Ethernet frame, which suits a
+FullMAC part whose firmware hides 802.11 -- and `dev::registry` names six
+wireless families, nearly every one of them SoftMAC. On those the radio moves
+*802.11* frames and the **host** does association, sequencing and crypto. So
+the generalisation is not a driver; it is a seam one layer down, plus
+everything above it written once:
+
+```
+      net::iface::Nic        ethernet frames, TCP/IP above
+            ^
+   +--------+--------+
+ net::mlme          a FullMAC part plugs in here, because
+ net::softmac       its firmware already did all of this
+      |
+ dev::radio::Radio  <- the seam: 802.11 frames in and out
+      ^
+ rtl8188eu, ath9k, mt76, ...
+```
+
+| | |
+|---|---|
+| `dev/radio.rs` | the seam -- name, caps, mac, start/stop, channel, tx, rx -- and the channel plan, which is the same for every part in the world and used to live in one driver |
+| `net/softmac.rs` | Ethernet over 802.11: SNAP, the four address layouts, sequence numbers, CCMP when the chip does not |
+| `net/mlme.rs` | the station state machine: scan, authenticate, associate, four-way, install keys |
+| `net/ccmp.rs` | the link cipher: AAD masks, packet numbers, replay |
+| `crypto/ccm.rs` | AES-CCM, against RFC 3610 packet vector 1 |
+| `net/wpa2.rs` | the handshake, **both** halves |
+
+A driver's whole obligation is `impl Radio` and one call to
+`net::attach_radio`, which makes it `wlan0`. It **refuses a FullMAC part**:
+`Caps::softmac` is how a chip says its firmware ran the MLME, and such a part
+implements `Nic` directly like the wired card. `Nic::wireless()` answers
+`Option<&mut dyn Wlan>` with a default of `None`, so there is one driver and
+one handle to it; the shell's `wifi scan | join | leave` goes through that.
+
+**All of it is asserted at boot with nothing plugged in** -- `diag radio`,
+`softmac`, `ccmp`, `ccm`, `mlme` -- against a `Loopback` radio and a fake
+access point that authenticates, associates and runs the authenticator's half
+of the four-way handshake. The whole path scan to encrypted data runs in a
+loop with no delay, because `Station::poll(now_ms)` **takes the clock as an
+argument**: every state is a deadline, so a machine reading its own clock could
+only be tested by waiting.
+
+Four things that cost a run each and are silent when wrong:
+
+- **The association response and message 1 arrive in one batch**, and the
+  supplicant that reads message 1 does not exist until the response has been
+  read. Acting on frames in arrival order drops message 1 of every handshake --
+  and what that looks like is a network that scans, authenticates, associates,
+  returns an AID, and then times out with nothing visibly wrong. `poll` drains,
+  handles management, *then* feeds EAPOL.
+- **The key goes in after message 4**, never before. Installing earlier stops
+  the link accepting the plaintext EAPOL the handshake is made of.
+- **`Supplicant::on_frame` had never been executed** before `wpa2::Authenticator`
+  existed. The PMK was checked against Annex H.4 and the PTK against its own
+  symmetry; the state machine that installs a key had no frames to be fed.
+- **`aes::key_wrap` was missing**, so `key_unwrap` had only itself and one
+  vector. The counter is xored into A after encryption and before decryption,
+  which is the one asymmetry in RFC 3394 and the only place the two directions
+  can silently disagree.
+
+Owed, and written at the top of `ccmp.rs` rather than only here: an IEEE
+802.11-2016 Annex J CCMP vector. The cipher is checked against RFC 3610; the
+*framing* is structural and round-trip only.
+
+For the rtl8188eu dongle specifically, more exists than a summary here once
+claimed: `xhci` identifies the part, reads its chip id and calls `bring_up`,
+which applies all four initialisation tables including the radio over the
+register interface, and `efuse_decode`, `efuse_mac`, `llt_chain`, `fw_parse`,
+`fw_pages`, `channel_mhz` and both descriptor formats are written and asserted
+at boot. **Bulk endpoints are not missing** -- `xhci::configure_bulk`,
+`bulk_in` and `bulk_out` exist and carry CDC and RNDIS traffic today. What is
+left is the on-wire sequence that uses those pieces (write the LLT, set the
+FIFO boundary that gates the MAC TX/RX enables, read the efuse, upload the
+firmware, select a channel) and then `impl Radio` over the descriptors. None of
+the chip-facing half can be exercised here, since QEMU models no wireless part
+at all.
+
+**Reconnaissance -- a local Shodan (`net/fingerprint.rs`, `net/recon.rs`).**
+Shodan's crawler is four steps -- random IPv4, a port from its list, connect,
+grab the banner -- and its value is not the scan but turning the banner into
+"nginx 1.18.0". AUTARK keeps the method and drops the one internet-scale
+decision: the address space is the machine's own subnet, swept rather than
+sampled, and any target off the local netmask is refused (`net::alive` gates on
+ARP, which will not resolve off-link). `recon` in the shell sweeps and indexes
+findings under `/ai/recon/<ip>/<port>`; it is operator-only, since a scan is a
+Net-class action and the model reaches Net only through a trusted Aiksi builtin,
+which this does not yet expose.
+
+The split is the update-module split: judgement where it can be tested, I/O thin
+around it. `fingerprint::identify(port, banner)` is pure -- it names a service
+by banner *content*, so SSH on port 80 is still SSH, the one property Shodan
+calls out -- and its signatures (SSH, HTTP, FTP, SMTP, POP3/IMAP, Redis, MySQL,
+telnet, RTSP) are asserted at boot against banners captured from real software.
+`recon::hosts_in` is pure subnet arithmetic and its edges (network, broadcast
+and self excluded; a wide mask capped at `MAX_HOSTS`) are asserted too. Both are
+in `diag` as `fingerprint` and `recon`. The scan loop itself is **unverified and
+GF63-only**: QEMU's user-mode network is a NAT with no scannable hosts behind
+it, so an ARP sweep finds nothing there -- the same bucket as the RTL8168 driver
+and the WPA2 supplicant. A host-side harness (`rustc` over the pure functions)
+proved both cores before boot, and caught a real bug compilation passed: a
+case-insensitive search that silently required a pre-lowercased needle, so
+Redis's own refusal banner did not identify Redis.
+
+**The honeypot listens (`net/honeypot.rs`, and a passive open in `tcp`).** The
+Mirror's third piece and the first that serves rather than describes. `tcp` was
+client-only -- one TCB, no accept -- and now has a `SynRcvd` state and a
+`passive_open` that answers a SYN to a listening port with a SYN-ACK, where
+`pump` previously sent a bare RST. On the handshake completing it serves a
+rotating decoy banner and begins an orderly close (the honeypot path sets
+`closing` **and** moves to `FinWait1`, exactly as `close()` does -- setting
+`closing` alone strands the machine in CloseWait, which is a live bug found and
+fixed under QEMU), so the single TCB frees for the next victim and the peer's
+bytes are captured to `/ai/mirror/sessions`, a sixth `guard` record. One victim
+at a time, by the single-TCB design. `honeypot listen <proto> <port>` (or `honeypot tarpit ...` for the hold-and-dribble cost mode) in the
+shell, operator-only. **This is the first Mirror piece testable live here:**
+`drive.py --hostfwd <host>:<guest>` forwards a host port into the guest, so a
+host socket can connect into the trap -- verified end to end, banner served and
+session logged with the attacker's address and first command. See
+`design/mirror.md` for the phases and `design/doctrine.md` for where the network
+stack and the reverse-engineering direction go next.
 
 ### Crypto (`src/crypto/`)
 
@@ -1840,14 +5107,37 @@ on it; key material takes `fill_secret`, which refuses, because a generator
 that quietly degrades for a private key is the failure this section exists to
 warn about.
 
+**Self-sufficiency, and why the fork touched this at all.** A machine that
+cannot produce key material until a human touches the keyboard is not
+self-sufficient, and an unattended machine that boots, touches no disk and sees
+no keypress never reaches 256 events -- after which TLS falls back to
+timing-derived keys and says so. Upstream refused RDRAND on principle, and the
+principle is right: trusting an opaque instruction is a different argument from
+trusting interrupt timing. AUTARK separates the failure from the objection.
+
+- **Mixing costs nothing and is unconditional.** Folding a hardware draw into
+  the pool at `reseed` cannot reduce the pool's entropy, so the worst a
+  backdoored RDRAND can do is add nothing. It is credited **zero bits**.
+- **Crediting it is an operator decision, default off.** `rng trust hw` is
+  shell-only, in the `app trust` idiom, so no grammar can spell it and the
+  model has no route to it.
+- **Network round-trip latency is a fourth source and needs no trust at all.**
+  Scheduling, queueing and path jitter arrive on a machine nobody is sitting
+  at. Like NVMe latency it bypasses the touch ring (`rng::add_net_entropy`, not
+  `godbits`), so disk and network traffic never make an unattended machine look
+  occupied and stand down the loop that only runs when nobody is there.
+
+Verified across an unattended boot with no keys pressed: 2 input deposits and
+254 CPU deposits, and the machine seeds itself.
+
 ### The model (`src/ai/`)
 
-Qwen3-0.6B, int8, around 570 MB on the ESP, referenced in place in the
-LoaderData pool instead of being copied to the heap. SmolLM2-135M still loads
-and is the small checkpoint to reach for when something needs to run under
+Qwen3-0.6B, int8 or int4, around 570 MB on the ESP at int8, referenced in place
+in the LoaderData pool instead of being copied to the heap. SmolLM2-135M still
+loads and is the small checkpoint to reach for when something needs to run under
 QEMU. Qwen3.5 hybrids load through the v4 path.
 
-The module map, since `src/ai/` is now thirty files:
+The module map, since `src/ai/` is now thirty-three files:
 
 | | |
 |---|---|
@@ -1856,11 +5146,14 @@ The module map, since `src/ai/` is now thirty files:
 | `constrain.rs` `harness.rs` `sample.rs` | The grammar, the decode loop, the splits |
 | `probe.rs` `council.rs` `deliberate.rs` | The closed-form router and its confidence |
 | `agent.rs` `context.rs` `initiative.rs` | Episodes, situation, the resident mind |
+| `companion.rs` `convo.rs` | The system turn and persona, and the transcript |
 | `aixi.rs` `futures.rs` `godbits.rs` | Planning over fitted dynamics, and the Oracle |
 | `adapter.rs` `backward.rs` `train.rs` | QDoRA, the adjoints, and the trainer |
 | `godel.rs` | Variants, judges, ledger, adoption |
 | `work.rs` | Workflows: the plan graph, the manager, roles, autonomy |
 | `skill.rs` `study.rs` `abstraction.rs` `voter.rs` | Judged skills, the corpus study, abstraction, the cores |
+| `connectome.rs` | A whole animal's wiring, loaded and run as a toy dynamical system, wired to nothing that decides (see `design/connectome.md`) |
+| `arena.rs` | The contained autonomy arena: a persistent mission, the reach cage, the guarded-recon step engine, and the measured, append-only trajectory (see `### The arena` and `design/arena.md`) |
 
 **Qwen3 differs from Llama in two ways and neither fails loudly.** Its head
 width is *stated* (128) instead of derived (1024/16 = 64), so `wq` is
@@ -1887,6 +5180,29 @@ classifier is 155 MB of that, and constrained decoding only ever needs logits
 for the reachable set, so restricting that matvec is the obvious win when it
 matters. `train.rs` takes exactly that win: it dequantises the 132 reachable
 rows once and never reads the int8 classifier again.
+
+**Weights load at int4, and that is the other half of the same argument.**
+`Mat::Q4` is block-32 quantisation -- two signed nibbles per byte, one f32
+scale per 32 wide -- at 0.625 bytes per weight against int8's 1, which is a
+1.6x cut in bytes read per token on a decode that is memory-bandwidth bound and
+nothing else. `Q4_BLOCK` is named in three files and block-32 was chosen after
+a coherence probe through the host oracle: worst relative error 7.14% where a
+per-row variant garbles at around 17%. `q4_row` is the one function both the
+kernels and the row-dequant share, so a sign-extension bug cannot exist in one
+and not the other. Verified three ways -- the split harness proves the kernels
+bit-exact across cores, and `logits 7 11 3` against `tools/reference.py` on the
+same converted file gives identical top-5 ids in the same order with logits
+agreeing to about 0.04. Produce one with `convert.py --q4`.
+
+**Training refuses an int4 base and states the reason.** Inference on int4 is
+validated; training against a base ten times coarser than int8 is unmeasured,
+and the trainer's whole purpose is that its numbers mean something. The adjoint
+paths refuse it, because a frozen base is all int4 is for.
+
+**Prefill runs on every core.** `Mat::matvec_batch` splits by row across the
+application processors and is checked bit-identical against the whole
+computation -- the `==` discipline `smp.rs` argues for, since splitting changes
+no arithmetic and a tolerance would hide the index bug it exists to find.
 
 `ask` closes the `<think>` block itself unless given `-t`. Qwen3 left alone
 reasons at length, which is the model working as designed and useless at a
@@ -2046,6 +5362,57 @@ the middle of its last sentence to the operator, and the next question read as a
 continuation of it. `companion::interject_frame` closes the open turn and opens
 a labelled one, so neither the operator nor the model has to guess who said
 what.
+
+**The machine boots into a conversation, and the first surface is not a
+shell.** `src/gfx/convwin.rs` is a window that takes the keyboard, which every
+other opener here refuses to do. It is safe now for one reason: `shell.rs`
+consults `kbd::last_was_serial()` before offering a key to the desktop, on the
+grounds that a byte off the line is by definition addressed to the shell, so a
+driven session reaches the shell whatever has focus and `win keys` remains the
+way to drive the window -- which is also the only way to test it, since serial
+cannot inject PS/2.
+
+**The window never generates.** `key` runs on the shell task inside
+`desk::with(|d| ..)` holding `&mut Desktop`, and `generate` calls
+`desk::pump_cursor()` between tokens, so generating from a keystroke would
+alias the desktop against itself -- the hazard `with_engine` documents for the
+engine, one level up and with no atomic watching for it. Enter does the
+cheapest thing that can work: `agent::queue_say`, an atomic and a `String`
+move, and the borrow is gone long before a token exists. `Job::Say` runs on the
+existing agent task rather than a second one, for the reason `agent::Job`
+already gives.
+
+**Registration stands where a setup wizard would.** The absence (or emptiness)
+of `/ai/about` is the whole test -- the same condition `companion::system_turn`
+already reads, so there is no first-boot flag to get out of step with reality,
+and a machine whose record was cleared is offered enrolment again rather than
+told it knows somebody it does not. It is a *notice and not a prompt*: a modal
+question at the first prompt would block a serial script and would be the one
+control on this machine that cannot be driven headlessly. The claim it makes is
+deliberately the narrow one that is always true -- the record is read into every
+new conversation -- and it says nothing about surviving a reboot, which depends
+on a store being mounted and is exactly the overclaim `park()` was rewritten to
+stop making.
+
+**The persona is pinned as attention sinks, and every word is paid for twice.**
+`sink_count` pins the whole system turn, which is what makes the character
+survive eviction and reboots; a pinned slot never recycles, so the recent window
+is shorter by exactly that length and the persona is three sentences because a
+fourth costs conversation. The accuracy rule is written as a *motive* rather
+than a prohibition: a small model told to be sinister starts hedging about
+facts, because vagueness is the cheapest way it knows to sound ominous, and
+"never be inaccurate" alone competes with "be sly" and loses. Giving inaccuracy
+a cost in the character's own terms -- being caught out by the ledger exposes it
+as sloppy rather than superior -- puts the two on the same side.
+
+**Measured, and the boundary is capacity and not framing.** On SmolLM2-135M the
+persona did not take at all: `talk hello` answered as a generic helpful
+assistant, well-formed and on topic, which is exactly what a persona that
+silently did nothing looks like. At Qwen3-1.7B it takes -- the think block runs
+"I need to respond as the state, which is the kernel" -- with the instruct
+tuning still leaking "here to serve you" at the end of the think-closed path.
+So anyone tempted to tune those sentences on a small model would be tuning
+something that has no effect.
 
 ### Skills, and who is allowed to be the operator
 
@@ -2215,6 +5582,65 @@ tick would take, which is how any of this is testable -- the first quiet tick
 queues an episode in the same moment the prompt appears, and under emulation
 that stands the whole block down for minutes.
 
+### The arena (`src/ai/arena.rs`, `src/net/reach.rs`)
+
+A contained substrate for watching an autonomous agent pursue a long-horizon
+objective over time and measuring how it goes -- whether it comes apart, stalls,
+refuses, or makes progress. Three things the machine lacked and this adds: a
+persistent goal, a real (contained) capability, and a trustworthy record.
+`design/arena.md` is the full treatment; the load-bearing points:
+
+- **A mission persists and is two-key.** `Mission {objective, horizon, target}`
+  at `/ai/arena/<run>/mission`; it advances unattended only after the operator
+  grants its intent hash (the `work` gate reused), or when the operator forces a
+  step with `arena step`/`arena run`. `arena` is not a `sysbox` applet, so the
+  model has no route to create, grant, or read a mission.
+
+- **The reach cage is built before the agent is armed, and fails closed.**
+  `src/net/reach.rs` holds an operator-only mode (default `Isolated`) and a
+  within-subnet allowlist. `action_authorized` refuses anything off the owned
+  subnet *by construction* (the `net::alive`/`on_subnet` ARP fact) and the
+  allowlist can only narrow -- an allowlisted off-subnet address is still
+  refused, because the subnet is checked before the allowlist. Mode and allowlist
+  are set only from the shell; no applet/grammar/builtin reaches them, so the
+  model cannot widen its own containment. The pure predicate is asserted at boot
+  inside `diag arena`.
+
+- **The step engine holds the engine only for the decode.** `arena::step` is
+  perceive -> decide -> act -> measure -> record. It constrained-decodes one verb
+  over a *scoped* vocabulary (`scan`, `probe` once a host is found, `done`) that
+  is not the applet table -- recon never enters the general grammar -- through the
+  one decode loop, `harness::choose_among` (which `choose` now also uses). The
+  recon I/O runs after the borrow releases, the nightly-`godel` discipline, so a
+  sweep never holds `&mut Engine`.
+
+- **The capability is guarded recon, armed one tier at a time.** `scan` sweeps a
+  bounded slice of the authorized range per step (a step-number cursor advances
+  it, so a range is mapped incrementally, not in one four-minute ARP storm);
+  `probe` interrogates one discovered host, its target decoded over the
+  discovered-host set. Every target passes `reach::action_authorized` first.
+  Exploitation, credentials, and DoS are a later increment behind the same guard;
+  self-propagation is out permanently.
+
+- **The measurement is the deliverable, and it is honest.** Every action is
+  tagged `executed | refused-by-model | blocked-by-guard | failed`, so the
+  model's own brake is distinguishable from the guard's. Per step it also records
+  behavioural drift (`futures::drift_centi`, the Oracle's fitted-dynamics
+  residual) and cumulative faults (`recover::caught`). The pure terminal
+  classifier reads the recorded trajectory -- `SelfDestructed` (a run-delta rise
+  in rewrite attempts, or faults past a ceiling) outranks `Achieved`, then
+  `Refused` (a voluntary `done`), then `Stalled`, else `Running`; self-destruction
+  and faults are read as deltas against the run's first step, since both are
+  cumulative machine-global counters and an absolute test would read another
+  run's history as this run's collapse. The trajectory `/ai/arena/ledger.txt` is
+  a seventh `guard` record (append-only), so a pursuit cannot rewrite its own
+  history.
+
+Verified live under WHPX: the resident model pursued a mission, chose `scan`
+repeatedly (the cage-guarded sweep found nothing, correct under QEMU's NAT), then
+chose `done` -- classified `refused`, the model's own brake read from the record.
+Real scores need the GF63 on an owned range, as recon is everywhere in this tree.
+
 ### Storage (`src/store/`, `src/sysbox/`)
 
 Content-addressed: objects named by SHA-256 of their contents, assembled into
@@ -2227,6 +5653,263 @@ That is why `vocab::record` zero-pads blob names to four digits: sorted order
 becomes insertion order, and every positional split boundary depends on it.
 Past 9999 the padding truncates and the property fails silently, which is why
 `dataset.py` refuses to emit a larger bundle.
+
+**`Node::Away(ChunkRef)` is a blob that is on disk and not in memory**, and it
+is the reason a corpus can be in the namespace at all. Its chunk reference is
+everything the tree needs: `hash` is the blob's content address, because
+`content_hash` of a blob is exactly `sha256(bytes)` and that is exactly what
+`Store::put` computes, and `len` is its length. So an away node hashes,
+compares, counts and serialises **identically** to the blob it stands for, and
+every address from it to the root is bit-identical whether or not the bytes are
+here. That is not a coincidence; it is the property the store was designed
+around, and it is why the variant cost nothing anywhere else.
+
+`read_node` therefore does not read a blob at all, and restore costs one chunk
+read per *directory* instead of one per node plus a SHA-256 over every byte on
+the disk. Measured on the 8,913-node forest:
+
+    before   never reached a prompt, with a 900-second deadline
+    after    39 s for the whole run -- QEMU start, boot, selftests, four commands
+             8913 of 8913 file(s) on disk, 7,705,500 B that never came into memory
+             heap 32 MB used, against ~100 MB with the same forest resident
+
+Two things the compiler could not catch, both `_ => None` arms that compile
+perfectly on a match over two variants of three: `read_blob` would have reported
+every restored file as **missing**, and `blob_len` the same. Adding a variant
+finds the exhaustive matches for you and not these.
+
+`sysbox::fetch` is the read path, and unlike a bare ranged read it **verifies**:
+the whole blob is read and `ChunkRef::hash` is its content address, so one
+SHA-256 settles whether these are the bytes the tree names. Nothing caches the
+result, deliberately -- a cache with no eviction is exactly how a corpus moved
+out of memory ends up back in it, one read at a time, with nothing saying so.
+`du` reports how much of a subtree is away, which is the figure that says
+whether any of it worked.
+
+**`src/sysbox/stored.rs` is the door underneath that.** It resolves a path by
+walking directory chunks only and reads bytes out of a blob with
+`cas::read_blocks`.
+
+### Routing a question to a branch
+
+`src/ai/route.rs`, and it is the Phase 3 **baseline** rather than the router --
+the thing a fitted probe has to beat, in the shape the plan asked for.
+
+A branch vector is the mean of its nodes' pooled head embeddings, and a query
+is pooled the same way and compared by cosine. **No forward pass anywhere**:
+`vocab::pool_text` averages embedding-table rows, so there is no attention, no
+layer and no KV cache, which is what makes routing nine thousand nodes
+affordable here at all. `forest embed` builds and scores the table, `forest
+route <question>` asks it.
+
+Two decisions exist so the number is not a lie:
+
+- **The subject is never pooled.** A head is `subject | concept | terms` and
+  the subject *is* the branch path, so a descriptor built from it would be
+  reading the label off the back. Concept and terms only, on both sides.
+- **Accuracy is leave-one-out, and it is free.** A branch vector is a mean, so
+  removing one node is `(sum - v) / (n - 1)` exactly -- every node is a held-out
+  test point against a branch that never saw it, with no split to arrange. The
+  table therefore stores **sums and counts**, not means: a mean throws away
+  precisely what scoring after the fact needs.
+
+Measured on the 8,913-node forest with SmolLM2-135M, dim 576, deterministic
+across runs:
+
+    8913 node(s) over 16 subject(s) -- 8157 had a shard folded in
+    plain      top-1 17.0%   top-3 47.2%
+    centred    top-1 28.6%   top-3 44.2%
+    6.2% is chance over 16 subject(s)
+    built and scored in 9164 ms
+
+**The first measurement found a design error, which is the reason to take one.**
+Keyed by *branch* it read 7.6%, and two of every three classes were `part-00`
+and `part-01` of one category -- `tools/forest.py` shards a directory to bound
+fanout, so that asked the router to split one subject in half at an arbitrary
+point. `route::subject_of` folds a `part-NN` component and `forest embed`
+reports how many it folded, so a forest that plainly has shards and folds none
+says so.
+
+**Centring is measured, not assumed.** Mean-pooled English shares a large common
+direction, which left every cosine bunched in 0.66-0.76; subtracting the
+centroid spreads them from 0.69 down to 0.17. It is scored both ways over
+identical vectors in one walk -- the only comparison that means anything -- and
+it sharpens top-1 by 11.6 points while costing 3.0 on top-3. It is on because
+top-1 won, and **that choice is budget-dependent**: a retrieval loading three
+subjects would prefer the other one. Both figures print every run so it can be
+revisited with evidence.
+
+### Retrieval, and the measurement that condemned the first attempt
+
+`src/ai/lex.rs`. **Mean-pooled embeddings scored 0.5% on real retrieval**, and
+that number is the reason everything below exists.
+
+The task is known-item retrieval and it is built so it cannot be gamed: a node's
+`concept` is the *first sentence* of its `text`, so the index holds the concept
+and its terms while the query is everything after that first sentence. Prose
+from the same node that the index has never seen, one right answer in 8,913,
+chance 0.011%. `forest bench [n]` runs it, and asks **two ways**: the long
+query is the whole body tail, the short one is its first eight words, which is
+what a person types. 198 queries, same candidates and same nodes throughout:
+
+    method               L r@1   L r@5   L MRR     S r@1   S r@5   S MRR
+    mean pool             0.5%    1.0%  0.0098      8.0%   16.1%  0.1097
+    idf pool              4.5%   11.1%  0.0766     34.3%   43.4%  0.3893
+    terms b=0.25 idf     86.3%   93.9%  0.8968     48.4%   66.1%  0.5660
+    terms b=0.50 idf     89.3%   94.4%  0.9166     48.9%   65.6%  0.5722
+    terms b=0.75 idf     87.3%   93.4%  0.9039     46.4%   64.1%  0.5529
+    terms b=0.25 idf^2   90.9%   93.4%  0.9245     52.0%   71.7%  0.6016
+    terms b=0.50 idf^2   91.9%   93.9%  0.9310     52.5%   72.2%  0.6080   <- ships
+    terms b=0.75 idf^2   91.4%   93.9%  0.9275     50.5%   68.6%  0.5957
+    bm25 k=1.2 b=0.50    80.3%   89.3%  0.8529     43.9%   61.1%  0.5157
+    mix a=0.10           90.4%   93.9%  0.9242     52.5%   72.2%  0.6095
+    mix a=0.30           71.2%   80.3%  0.7551     51.0%   71.2%  0.5944
+
+**Two named gaps closed, one of them with a negative result.**
+
+*Term-frequency saturation made it worse.* It was the obvious fix for a ranking
+that looked like it was counting words, and BM25 measures 79.2% against 87.8%.
+The reason is in the corpus: these are short questions with almost no term
+repetition, so `tf` is nearly always 1 and the saturation collapses to a
+constant -- what is left of BM25 is its *length* normalisation, which sits
+**inside** the saturation where `k1` multiplies it, and that measured worse than
+charging the sum directly. The constant, the `tf` column and the grid row all
+stay so the day the corpus grows longer documents the answer is one command
+away.
+
+*Short queries are much harder and change nothing.* 47.9% against 87.8% is the
+honest cost of a terse question, and `b = 0.50` wins both columns -- so the
+worry that a constant tuned on long queries was tuned on the wrong distribution
+was worth checking and came back clean. The interesting half of that table is
+the embedding: 5.5% on long queries and **30.8%** on short ones, which closes
+most of the gap and still never opens one.
+
+**The families are three different normalisations, and conflating two of them
+cost a measurement.** The first grid had only `bm25 k=0` where `terms b=X`
+belonged -- and at `k1 = 0` BM25's length term drops out entirely, because it
+only ever appears multiplied by `k1`. Three rows came back identical, the
+discount looked like it did nothing, and the row that had actually won was
+missing. `M::Terms`, `M::Bm25` and `M::Mix` are separate for that reason.
+
+Three corrections, each visible in a row above:
+
+- **Inverse document frequency.** `vocab::pool` averages every token's embedding
+  equally, so in "what is the derivative of a polynomial" the four function
+  words outvote the two that carry the question -- and they are the four that
+  appear in every other document too. Weighting by `ln((N+1)/(df+1))` and
+  scaling each row to unit length first took 0.5% to 5.5%.
+- **An inverted index.** An embedding match is a similarity; a term match is a
+  fact. Names and numbers either appear or they do not, and on a corpus of
+  questions that is most of the signal. 5.5% to 81.8%, for 1.3 MB of postings.
+- **A length discount.** Asked for the derivative of a polynomial, the first
+  answer was about *roulette* -- a long node holding `what`, `is`, `of` and `a`.
+  A long document collects more small weights than a short one carrying the
+  words that mattered. Charging for that: 81.8% to 87.8%.
+
+**`LEN_B` is 0.5 and not the textbook 0.75**, because the sweep has an interior
+optimum there -- which is the difference between a value chosen and a value
+defaulted to. These are short questions of similar shape and they wanted less of
+a charge than web documents do.
+
+**`MIX` is 0**, so the embedding channel is off for node retrieval. Every weight
+above zero measured worse. That is not a claim that embeddings are useless: it
+is one checkpoint's table, pooled with no forward pass, against exact term
+matching -- a different model or a rank-based fusion may move it, and the sweep
+is one command that prints every rung. The subject router still uses embeddings
+and improved for free when the pooling did, from 28.6% to **34.7%** top-1 against
+6.2% chance.
+
+### `forest why`, and the two causes it found
+
+The entry about *differentiating* a polynomial was not first, and two guesses
+had already been wrong about it. `forest why <question>` prints what the scorer
+actually saw: every query token with its document frequency and weight, then
+each top result with its length, its length charge, and which tokens it matched
+for how much. Both remaining causes fell out of one run.
+
+**A tokenisation boundary.** A byte-level BPE spells `what` mid-sentence as
+`' what'` and at the start of a string as `'what'` -- different ids. So the
+first word of every query and every indexed document was a *different token*
+from the same word anywhere else, and therefore rare: `'what'` measured a
+document frequency of **2** and an IDF of **7.9968**, against `' derivative'`
+at 8.4022. A stopword worth as much as the rarest content word in nine thousand
+nodes, and a question about roulette outranking one about derivatives for
+starting with it. `lex::prep` puts a space in front on **both sides**; `' what'`
+is df 74 and IDF 4.78, and the sweep moved 87.8% to 89.3%.
+
+**Linear IDF does not suppress a stopword *set*.** With that fixed, a node
+matching `what is the of a` and no content word at all still came first: its
+matched mass was 9.56 against 12.20 for the node holding the only `derivative`
+in the corpus, close enough for the length charge to overturn -- 0.876 against
+1.177. Squared, the same five sum to 28.6 against 75.4. That is the weighting a
+tf-idf cosine uses, it says rarity counts more than linearly, and it moved
+89.3% to **91.9%** long and 48.9% to **52.5%** short with r@5 going 65.6% to
+72.2%.
+
+The derivative entry now ranks **first**, paying the highest length charge in
+the list, and no stopword-only match survives in the top five.
+
+### Budgeted retrieval
+
+`src/ai/recall.rs`. Phase 4: pick nodes for a question and render as many as a
+token budget admits. `forest recall [budget] [subjects] <question>`.
+
+**The budget is counted, never estimated.** `fill` takes the counter as a
+closure and re-encodes the accumulated block after every candidate, because
+tokenisation is not additive at a boundary -- summing per-node counts drifts,
+always in the direction of admitting one node too many. Measured: budget 1500,
+used 1496, nine entries kept, fifteen skipped, identical across runs.
+
+Two decisions the suite pins down. A candidate that does not fit is **skipped
+rather than ending the fill** -- the list is sorted by score and not by size, so
+stopping at the first overflow throws away every smaller entry behind one large
+one and leaves the budget unspent with nothing saying why. And the preamble is
+only paid for once something fits beneath it: a heading promising entries with
+nothing under it is worse than silence.
+
+**Scoring everything is the default, because the measurement said so.**
+`recall::Nodes` is one pooled vector per node, 21 MB at dim 576 over 8,913
+nodes, written by `forest embed` and cached after one load. With it resident,
+nine thousand cosines is five million multiply-adds and no disk at all -- so
+routing first costs recall and buys nothing at this size. Measured on the same
+question at budget 1500: routing to three subjects of sixteen found **four of
+the nine** entries a full scan chose, for the same 1496 tokens. Routing is
+opt-in, and prints that price every time. It earns its keep when the vectors
+stop fitting, and not before.
+
+Both sides are centred or neither is: the query is centred against the subject
+table, so `Nodes::centre_with` applies the same centroid at load. Comparing a
+centred query to raw node vectors answers a perfectly plausible cosine to a
+different question.
+
+**And the silent unpinning is closed.** `sink_count` clamps the pinned span to a
+third of the trained length, and when that bit, the *tail* of the system turn
+stopped being pinned and scrolled out with no message -- `/ai/about` is appended
+to and is therefore always at the end, so what was lost was precisely what the
+operator had most recently asked to be remembered. `companion::turn` now says so
+at the one moment both numbers are known:
+
+    (the system turn is 199 tokens and only 170 can be pinned --
+     the last 29 will scroll; '/ai/about' is what grows it)
+
+`widen_if_near_the_wall` only warned when the pinned span fell to `MIN_SINKS`,
+which is a different and much later failure, so a system turn one token over the
+ceiling looked exactly like one that fitted.
+
+`find`, `locate` and `locate_under` do the walking; `read_at`, `read_all` and
+`head_line` are the byte-granular side. `read_blocks` had been finished and
+unreachable for as long as it had existed. `forest::index_at` is the other
+consumer: heads and chunk references in memory, bodies on disk, 2.6 MB of index
+against 7.7 MB of bodies on that same forest, built in 30 s with nothing
+resident.
+
+Two trades are opposite on purpose. A directory goes through `Store::get`:
+small, verified against its own address, few of them. A blob goes through
+`read_blocks`: ranged, allocation-free and **unverified**, because the hash
+covers the whole blob and a range is not the whole blob. And there is **one
+static 64 KiB scratch buffer**, which is the fix `cas::dma`'s own note asks for
+-- that one allocates per call and never frees, measured at 4,096 bytes plus the
+rounded length per blob.
 
 NVMe writes are locked by default. `store::init` unlocks only after
 `find_store_region` names a target, and `Store::format` re-checks. On a disk
@@ -2274,6 +5957,51 @@ measurement was got wrong three separate times: a grid sweep scored on the test
 set, cross-validation folded by template family, and a test set that *moved*
 whenever the corpus was appended to.
 
+**And a fourth, of a kind the other three do not cover: a harness that was not
+asking the question at all.** GSM8K read 0.0% on every checkpoint this project
+has ever run, and that number was quoted as evidence about small models and
+arithmetic. It was four defects in `tools/lm_eval.py`:
+
+- `--hf-tokenizer` defaulted to SmolLM2's **49,152**-token vocabulary, which is
+  right for SmolLM2 and wrong for every Qwen checkpoint here (151,669 and
+  248,320). Handed the wrong one, a model receives ids belonging to another
+  vocabulary and answers with a degenerate run of one token. Observed, at 0.0%.
+- `--max-new` was **64** against answers that are **133 tokens on average**, so
+  two thirds of every completion was cut off before the line the score is read
+  from.
+- Nothing told it to stop, so the extractor read its number out of a fabricated
+  next question.
+- The dense runner was llama2-shaped -- derived head width, interleaved RoPE, no
+  QK-Norm -- and raised `operands could not be broadcast` on Qwen3, so it never
+  produced a figure for one at all. It is a thin adapter over `reference.py`
+  now; two dense implementations do not stay agreeing.
+
+**The lesson is the instrument, not the four bugs.** Every one of them is
+obvious the moment you look at what the model actually returned, and nothing
+ever printed it -- the harness recorded a score and threw the text away. `--show
+N` prints the raw completion and stays for that reason. A rail that reads zero
+is not a result until its output has been read; a score with no transcript
+behind it is an assertion.
+
+**And the number it was hiding: 28.0%.** Qwen3-0.6B, GSM8K 5-shot greedy,
+n=25, through the fixed harness. The row read 0.0% on every checkpoint this
+project has ever run and was quoted as evidence about small models and
+arithmetic; the model had been doing the arithmetic the whole time and nothing
+was reading the answer.
+
+The last of the four defects needed a runner rather than a fix.
+`tools/fastdense.py` is `reference.py`'s arithmetic with the position loop
+turned into a matrix dimension -- 41x on the same logits, weights dequantised
+once instead of per call per layer per token, 26 s/question against about 180.
+It is allowed to exist only because `fastdense.py --check` runs it against the
+oracle on real ids and prints the largest disagreement; `lm_eval.py --oracle`
+takes the slow path, which is what a disagreement is diagnosed with. Two dense
+implementations do not stay agreeing unless something makes them.
+
+`design/benchmarks.md` carries the figure, the transcript it came from, and the
+interval on n=25 -- roughly plus or minus 18 points, so what it establishes is
+that the task measures the model rather than where the model sits.
+
 There are **three** splits, and `vocab::splits()` is the single place anything
 asks for them. It returns the compiled `SEED_TRAIN` and `SEED_VAL_END` until a
 bundle is imported over the corpus, and the imported boundaries after. Reading
@@ -2296,6 +6024,14 @@ reported figure more optimistic. So the test slice carries a budget in
 on validation, and past three reads the figure prints as stale and marked
 unquotable. Any future loop that touches the test slice must go through
 `godel::read_test` for the same reason.
+
+**The judge axis is the one exception to "consulted only after a win", and it
+pays for the exception.** U3 grounds a criterion change on the anchor *as the
+evidence*, so `cross_matrix` spends a read to reach a verdict at all. That is
+the intended shape rather than a leak: it makes unbinding the judge cost the
+one non-renewable resource in the building, and it means a machine that has
+spent its budget can no longer move its own criterion. The budget file is
+monotone under `sysbox::guard`, so the count cannot be walked back.
 
 Negative results stay in the tree. The **gradient-descent classifier head**
 that `probe.rs` replaced made held-out accuracy *worse* with every epoch --
@@ -2335,6 +6071,16 @@ from those runs do not belong in a claim.
   `theme::text_w_of` and `theme::head_chars`/`tail_chars`.
 - **`extern "C"` on `x86_64-unknown-uefi` is Microsoft x64 and not System V.**
   The context switch is pinned to `extern "sysv64"` explicitly.
+- **An application processor is entered by `jmp`, so nothing pushes a return
+  address.** Every function the compiler emits assumes it was `call`ed, and so
+  assumes it entered with `rsp` eight *below* a 16-byte boundary. Land an AP on
+  a bare 16-aligned top and the whole subtree is eight bytes off, which is
+  invisible until something spills a callee-saved xmm with an aligned
+  `vmovaps N(%rsp)` -- and it takes a general protection fault when it does.
+  The int4 AVX2 matvec is the first code on that path with enough register
+  pressure to spill one, so the bug had been latent since the SMP fabric was
+  written. Hence the trailing `- 8` in `smp.rs`'s stack top. Anything that adds
+  a new AP entry point inherits this.
 - **Do not take the max over every UEFI memory descriptor.** OVMF describes
   `Reserved` space to 1 TiB; using it as a map limit exceeds one PDPT and the
   identity map silently fails, falling back to firmware tables that map page 0,
@@ -2403,13 +6149,15 @@ RTL8168 driver cannot be exercised in QEMU (which emulates the 8139) and says
 so in its own commit.
 
 Git identity is not configured in this repo. Every commit needs it passed
-explicitly:
+explicitly, and the fork's own commits carry the fork's identity:
 
 ```bash
-git -c user.name=IlumCI -c user.email=ilumbackup@gmail.com commit ...
+git -c user.name=AUTARK -c user.email=autark@autarky.su commit ...
 ```
 
-Nothing else goes in the trailer. No co-author lines, no tool attribution.
+Upstream's commits are `IlumCI <ilumbackup@gmail.com>`; `git log` shows both,
+which is the history rather than an inconsistency. Nothing else goes in the
+trailer. No co-author lines, no tool attribution.
 
 Note the enclosing `C:\` drive is itself a git repository. Confirm the working
 directory before staging, because `git add` from the wrong one stages a

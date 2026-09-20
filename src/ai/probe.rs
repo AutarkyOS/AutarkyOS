@@ -104,6 +104,20 @@ pub(crate) fn ridge_solve(g: &mut [f32], n: usize, b: &mut [f32]) -> bool {
 }
 
 impl Probe {
+    /// How many classes it was fitted over.
+    ///
+    /// Exposed so a caller holding a table of names can check the two agree
+    /// before indexing one by the other's answer. They agree by construction
+    /// today -- both come from one walk in first-seen order -- and a check is
+    /// what keeps that true after somebody changes one of them.
+    pub fn classes(&self) -> usize {
+        self.classes
+    }
+
+    pub fn dim(&self) -> usize {
+        self.dim
+    }
+
     pub fn params(&self) -> usize {
         self.w.len() + self.mean.len()
     }

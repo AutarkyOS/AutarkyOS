@@ -45,6 +45,36 @@ pub const SUITES: &[Suite] = &[
         run: crate::crypto::selftest,
     },
     Suite {
+        name: "radio",
+        about: "the channel plan every part shares, and its refusals",
+        run: crate::dev::radio::selftest,
+    },
+    Suite {
+        name: "softmac",
+        about: "ethernet over 802.11, driven end to end with no hardware",
+        run: crate::net::softmac::selftest,
+    },
+    Suite {
+        name: "hostile",
+        about: "malformed 802.11 by the thousand, and not one of them lands",
+        run: crate::net::hostile::selftest,
+    },
+    Suite {
+        name: "mlme",
+        about: "scan, authenticate, associate, handshake, keys -- and no dongle",
+        run: crate::net::mlme::selftest,
+    },
+    Suite {
+        name: "ccmp",
+        about: "the 802.11 link cipher: masks, replay, and every tamper refused",
+        run: crate::net::ccmp::selftest,
+    },
+    Suite {
+        name: "ccm",
+        about: "AES-CCM against RFC 3610, and every way to forge refused",
+        run: crate::crypto::ccm::selftest,
+    },
+    Suite {
         name: "rng",
         about: "the generator, and that it refuses when starved",
         run: crate::rng::selftest,
@@ -105,6 +135,16 @@ pub const SUITES: &[Suite] = &[
         run: crate::gfx::desk::selftest,
     },
     Suite {
+        name: "mindwin",
+        about: "the AI windows lay out without overlapping, and read a verdict honestly",
+        run: crate::gfx::mindwin::selftest,
+    },
+    Suite {
+        name: "glance",
+        about: "what a window may read about the machine, and what it must never touch",
+        run: crate::ai::glance::selftest,
+    },
+    Suite {
         name: "paint",
         about: "ramps, shading and the window silhouette, which a screenshot cannot settle",
         run: crate::gfx::paint_selftest,
@@ -113,6 +153,16 @@ pub const SUITES: &[Suite] = &[
         name: "recover",
         about: "a fault inside a program does not stop the machine",
         run: crate::cpu::recover::selftest,
+    },
+    Suite {
+        name: "repair",
+        about: "the actions a machine may try on itself, and the judge that says one worked",
+        run: crate::repair::selftest,
+    },
+    Suite {
+        name: "repairs",
+        about: "what survives a reboot, and the rule that withdraws a repair that stopped one",
+        run: crate::update::repairs::selftest,
     },
     Suite {
         name: "census",
@@ -189,46 +239,335 @@ pub const SUITES: &[Suite] = &[
         about: "structures collide when they should, and the objective refuses what does not pay",
         run: crate::ai::abstraction::selftest,
     },
+    Suite {
+        name: "fingerprint",
+        about: "a banner names its service, by content and not by port",
+        run: crate::net::fingerprint::selftest,
+    },
+    Suite {
+        name: "recon",
+        about: "a subnet sweep enumerates the right hosts and no others",
+        run: crate::net::recon::selftest,
+    },
+    Suite {
+        name: "enumerate",
+        about: "HTTP path enumeration parses responses and filters by content",
+        run: crate::net::enumerate::selftest,
+    },
+    Suite {
+        name: "vulnid",
+        about: "known-weak version matching is pure and every entry is asserted",
+        run: crate::net::vulnid::selftest,
+    },
+    Suite {
+        name: "decoy",
+        about: "every decoy banner the recon engine reads back as the real thing",
+        run: crate::net::decoy::selftest,
+    },
+    Suite {
+        name: "canary",
+        about: "a honeytoken trips once and its alarm cannot be erased",
+        run: crate::sysbox::canary::selftest,
+    },
+    Suite {
+        name: "honeypot",
+        about: "a served decoy reads back as its service and the seed rotates",
+        run: crate::net::honeypot::selftest,
+    },
+    Suite {
+        name: "connectome",
+        about: "a whole nervous system parses walking-and-asserting, and one step is deterministic",
+        run: crate::ai::connectome::selftest,
+    },
+    Suite {
+        name: "arena",
+        about: "a pursuit's trajectory records append-only and the terminal verdict is what the record says",
+        run: crate::ai::arena::selftest,
+    },
+    Suite {
+        name: "keys",
+        about: "the held-key map: a make sets, a break clears",
+        run: crate::dev::kbd::selftest,
+    },
+    Suite {
+        name: "linux",
+        about: "the ELF reader, the syscall surface, and the POSIX view of the namespace",
+        run: linux_selftest,
+    },
+    Suite {
+        name: "paging",
+        about: "page rights, and a write to a read-only page that has to fault",
+        run: paging_selftest,
+    },
+    Suite {
+        name: "devices",
+        about: "the driver table: which rule claims which device, and which claims none",
+        run: devices_selftest,
+    },
+    Suite {
+        name: "wifi",
+        about: "the half of the wireless bring-up that can be checked without a radio",
+        run: wifi_selftest,
+    },
+    Suite {
+        name: "sockets",
+        about: "the connection table, and which segment belongs to which one",
+        run: sockets_selftest,
+    },
+    Suite {
+        name: "place",
+        about: "which physical ranges a fixed-address image may be placed at",
+        run: place_selftest,
+    },
+    Suite {
+        name: "gdt",
+        about: "the ring-3 descriptors, and the order sysret dictates",
+        run: gdt_selftest,
+    },
+    Suite {
+        name: "space",
+        about: "a second address space, and CR3 moving after boot",
+        run: space_selftest,
+    },
+    Suite {
+        name: "sky",
+        about: "the Wayland wire format, and which object ids belong to whom",
+        run: sky_selftest,
+    },
+    Suite {
+        name: "problem",
+        about: "a problem is checkable, and a trivial one is refused",
+        run: crate::ai::problem::selftest,
+    },
+    Suite {
+        name: "redqueen",
+        about: "a solver measures difficulty, and a mutation outruns it",
+        run: crate::ai::redqueen::selftest,
+    },
+    Suite {
+        name: "forest",
+        about: "a branch is told from a node, and a head is one line",
+        run: crate::ai::forest::selftest,
+    },
+    Suite {
+        name: "lib",
+        about: "the standard library imports, and its answers are exact",
+        run: crate::aiksi::lib_selftest,
+    },
+    Suite {
+        name: "lex",
+        about: "inverse document frequency, postings, and weighted pooling",
+        run: crate::ai::lex::selftest,
+    },
+    Suite {
+        name: "recall",
+        about: "a budget counted rather than estimated, and a table that reads back",
+        run: crate::ai::recall::selftest,
+    },
+    Suite {
+        name: "route",
+        about: "branch vectors, leave-one-out, and a table that reads back",
+        run: crate::ai::route::selftest,
+    },
 ];
+
+/// The descriptor table, checked as bit fields rather than by loading it.
+///
+/// Every one of these is a silent triple fault if it is wrong, which is the
+/// worst diagnostic this machine has: an instant reboot with nothing printed.
+fn gdt_selftest() -> bool {
+    use crate::kprintln;
+    let mut ok = true;
+    let mut n = 0usize;
+    for (what, good) in crate::cpu::gdt::checks() {
+        n += 1;
+        if !good {
+            kprintln!("    FAIL: {}", what);
+            ok = false;
+        }
+    }
+    kprintln!("    {} claim(s)", n);
+    ok
+}
+
+/// Page rights, and whether they are enforced or merely recorded.
+///
+/// This one genuinely faults on purpose, inside `recover::guard`, because a
+/// permission nobody has watched the processor refuse is a permission written
+/// in a comment. Everything else about page tables can be asserted by reading
+/// them back; enforcement cannot.
+/// The placement table's arithmetic, against a synthetic map.
+///
+/// Synthetic on purpose. The real table is this machine's firmware map less
+/// what this boot took, so a claim written against it would assert something
+/// about QEMU and fail on the GF63 for a correct reason -- and the map is
+/// exactly the thing that cannot be reproduced here. What is checked is the
+/// subtraction and the refusals, which are the same everywhere.
+/// The efuse layout, the packet-buffer arithmetic, the firmware header and the
+/// channel table. Not the register writes, which no machine here can answer.
+fn devices_selftest() -> bool {
+    use crate::kprintln;
+    let mut ok = true;
+    let mut n = 0usize;
+    for (what, good) in crate::dev::registry::checks() {
+        n += 1;
+        if !good {
+            kprintln!("    FAIL: {}", what);
+            ok = false;
+        }
+    }
+    kprintln!("    {} claim(s) over {} row(s)", n, crate::dev::registry::TABLE.len());
+    ok
+}
+
+fn wifi_selftest() -> bool {
+    use crate::kprintln;
+    let mut ok = true;
+    let mut n = 0usize;
+    // Two drivers, one suite, because they answer the same question from
+    // opposite ends: rtl8188eu is one chip identified by vendor id, and rndis
+    // is an interface class that covers every phone that speaks it. The second
+    // is the one that gets an arbitrary machine onto a network.
+    for (what, good) in crate::dev::rtl8188eu::init::checks() {
+        n += 1;
+        if !good {
+            kprintln!("    FAIL: {}", what);
+            ok = false;
+        }
+    }
+    for (what, good) in crate::dev::rndis::checks() {
+        n += 1;
+        if !good {
+            kprintln!("    FAIL: {}", what);
+            ok = false;
+        }
+    }
+    kprintln!("    {} claim(s)", n);
+    ok
+}
+
+fn sockets_selftest() -> bool {
+    use crate::kprintln;
+    let mut ok = true;
+    let mut n = 0usize;
+    for (what, good) in crate::net::tcp::checks() {
+        n += 1;
+        if !good {
+            kprintln!("    FAIL: {}", what);
+            ok = false;
+        }
+    }
+    kprintln!("    {} claim(s)", n);
+    ok
+}
+
+fn space_selftest() -> bool {
+    use crate::kprintln;
+    let mut ok = true;
+    let mut n = 0usize;
+    for (what, good) in crate::mem::space::checks() {
+        n += 1;
+        if !good {
+            kprintln!("    FAIL: {}", what);
+            ok = false;
+        }
+    }
+    kprintln!("    {} claim(s)", n);
+    ok
+}
+
+fn sky_selftest() -> bool {
+    use crate::kprintln;
+    let mut ok = true;
+    let mut n = 0usize;
+    for (what, good) in crate::sky::checks() {
+        n += 1;
+        if !good {
+            kprintln!("    FAIL: {}", what);
+            ok = false;
+        }
+    }
+    kprintln!("    {} claim(s)", n);
+    ok
+}
+
+fn place_selftest() -> bool {
+    use crate::kprintln;
+    let mut ok = true;
+    let mut n = 0usize;
+    for (what, good) in crate::mem::fixed::checks() {
+        n += 1;
+        if !good {
+            kprintln!("    FAIL: {}", what);
+            ok = false;
+        }
+    }
+    kprintln!("    {} claim(s)", n);
+    ok
+}
+
+fn paging_selftest() -> bool {
+    use crate::kprintln;
+    let mut ok = true;
+    let mut n = 0usize;
+    for (what, good) in crate::mem::paging::checks() {
+        n += 1;
+        if !good {
+            kprintln!("    FAIL: {}", what);
+            ok = false;
+        }
+    }
+    kprintln!("    {} claim(s)", n);
+    ok
+}
+
+/// The reader for binaries this kernel did not compile.
+///
+/// The claims answer names and verdicts and the talking happens on this side
+/// of the seam. A foreign-binary parser is the one place in this
+/// tree where every negative matters more than the positive, so the count is
+/// printed for the reason it is printed there -- a list that returned early
+/// passes in exactly the same silence as one that checked everything.
+fn linux_selftest() -> bool {
+    use crate::kprintln;
+    let mut ok = true;
+    let mut n = 0usize;
+    for (what, good) in crate::linux::checks() {
+        n += 1;
+        if !good {
+            kprintln!("    FAIL: {}", what);
+            ok = false;
+        }
+    }
+    kprintln!("    {} claim(s)", n);
+    ok
+}
+
+/// How many suites there are, and therefore how many verdict slots.
+///
+/// One number rather than two, because the assertion below used to compare
+/// `SUITES.len()` against a *literal* while the table it was protecting was a
+/// separate literal beside it. Adding the thirty-third suite therefore passed
+/// the guard and panicked at the store -- "index out of bounds: the len is 32
+/// but the index is 32" -- which is the exact failure the guard's own comment
+/// says it exists to prevent. A `static` cannot be read in a const context, so
+/// the array cannot be measured directly; naming its length is the next best
+/// thing and it is now the only place the number appears.
+const SLOTS: usize = 66;
 
 /// One slot per suite. Indexed by position in `SUITES`, which is a constant,
 /// so the table cannot get out of step with the list.
-static RESULTS: [AtomicU8; 30] = [
-    AtomicU8::new(0),
-    AtomicU8::new(0),
-    AtomicU8::new(0),
-    AtomicU8::new(0),
-    AtomicU8::new(0),
-    AtomicU8::new(0),
-    AtomicU8::new(0),
-    AtomicU8::new(0),
-    AtomicU8::new(0),
-    AtomicU8::new(0),
-    AtomicU8::new(0),
-    AtomicU8::new(0),
-    AtomicU8::new(0),
-    AtomicU8::new(0),
-    AtomicU8::new(0),
-    AtomicU8::new(0),
-    AtomicU8::new(0),
-    AtomicU8::new(0),
-    AtomicU8::new(0),
-    AtomicU8::new(0),
-    AtomicU8::new(0),
-    AtomicU8::new(0),
-    AtomicU8::new(0),
-    AtomicU8::new(0),
-    AtomicU8::new(0),
-    AtomicU8::new(0),
-    AtomicU8::new(0),
-    AtomicU8::new(0),
-    AtomicU8::new(0),
-    AtomicU8::new(0),
-];
+static RESULTS: [AtomicU8; SLOTS] = {
+    // `AtomicU8` is not `Copy`, so an array repeat needs a `const` item rather
+    // than a value -- each element is a fresh evaluation of the constant.
+    #[allow(clippy::declare_interior_mutable_const)]
+    const UNRUN: AtomicU8 = AtomicU8::new(0);
+    [UNRUN; SLOTS]
+};
 
 /// Checked here rather than trusted: a suite added to `SUITES` without a slot
 /// would silently never record a verdict.
-const _: () = assert!(SUITES.len() == 30);
+const _: () = assert!(SUITES.len() == SLOTS);
 
 pub fn verdict(i: usize) -> Verdict {
     match RESULTS.get(i).map(|r| r.load(Ordering::Relaxed)) {

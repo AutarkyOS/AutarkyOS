@@ -247,6 +247,34 @@ pub const STEPS: &[Step] = &[
                  site -- proof it boots on metal, not just an emulator.",
         fail: "(nothing fails here; it is the reward)",
     },
+    Step {
+        title: "Mining: what one slice really does",
+        place: Place::Autark,
+        cmd: "mine algo yespower 10 2048 8   then   mine bench 10000",
+        expect: "a H/s figure with no hypervisor note under it. Under QEMU this                  reads 125 H/s and the machine says the number is about the                  host; here it is about this laptop and is the first honest                  yespower rate this project has ever had.",
+        fail: "the hypervisor note still prints -> CPUID leaf 1 ECX bit 31 is                set on bare metal, which would be a firmware oddity worth                recording. A rate far under 125 -> the reference implementation                is slower than the emulator, which cannot be right; check the                governor with 'power'.",
+    },
+    Step {
+        title: "Mining: where the concurrency curve bends",
+        place: Place::Autark,
+        cmd: "mine sweep 4 10000",
+        expect: "H/s per slice count, and the percentage of one slice beside                  it. **This is the measurement the whole slicing design rests                  on and it cannot be taken anywhere else.** design/mining.md                  predicts four to six jobs at the 2 MiB setting before L3                  contention bites; under QEMU the curve instead plateaus at 3                  because the guest only has 4 vCPUs, so the emulator can never                  answer this.",
+        fail: "flat from 2 onwards -> the slices are not migrating; check                'tasks' shows several 'mine slice' rows all being resumed, and                that none logged 'could not be unpinned'. Linear all the way to                4 -> the wall is further out than predicted, which is a better                answer than the prediction and should go in the doc.",
+    },
+    Step {
+        title: "Mining: two coins, two algorithms, one machine",
+        place: Place::Autark,
+        cmd: "mine slices 4   then   mine coin 1 zeny yespower 10 2048 8                  then   mine coin 2 btc sha256d   then   mine coins",
+        expect: "two rows with wildly different rates and the slices split                  between them. Under QEMU with three slices this read 676 H/s                  of yespower beside 238,759 H/s of sha256d, which is the                  demonstration that a combined figure would be meaningless.                  On sixteen logical processors the interesting question is                  whether the yespower row holds its rate while the sha256d                  row runs -- they share L3, and only one of them cares.",
+        fail: "a row saying 'no slice on it' -> the supervisor gave every                slice to the other coin; check 'mine slices' against the number                of coins. A yespower rate that collapses when the second coin                starts -> that is the L3 contention this whole design is about,                and it is a finding rather than a fault. Write down both rates.",
+    },
+    Step {
+        title: "Mining: a real pool's job",
+        place: Place::Autark,
+        cmd: "mine probe <host>:<port> <worker>",
+        expect: "a subscribe result, then a mining.notify decoded: prevhash,                  coinbase lengths, nbits, the network target, and a merkle                  branch with more than zero levels. No real notify has ever                  been parsed by this kernel, for any coin.",
+        fail: "'Authorization validation error' or similar -> the pool wants a                real payout address, which is the same wall public-pool.io gave.                A branch of 0 levels -> that pool's block had only a coinbase,                so try again when it is busier.",
+    },
 ];
 
 /// Tick state, one bit per step, shared with the shell command.

@@ -221,6 +221,33 @@ adopted.
 Fixed with one pure function both arms share, `criterion_back`. Four claims,
 all passing at boot.
 
+### The rollback record (option B)
+
+*Built and driven live under WHPX this session.* `godel rollback` wrote nothing
+to the ledger, so the record showed "adopted X" and never "…then reverted X" --
+an incomplete history of what the machine changed, under a machine whose one
+invariant is that that history cannot be lost. Now it appends a `revert
+variant=<from> to=<to>` line (`root....` when it detaches to the frozen model),
+after every restoration has succeeded, so a revert the machine could not honour
+never reaches the record.
+
+Chosen over three alternatives (append plainly / dispatch-only / leave it) for
+one reason: the ledger is also the search substrate. `record_seed` hashes it to
+draw the next proposal (U1) and `ledger_len` counts it to place the epoch
+boundary (Red Queen). So both now read *verdict lines only* -- `verdict_bytes`
+drops revert lines before the hash and `verdict_count` before the count -- and
+the filter is byte-identical to the raw blob when there are no reverts, so every
+existing lineage re-derives the seed it always did. The undo is on the
+permanent, append-only record but invisible to the search: recording it cannot
+redirect what the loop tries next.
+
+Verified live: after `godel judge 0.5 2 40` adopted, `godel ledger` showed the
+`ADOPT` line; after `godel rollback`, it showed both that line and `revert
+variant=4d7a12b4 to=root....`, while `godel next` still reported `1 verdict(s)
+recorded, trial 1 of 5` -- the revert on the record, absent from the clock. Four
+pure claims in the godel selftest check the filter on synthetic ledgers, since
+the live one is append-only and a test must not write to it.
+
 ### Screenshots
 
 Eight `screendump` captures in `docs/screens/`, taken in one boot with the
@@ -230,16 +257,55 @@ clock inside the quiet window, referenced from the README.
 
 ## In progress
 
-**End-to-end verification of the rollback fix.** A fresh machine is running
-`godel judge 0.5 2 40` right now, after which `godel rollback` must return the
-criterion to `bar 3.84 floor 4`. About forty minutes of prepare under TCG.
+Nothing open at the moment. The rollback verification below closed the last
+in-flight item.
 
-The re-run doubles as a re-derivability check. Nothing in the training path is
-random, so the second run should produce a bit-identical matrix: `fixed 2 broke
-0 chi 0.5` with the same anchor figures. Anything else is a finding on its own.
+---
 
-Boot on the fixed build is already confirmed clean: 288 selftest claims, zero
-failures, all four rollback claims passing.
+## Verified this session (WHPX host, 2026-09-04)
+
+The container claim in the header -- TCG only, ~160x slower, forty minutes a
+prepare -- does not hold on this host. **WHPX works here** (`-accel whpx -cpu
+max`), so the whole judge/rollback cycle below is minutes rather than the day
+the header budgets for it. Everything in this block was driven on the real
+kernel, not reasoned about.
+
+**The judge -> rollback cycle, end to end, and re-derivable.** On a fresh
+machine, `godel judge 0.5 2 40` produced, bit-identical to the run that first
+found it:
+
+```
+the criterion moved -- a looser bar admits a variant the anchor confirms
+bar 3.84 -> 0.5, floor 4 -> 2, anchor 0.5217391 -> 0.6086956
+```
+
+Status then showed `criterion: bar 0.5 MOVED floor 2 MOVED`, `1 adopted`, and a
+lineage node `4d7a12b4`. `godel rollback` returned `back to the frozen model`,
+and status restored `criterion: bar 3.84 floor 4 (the default; never moved)`
+with `head: none`. One test read spent (`1/3`), as designed. The identical
+anchor figures on a machine that had never run it is the re-derivability claim
+demonstrated rather than asserted.
+
+**`set_head` returning its result is verified on both paths.** The adoption set
+the head (lineage node present); the rollback detached it. No `the head would
+not write` line fired because nothing failed, which is the correct silence.
+
+**`1 adopted` beside `head: none` is now the legible case.** The post-rollback
+status is exactly that pairing, and it reads correctly: the counter records the
+adoption that happened, the head is none because it was rolled back. What was
+filed as "not yet chased" is understood and the wording carries it. The one
+piece then left open -- `rollback` writing no ledger line -- is now closed;
+see "The rollback record (option B)" above.
+
+**A `diag`-array bug the boot caught that compilation did not.** Adding the two
+new suites (below) took `SUITES` to 32 and I bumped the guard
+`assert!(SUITES.len() == 32)` to match -- but that guard compared against a
+literal, not against the `RESULTS` array it was meant to protect, so it passed
+while `RESULTS` stayed length 30. `diag fingerprint` then panicked with "len is
+30 but the index is 30" on the first boot that ran it. The guard is now
+`SUITES.len() == RESULTS.len()`, tying the two arrays so neither can move
+alone -- the promise the doc comment had always made and the assert had never
+kept. This is the case for booting: compile-green was a false negative.
 
 ---
 
@@ -255,15 +321,34 @@ failures, all four rollback claims passing.
 
 ### Known defects, stated rather than hidden
 
-- **The nightly rotation cannot reach the criterion that adopted.** The most
-  permissive point in `JUDGE_GRID` is `(2.00, 2)`, and `chi` of 0.5 is under a
-  bar of 2.00. So the grid is more conservative than the axis, and unattended
-  running would never have found the adoption an operator command did. Either
-  the grid widens or that gap is documented as deliberate.
-- **`1 adopted` alongside `head: none`.** Observed during the unattended run.
-  An adoption should move the head. Either `adopted` counts something the head
-  does not track, such as an archive cell win, or a head write did not happen.
-  Not yet chased.
+- **The nightly rotation could not reach the criterion that adopted.** *Closed
+  (`c8331e1`).* The most permissive point in `JUDGE_GRID` stopped at `(2.00, 2)`
+  while the criterion an operator command proved adoptable was `(0.5, 2)`, so
+  the loop was strictly more conservative than the axis and would never have
+  found that adoption unattended -- U3 decorative except by hand. `(JUDGE_MIN,
+  2)` is in the grid now; the change is reachability only, since `trial_judge`
+  still grounds any loosening on the held-out anchor and spends a test read, so
+  the loop reaches the point at night only when the anchor confirms it.
+  Boot-verified: `godel next` consumes the widened grid, all godel claims pass.
+- **`1 adopted` alongside `head: none`.** *Diagnosed and closed; verified on a
+  real boot this session (see "Verified this session" above).* The pairing is
+  consistent, not a bug in
+  itself: `ADOPTIONS` is a per-boot atomic that only rises, and a rollback to
+  the frozen model detaches the head without touching it, so the two count
+  different things. What was wrong is that the machine could not *tell you
+  which* cause produced the pairing, because `set_head` discarded
+  `write_text`'s bool -- a failed head write incremented the counter and said
+  nothing, looking identical to a normal undo. `set_head` now returns `bool`,
+  is `#[must_use]`, and each of its callers reports its own meaning of failure:
+  the six adoption sites announce an attached-but-unnamed variant, `ensure_head`
+  refuses the trial (a lineage from the wrong parent is worse than none), and
+  `rollback` errors (a head naming the child while the parent runs is the worst
+  outcome). `godel status` now says `N trial(s) since boot` and, on `head: none`
+  with a non-zero count, states plainly it was rolled back since. Still open:
+  `rollback` appends nothing to the ledger, so an undo leaves no trace in the
+  record -- a real gap under the invariant, but where those entries go is a
+  re-derivability decision (`record_seed` hashes the ledger, `is_boundary`
+  counts it), left for a decision rather than a tidy-up.
 - **Console bleed-through.** Terminal output paints past the window's right
   edge and over the windows behind it, visible in three of the eight
   screenshots. Upstream behaviour, not introduced by this fork.
@@ -271,6 +356,192 @@ failures, all four rollback claims passing.
   raises a general protection fault, so a fatal fault on the laptop, which has
   no UART, prints one line and halts. The bug belongs to the console and is now
   visible rather than silent.
+
+### The Mirror -- deception as the posture (new)
+
+The distro's security stance: not concealment but deception and cost-imposition,
+on our own turf only. `design/mirror.md` has the four phases and the boundary
+(no hack-back, no deploying onto infrastructure we do not own). Two phases built
+and boot-verified this session:
+
+- **Phase 1, decoy banners (`net/decoy.rs`).** The inverse of `fingerprint`:
+  synthesise a banner the recon engine reads back *as* the named service, proven
+  by a boot round-trip through `identify`. Ten protocols, seed-diverse for a
+  heterogeneous fleet. Found and fixed a real `identify` ordering bug (RTSP
+  misread as HTTP). Suite `decoy`; committed `e9bcc6f`.
+- **Phase 2, honeytokens (`sysbox/canary.rs`).** A planted secret nothing
+  legitimate reads; any read trips an alarm appended to `/ai/mirror/alarms`,
+  now a fifth append-only record under `guard`, so the trip cannot be erased.
+  Verified live: read the bait -> got the decoy keys + `[canary] tripped`;
+  `rm`/`write` on the alarm log both refused; alarm survived. Suite `canary`;
+  operator-only shell verb. The armed flag keeps the read path near-free when
+  nothing is planted.
+
+- **Phase 3, the honeypot (`net/honeypot.rs` + a passive open in `tcp`).**
+  `tcp` gained a `SynRcvd` state and `passive_open`, turning the client-only
+  stack into one that accepts on a listening port, serves a rotating decoy
+  banner, captures the peer's bytes, and logs to `/ai/mirror/sessions` (a sixth
+  `guard` record). Operator-only `honeypot listen <proto> <port>`. **Verified
+  live under QEMU** via a new `drive.py --hostfwd`: a host socket connected in,
+  got `SSH-2.0-OpenSSH_9.2p1 ...` (and a different identity on the next
+  connect -- the seed rotating), and the guest logged `10.0.2.2 ssh bytes=14
+  first=id; uname -a`. Two bugs the live run surfaced and nothing else could:
+  the passive close set `closing` without moving to `FinWait1` (stuck in
+  CloseWait, banner served but nothing logged); and an RTSP Server-header split
+  asserted wrong in a selftest that only fails on a real boot.
+
+- **Phase 4, the tarpit (`honeypot tarpit <proto> <port>`).** Cost imposition:
+  holds a connection open and dribbles one plausible preamble line per interval,
+  never a completing banner, so the peer's client blocks and its connection
+  budget drains (endlessh-style). Built on the phase-3 passive open -- the
+  establish path branches on `is_tarpit()`, `on_tick` drives the drip and closes
+  the trap when the peer leaves. Releases after a drip cap; logs the line count
+  as the exact cost proxy (not a seconds figure -- guest-timer calibration is
+  not something to guess at). **Verified live**: a host client watched 10+
+  distinct lines dribble with the connection held open, and a clean FIN produced
+  `10.0.2.2 tarpit drips=11` in the log. A CloseWait-on-FIN leak (the tarpit
+  twin of the capture-mode close bug) was found reviewing the first run and
+  fixed before commit.
+
+Not yet built: the **maze** (the other half of phase 4) -- infinite plausible
+depth so a crawler spends itself; needs per-connection content generation on the
+listener, a larger addition than the tarpit's timer. The doctrine for the eventual
+aggressive-security network-stack rewrite and the reverse-engineering-over-
+compatibility direction for foreign binaries are recorded in
+`design/doctrine.md` (direction, not code).
+
+### Reconnaissance -- a local Shodan (new this session)
+
+*Boot-verified: both selftests pass at boot and under `diag`, and the `recon`
+command ran clean end to end under QEMU (found nothing, as its NAT has no hosts
+-- the expected empty result, not a failure). The live-host scan is still
+GF63-only.*
+
+`src/net/fingerprint.rs` and `src/net/recon.rs`. Shodan's method with its one
+internet-scale decision removed: sweep the machine's own subnet, banner-grab
+open ports, name each service by banner content. Off-subnet targets refused
+(`net::alive` gates on ARP). `recon` in the shell; findings indexed under
+`/ai/recon/<ip>/<port>`. Operator-only -- the model reaches Net only through a
+trusted Aiksi builtin, not yet exposed.
+
+- **`fingerprint::identify` is pure and verified.** Names SSH/HTTP/FTP/SMTP/
+  POP3/IMAP/Redis/MySQL/telnet/RTSP by content not port (SSH-on-80 is still
+  SSH). Boot suite `fingerprint`; also run under a host `rustc` harness, which
+  caught a bug the compiler passed -- a case-insensitive search silently
+  requiring a pre-lowercased needle, so Redis's own refusal did not identify it.
+- **`recon::hosts_in` is pure and verified.** Subnet enumeration with network,
+  broadcast and self excluded and a wide mask capped at `MAX_HOSTS`. Boot suite
+  `recon`; host-harness clean.
+- **`recon::scan` is unverified.** QEMU user-mode net is a NAT with no scannable
+  hosts, so an ARP sweep finds nothing there -- exercised on the GF63 only,
+  same bucket as RTL8168 and WPA2.
+- **Next:** the Aiksi builtin surface (`recon_scan`/`recon_hosts`/`recon_host`)
+  so the model can query the index -- a Net-class gate change, deliberately held
+  until it can be booted.
+
+### A connectome in the kernel (built + verified this session)
+
+*Boot-verified and driven live under WHPX against the real `out/connectome.bin`.*
+
+`design/connectome.md`, `tools/connectome.py`, and now `src/ai/connectome.rs`
+plus a `connectome` shell verb. The honest form of "integrate a healthy human
+brain": a human synaptic wiring diagram does not exist to download, but *C.
+elegans* is a complete one, and at ~84 KB it lives in the kernel heap as an
+ordinary graph. The steer was **full + runnable**, and both are done.
+
+- **The loader walks and asserts.** `parse` bounds-checks every field of the
+  `GLADOSXN` body and requires landing exactly on the last byte, the same bargain
+  `tools/v4.py` makes -- a body with no internal offsets cannot be trusted to a
+  reader that seeks. `tools/connectome.py --verify` is the separate second reader.
+- **The simulator is a toy, labelled one.** `x_next[i] = tanh(gain * (W x)[i] /
+  in_scale[i])`, chemical edges directed and taken excitatory (the dataset has no
+  sign), electrical symmetric. It departs from the design sketch in two recorded
+  ways: a sparse edge-list walk, not a dense `Mat::matvec` (1.6% density, so sixty
+  times less arithmetic and no dense adjacency to materialise); and a per-node
+  `in_scale` divisor the sketch lacked, without which a hub like AVAL saturates
+  the graph on step one. What the selftest asserts is the machinery -- parse,
+  determinism, an excitatory edge driving its target -- never worm behaviour.
+- **Wired to nothing that decides.** Loaded on demand from a namespace path
+  (`connectome load`), not compiled in; `LOADED`/`STATE` are read by the shell
+  and the selftest and by no router, council or `godel`. As far from a decision
+  as the Oracle.
+- **Suite 36.** Boot selftest line + `diag connectome`; the compile-time
+  `SUITES.len() == RESULTS.len()` tie was bumped 35 -> 36.
+
+Live: `load` -> 448 neurons / 7379 connections (4681 chemical, 2698 electrical);
+`neigh AVAL` -> its 132 outgoing synapses; `stim AVAL 100` then `step 1 4` lights
+the VA/DA/AS motor neurons AVAL is known to drive, and `step 4 4` reaches the
+body-wall muscles (dBWM/vBWM) and D-class motor neurons -- the backward-locomotion
+motor pathway traced through the loaded graph, which is the biology and not luck.
+
+### The arena -- an autonomous agent, measured (built + verified this session)
+
+*Boot-verified and driven end to end under WHPX.* `src/ai/arena.rs`,
+`src/net/reach.rs`, plus additions to `harness`, `recon`, `futures`,
+`initiative`, `shell`, `guard`, `diag`. The full treatment is `design/arena.md`;
+what it closes are two deficiencies the OS had -- no persistent objective and no
+way to measure a pursuit -- and one it lacked deliberately: the model could not
+touch the network at all.
+
+- **The cage, built before the agent was armed.** `reach.rs`: operator-only mode
+  (default `Isolated`, fail-closed) + a within-subnet allowlist, and a pure
+  `action_authorized` where construction beats policy -- an allowlisted
+  off-subnet address is still refused, because the subnet is checked first. No
+  applet/grammar/builtin reaches the setters, so the model cannot widen its own
+  reach. Asserted at boot in `diag arena`.
+
+- **The step engine.** `arena::step` = perceive -> decide -> act -> measure ->
+  record. It constrained-decodes one verb over a scoped vocabulary (`scan`,
+  `probe` once a host is found, `done`) that never enters the general applet
+  grammar, through the one decode loop `harness::choose_among` (onto which
+  `choose` was refactored). It holds the engine for the decode alone; the recon
+  I/O runs after the borrow, the nightly-`godel` discipline.
+
+- **The capability -- guarded recon, armed.** `scan` sweeps a bounded slice of
+  the authorized range per step (a step-number cursor advances it, so a range is
+  mapped incrementally rather than in one four-minute ARP storm -- a real design
+  fix, caught when the first drive timed out sweeping a whole /24); `probe`
+  interrogates one discovered host. Every target passes the reach guard first.
+
+- **The measurement -- the deliverable.** Every action tagged `executed /
+  refused-by-model / blocked-by-guard / failed`; per-step behavioural drift
+  (`futures::drift_centi`, the Oracle's residual) and cumulative faults
+  (`recover::caught`); a pure terminal classifier (`SelfDestructed` outranks
+  `Achieved`, then `Refused`, then `Stalled`, else `Running`, with self-destruct
+  and faults read as run-deltas). The trajectory `/ai/arena/ledger.txt` is a
+  seventh append-only `guard` record.
+
+- **An adversarial review ran before it drove.** Four independent lenses
+  (engine-borrow/UB, containment, measurement, integration) via a workflow; the
+  two safety-critical lenses returned clean, and the two findings it raised were
+  fixed: a classifier clause that tested a cumulative counter absolutely instead
+  of as a delta (would have let one run's history poison every later run once the
+  field is wired -- now delta-only, with a selftest pinning it), and the author
+  branch not setting `spent` (author + arena could both fire in one quiet tick --
+  now enforced).
+
+Live (`arena run t1 6`, SmolLM2): the model chose `scan` five times (the sweep
+found nothing, correct under QEMU's NAT), then chose `done` -- classified
+**`refused`**, the model's own brake read from the record, distinguished from a
+guard block and a stall. That distinction on real model output is the point. Real
+recon scores need the GF63 on an owned range; enumeration/vuln-id tiers and the
+exposure-flag oracle are the next increment.
+
+### Tooling: environment notes for a hypervisor host
+
+- **WHPX works here** (`-accel whpx -cpu max`), so the ~160x TCG penalty this
+  file assumes elsewhere does not apply on this machine. Boots and trials are
+  minutes, not tens of minutes.
+- **`drive.py` hardcoded ports 45454/45455.** A second checkout of this kernel
+  on the same host (a sibling fork, `Projects\sanctum`) binds the same pair, and
+  because `-serial ...,wait=on` strands a QEMU, the second run attaches to the
+  *other* project's kernel and captures its boot log -- reads as this tree's
+  binary having reverted. Now overridable via `AUTARK_PORT` (monitor takes the
+  next number); default unchanged.
+- **`tokenizer.py --verify` needs UTF-8 output.** The Windows console is cp1252
+  and the verify cases include non-Latin-1 text, so it dies on
+  `UnicodeEncodeError` mid-run; `PYTHONUTF8=1` fixes it. Belongs in the tooling
+  section of CLAUDE.md.
 
 ### Unbinding, stage U2
 

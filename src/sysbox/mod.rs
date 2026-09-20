@@ -19,7 +19,9 @@
 //! step, `rm` cannot destroy content, and a snapshot costs nothing. Those are
 //! not features bolted on, they are what content addressing already implies.
 
+pub mod canary;
 pub mod guard;
+pub mod stored;
 pub mod tree;
 
 use crate::gfx::console::{self, LTCYAN, LTGREEN, LTGRAY, LTRED, WHITE, YELLOW};
@@ -154,6 +156,7 @@ pub fn init() {
           type 'sysbox' for the applet list.\n".to_vec()));
     let _ = tree::put(&mut sb.root, &path_of("/tmp/.keep"), Node::Blob(Vec::new()));
     let _ = tree::put(&mut sb.root, &path_of("/ai/.keep"), Node::Blob(Vec::new()));
+    seed_lib(&mut sb);
     seed_tools(&mut sb);
     seed_apps(&mut sb);
     unsafe {
@@ -169,6 +172,10 @@ pub fn init() {
     if moved > 0 {
         kprintln!("  [app] carried {} program(s) to code.ai&xi", moved);
     }
+    // Load any planted canaries from the namespace so the read-path hook is
+    // armed before the first thing reads anything. On a fresh machine the
+    // registry is absent and this arms nothing.
+    canary::arm_from_namespace();
 }
 
 /// The starter skills. Shipped rather than documented, so the convention is
@@ -248,6 +255,19 @@ fn rows() {\n\
 }\n".to_vec()));
 }
 
+/// The shared library at `/lib`, which `Interp::import` will admit to a
+/// sandboxed program where it admits nothing else outside that program's own
+/// subtree. Seeded rather than left empty: an import path with nothing in it
+/// is a jail around an empty room.
+fn seed_lib(sb: &mut Sysbox) {
+    // Every row of `aiksi::LIBS`, rather than a call per library. One list
+    // means adding a library and forgetting to seed it is not a thing that can
+    // happen, and the boot check that walks `/lib` walks the same list.
+    for (path, src) in crate::aiksi::LIBS {
+        let _ = tree::put(&mut sb.root, &path_of(path), Node::Blob(src.as_bytes().to_vec()));
+    }
+}
+
 fn seed_tools(sb: &mut Sysbox) {
     let _ = tree::put(&mut sb.root, &path_of("/ai/tools/hello.ai&xi"), Node::Blob(
         b"// says hello; the smallest working skill\n\
@@ -306,6 +326,25 @@ pub fn restore_latest() {
                     seed_tools(s);
                     seed_apps(s);
                 }
+                // **Unconditionally, and the guard that used to be here was a
+                // real bug.** It asked whether `/lib` was *empty*, when the
+                // question is whether it holds every library this image
+                // carries -- so the moment the set grew from six to seven,
+                // every machine that had ever taken a snapshot restored the
+                // six it already had and the seventh never appeared. Nothing
+                // said so; `use "/lib/chem"` simply answered that there was
+                // no such file, on a kernel that had it compiled in.
+                //
+                // So `/lib` belongs to the image rather than to the machine:
+                // it is seeded from `LIBS` at every boot and an edit made
+                // there does not survive one. That is the same rule the
+                // routing corpus follows and the reason it can be relied on at
+                // all -- a program that needs its own version of something
+                // keeps it in its own subtree, which is where the jail admits
+                // it anyway. `/ai/tools` is deliberately not like this: it is
+                // where `agent learn` writes, so it is the machine's and is
+                // only re-seeded when it has been emptied.
+                seed_lib(s);
             });
             console::set_color(LTGREEN);
             kprintln!("  restored snapshot {} ({} files)", seq, files);
@@ -327,16 +366,20 @@ fn index_walk(st: &cas::Store, r: &cas::ChunkRef, kind: u8, depth: usize, w: &mu
     if depth > tree::MAX_DEPTH {
         return;
     }
+    // A blob's chunk address IS its content address, so the ChunkRef is
+    // memoised directly -- **and the read that used to happen first was pure
+    // waste**, since the bytes it fetched were never looked at. Every blob on
+    // the disk was read and hashed here, and then read and hashed again by
+    // `read_node` one call earlier, to produce a memo entry available from the
+    // reference alone.
+    if kind == tree::KIND_BLOB {
+        w.insert(r.hash, *r);
+        return;
+    }
     let raw = match st.get(r) {
         Ok(v) => v,
         Err(_) => return,
     };
-    if kind == tree::KIND_BLOB {
-        // A blob's chunk address IS its content address, so the ChunkRef can be
-        // memoised directly.
-        w.insert(r.hash, *r);
-        return;
-    }
     let entries = match tree::decode_dir(&raw) {
         Some(v) => v,
         None => return,
@@ -893,15 +936,98 @@ pub fn write_blob(path: &str, data: Vec<u8>) -> bool {
     .unwrap_or(false)
 }
 
+/// An away blob, read back and checked against its own address.
+///
+/// **Verified, where a bare ranged read cannot be.** `stored::read_at` says in
+/// its own doc that it cannot check what it returns, because the hash covers
+/// the whole blob and a range is not the whole blob. Here the whole blob *is*
+/// what is read, and `ChunkRef::hash` is its content address, so one SHA-256
+/// settles whether these are the bytes the tree names or whatever those blocks
+/// happen to hold now.
+///
+/// **Nothing caches the result, deliberately.** A cache with no eviction is
+/// exactly how a corpus moved out of memory ends up back in it, one read at a
+/// time, with nothing saying so. A repeated read costs a repeated disk read,
+/// and a caller wanting a body twice should keep it.
+pub fn fetch(r: &cas::ChunkRef) -> Option<Vec<u8>> {
+    // **Both failures are said out loud**, and they have to be. Every caller
+    // above this sees `Option<Vec<u8>>` and reads `None` as "no such file" --
+    // so a store that went away under a restored tree, and a body that no
+    // longer matches its own address, would both present as a file that was
+    // never there. On a machine that printed "restored snapshot 2 (9,649
+    // files)" a minute earlier, that is the worst shape a failure can take.
+    let bytes = match stored::read_at(r, 0, r.len as usize) {
+        Some(v) => v,
+        None => {
+            console::set_color(LTRED);
+            kprintln!(
+                "  a body on disk would not read back (lba {}, {} B) -- store gone, or a read in flight",
+                r.lba,
+                r.len
+            );
+            console::set_color(LTGRAY);
+            return None;
+        }
+    };
+    if crate::store::sha256::hash(&bytes) != r.hash {
+        console::set_color(LTRED);
+        kprintln!(
+            "  a body on disk failed its own address (lba {}, {} B) -- the store is corrupt here",
+            r.lba,
+            r.len
+        );
+        console::set_color(LTGRAY);
+        return None;
+    }
+    Some(bytes)
+}
+
 pub fn read_blob(path: &str) -> Option<Vec<u8>> {
-    with(|s| {
+    // Resolve inside the borrow, then check the canary registry *outside* it:
+    // a trip writes the alarm log, which takes the borrow again, so springing
+    // the trap from within this one would double-borrow. The absolute path is
+    // carried out so the check does not re-parse. A blob may be Away (offloaded
+    // by `stored`), fetched outside the borrow for the same reason.
+    let (found, abs) = with(|s| {
+        let p = parse(&s.cwd, path);
+        let abs = show(&p);
+        let found = match tree::resolve(&s.root, &p) {
+            Some(Node::Blob(b)) => Some(Ok(b.clone())),
+            Some(Node::Away(r)) => Some(Err(*r)),
+            _ => None,
+        };
+        (found, abs)
+    })
+    .unwrap_or((None, String::new()));
+    let out = match found {
+        Some(Ok(bytes)) => Some(bytes),
+        Some(Err(r)) => fetch(&r),
+        None => None,
+    };
+    if out.is_some() {
+        canary::on_read(&abs);
+    }
+    out
+}
+
+/// A read with no canary hook, for the canary layer's own use. Reading the
+/// alarm log to append to it must not spring a trap; this is the path that
+/// cannot, structurally, rather than by relying on the eligibility rule.
+pub(crate) fn read_blob_raw(path: &str) -> Option<Vec<u8>> {
+    let found = with(|s| {
         let p = parse(&s.cwd, path);
         match tree::resolve(&s.root, &p) {
-            Some(Node::Blob(b)) => Some(b.clone()),
+            Some(Node::Blob(b)) => Some(Ok(b.clone())),
+            Some(Node::Away(r)) => Some(Err(*r)),
             _ => None,
         }
     })
-    .flatten()
+    .flatten();
+    match found {
+        Some(Ok(bytes)) => Some(bytes),
+        Some(Err(r)) => fetch(&r),
+        None => None,
+    }
 }
 
 /// Detach a name. The content stays addressable, as everywhere else.
@@ -947,13 +1073,58 @@ pub fn listing(path: &str) -> Vec<(String, bool, usize)> {
                 .iter()
                 .map(|(k, v)| match v {
                     Node::Dir(inner) => (k.clone(), true, inner.len()),
-                    Node::Blob(b) => (k.clone(), false, b.len()),
+                    other => (k.clone(), false, other.blob_len().unwrap_or(0) as usize),
                 })
                 .collect(),
             _ => Vec::new(),
         }
     })
     .unwrap_or_default()
+}
+
+/// How many bytes a blob holds, without copying it out.
+///
+/// `read_blob` clones, which is right for a caller that wants the contents and
+/// ruinous for one that only wants the length: `stat` on a file asks exactly
+/// that question, and answering it through `read_blob` allocates the whole
+/// file to look at a `usize`. A 600 MB checkpoint is a legal thing to `stat`
+/// and not a legal thing to copy on a machine with one address space.
+///
+/// `None` for a directory as well as for a missing path, since a directory has
+/// no byte count and answering zero would be indistinguishable from an empty
+/// file.
+pub fn blob_len(path: &str) -> Option<usize> {
+    with(|s| {
+        let p = parse(&s.cwd, path);
+        match tree::resolve(&s.root, &p) {
+            // An away blob answers here without a read, which is the whole
+            // reason the length is in the chunk reference. `_ => None` was the
+            // arm before and would have reported every restored file as
+            // missing -- silently, because a match on two variants of three
+            // compiles perfectly.
+            Some(n) => n.blob_len().map(|v| v as usize),
+            None => None,
+        }
+    })
+    .flatten()
+}
+
+/// Create an empty directory, failing if the name is taken.
+///
+/// `write_blob` already creates intermediate directories, so this exists for
+/// the one case that has no blob at the end of it: `mkdir`. Refusing an
+/// existing name rather than replacing it is what `EEXIST` is, and replacing a
+/// directory that has things in it would be a silent recursive delete.
+pub fn make_dir(path: &str) -> bool {
+    with(|s| {
+        let p = parse(&s.cwd, path);
+        if tree::resolve(&s.root, &p).is_some() {
+            return false;
+        }
+        note(&s.root, &p);
+        tree::put(&mut s.root, &p, Node::Dir(Vec::new())).is_ok()
+    })
+    .unwrap_or(false)
 }
 
 /// Whether a path names a directory.
@@ -1134,6 +1305,84 @@ pub fn selftest() -> bool {
         }
     }
 
+    // --- a blob that is not here --------------------------------------------
+    //
+    // The whole variant rests on one equality: an away node's address must be
+    // the address of the blob it stands for. If it is not, every directory
+    // above it changes, and `same`, `diff`, every snapshot and every stored
+    // lineage stop meaning what they meant -- all at once and with nothing
+    // announcing it.
+    //
+    // It holds because `content_hash` of a blob is exactly `sha256(bytes)` and
+    // `Store::put` computes exactly that. That is a property of how the store
+    // was designed rather than a coincidence, and it is asserted here rather
+    // than assumed, with no store and no disk involved.
+    {
+        let body: &[u8] = b"a body that lives somewhere else";
+        let here = tree_with("/deep/er/leaf", body);
+        let at = cas::ChunkRef {
+            hash: crate::store::sha256::hash(body),
+            lba: 4096,
+            len: body.len() as u64,
+        };
+        let mut there = Node::empty_dir();
+        let _ = tree::put(&mut there, &path_of("/deep/er/leaf"), Node::Away(at));
+        ok &= check(
+            "an away node addresses the same as the blob it stands for, root included",
+            tree::content_hash(&here) == tree::content_hash(&there),
+        );
+
+        // And the address must not depend on *where* the bytes are, or moving
+        // a block would rename an object -- which is the property `tree.rs`
+        // opens by stating and the reason the hash covers content only.
+        let mut moved = Node::empty_dir();
+        let _ = tree::put(
+            &mut moved,
+            &path_of("/deep/er/leaf"),
+            Node::Away(cas::ChunkRef { lba: 999_999, ..at }),
+        );
+        ok &= check(
+            "and not on which block it happens to sit on",
+            tree::content_hash(&there) == tree::content_hash(&moved),
+        );
+
+        let leaf = tree::resolve(&there, &path_of("/deep/er/leaf"));
+        ok &= check(
+            "an away blob is a blob: same kind, same length, and no read to say so",
+            leaf.map(|n| n.kind()) == Some(tree::KIND_BLOB)
+                && leaf.and_then(|n| n.blob_len()) == Some(body.len() as u64),
+        );
+
+        // `stats` has to count it. Without this `du` would report a restored
+        // tree as empty, and the figure that says whether moving a corpus out
+        // of memory worked would say that nothing is there at all.
+        let st = tree::stats(&there);
+        ok &= check(
+            "stats counts it, with its length, and separately as away",
+            st.files == 1
+                && st.apparent == body.len() as u64
+                && st.away == 1
+                && st.away_bytes == body.len() as u64,
+        );
+
+        // Cloning must not materialise it. `cp` of an away subtree is 48 bytes
+        // a node; a clone that faulted every body in would turn the cheapest
+        // operation in this file into the most expensive one.
+        let copy = tree::clone_node(&there);
+        ok &= check(
+            "cloning leaves it away rather than fetching it",
+            tree::resolve(&copy, &path_of("/deep/er/leaf")).and_then(|n| n.away()).is_some()
+                && tree::content_hash(&copy) == tree::content_hash(&there),
+        );
+
+        let mut under = tree::clone_node(&there);
+        ok &= check(
+            "and nothing goes underneath it, exactly as for a blob that is here",
+            tree::put(&mut under, &path_of("/deep/er/leaf/child"), Node::Blob(Vec::new()))
+                .is_err(),
+        );
+    }
+
     ok
 }
 
@@ -1165,6 +1414,9 @@ fn cmd_ls(arg: &str) {
             Some(Node::Blob(b)) => {
                 kprintln!("  {:>10}  {}", b.len(), show(&p));
             }
+            Some(Node::Away(r)) => {
+                kprintln!("  {:>10}  {}  (on disk)", r.len, show(&p));
+            }
             Some(Node::Dir(es)) => {
                 if es.is_empty() {
                     console::set_color(LTGRAY);
@@ -1183,6 +1435,14 @@ fn cmd_ls(arg: &str) {
                         Node::Blob(b) => {
                             console::set_color(WHITE);
                             kprintln!("  {}  {:>8}  {}", hx, b.len(), name);
+                        }
+                        // Dimmed rather than labelled: a suffix on every row is
+                        // noise over a directory of any size, and `du` carries
+                        // the count. The address printed is identical either
+                        // way, which is exactly the point of the variant.
+                        Node::Away(r) => {
+                            console::set_color(LTGRAY);
+                            kprintln!("  {}  {:>8}  {}", hx, r.len, name);
                         }
                     }
                 }
@@ -1206,7 +1466,7 @@ fn cmd_cd(arg: &str) {
                 s.prev = core::mem::replace(&mut s.cwd, target);
                 kprintln!("  {}", show(&s.cwd));
             }
-            Some(Node::Blob(_)) => err("not a directory"),
+            Some(Node::Blob(_)) | Some(Node::Away(_)) => err("not a directory"),
             None => err("no such path"),
         }
     });
@@ -1242,9 +1502,9 @@ fn walk_tree(n: &Node, depth: usize) {
                     kprintln!("  {}{}/", pad, name);
                     walk_tree(child, depth + 1);
                 }
-                Node::Blob(b) => {
-                    console::set_color(WHITE);
-                    kprintln!("  {}{}  ({} B)", pad, name, b.len());
+                other => {
+                    console::set_color(if matches!(other, Node::Away(_)) { LTGRAY } else { WHITE });
+                    kprintln!("  {}{}  ({} B)", pad, name, other.blob_len().unwrap_or(0));
                 }
             }
         }
@@ -1252,18 +1512,28 @@ fn walk_tree(n: &Node, depth: usize) {
 }
 
 fn cmd_cat(arg: &str) {
-    with(|s| {
+    // The kind under the borrow, the body outside it. `read_blob` would do
+    // both in one call and cannot say *why* it answered nothing, which is a
+    // distinction `cat` owes the operator -- a directory, a missing path and a
+    // body that would not read back are three different problems.
+    let kind = with(|s| {
         let p = parse(&s.cwd, arg);
-        match tree::resolve(&s.root, &p) {
-            Some(Node::Blob(b)) => {
-                for line in b.split(|&c| c == b'\n') {
-                    kprintln!("  {}", core::str::from_utf8(line).unwrap_or("<binary>"));
-                }
+        tree::resolve(&s.root, &p).map(|n| n.is_dir())
+    })
+    .flatten();
+    match kind {
+        None => return err("no such path"),
+        Some(true) => return err("that is a directory"),
+        Some(false) => {}
+    }
+    match read_blob(arg) {
+        None => err("that body is on disk and would not read back"),
+        Some(b) => {
+            for line in b.split(|&c| c == b'\n') {
+                kprintln!("  {}", core::str::from_utf8(line).unwrap_or("<binary>"));
             }
-            Some(Node::Dir(_)) => err("that is a directory"),
-            None => err("no such path"),
         }
-    });
+    }
 }
 
 fn cmd_stat(arg: &str) {
@@ -1283,6 +1553,9 @@ fn cmd_stat(arg: &str) {
                 }
                 kprintln!("  apparent {} B", st.apparent);
                 kprintln!("  unique   {} B", st.unique);
+                if st.away > 0 {
+                    kprintln!("  resident {} of {} file(s)", st.files - st.away, st.files);
+                }
                 let stored = with_store_lookup(&h);
                 kprintln!("  on disk  {}", if stored { "yes" } else { "not since last snap" });
             }
@@ -1354,6 +1627,19 @@ fn cmd_du(arg: &str) {
                     kprintln!("  shared    {} B never had to be stored twice", saved);
                     console::set_color(LTGRAY);
                 }
+                // The figure that says whether moving a corpus out of memory
+                // worked. A restored tree starts entirely away and fills in
+                // only where something has actually read.
+                if st.away > 0 {
+                    console::set_color(LTGREEN);
+                    kprintln!(
+                        "  on disk   {} of {} file(s), {} B that never came into memory",
+                        st.away,
+                        st.files,
+                        st.away_bytes
+                    );
+                    console::set_color(LTGRAY);
+                }
             }
         }
     });
@@ -1366,17 +1652,40 @@ fn cmd_find(needle: &str) {
     }
     with(|s| {
         let mut hits = 0u32;
-        find_walk(&s.root, &mut Vec::new(), needle, &mut hits);
+        let mut skipped = 0u32;
+        find_walk(&s.root, &mut Vec::new(), needle, &mut hits, &mut skipped);
         console::set_color(LTGRAY);
         kprintln!("  {} match(es)", hits);
+        if skipped > 0 {
+            // Said rather than left out. A search that stopped searching most
+            // of the tree and reported nothing would read exactly like a
+            // search that found nothing.
+            kprintln!("  {} body(s) are on disk and were not read -- names only for those", skipped);
+        }
     });
 }
 
-fn find_walk(n: &Node, at: &mut Vec<String>, needle: &str, hits: &mut u32) {
+/// Names always, bodies only where they are resident -- and the count of what
+/// was skipped is reported rather than left out.
+///
+/// Fetching every away body would make `find` over a corpus a disk read per
+/// node, which is the `ls`-hashes-the-whole-forest trap in another command.
+/// Skipping them silently would be worse: a search that quietly stops
+/// searching most of the tree reads exactly like a search that found nothing.
+/// So it skips and says how many, which is a fact the operator can act on.
+fn find_walk(n: &Node, at: &mut Vec<String>, needle: &str, hits: &mut u32, skipped: &mut u32) {
     match n {
-        Node::Blob(b) => {
+        Node::Blob(_) | Node::Away(_) => {
             let name_hit = at.last().map(|s| s.contains(needle)).unwrap_or(false);
-            let body_hit = core::str::from_utf8(b).map(|t| t.contains(needle)).unwrap_or(false);
+            let body_hit = match n {
+                Node::Blob(b) => {
+                    core::str::from_utf8(b).map(|t| t.contains(needle)).unwrap_or(false)
+                }
+                _ => {
+                    *skipped += 1;
+                    false
+                }
+            };
             if name_hit || body_hit {
                 *hits += 1;
                 console::set_color(WHITE);
@@ -1386,7 +1695,7 @@ fn find_walk(n: &Node, at: &mut Vec<String>, needle: &str, hits: &mut u32) {
         Node::Dir(es) => {
             for (name, child) in es {
                 at.push(name.clone());
-                find_walk(child, at, needle, hits);
+                find_walk(child, at, needle, hits, skipped);
                 at.pop();
             }
         }
@@ -1576,6 +1885,12 @@ fn report_store_error(e: cas::Error) {
         cas::Error::Full => err("the store region is full"),
         cas::Error::NoDevice => err("no block device"),
         cas::Error::HashMismatch => err("an object failed to verify against its address"),
+        // The other two sentinels the block layer answers with. Named here
+        // rather than printed as numbers, for the reason the locked one is:
+        // a number sends somebody to look at the hardware.
+        cas::Error::Io(crate::store::block::Error::Io(crate::dev::nvme::ERR_OUTSIDE)) => {
+            err("that write falls outside the region 'store unlock' claimed")
+        }
         other => {
             console::set_color(LTRED);
             kprintln!("  store error: {:?}", other);
@@ -1595,6 +1910,10 @@ fn write_node(
     }
     let r = match n {
         Node::Blob(b) => st.put(b)?,
+        // Already stored, at this exact address, which is what the reference
+        // says. Re-writing it would allocate a second copy of identical bytes
+        // in an append-only store that never reclaims.
+        Node::Away(r) => *r,
         Node::Dir(es) => {
             let mut encoded = Vec::new();
             for (name, child) in es {
@@ -1617,10 +1936,16 @@ fn read_node(
     if depth > tree::MAX_DEPTH {
         return Err(cas::Error::Corrupt);
     }
-    let raw = st.get(r)?;
+    // **A blob is not read at all.** Its chunk reference is its content
+    // address and its length, which is everything the tree needs to hash,
+    // compare, count and re-store it -- so restore costs one read per
+    // *directory* instead of one per node, plus a SHA-256 over every byte on
+    // the disk. A machine whose snapshot held an 8,913-node forest did not
+    // reach a prompt inside fifteen minutes because of the line this replaces.
     if kind == tree::KIND_BLOB {
-        return Ok(Node::Blob(raw));
+        return Ok(Node::Away(*r));
     }
+    let raw = st.get(r)?;
     let entries = tree::decode_dir(&raw).ok_or(cas::Error::Corrupt)?;
     let mut out = Vec::new();
     for (name, k, cr) in entries {

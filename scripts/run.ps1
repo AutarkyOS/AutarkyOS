@@ -36,7 +36,50 @@ param(
     # WHPX, best of nine: the decode path is flat across one, two and four, and
     # `logits` is bit-identical, which is what `smp.rs` claims for a split
     # matvec.
-    [int]$Smp = 4
+    [int]$Smp = 4,
+    # The accelerator, and it defaults to the fast one.
+    #
+    # This script ran under TCG for its whole life, silently, because nothing
+    # here ever passed `-accel`. WHPX -- the Windows Hypervisor Platform, which
+    # is what KVM is on Linux -- measures roughly **160x** faster on this
+    # workload: a forward-pass group is 286,370 ms under TCG and 1,795 under
+    # WHPX. Everything this project called "too slow to run here" was an
+    # untested assumption about the emulator, and the same assumption was built
+    # into the one script a person actually watches.
+    #
+    # `-Accel tcg` falls back where the hypervisor is unavailable, and
+    # `-Accel 'tcg,thread=multi'` is MTTCG -- which is worth knowing about and
+    # not worth using here: it parallelises the *translation* across vCPUs, and
+    # this kernel runs everything on the bootstrap processor, so there is no
+    # second thread of guest work for it to spread. It is still TCG.
+    [string]$Accel = 'whpx',
+    # `-cpu max` alongside it, because WHPX alone reports `avx2=0 fma=0` and
+    # the trainer's hardware gate then declines to run at all.
+    [string]$Cpu = 'max',
+    # A WAD to boot with, staged as `GLADOS\doom.wad`.
+    #
+    # `drive.py --wad` has done this for headless runs since DOOM existed here;
+    # this script could not, so the one path a person uses to *look* at it was
+    # the one that could not load a level. FreeDoom is the freely licensed one:
+    # `out\freedoom\freedoom-0.13.0\freedoom1.wad` after the recipe in
+    # CLAUDE.md.
+    [string]$Wad,
+    # The checkpoint to stage. SmolLM2 by default, which is what QEMU can
+    # actually run: the volume below is capped at 516 MB and Qwen3-0.6B is 570.
+    # `drive.py` has defaulted to the same file for the same reason.
+    [string]$Model,
+    # Its tokenizer, which has to match the checkpoint -- Qwen3.5's vocabulary
+    # is 248k against Qwen3's 152k, so the wrong one produces text that still
+    # looks like text.
+    [string]$Tokenizer,
+    # Anything else to hand QEMU, for the things this script should not have an
+    # opinion about: `-QemuExtra '-full-screen'`, or
+    # `-QemuExtra '-display','gtk,show-menubar=off'` for a window with no
+    # chrome in it, which is what you want if you are recording.
+    [string[]]$QemuExtra = @(),
+    # Keep the NVRAM from the last run instead of resetting it. Only the
+    # staged-update tests want this; see where it is used.
+    [switch]$KeepNvram
 )
 
 $ErrorActionPreference = 'Stop'
@@ -114,8 +157,22 @@ if ($Ovmf) {
         Write-Error "Found $Ovmf but no matching vars image (edk2-i386-vars.fd) in $share."
     }
     $varsFile = Join-Path $qemuDir 'vars.fd'
-    if (-not (Test-Path $varsFile)) {
-        Copy-Item $varsTemplate $varsFile
+    # Refreshed from the template every run unless asked otherwise.
+    #
+    # It used to be written once and kept forever, which is right for a machine
+    # whose boot entries you are testing and wrong for every other run: a stale
+    # entry naming a volume that has moved sends the firmware to the **UEFI
+    # shell**, and what that looks like is a kernel that failed to boot. Moving
+    # the staged ESP to its own directory triggered exactly that, and the
+    # symptom was a `Shell>` prompt with no clue as to why.
+    #
+    # `drive.py` has reset NVRAM on every run since it was written, and says so
+    # for the same reason. `-KeepNvram` is for the update tests, which are the
+    # only thing here that wants a boot entry to survive.
+    if ($KeepNvram -and (Test-Path $varsFile)) {
+        Write-Host "nvram: kept"
+    } else {
+        Copy-Item $varsTemplate $varsFile -Force
     }
 
     # QEMU's default install path is "C:\Program Files\qemu", and a space inside
@@ -154,16 +211,76 @@ $efi = Join-Path $root "target\x86_64-unknown-uefi\$profileDir\autark.efi"
 if (-not (Test-Path $efi)) { Write-Error "missing build artifact: $efi" }
 
 # --- stage an ESP tree ---
+#
+# **A tree of its own, and not the repo's `esp/`.** This booted `esp/` directly
+# for its whole life, which is the same directory `deploy.ps1` fills for the
+# real machine -- and that one holds the *real* checkpoint, 598 MB of
+# Qwen3-0.6B. QEMU projects this directory as a synthetic FAT volume with a
+# fixed 516 MB geometry, so the moment anybody staged a model for the GF63 this
+# script stopped booting at all, with `Directory does not fit in FAT32` and
+# nothing to say which file was the problem.
+#
+# `drive.py` never had the fault because it has always staged its own minimal
+# tree under `.qemu/`. This does the same now, and the two agree on the
+# default checkpoint for the same reason: SmolLM2 is what fits.
+#
 # BOOTX64.EFI on the removable-media path is what firmware boots with no NVRAM
 # entry configured. Same layout works on the real USB SSD.
-$esp = Join-Path $root 'esp'
+$esp = Join-Path $root '.qemu\esp-run'
 $bootDir = Join-Path $esp 'EFI\BOOT'
+$gladosDir = Join-Path $esp 'GLADOS'
 New-Item -ItemType Directory -Force -Path $bootDir | Out-Null
+New-Item -ItemType Directory -Force -Path $gladosDir | Out-Null
 Copy-Item $efi (Join-Path $bootDir 'BOOTX64.EFI') -Force
+
+# Copied only when it would change anything. A checkpoint is 129 MB and this
+# runs on every launch, so comparing first turns most launches from a copy into
+# two `stat`s.
+function Stage-File($src, $dest, $label) {
+    if (-not $src) { return }
+    if (-not (Test-Path $src)) {
+        Write-Host "$label : $src not found, skipping"
+        return
+    }
+    $s = Get-Item $src
+    $d = if (Test-Path $dest) { Get-Item $dest } else { $null }
+    if (-not $d -or $d.Length -ne $s.Length -or $d.LastWriteTimeUtc -lt $s.LastWriteTimeUtc) {
+        Copy-Item $src $dest -Force
+    }
+    $mb = [math]::Round($s.Length / 1MB, 1)
+    Write-Host "$label : $src ($mb MB)"
+}
+
+if (-not $Model)     { $Model     = Join-Path $root 'out\smollm2-135m.bin' }
+if (-not $Tokenizer) { $Tokenizer = Join-Path $root 'out\smollm2-tokenizer.bin' }
+Stage-File $Model     (Join-Path $gladosDir 'model.bin')     'model'
+Stage-File $Tokenizer (Join-Path $gladosDir 'tokenizer.bin') 'tokn '
+Stage-File (Join-Path $root 'esp\GLADOS\roots.der') (Join-Path $gladosDir 'roots.der') 'roots'
+if ($Wad) {
+    if (-not (Test-Path $Wad)) { Write-Error "no such WAD: $Wad" }
+    Stage-File $Wad (Join-Path $gladosDir 'doom.wad') 'wad  '
+}
+
+# The cap, checked here rather than discovered by QEMU. Its message names the
+# capacity and not the offender, which is a long way from telling you that the
+# 598 MB checkpoint you staged for the laptop is the reason DOOM will not boot.
+$vvfatMb = 516
+$stagedMb = [math]::Round(((Get-ChildItem $esp -Recurse -File | Measure-Object Length -Sum).Sum) / 1MB, 1)
+if ($stagedMb -ge $vvfatMb) {
+    Get-ChildItem $esp -Recurse -File | Sort-Object Length -Descending |
+        Select-Object -First 3 |
+        ForEach-Object { Write-Host ("  {0,7:N1} MB  {1}" -f ($_.Length / 1MB), $_.Name) }
+    Write-Error ("staged $stagedMb MB, and QEMU projects this directory as a " +
+        "FAT volume of $vvfatMb MB. The largest files are above; pass a smaller " +
+        "-Model, or use tools/drive.py --stage-iso, which has no such cap.")
+}
+Write-Host "esp  : $esp ($stagedMb MB of $vvfatMb)"
 
 # --- launch ---
 $qemuArgs = @(
     '-machine', 'q35',
+    '-accel', $Accel,
+    '-cpu', $Cpu,
     '-m', $Memory,
     '-smp', $Smp
 )
@@ -192,10 +309,21 @@ if (-not (Test-Path $nvmeImg)) {
 }
 
 $qemuArgs += @(
-    # fat:32: rather than the default: QEMU's VVFAT builds FAT16 unless told
-    # otherwise, and FAT16 tops out at 516 MB. Qwen3-0.6B is 570 MB, and the
-    # refusal comes from the -drive parser before any firmware runs.
-    '-drive', "format=raw,file=fat:32:rw:$esp",
+    # Plain VVFAT, which is FAT16, and **not** `fat:32:`.
+    #
+    # This said `fat:32:` on the reasoning that FAT16 tops out at 516 MB and
+    # Qwen3-0.6B is 570. The reasoning is sound and the conclusion does not
+    # work: QEMU says its FAT32 is untested, and what it produces is a volume
+    # **the firmware cannot read** -- the guest finds no bootloader and lands
+    # in the UEFI shell, which looks exactly like a kernel that failed to boot.
+    # So the 516 MB ceiling was never raised, only moved somewhere it could not
+    # be seen, and a model larger than it is not testable here at all.
+    #
+    # `drive.py` has used plain `fat:rw:` all along and says why in the same
+    # words. Two files disagreeing about one flag, with the working one
+    # documenting the failure, is how this went unnoticed: nothing ever ran
+    # `run.ps1` and `drive.py` against the same question.
+    '-drive', "format=raw,file=fat:rw:$esp",
     '-drive', "file=$nvmeImg,if=none,id=nvm0,format=raw",
     '-device', 'nvme,serial=GLADOSQEMU0001,drive=nvm0',
     '-serial', 'stdio',
@@ -204,6 +332,7 @@ $qemuArgs += @(
     # paging bug looks like an infinite boot loop with nothing to read.
     '-no-reboot'
 )
+if ($QemuExtra)   { $qemuArgs += $QemuExtra }
 if ($TraceFaults) { $qemuArgs += @('-d', 'int,cpu_reset') }
 if ($Gdb)         { $qemuArgs += @('-s', '-S') }
 

@@ -403,6 +403,28 @@ pub fn argmax(x: &[f32]) -> usize {
 // `std` and bottom out in libm, which we do not have. These are small
 // implementations, accurate enough for inference, where a 1e-6 error in a
 // logit changes nothing.
+//
+// **That 1e-6 is not one figure for the whole file, and `diag lib` measures
+// which is which.** Exposing these as Aiksi's `exp`, `ln`, `sin` and `cos` was
+// the first thing to ask:
+//
+//     sqrt              exact        one hardware instruction
+//     ln(exp(x))        2.1e-6       relative, over 0.5..8
+//     sin^2 + cos^2     3.1e-4       absolute, over 0..8
+//
+// `sinf` is three hundred times looser than the sentence above suggests, and
+// the series says why: it is truncated after x^7, so the first dropped term is
+// x^9/9!, which at the fold boundary pi/2 is 1.6e-4. The claim at
+// `ai::selftest` has always checked `sinf(pi/2)` against **1e-4** rather than
+// 1e-6, so the tree carried both numbers without anybody putting them side by
+// side.
+//
+// It is still within what it was written for, and `rope` is the reason to
+// care: `model.rs` builds its tables from `sinf`/`cosf`, so the positional
+// encoding carries that error. Anything wanting more than four digits from
+// this file needs a different series, and changing one would move every logit
+// the model produces -- so it is a re-verification against `reference.py`, not
+// an edit.
 
 pub fn sqrtf(x: f32) -> f32 {
     if x <= 0.0 {

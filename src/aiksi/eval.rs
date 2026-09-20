@@ -24,6 +24,101 @@ use alloc::vec::Vec;
 #[derive(Clone, Debug, PartialEq)]
 pub enum Value {
     Int(i64),
+    /// An exact rational: numerator, denominator.
+    ///
+    /// `kernel.rs` said for a long time that "there are no floats in this
+    /// language and adding them for one builtin would change every arithmetic
+    /// path", which was the right judgement for one integer `sqrt` and the
+    /// wrong one for physics, statistics or competition mathematics -- none of
+    /// which can be written with integers at all.
+    ///
+    /// **Exact rather than floating, because the answer to a maths problem is
+    /// a number and not an approximation to one.** A third is a third here; it
+    /// does not become 0.333... and it does not stop comparing equal to
+    /// itself. That also keeps `differ`'s rule intact, which requires two
+    /// routes to agree *bit for bit with no tolerance* -- a float would have
+    /// forced a tolerance, and its own doc says a tolerance hides the bug
+    /// worth finding.
+    ///
+    /// Three invariants, all established by `rational` and relied on
+    /// everywhere else:
+    ///
+    ///   * `den > 0` -- the sign lives in the numerator, so there is one
+    ///     spelling of a negative value rather than two.
+    ///   * reduced -- `2/4` and `1/2` are the same number and must be the
+    ///     same *value*, or two programs computing the same answer disagree.
+    ///   * **`den != 1`** -- an integer is an `Int` and never a `Rat`. This is
+    ///     the one that makes the rest safe: without it `3` and `3/1` render
+    ///     differently, hash differently, and compare unequal while being the
+    ///     same number.
+    ///
+    /// Arithmetic goes through `i128` and is checked back into `i64`, so an
+    /// overflow is an error rather than a wrap. That is deliberate and it is
+    /// the cost of exactness: repeated exact arithmetic grows denominators,
+    /// and a wrapped numerator is a confidently wrong exact answer, which is
+    /// worse than no answer at all.
+    Rat(i64, i64),
+    /// A physical quantity: an exact magnitude, and what it is a quantity *of*.
+    ///
+    /// **This project has already been bitten by a missing unit.** `acpi`
+    /// records it: `_BIF` element zero says whether a battery reports in
+    /// milliwatts or milliamps, machines differ, and "a capacity in mAh over a
+    /// rate in mW gives a number that looks like a time and is wrong by the
+    /// battery's voltage". A number that looks like a time is the whole
+    /// failure mode -- nothing errors, nothing is out of range, and the answer
+    /// is simply about something else.
+    ///
+    /// So the dimension travels *in the value* and is checked where the
+    /// arithmetic happens, rather than living in a variable name that only a
+    /// reader enforces. Adding metres to seconds is an error here, and
+    /// dividing amp-seconds by watts does not answer a time.
+    ///
+    /// Seven exponents, one per SI base dimension, in the order `DIM_NAMES`
+    /// gives: m, kg, s, A, K, mol, cd. Multiplying adds them and dividing
+    /// subtracts them, which is the whole of dimensional analysis.
+    ///
+    /// Two invariants, both established by `quantity`:
+    ///
+    ///   * the magnitude is a reduced fraction with a positive denominator,
+    ///     exactly as `Rat` is -- a quantity is a number with a label, and the
+    ///     number half obeys the same rules.
+    ///   * **the dimension is never all zeros.** A dimensionless quantity is a
+    ///     number, so it comes back as `Int` or `Rat`. Without that rule
+    ///     `6 m / 2 m` is a `Qty` that renders as `3` and compares unequal to
+    ///     `3`, which is the same trap `Rat` avoids by never holding a
+    ///     denominator of one.
+    Qty(i64, i64, Dim),
+    /// A number that is **not** exact, and says so.
+    ///
+    /// Everything else in this tower is exact by construction: an `Int` is a
+    /// whole number, a `Rat` is a ratio of two, a `Qty` is one of those with a
+    /// dimension. None of them can hold the square root of two, the sine of
+    /// anything interesting, or a logarithm -- those are irrational, and a type
+    /// that quietly rounded one would make every value downstream of it a
+    /// number nobody could tell from an exact one.
+    ///
+    /// So approximation is a **different type**, and that is the whole design:
+    /// the moment an answer stops being exact, the value it is carried in says
+    /// so, and it goes on saying so through every operation afterwards.
+    /// `render` puts a `~` in front of it, so a transcript, a ledger line or a
+    /// forest node's `method` shows at a glance which numbers in it are
+    /// trustworthy and which are close.
+    ///
+    /// **There is no literal for one.** The lexer has no float, deliberately
+    /// -- `lex.rs` records that a `.` is unambiguously field access precisely
+    /// because no number contains one -- so an approximate value cannot be
+    /// *written*, only produced by asking for one (`real`) or by an operation
+    /// that has no exact answer. Exactness is the default and inexactness is
+    /// opt-in, which is the same bargain `rat` makes for division.
+    ///
+    /// `f32` and not `f64`, and the reason is verification rather than taste:
+    /// `tensor.rs` is what implements these functions, it is `f32` throughout
+    /// because the model's forward pass is, and adding an `f64` path would
+    /// mean writing a second set of transcendentals that nothing checks. See
+    /// the accuracy figures in `lib_selftest` -- `sqrtf` is one hardware
+    /// instruction and exact, and the rest are series whose stated target is
+    /// "a 1e-6 error in a logit changes nothing".
+    Approx(f32),
     Str(String),
     /// A sequence, and the only compound value there is.
     ///
@@ -73,6 +168,9 @@ impl Value {
     pub fn type_name(&self) -> &str {
         match self {
             Value::Int(_) => "int",
+            Value::Rat(..) => "rat",
+            Value::Qty(..) => "qty",
+            Value::Approx(_) => "approx",
             Value::Str(_) => "str",
             Value::List(_) => "list",
             Value::Rec(n, _) => n,
@@ -83,6 +181,18 @@ impl Value {
     pub fn truthy(&self) -> bool {
         match self {
             Value::Int(v) => *v != 0,
+            // Never zero, and that is a property rather than an assumption:
+            // `rational(0, d)` reduces to `0/1`, whose denominator is one, so
+            // it comes back an `Int`. A `Rat` with a zero numerator cannot be
+            // constructed.
+            Value::Rat(..) => true,
+            // A quantity is a number with a label. Zero of something is still
+            // zero, so the magnitude decides and the label does not.
+            Value::Qty(n, ..) => *n != 0,
+            // NaN is not zero and is not a number either; treating it as false
+            // would make a computation that went wrong look like one that
+            // answered nothing.
+            Value::Approx(v) => *v != 0.0,
             Value::Str(s) => !s.is_empty(),
             Value::List(v) => !v.is_empty(),
             // A record always exists, and one with no fields cannot be
@@ -95,6 +205,28 @@ impl Value {
     pub fn as_int(&self) -> Result<i64, String> {
         match self {
             Value::Int(v) => Ok(*v),
+            // Never silently truncated. A caller wanting 3 from 7/2 has to say
+            // which way it rounds, because the two answers differ and the
+            // language has no business choosing. `floor`, `ceil` and `round`
+            // are the ways to ask.
+            Value::Rat(n, d) => Err(format!(
+                "expected a whole number, found {}/{} -- use floor, ceil or round",
+                n, d
+            )),
+            // A quantity is not a whole number however round its magnitude
+            // is: 3 metres is not 3. Stripping the unit has to be asked for,
+            // which is what `mag` is.
+            Value::Qty(_, _, k) => Err(format!(
+                "expected a plain number, found a quantity in {} -- use mag to drop the unit",
+                render_dim(k)
+            )),
+            // Approximate, so there is no whole number it *is*. Rounding has
+            // three answers and the language does not pick one silently, which
+            // is the same refusal `Rat` gets.
+            Value::Approx(_) => Err(
+                "expected a whole number, found an approximate one -- use floor, ceil or round"
+                    .to_string(),
+            ),
             Value::Str(_) => Err("expected a number, found a string".to_string()),
             Value::List(_) => Err("expected a number, found a list".to_string()),
             Value::Rec(n, _) => Err(format!("expected a number, found a {}", n)),
@@ -102,9 +234,475 @@ impl Value {
         }
     }
 
+    /// Any number as a fraction. An `Int` is itself over one.
+    pub fn as_rat(&self) -> Result<(i64, i64), String> {
+        match self {
+            Value::Int(v) => Ok((*v, 1)),
+            Value::Rat(n, d) => Ok((*n, *d)),
+            other => other.as_int().map(|v| (v, 1)),
+        }
+    }
+
+    /// Is this a number at all? Used to decide whether an operation is
+    /// arithmetic before either side has been coerced.
+    pub fn is_num(&self) -> bool {
+        matches!(self, Value::Int(_) | Value::Rat(_, _) | Value::Qty(..) | Value::Approx(_))
+    }
+
+    /// The only way a `Rat` is built. Establishes all three invariants.
+    ///
+    /// Returns an `Int` whenever the denominator reduces to one, which is what
+    /// keeps a whole number from having two spellings.
+    pub fn rational(n: i64, d: i64) -> Result<Value, String> {
+        if d == 0 {
+            return Err("division by zero".to_string());
+        }
+        // `i64::MIN` has no positive counterpart, so negating it to move the
+        // sign out of the denominator overflows. Refusing is the honest answer
+        // and the alternative is a value whose sign is silently wrong.
+        if n == i64::MIN || d == i64::MIN {
+            return Err("number too large to reduce".to_string());
+        }
+        let (mut n, mut d) = if d < 0 { (-n, -d) } else { (n, d) };
+        let g = gcd(n.unsigned_abs(), d.unsigned_abs()) as i64;
+        if g > 1 {
+            n /= g;
+            d /= g;
+        }
+        Ok(if d == 1 { Value::Int(n) } else { Value::Rat(n, d) })
+    }
+}
+
+fn gcd(mut a: u64, mut b: u64) -> u64 {
+    while b != 0 {
+        let t = a % b;
+        a = b;
+        b = t;
+    }
+    a.max(1)
+}
+
+/// Exact arithmetic on two fractions, entirely in `i64`.
+///
+/// **128-bit division and modulo hang this kernel, and nothing else in the
+/// tree had ever used them -- so this is where it was found.** `.cargo/config`
+/// records that the build uses the stock precompiled `x86_64-unknown-uefi`
+/// target because `-Zbuild-std` needs a host linker this machine does not
+/// have, and `compiler_builtins` is therefore whatever that target ships.
+/// `__multi3` is fine -- an `i128` multiply is inline, and a comparison is a
+/// subtract -- but `__udivti3` and `__umodti3` do not return. A single
+/// `u128 % u128` in a gcd loop was enough to stop boot dead with no fault, no
+/// panic and no output, three sections before the shell.
+///
+/// So the obvious implementation -- widen to `i128`, multiply, reduce, narrow
+/// back -- is unavailable, and what replaces it is better anyway.
+/// **Cross-reduction before multiplying** keeps every intermediate inside
+/// `i64` for exactly the cases a wider one would have rescued: `a/b * c/d`
+/// divides out `gcd(a, d)` and `gcd(c, b)` first, and addition uses the lcm of
+/// the denominators rather than their product. That is strictly less likely to
+/// overflow than the naive widened version, not more.
+///
+/// Overflow is an error rather than a wrap. Exactness is the whole point of
+/// this type, and a wrapped numerator is a confidently wrong exact answer.
+pub fn rat_binary(op: &str, a: (i64, i64), b: (i64, i64)) -> Result<Value, String> {
+    let (an, ad) = a;
+    let (bn, bd) = b;
+    match op {
+        "+" | "-" => {
+            let bn = if op == "-" {
+                bn.checked_neg().ok_or("numerator overflowed")?
+            } else {
+                bn
+            };
+            // The common denominator is the lcm, `ad * (bd/g)`, and not the
+            // product. For `1/6 + 1/10` that is 30 rather than 60, and the
+            // difference is the whole margin on a long exact calculation.
+            let g = gcd(ad.unsigned_abs(), bd.unsigned_abs()) as i64;
+            let l = an.checked_mul(bd / g).ok_or("numerator overflowed")?;
+            let r = bn.checked_mul(ad / g).ok_or("numerator overflowed")?;
+            let n = l.checked_add(r).ok_or("numerator overflowed")?;
+            let d = ad.checked_mul(bd / g).ok_or("denominator overflowed")?;
+            Value::rational(n, d)
+        }
+        "*" | "/" => {
+            // Dividing is multiplying by the reciprocal, and the zero check
+            // has to happen before the flip rather than after -- afterwards it
+            // is a denominator of zero that `rational` would report as the
+            // wrong thing.
+            let (bn, bd) = if op == "/" {
+                if bn == 0 {
+                    return Err("division by zero".to_string());
+                }
+                (bd, bn)
+            } else {
+                (bn, bd)
+            };
+            let g1 = gcd(an.unsigned_abs(), bd.unsigned_abs()) as i64;
+            let g2 = gcd(bn.unsigned_abs(), ad.unsigned_abs()) as i64;
+            let n = (an / g1).checked_mul(bn / g2).ok_or("numerator overflowed")?;
+            let d = (ad / g2).checked_mul(bd / g1).ok_or("denominator overflowed")?;
+            Value::rational(n, d)
+        }
+        _ => Err(format!("{} is not exact arithmetic", op)),
+    }
+}
+
+// --- dimensions -------------------------------------------------------------
+
+/// Exponents of the seven SI base dimensions, in `DIM_NAMES` order.
+pub type Dim = [i8; 7];
+
+pub const DIMLESS: Dim = [0; 7];
+
+/// The base dimensions. Everything else is a product of these.
+pub const DIM_NAMES: [&str; 7] = ["m", "kg", "s", "A", "K", "mol", "cd"];
+
+/// Units that are not base but are worth being able to write.
+///
+/// A table rather than a feature of the parser, because every row is already
+/// expressible in base dimensions -- all it buys is writing `W` where
+/// `kg*m^2/s^3` is meant. Adding a row adds a name for something that could
+/// already be said, which is why the list can stay short without limiting
+/// anything.
+const DERIVED: &[(&str, Dim)] = &[
+    //          m  kg   s   A   K mol  cd
+    ("N", [1, 1, -2, 0, 0, 0, 0]),
+    ("J", [2, 1, -2, 0, 0, 0, 0]),
+    ("W", [2, 1, -3, 0, 0, 0, 0]),
+    ("Pa", [-1, 1, -2, 0, 0, 0, 0]),
+    ("Hz", [0, 0, -1, 0, 0, 0, 0]),
+    ("C", [0, 0, 1, 1, 0, 0, 0]),
+    ("V", [2, 1, -3, -1, 0, 0, 0]),
+    ("Ohm", [2, 1, -3, -2, 0, 0, 0]),
+];
+
+fn unit_dim(name: &str) -> Option<Dim> {
+    for (i, n) in DIM_NAMES.iter().enumerate() {
+        if *n == name {
+            let mut d = DIMLESS;
+            d[i] = 1;
+            return Some(d);
+        }
+    }
+    DERIVED.iter().find(|(n, _)| *n == name).map(|(_, d)| *d)
+}
+
+/// Read a unit written the way it is spoken: `m`, `m/s^2`, `kg*m/s^2`, `1/s`.
+///
+/// One solidus at most, and everything after it is divided. `a/b/c` is refused
+/// rather than guessed at -- it means `a/(b*c)` to a physicist and `(a/b)/c`
+/// to a parser, and those agree here but would not for a reader.
+pub fn parse_dim(spec: &str) -> Result<Dim, String> {
+    let mut acc = [0i32; 7];
+    let halves: Vec<&str> = spec.split('/').collect();
+    if halves.len() > 2 {
+        return Err("a unit has at most one '/'".to_string());
+    }
+    for (half_i, half) in halves.iter().enumerate() {
+        let sign: i32 = if half_i == 0 { 1 } else { -1 };
+        for factor in half.split('*') {
+            let f = factor.trim();
+            // `1` is how a reciprocal is written -- `1/s` -- and an empty
+            // piece is what a trailing separator leaves.
+            if f.is_empty() || f == "1" {
+                continue;
+            }
+            let (name, exp) = match f.split_once('^') {
+                Some((n, e)) => (
+                    n,
+                    e.parse::<i32>()
+                        .map_err(|_| format!("'{}' is not an exponent", e))?,
+                ),
+                None => (f, 1),
+            };
+            let base = unit_dim(name).ok_or_else(|| format!("no unit '{}'", name))?;
+            for k in 0..7 {
+                acc[k] += base[k] as i32 * exp * sign;
+            }
+        }
+    }
+    // Accumulated in `i32` and narrowed once, so a spec that overflows says so
+    // rather than wrapping into a dimension nobody wrote.
+    let mut out = DIMLESS;
+    for k in 0..7 {
+        if acc[k] < i8::MIN as i32 || acc[k] > i8::MAX as i32 {
+            return Err(format!("the exponent of {} is out of range", DIM_NAMES[k]));
+        }
+        out[k] = acc[k] as i8;
+    }
+    Ok(out)
+}
+
+/// A dimension, written back the way it would be read.
+pub fn render_dim(d: &Dim) -> String {
+    let (mut num, mut den): (Vec<String>, Vec<String>) = (Vec::new(), Vec::new());
+    for (i, e) in d.iter().enumerate() {
+        if *e == 0 {
+            continue;
+        }
+        let a = e.unsigned_abs();
+        let part = if a == 1 {
+            String::from(DIM_NAMES[i])
+        } else {
+            format!("{}^{}", DIM_NAMES[i], a)
+        };
+        if *e > 0 {
+            num.push(part);
+        } else {
+            den.push(part);
+        }
+    }
+    let mut s = if num.is_empty() {
+        String::from("1")
+    } else {
+        num.join("*")
+    };
+    if !den.is_empty() {
+        s.push('/');
+        s.push_str(&den.join("*"));
+    }
+    s
+}
+
+/// Combine two dimensions: `sign` 1 to multiply, -1 to divide.
+fn dim_combine(a: Dim, b: Dim, sign: i32) -> Result<Dim, String> {
+    let mut out = DIMLESS;
+    for k in 0..7 {
+        let v = a[k] as i32 + b[k] as i32 * sign;
+        if v < i8::MIN as i32 || v > i8::MAX as i32 {
+            return Err(format!("the exponent of {} is out of range", DIM_NAMES[k]));
+        }
+        out[k] = v as i8;
+    }
+    Ok(out)
+}
+
+/// The only way a `Qty` is built. Collapses to a plain number when the
+/// dimension cancels, which is what makes `6 m / 2 m` equal to `3`.
+pub fn quantity(n: i64, d: i64, dim: Dim) -> Result<Value, String> {
+    let base = Value::rational(n, d)?;
+    if dim == DIMLESS {
+        return Ok(base);
+    }
+    let (n, d) = base.as_rat()?;
+    Ok(Value::Qty(n, d, dim))
+}
+
+/// Any number as an `f32`, for the operations that have no exact answer.
+///
+/// A quantity refuses rather than dropping its unit, because a dimension that
+/// disappeared into a sine is exactly the error the type exists to catch.
+pub fn approximate(v: &Value) -> Result<f32, String> {
+    match v {
+        Value::Approx(x) => Ok(*x),
+        Value::Int(n) => Ok(*n as f32),
+        Value::Rat(n, d) => Ok(*n as f32 / *d as f32),
+        Value::Qty(_, _, k) => Err(format!(
+            "an approximation has no dimension, and this is in {} -- use mag first",
+            render_dim(k)
+        )),
+        other => Err(format!("expected a number, found {}", other.type_name())),
+    }
+}
+
+/// One ordering for every rung of the tower.
+///
+/// Dispatch is `binary`'s -- quantity, then approximation, then fraction,
+/// then whole number -- because an ordering that took a different route would
+/// be a second answer to a question with one. Cross-multiplied in `i128`:
+/// both denominators are positive by invariant, so the inequality keeps its
+/// direction and there is no sign analysis to get wrong. A 128-bit
+/// *comparison* is a subtract and is safe; it is division and modulo that do
+/// not return on this target, which `rat_binary` records.
+///
+/// **`min`, `max`, `clamp` and `sort` read this; `<` in `binary` does its own
+/// cross-multiply inline.** They agree everywhere except NaN, deliberately:
+/// `<` answers what IEEE says, which is false in both directions, and a
+/// sorting comparator that answered neither would be inconsistent and could
+/// make `sort` misbehave. Here NaN orders equal, so `min` hands back its left
+/// argument -- an arbitrary answer, but the same one every time. Change one
+/// of the two and read the other.
+pub fn num_cmp(a: &Value, b: &Value) -> Result<core::cmp::Ordering, String> {
+    if matches!(a, Value::Qty(..)) || matches!(b, Value::Qty(..)) {
+        let (an, ad, ak) = as_qty(a)?;
+        let (bn, bd, bk) = as_qty(b)?;
+        if ak != bk {
+            return Err(format!(
+                "cannot compare {} and {}",
+                render_dim(&ak),
+                render_dim(&bk)
+            ));
+        }
+        return Ok((an as i128 * bd as i128).cmp(&(bn as i128 * ad as i128)));
+    }
+    if matches!(a, Value::Approx(_)) || matches!(b, Value::Approx(_)) {
+        let (x, y) = (approximate(a)?, approximate(b)?);
+        return Ok(x.partial_cmp(&y).unwrap_or(core::cmp::Ordering::Equal));
+    }
+    let (an, ad) = a.as_rat()?;
+    let (bn, bd) = b.as_rat()?;
+    Ok((an as i128 * bd as i128).cmp(&(bn as i128 * ad as i128)))
+}
+
+/// A number raised to a whole power, up the tower.
+///
+/// The exponent stays whole because a fractional one is irrational for almost
+/// every base -- there is no `Rat` that is the square root of two -- so
+/// admitting one would mean approximating without being asked. `real` and the
+/// transcendentals are the door to that, and they say so in the rendering.
+///
+/// **A negative exponent is the reciprocal, and previously was nothing at
+/// all.** The old implementation clamped the exponent to `0..62`, so
+/// `pow(2, -1)` answered 1 -- not a wrong answer to the question, an answer to
+/// no question. Nothing in the tree passed one, which is why it survived.
+///
+/// A quantity carries its dimension through: `pow(qty(2, "m"), 3)` is 8 m^3,
+/// and a negative power inverts the dimension with the magnitude, so a
+/// reciprocal second really is a hertz.
+pub fn num_pow(base: &Value, e: i64) -> Result<Value, String> {
+    const MAX_POW: u64 = 4096;
+    // A whole base and a non-negative power answer exactly what they answered
+    // before this existed, saturation and the clamp at 62 included. Every
+    // program, core and stored candidate written earlier still means what it
+    // meant, which is the same bargain `rat` and `qty` made.
+    if let Value::Int(b) = base {
+        if e >= 0 {
+            let mut acc: i64 = 1;
+            for _ in 0..e.clamp(0, 62) {
+                acc = acc.saturating_mul(*b);
+            }
+            return Ok(Value::Int(acc));
+        }
+    }
+    // A bound, because the exponent is a caller's number and this loop is not
+    // interruptible from inside. **Refused rather than clamped**: clamping
+    // answers a different question confidently, which is exactly what the old
+    // `e.clamp(0, 62)` did when it turned every negative exponent into 1. The
+    // `Int` path above keeps its clamp, and only because changing it would move
+    // what programs written before this answered.
+    if e.unsigned_abs() > MAX_POW {
+        return Err(format!("exponent out of range: at most {} here", MAX_POW));
+    }
+    if let Value::Approx(x) = base {
+        let mut acc = 1.0f32;
+        for _ in 0..e.unsigned_abs() {
+            acc *= *x;
+        }
+        return Ok(Value::Approx(if e < 0 { 1.0 / acc } else { acc }));
+    }
+    let (n, d, k) = as_qty(base)?;
+    // Reciprocate once, so the loop below is the same either way. Zero has no
+    // reciprocal and saying so is better than an infinity this type cannot
+    // hold -- the same reason the exact path refuses a division by zero where
+    // the approximate path is allowed to answer `~inf`.
+    let (n, d, k) = if e < 0 {
+        if n == 0 {
+            return Err("division by zero".to_string());
+        }
+        (d, n, dim_combine(DIMLESS, k, -1)?)
+    } else {
+        (n, d, k)
+    };
+    let mut acc = (1i64, 1i64);
+    let mut dim = DIMLESS;
+    // Exact, so an overflow is an error rather than a saturation. A saturated
+    // exact answer is a confidently wrong one, which is the whole objection
+    // `rat_binary` makes.
+    for _ in 0..e.unsigned_abs() {
+        acc = rat_binary("*", acc, (n, d))?.as_rat()?;
+        dim = dim_combine(dim, k, 1)?;
+    }
+    quantity(acc.0, acc.1, dim)
+}
+
+/// An approximate value, written so it cannot be mistaken for an exact one.
+///
+/// The `~` is the point. Trailing zeros come off, so a whole-valued
+/// approximation reads as `~3` rather than `~3.000000` while still saying it
+/// is approximate.
+///
+/// **Six *significant* digits, not six decimal places, and the difference is a
+/// bug this printed for a while.** The reasoning was right -- `f32` carries
+/// about seven significant digits and printing more invents them -- and six
+/// decimal places only implements it for values below ten. At 74.092 it is
+/// nine significant digits, so the molar mass of calcium hydroxide came back
+/// `~74.091995`: three digits of float noise presented as measurement, from a
+/// number that is exactly 18523/250 one call earlier.
+///
+/// So the number of places is taken from the magnitude. Below one it stays at
+/// six, which is fewer than six significant digits for something very small
+/// and is left that way deliberately -- the alternative is exponent notation,
+/// and a number that reads `~0.000123` is not claiming anything it does not
+/// have.
+pub fn render_approx(v: f32) -> String {
+    if v.is_nan() {
+        return String::from("~nan");
+    }
+    if v.is_infinite() {
+        return String::from(if v > 0.0 { "~inf" } else { "~-inf" });
+    }
+    let a = v.abs();
+    let places = if a >= 100_000.0 {
+        0
+    } else if a >= 10_000.0 {
+        1
+    } else if a >= 1_000.0 {
+        2
+    } else if a >= 100.0 {
+        3
+    } else if a >= 10.0 {
+        4
+    } else if a >= 1.0 {
+        5
+    } else {
+        6
+    };
+    let mut s = format!("{:.*}", places, v);
+    if s.contains('.') {
+        while s.ends_with('0') {
+            s.pop();
+        }
+        if s.ends_with('.') {
+            s.pop();
+        }
+    }
+    let mut out = String::from("~");
+    out.push_str(&s);
+    out
+}
+
+/// Any number as (numerator, denominator, dimension). A plain number is
+/// dimensionless, which is what makes `3 m * 2` work and `3 m + 2` not.
+fn as_qty(v: &Value) -> Result<(i64, i64, Dim), String> {
+    match v {
+        Value::Qty(n, d, k) => Ok((*n, *d, *k)),
+        _ => {
+            let (n, d) = v.as_rat()?;
+            Ok((n, d, DIMLESS))
+        }
+    }
+}
+
+impl Value {
+
     pub fn render(&self) -> String {
         match self {
             Value::Int(v) => format!("{}", v),
+            // `n/d`, which is how it was written and how it reads back. A
+            // denominator of one is impossible here by construction, so this
+            // never renders `3/1` for something `Int` would render as `3`.
+            Value::Rat(n, d) => format!("{}/{}", n, d),
+            // Magnitude then unit, the way it is spoken and written: `5 m`,
+            // `1/3 m`, `9 m/s^2`. A denominator of one is dropped, so a whole
+            // magnitude reads as one.
+            Value::Qty(n, d, k) => {
+                if *d == 1 {
+                    format!("{} {}", n, render_dim(k))
+                } else {
+                    format!("{}/{} {}", n, d, render_dim(k))
+                }
+            }
+            Value::Approx(v) => render_approx(*v),
             Value::Str(s) => s.clone(),
             // `Host{name: "x", port: 80}`, which is how it was written apart
             // from the type name leading instead of calling. Legible in a
@@ -543,6 +1141,38 @@ pub const BUILTINS: &[(&str, Touch, usize, usize)] = &[
     ("clamp", Touch::Pure, 3, 3),
     ("sqrt", Touch::Pure, 1, 1),
     ("pow", Touch::Pure, 2, 2),
+    // Exact fractions. `rat` is the only way one is made, so exactness is
+    // opt-in at a named point and every program written before them still
+    // means what it meant -- `10/3` is still 3.
+    //
+    // Short common words on purpose. `grammar` measured that 19 of 23 applet
+    // names are a single token, and `repair` measured a model preferring
+    // `retry` over `skip-hwp` five times in six on token cost alone. A maths
+    // library the model cannot cheaply spell is one it will not reach for.
+    ("rat", Touch::Pure, 1, 2),
+    ("num", Touch::Pure, 1, 1),
+    ("den", Touch::Pure, 1, 1),
+    ("floor", Touch::Pure, 1, 1),
+    ("ceil", Touch::Pure, 1, 1),
+    ("round", Touch::Pure, 1, 1),
+    // Physical quantities. `qty` is the only way a unit is attached, so a
+    // dimension is something a program states rather than something it hopes
+    // a variable name carries.
+    ("qty", Touch::Pure, 2, 2),
+    ("unit", Touch::Pure, 1, 1),
+    ("mag", Touch::Pure, 1, 1),
+    // Approximation, opt-in. `real` is the one door into it, exactly as `rat`
+    // is the one door into exact division -- so a program that never calls it
+    // never holds an inexact number, and one that does can be read.
+    //
+    // The transcendentals answer approximate values because their answers are
+    // irrational: there is no `Rat` that is the sine of anything but zero.
+    ("real", Touch::Pure, 1, 1),
+    ("exp", Touch::Pure, 1, 1),
+    ("ln", Touch::Pure, 1, 1),
+    ("sin", Touch::Pure, 1, 1),
+    ("cos", Touch::Pure, 1, 1),
+    ("pi", Touch::Pure, 0, 0),
 
     // --- lists, beyond building one ----------------------------------------
     ("sort", Touch::Pure, 1, 1),
@@ -1247,7 +1877,24 @@ impl Interp {
             Expr::Unary(op, inner) => {
                 let v = self.expr(inner)?;
                 match op {
-                    UnOp::Neg => Ok(Value::Int(v.as_int()?.wrapping_neg())),
+                    // Up the tower rather than through `as_int`, which
+                    // refuses everything but a whole number. That refusal is
+                    // why `/lib/geom` carries its own `absv` and writes
+                    // `0 - x`: unary minus was the one operator that never
+                    // learned about fractions, and a library working around a
+                    // gap in the language is how the gap survives.
+                    //
+                    // `rational` refuses to build a numerator of `i64::MIN`,
+                    // so no `Rat` or `Qty` holds one and the negation here
+                    // cannot overflow.
+                    UnOp::Neg => match &v {
+                        Value::Rat(n, d) => Value::rational(-*n, *d),
+                        // A sign belongs to the magnitude. A negative length
+                        // is still a length, so the dimension is carried.
+                        Value::Qty(n, d, k) => quantity(-*n, *d, *k),
+                        Value::Approx(x) => Ok(Value::Approx(-*x)),
+                        _ => Ok(Value::Int(v.as_int()?.wrapping_neg())),
+                    },
                     UnOp::Not => Ok(Value::Int(if v.truthy() { 0 } else { 1 })),
                     UnOp::BitNot => Ok(Value::Int(!v.as_int()?)),
                 }
@@ -1403,6 +2050,144 @@ impl Interp {
         }
         if op == BinOp::Ne {
             return Ok(Value::Int(if a != b { 1 } else { 0 }));
+        }
+
+        // Dimensioned arithmetic, and it goes **before** the exact-fraction
+        // branch below rather than after: a quantity meeting a fraction would
+        // otherwise be routed through `rat_binary`, which knows nothing about
+        // dimensions and would quietly answer a bare number.
+        //
+        // This is where a unit error becomes an error. Adding metres to
+        // seconds is refused by name, and dividing amp-seconds by watts
+        // answers something that is not a time -- which is the `acpi` battery
+        // bug, caught by construction instead of by somebody noticing that a
+        // plausible number was about the wrong thing.
+        if a.is_num() && b.is_num() && (matches!(a, Value::Qty(..)) || matches!(b, Value::Qty(..))) {
+            let (an, ad, ak) = as_qty(&a)?;
+            let (bn, bd, bk) = as_qty(&b)?;
+            let mismatch = |what: &str| {
+                Err(format!(
+                    "cannot {} {} and {}",
+                    what,
+                    render_dim(&ak),
+                    render_dim(&bk)
+                ))
+            };
+            return match op {
+                // A plain number is dimensionless, so `3 m + 2` is refused by
+                // the same rule that refuses `3 m + 2 s`. That is the point:
+                // there is no quantity a bare number may be added to.
+                BinOp::Add | BinOp::Sub => {
+                    if ak != bk {
+                        return mismatch(if op == BinOp::Add { "add" } else { "subtract" });
+                    }
+                    let m = rat_binary(
+                        if op == BinOp::Add { "+" } else { "-" },
+                        (an, ad),
+                        (bn, bd),
+                    )?;
+                    let (n, d) = m.as_rat()?;
+                    quantity(n, d, ak)
+                }
+                BinOp::Mul => {
+                    let k = dim_combine(ak, bk, 1)?;
+                    let m = rat_binary("*", (an, ad), (bn, bd))?;
+                    let (n, d) = m.as_rat()?;
+                    quantity(n, d, k)
+                }
+                BinOp::Div => {
+                    let k = dim_combine(ak, bk, -1)?;
+                    let m = rat_binary("/", (an, ad), (bn, bd))?;
+                    let (n, d) = m.as_rat()?;
+                    quantity(n, d, k)
+                }
+                // Ordering two quantities of different kinds is not a
+                // comparison that has an answer, so it is refused rather than
+                // decided on the magnitudes.
+                BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge => {
+                    if ak != bk {
+                        return mismatch("compare");
+                    }
+                    let l = an as i128 * bd as i128;
+                    let r = bn as i128 * ad as i128;
+                    let t = match op {
+                        BinOp::Lt => l < r,
+                        BinOp::Le => l <= r,
+                        BinOp::Gt => l > r,
+                        _ => l >= r,
+                    };
+                    Ok(Value::Int(t as i64))
+                }
+                _ => Err("that operator wants plain numbers".to_string()),
+            };
+        }
+
+        // Approximation is contagious, and it has to be. An exact value meeting
+        // an approximate one cannot produce an exact answer, so the result says
+        // it is approximate -- which is the whole reason the type exists. It
+        // comes *after* the dimensioned branch, so a quantity meeting an
+        // approximation is refused there by name rather than silently losing
+        // its unit into an `f32`.
+        if a.is_num() && b.is_num() && (matches!(a, Value::Approx(_)) || matches!(b, Value::Approx(_)))
+        {
+            let x = approximate(&a)?;
+            let y = approximate(&b)?;
+            return match op {
+                BinOp::Add => Ok(Value::Approx(x + y)),
+                BinOp::Sub => Ok(Value::Approx(x - y)),
+                BinOp::Mul => Ok(Value::Approx(x * y)),
+                // No division-by-zero refusal here, deliberately: IEEE answers
+                // an infinity, `render` prints `~inf`, and that is a true
+                // statement about what happened. The exact path refuses
+                // instead because there an infinity is not representable at
+                // all, so there is nothing honest to hand back.
+                BinOp::Div => Ok(Value::Approx(x / y)),
+                BinOp::Lt => Ok(Value::Int((x < y) as i64)),
+                BinOp::Le => Ok(Value::Int((x <= y) as i64)),
+                BinOp::Gt => Ok(Value::Int((x > y) as i64)),
+                BinOp::Ge => Ok(Value::Int((x >= y) as i64)),
+                BinOp::Rem => Err("remainder wants whole numbers".to_string()),
+                _ => Err("that operator wants whole numbers".to_string()),
+            };
+        }
+
+        // Exact arithmetic, the moment either side is a fraction.
+        //
+        // `Eq` and `Ne` are already answered above by comparing the values
+        // themselves, which is only correct because `rational` guarantees one
+        // spelling per number -- reduced, positive denominator, never over
+        // one. Without those invariants `2/4 == 1/2` would be false.
+        //
+        // An `Int` meeting a `Rat` promotes; two `Int`s never reach here, so
+        // `10/3` is still 3 and every program, core and generated candidate
+        // written before fractions existed means exactly what it meant.
+        // Exactness is opt-in at the point the first fraction is made, and
+        // propagates from there.
+        if a.is_num() && b.is_num() && (matches!(a, Value::Rat(..)) || matches!(b, Value::Rat(..))) {
+            let (an, ad) = a.as_rat()?;
+            let (bn, bd) = b.as_rat()?;
+            return match op {
+                BinOp::Add => rat_binary("+", (an, ad), (bn, bd)),
+                BinOp::Sub => rat_binary("-", (an, ad), (bn, bd)),
+                BinOp::Mul => rat_binary("*", (an, ad), (bn, bd)),
+                BinOp::Div => rat_binary("/", (an, ad), (bn, bd)),
+                // Cross-multiplied in `i128`. Both denominators are positive
+                // by invariant, so the inequality keeps its direction and
+                // there is no case analysis on sign to get wrong.
+                BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge => {
+                    let l = an as i128 * bd as i128;
+                    let r = bn as i128 * ad as i128;
+                    let t = match op {
+                        BinOp::Lt => l < r,
+                        BinOp::Le => l <= r,
+                        BinOp::Gt => l > r,
+                        _ => l >= r,
+                    };
+                    Ok(Value::Int(t as i64))
+                }
+                BinOp::Rem => Err("remainder wants whole numbers".to_string()),
+                _ => Err("that operator wants whole numbers".to_string()),
+            };
         }
 
         let x = a.as_int()?;

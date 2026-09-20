@@ -1019,6 +1019,174 @@ pub fn open_todo() {
     open_app("ToDo", ICO_TODO, Box::new(super::todo::Todo::new()), w, h);
 }
 
+// --- Ported from upstream: the network window, window minimising, and tiling.
+// The upstream desktop grew these; AUTARK's icon rendering stayed its own, so
+// only the window-management half is carried over here.
+
+pub fn open_netman() {
+    let (w, h) = super::netman::NetMan::preferred();
+    open_app("Network", ICO_NET, Box::new(super::netman::NetMan::new()), w, h);
+}
+
+/// Put every window away.
+pub fn minimise_all() {
+    with(|d| {
+        for w in d.windows.iter_mut() {
+            w.state = WinState::Minimised;
+        }
+    });
+    draw();
+}
+
+/// Put every window away except the focused one.
+pub fn minimise_others() {
+    with(|d| {
+        let f = d.focus();
+        for (i, w) in d.windows.iter_mut().enumerate() {
+            if Some(i) != f {
+                w.state = WinState::Minimised;
+            }
+        }
+    });
+    draw();
+}
+
+/// Put the focused window away.
+pub fn minimise_focused() -> bool {
+    let ok = with(|d| {
+        let Some(f) = d.focus() else { return false };
+        d.windows[f].state = WinState::Minimised;
+        true
+    })
+    .unwrap_or(false);
+    if ok {
+        draw();
+    }
+    ok
+}
+
+/// Where a tile goes.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum Tile {
+    Left,
+    Right,
+    TopLeft,
+    TopRight,
+    BottomLeft,
+    BottomRight,
+    Full,
+}
+
+/// The rectangle a tile occupies on `screen`. Halves are computed as positions,
+/// not a width applied twice, so an odd width leaves no unpainted column.
+fn tile_rect(t: Tile, screen: Rect) -> Rect {
+    let midx = screen.x + screen.w / 2;
+    let midy = screen.y + screen.h / 2;
+    let right_w = (screen.x + screen.w).saturating_sub(midx);
+    let bottom_h = (screen.y + screen.h).saturating_sub(midy);
+    match t {
+        Tile::Full => screen,
+        Tile::Left => Rect::new(screen.x, screen.y, screen.w / 2, screen.h),
+        Tile::Right => Rect::new(midx, screen.y, right_w, screen.h),
+        Tile::TopLeft => Rect::new(screen.x, screen.y, screen.w / 2, screen.h / 2),
+        Tile::TopRight => Rect::new(midx, screen.y, right_w, screen.h / 2),
+        Tile::BottomLeft => Rect::new(screen.x, midy, screen.w / 2, bottom_h),
+        Tile::BottomRight => Rect::new(midx, midy, right_w, bottom_h),
+    }
+}
+
+/// Put the focused window in a tile.
+pub fn tile_focused(t: Tile) -> bool {
+    let Some(fb) = super::primary() else { return false };
+    let screen = screen_rect(&fb);
+    let ok = with(|d| {
+        let Some(f) = d.focus() else { return false };
+        let w = &mut d.windows[f];
+        w.snap_back = w.snap_back.or(Some(w.rect));
+        w.state = WinState::Normal;
+        w.rect = tile_rect(t, screen);
+        true
+    })
+    .unwrap_or(false);
+    if ok {
+        draw();
+    }
+    ok
+}
+
+/// The four quadrants, filled from the front of the stack back. Capped at four.
+pub fn tile_all() -> usize {
+    let Some(fb) = super::primary() else { return 0 };
+    let screen = screen_rect(&fb);
+    const ORDER: [Tile; 4] = [Tile::TopLeft, Tile::TopRight, Tile::BottomLeft, Tile::BottomRight];
+    let n = with(|d| {
+        let mut idx: Vec<usize> = (0..d.windows.len())
+            .filter(|i| d.windows[*i].state != WinState::Minimised)
+            .collect();
+        idx.reverse();
+        idx.truncate(ORDER.len());
+        for (slot, i) in idx.iter().enumerate() {
+            let w = &mut d.windows[*i];
+            w.snap_back = w.snap_back.or(Some(w.rect));
+            w.state = WinState::Normal;
+            w.rect = tile_rect(ORDER[slot], screen);
+        }
+        idx.len()
+    })
+    .unwrap_or(0);
+    if n > 0 {
+        draw();
+    }
+    n
+}
+
+/// Four named windows in a workbench layout: a rail either side, a wide main
+/// pane, and a foot strip under it. Answers how many it placed.
+pub fn tile_workspace(rail_l: &str, main: &str, foot: &str, rail_r: &str) -> usize {
+    let Some(fb) = super::primary() else { return 0 };
+    let screen = screen_rect(&fb);
+    let lw = screen.w * 22 / 100;
+    let rw = screen.w * 24 / 100;
+    let midx = screen.x + lw;
+    let midw = screen.w.saturating_sub(lw + rw);
+    let foot_h = screen.h * 30 / 100;
+    let mainh = screen.h.saturating_sub(foot_h);
+    let places = [
+        (rail_l, Rect::new(screen.x, screen.y, lw, screen.h)),
+        (main, Rect::new(midx, screen.y, midw, mainh)),
+        (foot, Rect::new(midx, screen.y + mainh, midw, foot_h)),
+        (rail_r, Rect::new(screen.x + lw + midw, screen.y, rw, screen.h)),
+    ];
+    let n = with(|d| {
+        let mut placed = 0;
+        for (title, r) in places.iter() {
+            if let Some(i) = d.windows.iter().position(|w| w.title == *title) {
+                let w = &mut d.windows[i];
+                w.snap_back = w.snap_back.or(Some(w.rect));
+                w.state = WinState::Normal;
+                w.rect = *r;
+                placed += 1;
+            }
+        }
+        placed
+    })
+    .unwrap_or(0);
+    if n > 0 {
+        draw();
+    }
+    n
+}
+
+/// Repaint after a command may have changed what the status strip reports.
+/// AUTARK's terminal has no separate status strip to repaint in isolation, so
+/// this is a full redraw -- the intent (the screen reflects the new state) at
+/// the cost of a repaint the upstream strip-only version avoided.
+pub fn refresh_status() {
+    if super::primary().is_some() && !super::splash::active() {
+        draw();
+    }
+}
+
 pub fn open_oracle(premise: &str) {
     let (w, h) = super::oracle::Oracle::preferred();
     open_app("Oracle", ICO_ORACLE, Box::new(super::oracle::Oracle::new(premise)), w, h);

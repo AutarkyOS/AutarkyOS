@@ -76,6 +76,21 @@ fn caps() -> u32 {
     HAVE.load(Ordering::Relaxed)
 }
 
+/// Whether a hypervisor said it is here.
+///
+/// Public because it is not only an MSR question. Anything that prints a
+/// *rate* has the same problem this module has with registers: under emulation
+/// the number is about the host's scheduler and the host's caches as much as
+/// about this machine, and a figure that does not say so gets quoted as though
+/// it were hardware. `mine bench` asks.
+///
+/// Advisory, like the bit itself. A hypervisor that hides the bit is lying and
+/// nothing here can catch it, which is the same limit `probe` already accepts.
+pub fn virtualised() -> bool {
+    probe();
+    caps() & CAP_VIRTUAL != 0
+}
+
 /// Whether MSR access is permitted right now.
 fn allowed(bit: u32) -> bool {
     let c = caps();
@@ -293,9 +308,57 @@ pub fn governor() -> Governor {
     }
 }
 
+/// Whether hardware-managed performance states are switched on.
+///
+/// **`IA32_PM_ENABLE` is the one HWP register that is safe to read on a part
+/// that advertises HWP**, and everything else in the group is gated behind its
+/// bit 0. It is architectural precisely so software has somewhere to ask.
+/// Set when reading the HWP registers is known to fault on this machine.
+///
+/// **A repair knob, and the shape every one of them should have.** It does not
+/// describe the hardware -- CPUID already does that -- it records a decision
+/// taken after something went wrong, and it makes the subsystem answer "not
+/// available" instead of touching the register again. Default off, so a
+/// machine that never failed behaves exactly as it did.
+static SKIP_HWP: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+pub fn skip_hwp(on: bool) {
+    SKIP_HWP.store(on, Ordering::Relaxed);
+}
+
+pub fn hwp_skipped() -> bool {
+    SKIP_HWP.load(Ordering::Relaxed)
+}
+
+pub fn hwp_enabled() -> bool {
+    if hwp_skipped() || !allowed(CAP_HWP) {
+        return false;
+    }
+    unsafe { cpu::rdmsr(IA32_PM_ENABLE) & 1 != 0 }
+}
+
 /// What the part says its performance range is: highest, guaranteed, lowest.
+///
+/// **CPUID saying HWP exists is not permission to read this register**, and
+/// that distinction cost a boot. `IA32_HWP_CAPABILITIES` is only readable once
+/// `IA32_PM_ENABLE` bit 0 is set; reading it while HWP is off is a #GP, and
+/// this laptop supports HWP and boots with it disabled. The whole module is
+/// built around refusing to touch an MSR the part may not implement -- and the
+/// gate it used asked whether the register *exists*, where the processor's rule
+/// is about whether it is *enabled*. Those are different questions and only the
+/// first was being asked.
+///
+/// Measured on the GF63: `power` printed every line down to the governor and
+/// then took `#GP` at rip 0x1400aa013, which disassembles to `rdmsr` with
+/// `rcx = 0x771`. There is no way an emulator could have found this, since
+/// `allowed` declines under a hypervisor before any of it runs.
+///
+/// It does not enable HWP to answer. A status command that switched the
+/// machine's power management on as a side effect of being asked a question
+/// would be a worse bug than the one it replaced, and enabling is one-way until
+/// reset.
 pub fn hwp_range() -> Option<(u8, u8, u8)> {
-    if !allowed(CAP_HWP) {
+    if !hwp_enabled() {
         return None;
     }
     let c = unsafe { cpu::rdmsr(IA32_HWP_CAPABILITIES) };
@@ -307,17 +370,26 @@ pub fn set_governor(g: Governor) -> bool {
     if !allowed(CAP_HWP) {
         return false;
     }
-    let Some((highest, _guaranteed, lowest)) = hwp_range() else {
-        return false;
-    };
+    // **Enable before reading the range, not after.** `hwp_range` reads
+    // `IA32_HWP_CAPABILITIES`, which faults while HWP is off, so the original
+    // order took a #GP on any part that had not already been switched on --
+    // the same fault `report` hit, reachable by a second route.
+    //
+    // Enabling is one-way on most parts: once hardware-managed states are on
+    // they stay on until reset. That is the processor's rule rather than this
+    // kernel's, and it is why the bit is only ever set. Doing it here is
+    // honest because this function exists to change the policy; doing it in
+    // `hwp_range` would not be.
     unsafe {
-        // Enabling is one-way on most parts: once hardware-managed states are
-        // on they stay on until reset. That is the processor's rule rather
-        // than this kernel's, and it is why the bit is only ever set.
         let en = cpu::rdmsr(IA32_PM_ENABLE);
         if en & 1 == 0 {
             cpu::wrmsr(IA32_PM_ENABLE, en | 1);
         }
+    }
+    let Some((highest, _guaranteed, lowest)) = hwp_range() else {
+        return false;
+    };
+    unsafe {
         let base = BASE_RATIO.load(Ordering::Relaxed) as u8;
         let (min, max) = match g {
             Governor::Performance => (lowest, highest),
@@ -426,10 +498,17 @@ pub fn why() -> &'static str {
 pub fn report() {
     use crate::kprintln;
     let c = caps();
+    // Named rather than merely reported present. "hypervisor yes" is enough to
+    // justify declining an MSR and useless in a bug report from somebody whose
+    // install story is "boot it in a VM", where which one is the first question
+    // anybody asks.
     kprintln!(
         "  vendor {}   hypervisor {}",
         if c & CAP_INTEL != 0 { "intel" } else { "other" },
-        if c & CAP_VIRTUAL != 0 { "yes" } else { "no" }
+        match crate::cpu::hypervisor_name() {
+            Some(n) => n,
+            None => alloc::string::String::from("no"),
+        }
     );
     kprintln!(
         "  dts {}  package {}  hwp {}  aperf {}  turbo {}",
@@ -461,6 +540,12 @@ pub fn report() {
     kprintln!("  governor {}", governor().name());
     match hwp_range() {
         Some((hi, gu, lo)) => kprintln!("  hwp range {}..{}, guaranteed {}", lo, hi, gu),
+        // Three states, not two. "Supported but off" is the one this machine
+        // is in, and printing "none" for it would be a false statement about
+        // the hardware -- as well as hiding why the range is unavailable.
+        None if allowed(CAP_HWP) => kprintln!(
+            "  hwp present but not enabled, so its range cannot be read yet"
+        ),
         None => kprintln!("  no hardware-managed performance states"),
     }
 }
