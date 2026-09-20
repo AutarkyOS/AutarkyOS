@@ -6,6 +6,7 @@ pub mod adapter;
 pub mod abstraction;
 pub mod work;
 pub mod aixi;
+pub mod arena;
 pub mod backward;
 pub mod connectome;
 pub mod constrain;

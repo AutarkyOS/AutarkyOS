@@ -200,6 +200,16 @@ pub const SUITES: &[Suite] = &[
         run: crate::net::recon::selftest,
     },
     Suite {
+        name: "enumerate",
+        about: "HTTP path enumeration parses responses and filters by content",
+        run: crate::net::enumerate::selftest,
+    },
+    Suite {
+        name: "vulnid",
+        about: "known-weak version matching is pure and every entry is asserted",
+        run: crate::net::vulnid::selftest,
+    },
+    Suite {
         name: "decoy",
         about: "every decoy banner the recon engine reads back as the real thing",
         run: crate::net::decoy::selftest,
@@ -219,11 +229,16 @@ pub const SUITES: &[Suite] = &[
         about: "a whole nervous system parses walking-and-asserting, and one step is deterministic",
         run: crate::ai::connectome::selftest,
     },
+    Suite {
+        name: "arena",
+        about: "a pursuit's trajectory records append-only and the terminal verdict is what the record says",
+        run: crate::ai::arena::selftest,
+    },
 ];
 
 /// One slot per suite. Indexed by position in `SUITES`, which is a constant,
 /// so the table cannot get out of step with the list.
-static RESULTS: [AtomicU8; 36] = [
+static RESULTS: [AtomicU8; 39] = [
     AtomicU8::new(0),
     AtomicU8::new(0),
     AtomicU8::new(0),
@@ -254,7 +269,10 @@ static RESULTS: [AtomicU8; 36] = [
     AtomicU8::new(0),
     AtomicU8::new(0),
     AtomicU8::new(0),
-    // fingerprint, recon, decoy, canary, honeypot, connectome
+    // fingerprint, recon, enumerate, vulnid, decoy, canary, honeypot, connectome, arena
+    AtomicU8::new(0),
+    AtomicU8::new(0),
+    AtomicU8::new(0),
     AtomicU8::new(0),
     AtomicU8::new(0),
     AtomicU8::new(0),

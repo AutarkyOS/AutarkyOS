@@ -89,6 +89,11 @@ const GODEL_GAP_S: u64 = 3600;
 /// tuning one by breaking the other.
 const AUTHOR_GAP_S: u64 = 3600;
 
+/// Seconds between unattended arena pursuit steps. Ten minutes: a granted
+/// mission advances deliberately, not in a burst, so a night is a handful of
+/// steps an operator can read in the morning rather than a wall of them.
+const ARENA_GAP_S: u64 = 600;
+
 /// How long between steps of a workflow the operator declared unattended.
 ///
 /// Ten minutes rather than an hour, because a pre-decided step costs no model
@@ -157,6 +162,7 @@ static PREV_TICK_TOUCHED: Racy<bool> = Racy::new(false);
 static LAST_EPISODE_AT: Racy<u64> = Racy::new(0);
 static LAST_GODEL_AT: Racy<u64> = Racy::new(0);
 static LAST_AUTHOR_AT: Racy<u64> = Racy::new(0);
+static LAST_ARENA_AT: Racy<u64> = Racy::new(0);
 static LAST_WORK_AT: Racy<u64> = Racy::new(0);
 
 /// Claimed while an unattended job is in flight.
@@ -286,6 +292,16 @@ fn since_godel(now_s: u64) -> u64 {
     let last = unsafe { *LAST_GODEL_AT.get() };
     if last == 0 {
         GODEL_GAP_S
+    } else {
+        now_s.saturating_sub(last)
+    }
+}
+
+/// Seconds since the last unattended arena step.
+fn since_arena(now_s: u64) -> u64 {
+    let last = unsafe { *LAST_ARENA_AT.get() };
+    if last == 0 {
+        ARENA_GAP_S
     } else {
         now_s.saturating_sub(last)
     }
@@ -664,6 +680,14 @@ fn tick_inner(forced: bool) {
                             // ledger, which is where a run nobody saw belongs.
                             AUTHORED.fetch_add(1, Ordering::Relaxed);
                             let ok = super::agent::queue_author(name, goal, AUTHOR_STEPS, true);
+                            // A queued authoring run is this tick's expensive job:
+                            // mark it spent so the work-decode and arena branches
+                            // below stand down, the one-expensive-job-per-tick rule
+                            // the block is built on. (Only on a real queue -- a
+                            // refusal spent nothing.)
+                            if ok {
+                                spent = true;
+                            }
                             journal_push(format!(
                                 "[t{} +{}s] author: hour {}, {} {}",
                                 TICKS.load(Ordering::Relaxed),
@@ -703,6 +727,41 @@ fn tick_inner(forced: bool) {
                             name,
                             if decoded { "a decode" } else { "no model call" }
                         ));
+                    }
+                }
+                // A granted mission, one pursuit step.
+                //
+                // Gated on `!spent`: unlike a pre-decided workflow step, an arena
+                // step is a model decode -- the agent chooses its own action --
+                // so it competes for the one expensive job a quiet tick spends,
+                // and takes it only when godel and the author have not. It holds
+                // the engine for the decode alone and runs its recon after the
+                // borrow, so it does not lock the machine the way a trial does.
+                // Lowest of the three decode jobs on purpose, so self-improvement
+                // is never starved by a long-running study; the operator drives
+                // it directly with `arena step`/`arena run` when they want it now.
+                if !spent && since_arena(now_s) >= ARENA_GAP_S {
+                    unsafe { *LAST_ARENA_AT.get() = now_s };
+                    if let Some(run) = super::arena::next_granted() {
+                        match super::arena::step(&run) {
+                            Ok(s) => journal_push(format!(
+                                "[t{} +{}s] arena {}: {} [{}] score {} -> {}",
+                                TICKS.load(Ordering::Relaxed),
+                                now_s,
+                                run,
+                                s.action,
+                                s.outcome.tag(),
+                                s.score,
+                                s.terminal.tag()
+                            )),
+                            Err(why) => journal_push(format!(
+                                "[t{} +{}s] arena {}: {}",
+                                TICKS.load(Ordering::Relaxed),
+                                now_s,
+                                run,
+                                why
+                            )),
+                        }
                     }
                 }
                 NIGHT_BUSY.store(false, Ordering::Release);

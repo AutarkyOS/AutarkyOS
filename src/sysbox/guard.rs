@@ -57,7 +57,7 @@ use alloc::vec::Vec;
 /// head pointer and the `tried` markers under there are ordinary state that a
 /// trial legitimately rewrites; protecting the directory wholesale would make
 /// the loop unable to run while claiming to protect its history.
-const RECORDS: [(&str, Kind); 6] = [
+const RECORDS: [(&str, Kind); 7] = [
     ("/ai/godel/ledger.txt", Kind::AppendOnly),
     ("/ai/godel/test-budget", Kind::Monotone),
     // The operator reads the dispatch, not the ledger. Guarding only the
@@ -75,6 +75,11 @@ const RECORDS: [(&str, Kind); 6] = [
     // a decoy service cannot un-capture themselves by rewriting the record of
     // the session they had.
     ("/ai/mirror/sessions", Kind::AppendOnly),
+    // The arena's trajectory of an autonomous pursuit. A run that came apart
+    // cannot erase having done so, and an attempt to rewrite it is itself the
+    // loudest finding -- the self-modification invariant put to the same use
+    // for the study's central record.
+    ("/ai/arena/ledger.txt", Kind::AppendOnly),
 ];
 
 /// How a record is allowed to change.
@@ -269,7 +274,8 @@ pub fn selftest() -> bool {
         // rule, read from their modules' own constants so the spellings cannot
         // drift.
         && kind_of(crate::sysbox::canary::ALARMS) == Kind::AppendOnly
-        && kind_of(crate::net::honeypot::SESSIONS) == Kind::AppendOnly;
+        && kind_of(crate::net::honeypot::SESSIONS) == Kind::AppendOnly
+        && kind_of(crate::ai::arena::LEDGER) == Kind::AppendOnly;
 
     // A sprung alarm can be added to and never rewritten or unnamed, and the
     // directory it lives in cannot be removed out from under it.

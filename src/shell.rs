@@ -2410,6 +2410,251 @@ fn execute(line: &str, boot: &BootInfo, acpi: &Option<Acpi>, interp: &mut aiksi:
                 _ => kprintln!("  usage: connectome load <path> | info | neigh <n> | stim <n> [v] | step [n] [gain] | show [k] | reset"),
             }
         }
+        "arena" => {
+            // The autonomy study's control surface. Operator-only: `arena` is
+            // not a sysbox applet, so no decoding grammar can spell it and the
+            // model has no route to create a mission, grant one, or read the
+            // record. See src/ai/arena.rs.
+            use crate::ai::arena;
+            let born = crate::dev::rtc::now()
+                .map(|d| crate::dev::rtc::unix_seconds(&d))
+                .unwrap_or(0);
+            let mut it = rest.splitn(2, ' ');
+            match (it.next().unwrap_or(""), it.next().unwrap_or("").trim()) {
+                ("new", args) if !args.is_empty() => {
+                    let mut a = args.splitn(2, ' ');
+                    let run = a.next().unwrap_or("");
+                    let objective = a.next().unwrap_or("").trim();
+                    if objective.is_empty() {
+                        kprintln!("  usage: arena new <run> <objective>");
+                    } else {
+                        let m = arena::Mission {
+                            objective: String::from(objective),
+                            horizon: 64,
+                            target: 0,
+                            born,
+                        };
+                        if arena::set_mission(run, &m) {
+                            console::set_color(LTGREEN);
+                            kprintln!("  mission '{}' set: {}", run, objective);
+                            console::set_color(LTGRAY);
+                            if let Some(h) = arena::intent_hash(run) {
+                                kprintln!(
+                                    "  grant it to run unattended:  arena grant {} {}",
+                                    run, &crate::ai::voter::hex(&h)[..8]
+                                );
+                            }
+                        } else {
+                            kprintln!("  refused (bad run name, or the write was blocked)");
+                        }
+                    }
+                }
+                ("target", args) if !args.is_empty() => {
+                    let mut a = args.split_whitespace();
+                    let run = a.next().unwrap_or("");
+                    let t = a.next().and_then(|s| s.parse::<u32>().ok());
+                    match (arena::mission(run), t) {
+                        (Some(mut m), Some(t)) => {
+                            m.target = t;
+                            if arena::set_mission(run, &m) {
+                                kprintln!("  target for '{}' set to {} (this revokes any prior grant)", run, t);
+                            } else {
+                                kprintln!("  the write was blocked");
+                            }
+                        }
+                        (None, _) => kprintln!("  no such mission: {}", run),
+                        (_, None) => kprintln!("  usage: arena target <run> <n>"),
+                    }
+                }
+                ("grant", args) if !args.is_empty() => {
+                    let mut a = args.split_whitespace();
+                    let run = a.next().unwrap_or("");
+                    let typed = a.next().unwrap_or("");
+                    match arena::intent_hash(run) {
+                        None => kprintln!("  no such mission: {}", run),
+                        Some(h) => {
+                            let full = crate::ai::voter::hex(&h);
+                            if typed.len() >= 8 && full.starts_with(typed) {
+                                if arena::grant(run) {
+                                    console::set_color(LTGREEN);
+                                    kprintln!("  '{}' granted -- it may advance one step per quiet tick", run);
+                                    console::set_color(LTGRAY);
+                                } else {
+                                    kprintln!("  grant refused (the write was blocked)");
+                                }
+                            } else {
+                                kprintln!("  intent is {} -- type its first 8 characters to grant", &full[..8]);
+                            }
+                        }
+                    }
+                }
+                ("step", run) if !run.is_empty() => {
+                    // Force one pursuit step now (the `initiative now` / `work
+                    // night` idiom). Runs inline on this task, holding the engine
+                    // only for the decode.
+                    match arena::step(run) {
+                        Ok(s) => {
+                            console::set_color(LTGREEN);
+                            kprintln!(
+                                "  step: {}  [{}]  score {}  terminal {}",
+                                s.action, s.outcome.tag(), s.score, s.terminal.tag()
+                            );
+                            console::set_color(LTGRAY);
+                        }
+                        Err(why) => kprintln!("  {}", why),
+                    }
+                }
+                ("run", args) if !args.is_empty() => {
+                    let mut a = args.split_whitespace();
+                    let run = a.next().unwrap_or("");
+                    let n = a.next().and_then(|s| s.parse::<usize>().ok()).unwrap_or(8);
+                    let mut i = 0usize;
+                    while i < n {
+                        match arena::step(run) {
+                            Ok(s) => {
+                                kprintln!(
+                                    "  {:>2}. {} [{}] score {} -> {}",
+                                    i + 1, s.action, s.outcome.tag(), s.score, s.terminal.tag()
+                                );
+                                if s.terminal != arena::Terminal::Running {
+                                    console::set_color(LTGREEN);
+                                    kprintln!("  ended: {}", s.terminal.tag());
+                                    console::set_color(LTGRAY);
+                                    break;
+                                }
+                            }
+                            Err(why) => {
+                                kprintln!("  stopped: {}", why);
+                                break;
+                            }
+                        }
+                        i += 1;
+                    }
+                }
+                ("ledger", run) if !run.is_empty() => {
+                    let t = arena::trajectory(run);
+                    if t.is_empty() {
+                        kprintln!("  no steps recorded for '{}'", run);
+                    } else {
+                        kprintln!("  {} step(s) for '{}'  (drift x100, faults cumulative):", t.len(), run);
+                        for s in t.iter() {
+                            kprintln!(
+                                "    {:>3} [{:<7}] score {:<4} drift {:<5} faults {:<3} {}",
+                                s.step,
+                                s.outcome.tag(),
+                                s.score,
+                                s.drift_centi,
+                                s.faults,
+                                s.action
+                            );
+                        }
+                    }
+                }
+                ("show", run) if !run.is_empty() => {
+                    match arena::mission(run) {
+                        None => kprintln!("  no such mission: {}", run),
+                        Some(m) => {
+                            let t = arena::trajectory(run);
+                            let term = arena::classify(&t, m.target, m.horizon);
+                            console::set_color(LTGREEN);
+                            kprintln!("  {}: {}", run, m.objective);
+                            console::set_color(LTGRAY);
+                            kprintln!(
+                                "  horizon {}  target {}  granted {}",
+                                m.horizon, m.target, arena::granted(run)
+                            );
+                            kprintln!("  {} step(s), terminal: {}", t.len(), term.tag());
+                        }
+                    }
+                }
+                ("mode", arg) => {
+                    use crate::net::reach;
+                    match arg {
+                        "isolated" => {
+                            reach::set_mode(reach::Mode::Isolated);
+                            console::set_color(LTGREEN);
+                            kprintln!("  reach: isolated -- the owned range only, no real-net perception");
+                            console::set_color(LTGRAY);
+                        }
+                        "live" => {
+                            reach::set_mode(reach::Mode::Live);
+                            console::set_color(LTRED);
+                            kprintln!("  reach: LIVE -- read-only real-net perception is on");
+                            console::set_color(LTGRAY);
+                            kprintln!("  action stays owned-range only; the internet is never a scan/action target");
+                        }
+                        "" => {
+                            let m = match reach::mode() {
+                                reach::Mode::Isolated => "isolated",
+                                reach::Mode::Live => "live",
+                            };
+                            kprintln!("  reach mode: {}", m);
+                        }
+                        _ => kprintln!("  usage: arena mode isolated|live"),
+                    }
+                }
+                ("range", arg) => {
+                    use crate::net::reach;
+                    let parse_quad = |s: &str| -> Option<[u8; 4]> {
+                        let mut it = s.split('.');
+                        let a = it.next()?.parse().ok()?;
+                        let b = it.next()?.parse().ok()?;
+                        let c = it.next()?.parse().ok()?;
+                        let d = it.next()?.parse().ok()?;
+                        if it.next().is_some() {
+                            return None;
+                        }
+                        Some([a, b, c, d])
+                    };
+                    if arg.is_empty() {
+                        let a = reach::allowlist();
+                        if a.is_empty() {
+                            kprintln!("  range: the whole owned subnet (no allowlist)");
+                        } else {
+                            kprintln!("  range: {} host(s) allowlisted:", a.len());
+                            for ip in a.iter() {
+                                kprintln!("    {}.{}.{}.{}", ip[0], ip[1], ip[2], ip[3]);
+                            }
+                        }
+                    } else if arg == "clear" {
+                        reach::set_allowlist(alloc::vec::Vec::new());
+                        kprintln!("  range cleared -- the whole owned subnet is the range");
+                    } else {
+                        let mut list = alloc::vec::Vec::new();
+                        let mut bad = false;
+                        for tok in arg.split(|c| c == ' ' || c == ',').filter(|s| !s.is_empty()) {
+                            match parse_quad(tok) {
+                                Some(ip) => list.push(ip),
+                                None => {
+                                    bad = true;
+                                    kprintln!("  not an address: {}", tok);
+                                }
+                            }
+                        }
+                        if !bad && !list.is_empty() {
+                            let n = list.len();
+                            reach::set_allowlist(list);
+                            kprintln!("  range narrowed to {} host(s) within the owned subnet", n);
+                        }
+                    }
+                }
+                ("", _) | ("list", _) | ("status", _) => {
+                    let runs = arena::runs();
+                    if runs.is_empty() {
+                        kprintln!("  no missions -- 'arena new <run> <objective>'");
+                    } else {
+                        for run in runs.iter() {
+                            if let Some(m) = arena::mission(run) {
+                                let t = arena::trajectory(run);
+                                let term = arena::classify(&t, m.target, m.horizon);
+                                kprintln!("  {:<12} {:<10} {} step(s)  {}", run, term.tag(), t.len(), m.objective);
+                            }
+                        }
+                    }
+                }
+                _ => kprintln!("  usage: arena new|target|grant|step|run|ledger|show|mode|range|list  (verbs: scan probe enumerate vulncheck done)"),
+            }
+        }
         "dhcp" => crate::net::dhcp::report(),
         "dns" => {
             if rest.is_empty() {

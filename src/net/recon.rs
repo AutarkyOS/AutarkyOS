@@ -105,7 +105,7 @@ pub struct Finding {
 /// Dots are the namespace's own separator -- `tree::put` would read `192.168`
 /// as two levels -- so the index would grow a directory per octet and a host
 /// would not be one node. Dashes keep a host to a single name.
-fn ip_seg(ip: Ipv4) -> String {
+pub fn ip_seg(ip: Ipv4) -> String {
     let mut s = String::new();
     for (i, o) in ip.iter().enumerate() {
         if i > 0 {
@@ -170,33 +170,49 @@ pub fn scan(cap: usize, per_port_ms: u64) -> Result<Vec<Finding>, &'static str> 
 
     let mut findings = Vec::new();
     for host in hosts {
-        // ARP first: a host that will not answer ARP will not answer anything,
-        // and skipping it here is one probe against fifteen timeouts.
-        if !super::alive(host) {
-            continue;
-        }
-        let host_str = ip_dotted(host);
-        for &(port, probe) in PORTS.iter() {
-            match super::tcp::connect(host, port, per_port_ms) {
-                Ok(()) => {
-                    let req = fingerprint::probe_bytes(probe, &host_str);
-                    if !req.is_empty() {
-                        let _ = super::tcp::send(&req, per_port_ms);
-                    }
-                    let banner = super::tcp::recv(per_port_ms.max(500));
-                    super::tcp::close(200);
-                    let fp = fingerprint::identify(port, &banner);
-                    record(host, port, &fp, &banner);
-                    findings.push(Finding { ip: host, port, fp });
-                }
-                // Refused means the host is up and the port is shut -- a fact,
-                // but not a service, so it is not indexed. Any other error is
-                // the host not answering this port at all.
-                Err(_) => {}
-            }
-        }
+        findings.extend(scan_host(host, per_port_ms));
     }
     Ok(findings)
+}
+
+/// Sweep one host's known ports, banner-grab, name each service, index it.
+///
+/// The per-host body of `scan`, lifted out so the arena's guarded recon can aim
+/// at a single target without re-deriving the loop -- one implementation of
+/// "connect, probe, identify, record", so the operator's sweep and the model's
+/// cannot drift. Returns what answered; an unreachable host yields nothing.
+/// It does **not** gate the target itself: `scan` gates by `alive`/`on_subnet`
+/// and the arena gates by the reach guard before calling in, so this trusts its
+/// caller to have authorized the host -- stated here because it is the one place
+/// that trust is assumed rather than checked.
+pub fn scan_host(host: Ipv4, per_port_ms: u64) -> Vec<Finding> {
+    let mut findings = Vec::new();
+    // ARP first: a host that will not answer ARP will not answer anything, and
+    // skipping it here is one probe against fifteen timeouts.
+    if !super::alive(host) {
+        return findings;
+    }
+    let host_str = ip_dotted(host);
+    for &(port, probe) in PORTS.iter() {
+        match super::tcp::connect(host, port, per_port_ms) {
+            Ok(()) => {
+                let req = fingerprint::probe_bytes(probe, &host_str);
+                if !req.is_empty() {
+                    let _ = super::tcp::send(&req, per_port_ms);
+                }
+                let banner = super::tcp::recv(per_port_ms.max(500));
+                super::tcp::close(200);
+                let fp = fingerprint::identify(port, &banner);
+                record(host, port, &fp, &banner);
+                findings.push(Finding { ip: host, port, fp });
+            }
+            // Refused means the host is up and the port is shut -- a fact, but
+            // not a service, so it is not indexed. Any other error is the host
+            // not answering this port at all.
+            Err(_) => {}
+        }
+    }
+    findings
 }
 
 /// Write one finding into the index: `/ai/recon/<ip>/<port>`.
@@ -226,7 +242,7 @@ fn record(ip: Ipv4, port: u16, fp: &Fingerprint, banner: &[u8]) {
     crate::sysbox::write_text(&path, &body);
 }
 
-fn push_u16(s: &mut String, v: u16) {
+pub fn push_u16(s: &mut String, v: u16) {
     if v == 0 {
         s.push('0');
         return;

@@ -77,6 +77,30 @@ impl Fingerprint {
         }
         s
     }
+
+    /// Reverse of `render`: extract proto, product, version from the first line
+    /// of a stored recon entry. The format is `"proto [product [version]]"`.
+    pub fn parse_rendered(text: &str) -> Self {
+        let first_line = text.split('\n').next().unwrap_or("");
+        let mut parts = first_line.split(' ');
+        let proto_str = parts.next().unwrap_or("unknown");
+        let proto: &'static str = match proto_str {
+            "ssh" => "ssh",
+            "http" => "http",
+            "ftp" => "ftp",
+            "smtp" => "smtp",
+            "pop3" => "pop3",
+            "imap" => "imap",
+            "redis" => "redis",
+            "mysql" => "mysql",
+            "telnet" => "telnet",
+            "rtsp" => "rtsp",
+            _ => "unknown",
+        };
+        let product = String::from(parts.next().unwrap_or(""));
+        let version = String::from(parts.next().unwrap_or(""));
+        Self { proto, product, version, extra: String::new() }
+    }
 }
 
 /// How to make a service talk.
@@ -519,6 +543,16 @@ pub fn selftest() -> bool {
     // A status code is not a version.
     check(first_version_token("220 ProFTPD").is_none(), "bare 220 is not a version");
     check(first_version_token("nginx/1.18.0").as_deref() == Some("1.18.0"), "version needs a dot");
+
+    // parse_rendered round-trip: render then parse should recover the fields.
+    let rt = Fingerprint::parse_rendered(&ssh.render());
+    check(rt.proto == "ssh", "parse_rendered recovers proto");
+    check(rt.product == ssh.product, "parse_rendered recovers product");
+    check(rt.version == ssh.version, "parse_rendered recovers version");
+
+    let rt2 = Fingerprint::parse_rendered("unknown\nbanner text");
+    check(rt2.proto == "unknown", "parse_rendered handles bare proto");
+    check(rt2.product.is_empty(), "parse_rendered with no product");
 
     ok
 }

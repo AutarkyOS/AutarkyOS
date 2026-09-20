@@ -1267,6 +1267,11 @@ fn selftest(acpi_ref: &Option<acpi::Acpi>) {
         kprintln!("  ok     connectome a whole nervous system parses and steps");
         console::set_color(LTGRAY_IDX);
     }
+    if ai::arena::selftest() {
+        console::set_color(LTGREEN);
+        kprintln!("  ok     arena     a pursuit records its trajectory and classifies its end");
+        console::set_color(LTGRAY_IDX);
+    }
 
     console::set_color(LTGREEN);
     kprintln!("\n[selftest] int3 should report and resume:");

@@ -174,7 +174,34 @@ pub struct Choice {
 /// the only way out of the decode loop is `Cursor::finished`, which yields an
 /// index into the very list the grammar was built from.
 pub fn choose(task: &str, trust: Trust, temperature: f32) -> Option<Choice> {
-    let (grammar, names) = grammar_for(trust);
+    let (_, names) = grammar_for(trust);
+    let prompt = prompt_for(task, &names);
+    let (idx, steps) = choose_among(&prompt, &names, temperature)?;
+    let name = names[idx];
+    let mutates = sysbox::APPLETS
+        .iter()
+        .find(|a| a.name == name)
+        .map(|a| a.mutates)
+        .unwrap_or(false);
+    Some(Choice { applet: name, mutates, steps })
+}
+
+/// Decode one name from an explicit list, over a grammar that makes any other
+/// output unreachable. Returns `(chosen index, decode steps)`, or `None` when
+/// there is no engine or the decode did not settle.
+///
+/// **The one constrained-decode loop in this kernel.** `choose` builds a prompt
+/// from a trust level and wraps the index as a `Choice`; the arena passes its
+/// own mission-aware prompt and a vocabulary that is not the applet table at all
+/// (recon verbs, discovered hosts). Routing every decoder through here keeps the
+/// discipline in one place: invalid output is unreachable because the only exit
+/// is `Cursor::finished`, and the KV cache is invalidated on *both* exits, since
+/// it is equally overwritten whether the decode settled or not.
+pub fn choose_among(prompt: &str, names: &[&str], temperature: f32) -> Option<(usize, usize)> {
+    if names.is_empty() {
+        return None;
+    }
+    let grammar = Grammar::new(names.iter().copied());
     if grammar.is_empty() {
         return None;
     }
@@ -182,12 +209,7 @@ pub fn choose(task: &str, trust: Trust, temperature: f32) -> Option<Choice> {
 
     with_alphabet(|alphabet| {
         with_engine(|e| {
-            let prompt = prompt_for(task, &names);
-            let tokens = e.tok.encode(&prompt, true, false);
-
-            // Prefill: run the prompt through so the KV cache holds it. The
-            // logits from all but the last are discarded -- we are not
-            // predicting the prompt, only conditioning on it.
+            let tokens = e.tok.encode(prompt, true, false);
             let mut pos = 0usize;
             let limit = e.model.cfg.seq_len;
             for &t in tokens.iter() {
@@ -204,9 +226,6 @@ pub fn choose(task: &str, trust: Trust, temperature: f32) -> Option<Choice> {
 
             while steps < bound && idle <= MAX_LEADING_SPACES && pos < limit {
                 let candidates = cursor.candidates(alphabet);
-                // Empty means no token in the vocabulary can extend the string
-                // toward any alternative. With a byte-fallback vocabulary this
-                // should be impossible, so it is a bug rather than a refusal.
                 let next =
                     sample::sample_among(&e.state.logits, &candidates, temperature, 0.0, &mut e.rng)?;
 
@@ -217,21 +236,10 @@ pub fn choose(task: &str, trust: Trust, temperature: f32) -> Option<Choice> {
                 }
 
                 if let Some(idx) = cursor.finished() {
-                    let name = names[idx];
-                    let mutates = sysbox::APPLETS
-                        .iter()
-                        .find(|a| a.name == name)
-                        .map(|a| a.mutates)
-                        .unwrap_or(false);
-                    // On the way out of the success path too, not just the
-                    // failure one -- the cache is equally overwritten either
-                    // way, and only invalidating on failure would leave the
-                    // corruption in place exactly when it went well.
                     invalidate_conversation(e);
-                    return Some(Choice { applet: name, mutates, steps });
+                    return Some((idx, steps));
                 }
 
-                // Advance the model by the token it just committed to.
                 e.model.forward(&mut e.state, next, pos);
                 pos += 1;
             }
