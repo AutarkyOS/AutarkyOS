@@ -14,6 +14,7 @@
 
 use super::theme::{self, Rect};
 use super::{DeskApp, Framebuffer};
+use super::mindwin::dense;
 use crate::ai::agent;
 use alloc::string::String;
 use core::cell::Cell;
@@ -42,11 +43,46 @@ impl DeskApp for AgentLog {
 
     fn draw_in(&self, fb: &Framebuffer, client: Rect, _focused: bool) {
         theme::panel(fb, client);
-        let lh = theme::text_h();
+        // Log density, not chrome density. This window sits along the foot of
+        // the workspace where it is a tail being watched out of the corner of
+        // an eye, and at chrome scale a third of the screen held four lines of
+        // it. `mindwin::dense()` is the same decision for the same reason.
+        let lh = theme::text_h_at(dense()) + 2;
         let area = client.shrink(6);
+
+        // One line saying what the machine is doing, above the log of what it
+        // did. Both readings are in `glance`'s free tier and both were being
+        // computed every second and rendered nowhere -- `doing` reached only
+        // the terminal's status strip, and `journal`, which is the resident
+        // mind's own narration of why it woke up, reached nothing at all.
+        let head = crate::ai::glance::with_glance(|g| {
+            let what = crate::ai::glance::engine_line(g);
+            let mind = if g.mind_on { "mind on" } else { "mind off" };
+            (
+                alloc::format!("{}  |  {}  |  {} episode(s)", what, mind, g.episodes),
+                g.engine.is_some(),
+                g.journal.clone(),
+            )
+        });
+        theme::text_over_at(
+            fb,
+            area.x,
+            area.y,
+            &head.0,
+            if head.1 { theme::APERTURE } else { theme::TEXT_DIM },
+            dense(),
+        );
+        let area = Rect::new(area.x, area.y + lh + 2, area.w, area.h.saturating_sub(lh + 2));
         let rows = (area.h / lh.max(1)) as usize;
 
-        let lines = agent::log_snapshot();
+        // The episode log, or -- when there has never been an episode -- the
+        // journal, which is the machine's account of its own ticks. An empty
+        // window that says "no episode yet" while the mind has been narrating
+        // to itself for ten minutes is a window with its back turned.
+        let lines = match agent::log_snapshot() {
+            v if v.is_empty() => head.2,
+            v => v,
+        };
         // The draw pass owns the scroll clamp because only it knows how many
         // rows fit -- the same arrangement the ToDo window uses.
         let max_scroll = lines.len().saturating_sub(rows);
@@ -60,24 +96,17 @@ impl DeskApp for AgentLog {
                 break;
             }
             let shown = clip_line(&lines[i], area.w);
-            theme::text(
-                fb,
-                area.x,
-                area.y + (k as u32) * lh,
-                &shown,
-                theme::TEXT,
-                theme::FACE,
-            );
+            theme::text_over_at(fb, area.x, area.y + (k as u32) * lh, &shown, theme::TEXT, dense());
         }
 
         if lines.is_empty() {
-            theme::text(
+            theme::text_over_at(
                 fb,
                 area.x,
                 area.y,
-                "no episode yet -- run 'agent <goal>' at the shell",
+                "nothing has happened yet -- 'agent <goal>' at the shell",
                 theme::TEXT_DIM,
-                theme::FACE,
+                dense(),
             );
         }
     }
@@ -106,7 +135,7 @@ impl DeskApp for AgentLog {
 /// window and across the desktop behind it. Cut on the char boundary the
 /// width allows -- `theme::text_w` counts glyphs, so this is exact.
 fn clip_line(s: &str, max_w: u32) -> String {
-    let budget = (max_w / theme::text_w(1).max(1)) as usize;
+    let budget = (max_w / theme::text_w_at(1, dense()).max(1)) as usize;
     if s.chars().count() <= budget {
         return String::from(s);
     }
@@ -156,56 +185,67 @@ impl DeskApp for AuthorWin {
 
     fn draw_in(&self, fb: &Framebuffer, client: Rect, _focused: bool) {
         theme::panel(fb, client);
-        let lh = theme::text_h();
+        let lh = theme::text_h_at(dense()) + 2;
         let area = client.shrink(8);
         let mut y = area.y;
 
         let Some(p) = crate::ai::author::progress() else {
-            theme::text(fb, area.x, y, "nothing is being written", theme::TEXT_DIM, theme::FACE);
+            theme::text_over_at(fb, area.x, y, "nothing is being written", theme::TEXT_DIM, dense());
             self.stop.set(Rect::new(0, 0, 0, 0));
             return;
         };
 
-        theme::text(
+        // Every line in this panel is drawn at `dense()`, and the three above
+        // this comment were the exception until they were caught in a
+        // screenshot. `theme::text` draws at `CHROME_SCALE`, which is 2 and
+        // fixed; `lh` comes from `text_h_at(dense())`, which is 1 on anything
+        // shorter than 1000 pixels. So a 16-pixel line advanced by 10 and each
+        // one was written six pixels into the one above it -- on the GF63, in
+        // QEMU, and on every screen this project has ever been photographed
+        // on. The sibling window above says why the density is the panel's and
+        // not the chrome's; these lines simply never got the message when
+        // `dense()` arrived, and one line height for one scale is the only
+        // arrangement where that cannot happen again.
+        theme::text_over_at(
             fb,
             area.x,
             y,
             &alloc::format!("{} {}", if p.running { "writing" } else { "wrote" }, p.name),
             theme::TEXT,
-            theme::FACE,
+            dense(),
         );
         y += lh + lh / 2;
 
-        theme::text(
+        theme::text_over_at(
             fb,
             area.x,
             y,
             &alloc::format!("step {} of {}", p.step, p.budget),
             theme::TEXT,
-            theme::FACE,
+            dense(),
         );
         y += lh;
-        theme::text(
+        theme::text_over_at(
             fb,
             area.x,
             y,
             &alloc::format!("{} of {} clause(s) met", p.met, p.total),
             theme::TEXT,
-            theme::FACE,
+            dense(),
         );
         y += lh + lh / 2;
 
         // The verdict verbatim, wrapped rather than clipped. It is what the
         // loop itself is acting on, and the half that gets cut off is where
         // the line number lives.
-        theme::text(fb, area.x, y, "last check", theme::TEXT_DIM, theme::FACE);
+        theme::text_over_at(fb, area.x, y, "last check", theme::TEXT_DIM, dense());
         y += lh;
         // One character's width, asked for as the width of one character --
         // `text_w` measures a string rather than answering a constant.
-        let cw = theme::text_w(1).max(1);
+        let cw = theme::text_w_at(1, dense()).max(1);
         let cols = (area.w / cw).max(8) as usize;
         for chunk in wrap(&p.last, cols).iter().take(3) {
-            theme::text(fb, area.x, y, chunk, theme::TEXT, theme::FACE);
+            theme::text_over_at(fb, area.x, y, chunk, theme::TEXT, dense());
             y += lh;
         }
 
@@ -213,7 +253,7 @@ impl DeskApp for AuthorWin {
         if p.running {
             let bw = 90u32.min(area.w);
             let r = Rect::new(area.x, area.y + area.h.saturating_sub(lh + 10), bw, lh + 8);
-            theme::button(fb, r, "Stop", false, false);
+            theme::button_at(fb, r, "Stop", false, false, dense());
             self.stop.set(r);
         } else {
             self.stop.set(Rect::new(0, 0, 0, 0));

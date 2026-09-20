@@ -1,0 +1,235 @@
+// Plane geometry over exact coordinates.
+//
+//   use "/lib/geom"
+//
+// Everything here is exact, and what makes that possible is a choice about
+// which questions to answer. A polygon with rational vertices has a rational
+// *area*, a rational *centroid*, and rational *intersections* -- but its side
+// lengths are square roots and its angles are transcendental. So this answers
+// the first kind and refuses to pretend about the second: `dist2` is here and
+// `dist` is not, because the distance between (0,0) and (1,1) is not a number
+// this library can hold and returning 1.414 would be the one lie in the file.
+//
+// **The predicates are the point.** `cross` uses no division at all, so its
+// sign is exact, and every decision below is that sign: whether three points
+// turn left, whether a polygon is wound clockwise, which side of a line a
+// point falls on, and which points are on the hull. Those are exactly the
+// decisions floating point gets wrong -- a hull built on rounded orientation
+// tests can contradict itself, reporting a vertex both inside and outside, and
+// the failure looks like a bug in the algorithm rather than in the arithmetic.
+
+rec Pt { x, y }
+
+// The z of the cross product of OA and OB. Positive when O -> A -> B turns
+// left, zero when the three are collinear, negative when it turns right.
+//
+// No division anywhere, so with whole coordinates this is a whole number and
+// its sign is beyond argument. Every predicate in this file is this sign.
+fn cross(o, a, b) {
+  return (a.x - o.x) * (b.y - o.y) - (a.y - o.y) * (b.x - o.x)
+}
+
+fn collinear(a, b, c): int {
+  return cross(a, b, c) == 0
+}
+
+// Which side of the directed line a -> b the point c falls on: 1 left,
+// -1 right, 0 on it.
+fn side(a, b, c): int {
+  t = cross(a, b, c)
+  if (t > 0) { return 1 }
+  if (t < 0) { return -1 }
+  return 0
+}
+
+// Twice the signed area of a polygon, by the shoelace sum.
+//
+// Twice, and returned as such, because the doubled value is a whole number
+// whenever the coordinates are -- so a caller that only needs to compare two
+// areas, or to read a winding direction from the sign, never has to touch a
+// fraction at all. Positive is counter-clockwise.
+fn area2(poly) {
+  n = len(poly)
+  if (n < 3) { return 0 }
+  s = 0
+  i = 0
+  while (i < n) {
+    a = get(poly, i)
+    b = get(poly, (i + 1) % n)
+    s = s + a.x * b.y - b.x * a.y
+    i = i + 1
+  }
+  return s
+}
+
+// The area, exactly.
+//
+// The halving is the whole reason this is worth having: the triangle
+// (0,0) (1,0) (0,1) has area 1/2, and in whole-number arithmetic that is 0.
+// A library that answered 0 for the area of a triangle would be wrong in the
+// first thing anybody asked it.
+// `abs` refused a fraction when this was written, so there was a hand-written
+// `absv` here with `0 - x` inside it -- unary minus went through `as_int` too.
+// Both were gaps in the language papered over by a library, which is how a gap
+// survives. Both are fixed, and this is what is left.
+fn area(poly) {
+  return rat(abs(area2(poly)), 2)
+}
+
+fn clockwise(poly): int {
+  return area2(poly) < 0
+}
+
+// The centroid of a polygon's *area*, which is not the mean of its vertices.
+// Exact, because it is a ratio of polynomials in the coordinates.
+fn centroid(poly) {
+  n = len(poly)
+  a2 = area2(poly)
+  // A polygon with no area has no centroid, and `Pt(0, 0)` would be a real
+  // point somebody could use. Nothing, as above.
+  if (a2 == 0) { return }
+  cx = 0
+  cy = 0
+  i = 0
+  while (i < n) {
+    p = get(poly, i)
+    q = get(poly, (i + 1) % n)
+    w = p.x * q.y - q.x * p.y
+    cx = cx + (p.x + q.x) * w
+    cy = cy + (p.y + q.y) * w
+    i = i + 1
+  }
+  return Pt(rat(cx, 3 * a2), rat(cy, 3 * a2))
+}
+
+fn mid(a, b) {
+  return Pt(rat(a.x + b.x, 2), rat(a.y + b.y, 2))
+}
+
+// The *square* of the distance. See the header: the distance itself is not a
+// rational and this file does not hold one. Squared distances compare, sort
+// and test for equality exactly as distances do, which covers most of what a
+// distance is actually wanted for.
+fn dist2(a, b) {
+  dx = a.x - b.x
+  dy = a.y - b.y
+  return dx * dx + dy * dy
+}
+
+// Where the line through a,b meets the line through c,d.
+//
+// Exact, and that is not a small claim: two lines with whole-number endpoints
+// meet at a point with rational coordinates, and computing it in floating
+// point gives a point that lies on neither line. Answers nil when they are
+// parallel, which includes the case where they are the same line -- "they
+// meet everywhere" and "they never meet" are both "there is no such point".
+fn meet(a, b, c, d) {
+  rx = b.x - a.x
+  ry = b.y - a.y
+  sx = d.x - c.x
+  sy = d.y - c.y
+  den = rx * sy - ry * sx
+  // A bare return, which the language answers as nothing. `stat` already uses
+  // that for a path with no file; there is no `nil` to write as a literal and
+  // inventing a sentinel point would be a lie a caller could not detect.
+  if (den == 0) { return }
+  t = rat((c.x - a.x) * sy - (c.y - a.y) * sx, den)
+  return Pt(a.x + t * rx, a.y + t * ry)
+}
+
+// Is the point inside the polygon? Ray casting: count the edges a rightward
+// ray crosses, and an odd count is inside.
+//
+// The crossing height is computed exactly, so a point that sits precisely on
+// a vertex or an edge is decided by the comparison rather than by whichever
+// way the rounding fell -- which is the case every floating-point version of
+// this gets wrong and the case test data is always full of.
+fn inside(poly, p): int {
+  n = len(poly)
+  c = 0
+  i = 0
+  j = n - 1
+  while (i < n) {
+    a = get(poly, i)
+    b = get(poly, j)
+    if ((a.y > p.y) != (b.y > p.y)) {
+      xc = a.x + rat((p.y - a.y) * (b.x - a.x), b.y - a.y)
+      if (p.x < xc) { c = c + 1 }
+    }
+    j = i
+    i = i + 1
+  }
+  return c % 2
+}
+
+// Order by x, then by y. The sort the hull below needs.
+fn ptless(a, b): int {
+  if (a.x < b.x) { return 1 }
+  if (a.x > b.x) { return 0 }
+  if (a.y < b.y) { return 1 }
+  return 0
+}
+
+fn bypos(pts) {
+  out = pts
+  n = len(out)
+  i = 0
+  while (i < n) {
+    m = i
+    j = i + 1
+    while (j < n) {
+      if (ptless(get(out, j), get(out, m))) { m = j }
+      j = j + 1
+    }
+    if (m != i) {
+      t = get(out, i)
+      out = set(out, i, get(out, m))
+      out = set(out, m, t)
+    }
+    i = i + 1
+  }
+  return out
+}
+
+// The convex hull, counter-clockwise, by Andrew's monotone chain.
+//
+// **This is the algorithm that most wants exact arithmetic.** Every decision
+// it makes is the sign of `cross` and nothing else, so with exact coordinates
+// the hull is exactly right. With rounded ones a near-collinear triple can
+// answer left here and right there, and the chain then builds a "hull" that is
+// not convex -- a failure that reads as a broken implementation and is not
+// one. Nothing is approximated here, so nothing can disagree with itself.
+//
+// Collinear points on an edge are dropped, because `cross == 0` pops: a hull
+// is its corners.
+fn hull(pts) {
+  n = len(pts)
+  if (n < 3) { return pts }
+  s = bypos(pts)
+  h = list()
+  i = 0
+  while (i < n) {
+    p = get(s, i)
+    while (len(h) > 1 && cross(get(h, len(h) - 2), get(h, len(h) - 1), p) <= 0) {
+      h = remove(h, len(h) - 1)
+    }
+    h = push(h, p)
+    i = i + 1
+  }
+  // The upper chain may not eat into the lower one, which is what the floor
+  // of `lower` protects. Taken after the lower chain is finished, never
+  // before.
+  lower = len(h) + 1
+  i = n - 2
+  while (i >= 0) {
+    p = get(s, i)
+    while (len(h) >= lower && cross(get(h, len(h) - 2), get(h, len(h) - 1), p) <= 0) {
+      h = remove(h, len(h) - 1)
+    }
+    h = push(h, p)
+    i = i - 1
+  }
+  // The chain closes on the point it started from, and a hull is a cycle
+  // rather than a closed path, so the repeat comes off.
+  return remove(h, len(h) - 1)
+}

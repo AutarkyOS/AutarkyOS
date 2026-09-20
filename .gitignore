@@ -37,6 +37,19 @@ update.key
 # Supabase CLI scratch, rewritten on every invocation.
 supabase/.temp/
 
-# The miner and the compute pool it runs on live on exp/xpu. Checking that
-# branch out and building it must not leave this one's status dirty.
-cuda/
+# The pool is its own workspace, so its build directory is its own too.
+# `/target` above is anchored at the repository root and does not reach it.
+pool/target
+
+# The miner is its own workspace, and nvcc build products are artefacts.
+#
+# `cuda/` was ignored wholesale until now, on the reason that the GPU work
+# lived only on exp/xpu and checking that branch out must not leave this one
+# dirty. That stopped being true when `miner/` started needing `cuda/xpu.cu`
+# to build: a source the tree depends on cannot be a file the tree ignores.
+# Only the artefacts nvcc emits are ignored now.
+miner/target
+cuda/*.exe
+cuda/*.exp
+cuda/*.lib
+cuda/*.pdb

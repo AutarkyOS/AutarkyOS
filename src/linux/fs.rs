@@ -1,0 +1,643 @@
+//! A POSIX view of a namespace that is not one.
+//!
+//! `sysbox::tree` says it plainly in its own header: the namespace is "not a
+//! filesystem in any sense a POSIX program would recognise". It is a
+//! content-addressed Merkle tree where a copy is O(1), a snapshot is a hash,
+//! and `rm` detaches a name rather than destroying anything. None of that has
+//! an `open`.
+//!
+//! A Linux program has the opposite set of expectations: a path resolves to an
+//! inode, an inode has a size and a mode, a descriptor is a small integer with
+//! a cursor in it, and reading advances the cursor. This module is the
+//! translation, and it is a *view* rather than a second store. Nothing here
+//! owns any bytes; every read goes to the tree and every listing comes from
+//! `sysbox::listing`.
+//!
+//! ### What is deliberately simplified, and what it costs
+//!
+//! **An open file holds its whole contents.** `read_blob` answers a `Vec`, so
+//! the honest options were to keep that or to teach the store ranged reads.
+//! Keeping it makes `read` a slice and `lseek` an integer, and it means a
+//! guest opening a 600 MB model file would take 600 MB of heap. Files a guest
+//! reads today are configuration and text. When that stops being true this is
+//! the first thing to change, and it is written down here rather than
+//! discovered by an allocation failure.
+//!
+//! **There are no permissions, owners or times.** Everything reports mode 0644
+//! or 0755, uid 0, and a zero timestamp. A program that branches on any of
+//! those gets a consistent answer rather than a true one, which is the right
+//! trade while the alternative is inventing a field the store does not have.
+//!
+//! **There are no links, no devices and no `..`.** `resolve` walks names
+//! forward. A path containing `..` is refused rather than normalised, because
+//! a tree with O(1) copies has no single parent to walk back to.
+
+use alloc::rc::Rc;
+use alloc::string::{String, ToString};
+use alloc::vec::Vec;
+use core::cell::RefCell;
+
+/// The one subtree a guest may write to.
+///
+/// **Writes were refused everywhere and that stopped being the right answer.**
+/// The reason given was sound: a write to a content-addressed store is a new
+/// root hash, so an unrestricted `O_WRONLY` hands a guest binary a route to the
+/// namespace that goes around every gate `sysbox` puts in front of the shell.
+/// What it argued for was a jail rather than a refusal, and `mkdir` failing was
+/// the measurement that made that concrete.
+///
+/// `/tmp` because that is already the scratch area: it is where `fat get` puts
+/// what it fetches and where a guest's own binary lives. Everything else is
+/// `EROFS`, which is the errno for exactly this and which every program already
+/// knows how to report.
+pub const WRITE_ROOT: &str = "/tmp";
+
+/// Whether a resolved path is inside the writable subtree.
+///
+/// Checked on the *resolved* path rather than the one the guest typed, so a
+/// relative path cannot climb out by being written differently. `resolve`
+/// refuses `..` outright, which is what makes one check enough.
+pub fn writable(path: &str) -> bool {
+    path == WRITE_ROOT || path.starts_with("/tmp/")
+}
+
+/// `AT_FDCWD`, the descriptor that means "relative to the working directory".
+pub const AT_FDCWD: i64 = -100;
+
+/// What a descriptor refers to.
+///
+/// The three standard ones are not files and never become files, which is why
+/// they are variants rather than an entry in the table with a magic path: a
+/// guest that `lseek`s on stdout should get `ESPIPE` from the type system
+/// rather than from a path comparison.
+pub struct File {
+    pub path: String,
+    pub data: Vec<u8>,
+    pub at: usize,
+    /// Whether this description may be written through.
+    pub writable: bool,
+    /// Set the moment a write lands, cleared when the blob is committed.
+    ///
+    /// Writes buffer here and go to the store on the last `close` rather than
+    /// per call, because a store keyed by content rewrites the whole blob and
+    /// gives it a new address: a program writing a kilobyte one byte at a time
+    /// would produce a thousand objects and a thousand hashes of everything
+    /// before them.
+    pub dirty: bool,
+}
+
+/// What a socket descriptor holds.
+///
+/// The connection is an `Option` because `socket` and `connect` are two calls:
+/// a descriptor exists before it names anything, and a program is entitled to
+/// close one it never connected. `None` after a close as well, so a second
+/// close is `EBADF` rather than a second teardown of a handle the table has
+/// already given to somebody else.
+pub struct Sock {
+    pub conn: Option<crate::net::tcp::Handle>,
+}
+
+pub struct Dir {
+    pub path: String,
+    /// Name, whether it is a directory, and size. Snapshotted at `open`,
+    /// because a directory that changed under a half-finished `getdents64`
+    /// would hand the guest a shifting list and there is no cursor the tree
+    /// could offer instead.
+    pub entries: Vec<(String, bool, usize)>,
+    pub at: usize,
+}
+
+/// What a descriptor refers to.
+///
+/// The three standard ones are not files and never become files, which is why
+/// they are variants rather than an entry in the table with a magic path: a
+/// guest that `lseek`s on stdout should get `ESPIPE` from the type system
+/// rather than from a path comparison.
+///
+/// **The body is behind an `Rc<RefCell<..>>` and that is what makes `dup`
+/// correct.** On Linux a duplicated descriptor shares one *open file
+/// description*, so the two numbers share a cursor: reading through one
+/// advances the other. The body used to live inside the `Fd`, so `dup` could
+/// only copy it, and two independent cursors is a program reading everything
+/// twice. It was refused rather than got wrong, which was the right call and
+/// still cost a real applet: `hexdump` does `dup2(fd, 0)` to read its file as
+/// stdin, and got `ENOSYS`.
+///
+/// `Rc` and not `Arc` for the reason `Interp` gives about its functions: one
+/// guest, one task, nothing crossing a core.
+/// Cloning one **shares** the open file description rather than copying it,
+/// which is what every variant holding an `Rc` already means and what `fork`
+/// needs: a parent and child that shared a cursor before the fork go on
+/// sharing it, so a child that reads advances the parent's offset, exactly as
+/// Linux has it.
+#[derive(Clone)]
+pub enum Fd {
+    Stdin,
+    Stdout,
+    Stderr,
+    File(Rc<RefCell<File>>),
+    Dir(Rc<RefCell<Dir>>),
+    /// Behind the same refcount as a file, and for the same reason: `dup2` on
+    /// a socket is how a program puts one on stdin, and two descriptors have
+    /// to name one connection rather than two copies of a handle.
+    Socket(Rc<RefCell<Sock>>),
+    /// A `AF_UNIX` socket: the state, and which end of a connection it is
+    /// once it has one.
+    ///
+    /// The side lives beside the socket rather than inside it because a
+    /// `Sock::Stream` and its side are two facts with one lifetime, and
+    /// `accept` produces a descriptor whose socket is brand new while
+    /// `connect` mutates one that already existed.
+    Unix(Rc<RefCell<crate::linux::unix::Sock>>),
+    /// One end of a pipe.
+    ///
+    /// The transport underneath is a Unix socket's, with one direction taken
+    /// away -- and taking it away is the whole difference. Reading the write
+    /// end is `EBADF` rather than an empty read, because a program handed zero
+    /// there would conclude the pipeline had finished.
+    ///
+    /// Behind an `Rc` for the reason a socket is: `dup` makes a second name
+    /// for one end, and end-of-file has to wait for the last of them.
+    Pipe(Rc<RefCell<PipeEnd>>),
+    /// An `epoll` set, which is a descriptor naming a list of descriptors.
+    Epoll(Rc<RefCell<crate::linux::epoll::Epoll>>),
+    /// An anonymous file made by `memfd_create`.
+    Memfd(Rc<RefCell<Memfd>>),
+    /// A `/dev` node, which is a function rather than a body of bytes.
+    ///
+    /// Deliberately not a `File` with contents. `/dev/zero` is infinite and
+    /// `/dev/fb0` is several megabytes of the display's own memory, so the
+    /// `Vec` a `File` carries would be either impossible or a copy of the
+    /// screen that nobody scans out.
+    Dev(Rc<RefCell<DevFile>>),
+}
+
+/// An open `/dev` node and where its cursor sits.
+///
+/// The cursor is shared through the `Rc` for the reason a file's is: `dup`
+/// makes a second name for one open file description, and a framebuffer
+/// program that writes a frame through two descriptors must not write the top
+/// half twice.
+/// An anonymous file: bytes with a size and a cursor, and no name in the store.
+///
+/// **This is the one file a guest may map shared and writable**, and the
+/// reason is the one `/dev/fb0` gives rather than an exception to it. Every
+/// other file here refuses `MAP_SHARED | PROT_WRITE` because writing back into
+/// a content-addressed store is a new root hash per modified page. A memfd is
+/// not in the store: it is heap pages that live and die with the descriptor,
+/// so the objection simply does not apply.
+///
+/// That matters beyond tidiness. It is how a Wayland client hands a
+/// compositor a buffer -- create, size, map, draw, pass the descriptor over a
+/// socket -- and every one of those steps except the last already existed.
+pub struct Memfd {
+    pub name: String,
+    /// Page-aligned backing, zero until `ftruncate` sizes it.
+    ///
+    /// Aligned from the start because a shared mapping hands out *these* pages:
+    /// this kernel is identity mapped, so "map this file here" is "give the
+    /// guest this address and open the U bit", exactly as the framebuffer
+    /// does. A `Vec` would be neither aligned nor pinned, and a reallocation
+    /// under a live mapping would leave the guest writing into freed memory.
+    pub at: u64,
+    pub len: usize,
+    pub cursor: usize,
+    /// How many live mappings there are. A resize while any exists is refused.
+    pub maps: usize,
+}
+
+impl Memfd {
+    /// The bytes, as a slice.
+    ///
+    /// # Safety
+    /// `at` and `len` describe a live allocation this structure owns, and the
+    /// identity map means the address is directly readable.
+    pub fn bytes(&self) -> &[u8] {
+        if self.len == 0 {
+            return &[];
+        }
+        unsafe { core::slice::from_raw_parts(self.at as *const u8, self.len) }
+    }
+
+    pub fn bytes_mut(&mut self) -> &mut [u8] {
+        if self.len == 0 {
+            return &mut [];
+        }
+        unsafe { core::slice::from_raw_parts_mut(self.at as *mut u8, self.len) }
+    }
+}
+
+/// One end of a pipe, and which end it is.
+pub struct PipeEnd {
+    pub pipe: Rc<RefCell<crate::linux::unix::Pipe>>,
+    pub writing: bool,
+    /// Whether a read that would wait answers `EAGAIN` instead.
+    ///
+    /// Per end rather than per descriptor, because `fcntl` sets it on the open
+    /// file description and `dup` makes a second name for that one thing.
+    pub nonblock: bool,
+}
+
+pub struct DevFile {
+    pub path: String,
+    pub node: super::dev::Node,
+    /// A byte offset for the framebuffer and an event sequence number for an
+    /// input device.
+    ///
+    /// One field with two meanings, which is the sort of thing this tree
+    /// normally splits. It stays one because the two never coexist on a
+    /// descriptor and because `lseek` is the only caller that could confuse
+    /// them, and `lseek` on an input device is refused for saying so.
+    pub at: usize,
+    /// Whether a read that has nothing to give answers `EAGAIN` rather than
+    /// waiting.
+    ///
+    /// Kept per description rather than per node, because two programs can
+    /// hold the same device open with different ideas about blocking and
+    /// `dup` has to carry the flag along with the cursor.
+    pub nonblock: bool,
+}
+
+impl Fd {
+    pub fn is_dir(&self) -> bool {
+        matches!(self, Fd::Dir(_))
+    }
+
+    /// A second name for the same open file description.
+    ///
+    /// The whole of `dup`: the streams have no state to share so they copy,
+    /// and everything else hands out another reference to one body.
+    /// Which side of the transport this end of a pipe drives.
+    ///
+    /// The writer is `A`, so its bytes land in the queue the reader drains and
+    /// the two never share a direction. One function rather than the mapping
+    /// written out at each of the four call sites, because a pipe that read
+    /// and wrote the same queue would work perfectly against itself and
+    /// deliver nothing to the other end.
+    pub fn pipe_side(writing: bool) -> crate::linux::unix::Side {
+        if writing {
+            crate::linux::unix::Side::A
+        } else {
+            crate::linux::unix::Side::B
+        }
+    }
+
+    pub fn share(&self) -> Fd {
+        match self {
+            Fd::Stdin => Fd::Stdin,
+            Fd::Stdout => Fd::Stdout,
+            Fd::Stderr => Fd::Stderr,
+            Fd::File(b) => Fd::File(b.clone()),
+            Fd::Dir(b) => Fd::Dir(b.clone()),
+            Fd::Socket(b) => Fd::Socket(b.clone()),
+            // Another name for one end, which is what `dup` on a socket means
+            // everywhere: two descriptors, one connection.
+            Fd::Unix(b) => Fd::Unix(b.clone()),
+            Fd::Pipe(b) => Fd::Pipe(b.clone()),
+            Fd::Epoll(b) => Fd::Epoll(b.clone()),
+            Fd::Memfd(b) => Fd::Memfd(b.clone()),
+            Fd::Dev(b) => Fd::Dev(b.clone()),
+        }
+    }
+
+    /// Commit a written file, if this is the last name for it.
+    ///
+    /// Answers whether anything was written. The `Rc` count is the test: while
+    /// another descriptor still names this body the bytes are not final, and
+    /// committing early would publish a half-written file under a hash that
+    /// the next write immediately invalidates.
+    pub fn flush(&self) -> bool {
+        // A socket's "flush" is closing its connection, and it happens on the
+        // last descriptor naming it for the same reason a file's write does:
+        // a `dup`ed socket closed once is still open.
+        if let Fd::Socket(b) = self {
+            if Rc::strong_count(b) > 1 {
+                return false;
+            }
+            if let Some(h) = b.borrow_mut().conn.take() {
+                crate::net::tcp::close_at(h, 300);
+                return true;
+            }
+            return false;
+        }
+        // **A Unix socket's close never reached its transport, and that was a
+        // real bug rather than an omission.** The descriptor went away and the
+        // `Rc` dropped, but nothing set the far end's flag, so the peer went
+        // on believing the connection was open: a reader on the other side got
+        // `EAGAIN` forever where it was owed a zero. Nothing had noticed
+        // because every fixture so far closed both ends by exiting, and
+        // teardown frees the whole table at once.
+        if let Fd::Unix(b) = self {
+            if Rc::strong_count(b) > 1 {
+                return false;
+            }
+            if let crate::linux::unix::Sock::Stream { pipe, side } = &*b.borrow() {
+                crate::linux::unix::close(pipe, *side);
+                return true;
+            }
+            return false;
+        }
+        // The same for a pipe, where it is not a nicety: end of file *is* the
+        // protocol. `cat f | head` finishes because the writer's close is what
+        // the reader sees, and a reader that never sees it hangs holding a
+        // pipeline nobody will write to again.
+        if let Fd::Pipe(b) = self {
+            if Rc::strong_count(b) > 1 {
+                return false;
+            }
+            let end = b.borrow();
+            crate::linux::unix::close(&end.pipe, Fd::pipe_side(end.writing));
+            return true;
+        }
+        let Fd::File(b) = self else { return false };
+        if Rc::strong_count(b) > 1 {
+            return false;
+        }
+        let mut f = b.borrow_mut();
+        if !f.dirty || !f.writable {
+            return false;
+        }
+        f.dirty = false;
+        let data = f.data.clone();
+        crate::sysbox::write_blob(&f.path, data)
+    }
+}
+
+/// Resolve a guest path against a working directory.
+///
+/// Answers `None` for anything with a `..` in it. The tree has O(1) copies and
+/// no single parent, so walking back up is not a question it can answer, and
+/// silently normalising the path would resolve to somewhere the guest did not
+/// name.
+pub fn resolve(cwd: &str, path: &str) -> Option<String> {
+    if path.split('/').any(|c| c == "..") {
+        return None;
+    }
+    let joined = if path.starts_with('/') {
+        path.to_string()
+    } else {
+        let mut s = String::from(cwd);
+        if !s.ends_with('/') {
+            s.push('/');
+        }
+        s.push_str(path);
+        s
+    };
+    // Collapse `.` and empty components so `/a//./b` is `/a/b`.
+    let mut out = String::from("/");
+    for c in joined.split('/') {
+        if c.is_empty() || c == "." {
+            continue;
+        }
+        if out.len() > 1 {
+            out.push('/');
+        }
+        out.push_str(c);
+    }
+    Some(out)
+}
+
+/// `S_IFREG | 0644`.
+pub const MODE_FILE: u32 = 0o100_644;
+/// `S_IFDIR | 0755`.
+pub const MODE_DIR: u32 = 0o040_755;
+/// `S_IFIFO | 0600`, which is what the standard three are here.
+///
+/// They were reported as empty regular files, under a comment saying that
+/// reporting them as empty regular files is what makes a program believe
+/// stdout is seekable. The comment was right and was describing the code
+/// beside it. A pipe is the shape that agrees with the rest of this module:
+/// `lseek` on one answers `ESPIPE`, `read` on stdin answers zero forever, and
+/// libc picks full buffering for it, all of which are true here.
+pub const MODE_FIFO: u32 = 0o010_600;
+/// `S_IFCHR` plus 0666, which is what `/dev/null` and `/dev/fb0` carry on a
+/// real system. Writable in the mode bits because they genuinely are, and this
+/// module has no owners to check it against anyway.
+pub const MODE_CHAR: u32 = 0o020_666;
+
+/// What kind of thing a `stat` is describing.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum Kind {
+    File,
+    Dir,
+    Fifo,
+    /// A character device, which is what everything under `/dev` is.
+    ///
+    /// It has to be its own kind rather than a regular file of size zero,
+    /// because that is precisely how a program decides whether to `mmap` a
+    /// thing or read it: `S_ISCHR` is the test SDL and every framebuffer
+    /// program makes before touching `/dev/fb0`, and a driver reporting a
+    /// regular file gets skipped.
+    Char,
+}
+
+impl Kind {
+    pub fn mode(self) -> u32 {
+        match self {
+            Kind::File => MODE_FILE,
+            Kind::Dir => MODE_DIR,
+            Kind::Fifo => MODE_FIFO,
+            Kind::Char => MODE_CHAR,
+        }
+    }
+}
+
+/// Linux's `struct stat` for x86-64, filled in as far as this store can.
+///
+/// 144 bytes, and the layout is fixed by the ABI rather than chosen. Writing
+/// it a field short is not a smaller answer, it is a different structure, and
+/// libc reads past the end of what was written.
+pub fn stat_bytes(kind: Kind, size: usize, ino: u64) -> [u8; 144] {
+    let mut b = [0u8; 144];
+    let put64 = |b: &mut [u8; 144], at: usize, v: u64| {
+        b[at..at + 8].copy_from_slice(&v.to_le_bytes());
+    };
+    let put32 = |b: &mut [u8; 144], at: usize, v: u32| {
+        b[at..at + 4].copy_from_slice(&v.to_le_bytes());
+    };
+    put64(&mut b, 0, 1); // st_dev
+    put64(&mut b, 8, ino); // st_ino
+    put64(&mut b, 16, 1); // st_nlink
+    put32(&mut b, 24, kind.mode());
+    put32(&mut b, 28, 0); // st_uid
+    put32(&mut b, 32, 0); // st_gid
+    put64(&mut b, 48, size as u64); // st_size
+    put64(&mut b, 56, 4096); // st_blksize
+    // Blocks are 512-byte units and libc's `du`-shaped callers divide by that
+    // rather than by st_blksize, so a file of one byte is one block.
+    put64(&mut b, 64, size.div_ceil(512) as u64);
+    b
+}
+
+/// One `linux_dirent64`, appended to `out`. Answers false when it will not fit.
+///
+/// The record length is padded to eight because the kernel does, and a guest
+/// walking the buffer adds `d_reclen` to its cursor. An unpadded record leaves
+/// the next one misaligned and the guest reads a name out of the middle of an
+/// inode.
+pub fn dirent(out: &mut Vec<u8>, room: usize, ino: u64, next: u64, is_dir: bool, name: &str) -> bool {
+    let len = (19 + name.len() + 1).next_multiple_of(8);
+    if out.len() + len > room {
+        return false;
+    }
+    let start = out.len();
+    out.extend_from_slice(&ino.to_le_bytes());
+    // `d_off` is the cursor a later `lseek` would restore to reach the *next*
+    // entry, and here the cursor is an entry index rather than a byte offset.
+    // It was the offset of the next record inside this buffer, which is a
+    // number that means nothing outside the one call that produced it -- so
+    // `telldir` would hand back a position `seekdir` could not use, and the
+    // two would disagree silently.
+    out.extend_from_slice(&next.to_le_bytes());
+    out.extend_from_slice(&(len as u16).to_le_bytes());
+    out.push(if is_dir { 4 } else { 8 }); // DT_DIR / DT_REG
+    out.extend_from_slice(name.as_bytes());
+    out.push(0);
+    while out.len() < start + len {
+        out.push(0);
+    }
+    true
+}
+
+/// A stable-ish inode number for a path.
+///
+/// The tree has no inodes. Programs use the number to tell two paths apart and
+/// to spot hard links, so a hash of the path answers both: distinct paths get
+/// distinct numbers, and the same path gets the same number twice running.
+/// Zero is avoided because some callers treat it as absent.
+pub fn ino_of(path: &str) -> u64 {
+    let h = crate::store::sha256::hash(path.as_bytes());
+    let n = u64::from_le_bytes([h[0], h[1], h[2], h[3], h[4], h[5], h[6], h[7]]);
+    n | 1
+}
+
+/// What `diag linux` asks of the projection.
+pub fn checks() -> Vec<(&'static str, bool)> {
+    let mut out = Vec::new();
+
+    out.push((
+        "an absolute path ignores the working directory",
+        resolve("/ai", "/tmp/x").as_deref() == Some("/tmp/x"),
+    ));
+    out.push((
+        "a relative path joins onto it",
+        resolve("/ai", "notes").as_deref() == Some("/ai/notes"),
+    ));
+    out.push((
+        "doubled and dotted separators collapse",
+        resolve("/", "/a//./b/").as_deref() == Some("/a/b"),
+    ));
+    out.push((
+        "a path that walks upwards is refused rather than normalised",
+        resolve("/ai", "../etc/passwd").is_none() && resolve("/", "a/../b").is_none(),
+    ));
+    out.push((
+        "the root resolves to itself",
+        resolve("/", "/").as_deref() == Some("/") && resolve("/", "").as_deref() == Some("/"),
+    ));
+
+    // The stat block is an ABI, so its size and the fields a program actually
+    // branches on are asserted rather than assumed.
+    let f = stat_bytes(Kind::File, 1234, 7);
+    let d = stat_bytes(Kind::Dir, 0, 9);
+    let s3 = stat_bytes(Kind::Fifo, 0, 1);
+    out.push(("a stat block is the 144 bytes the ABI fixes", f.len() == 144));
+    let mode = |b: &[u8; 144]| u32::from_le_bytes([b[24], b[25], b[26], b[27]]);
+    out.push((
+        "st_mode says regular or directory, and st_size is where libc looks",
+        mode(&f) == MODE_FILE
+            && mode(&d) == MODE_DIR
+            && u64::from_le_bytes(f[48..56].try_into().unwrap()) == 1234,
+    ));
+    out.push((
+        "the standard three are pipes, which is what agrees with ESPIPE on them",
+        mode(&s3) == MODE_FIFO && mode(&s3) != MODE_FILE,
+    ));
+    out.push((
+        "a one-byte file is one 512-byte block, since that is the unit callers divide by",
+        u64::from_le_bytes(stat_bytes(Kind::File, 1, 1)[64..72].try_into().unwrap()) == 1,
+    ));
+
+    // Directory entries, and the padding a guest's cursor depends on.
+    let mut buf = Vec::new();
+    let ok1 = dirent(&mut buf, 4096, 1, 1, true, "ai");
+    let first = buf.len();
+    let ok2 = dirent(&mut buf, 4096, 2, 2, false, "a-rather-longer-name.txt");
+    out.push(("two entries fit and both are eight-byte multiples", ok1 && ok2 && first % 8 == 0 && buf.len() % 8 == 0));
+    out.push((
+        "the record length in the first entry steps exactly to the second",
+        u16::from_le_bytes([buf[16], buf[17]]) as usize == first,
+    ));
+    out.push((
+        "d_off is the cursor that reaches the next entry, not a place in this buffer",
+        u64::from_le_bytes(buf[8..16].try_into().unwrap()) == 1
+            && u64::from_le_bytes(buf[first + 8..first + 16].try_into().unwrap()) == 2,
+    ));
+    out.push((
+        "the type byte separates a directory from a file",
+        buf[18] == 4 && buf[first + 18] == 8,
+    ));
+    out.push((
+        "an entry that will not fit is refused rather than truncated",
+        !dirent(&mut Vec::new(), 8, 1, 1, false, "toolong"),
+    ));
+    out.push((
+        "and a room of zero refuses without touching the buffer",
+        {
+            let mut v = Vec::new();
+            !dirent(&mut v, 0, 1, 1, false, "x") && v.is_empty()
+        },
+    ));
+
+    out.push((
+        "an inode number is stable for a path and different between paths",
+        ino_of("/a") == ino_of("/a") && ino_of("/a") != ino_of("/b") && ino_of("/a") != 0,
+    ));
+
+    out.push((
+        "the writable subtree is /tmp and its own name, and nothing above it",
+        writable("/tmp")
+            && writable("/tmp/x")
+            && writable("/tmp/a/b")
+            && !writable("/")
+            && !writable("/ai/about")
+            && !writable("/tmpish"),
+    ));
+    out.push((
+        "two names for one body share a cursor, which is the whole of dup",
+        {
+            let a = Fd::File(Rc::new(RefCell::new(File {
+                path: String::from("/tmp/x"),
+                data: alloc::vec![1, 2, 3, 4],
+                at: 0,
+                writable: false,
+                dirty: false,
+            })));
+            let b = a.share();
+            if let Fd::File(f) = &a {
+                f.borrow_mut().at = 3;
+            }
+            matches!(&b, Fd::File(f) if f.borrow().at == 3)
+        },
+    ));
+    out.push((
+        "and a stream shares nothing, since it has no cursor to disagree about",
+        matches!(Fd::Stdout.share(), Fd::Stdout),
+    ));
+    out.push((
+        "a body with another name outstanding does not commit yet",
+        {
+            let a = Fd::File(Rc::new(RefCell::new(File {
+                path: String::from("/tmp/never-written"),
+                data: Vec::new(),
+                at: 0,
+                writable: true,
+                dirty: true,
+            })));
+            let _b = a.share();
+            // Two names, so the flush declines and nothing reaches the store.
+            !a.flush()
+        },
+    ));
+    out
+}

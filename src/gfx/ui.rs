@@ -624,6 +624,7 @@ pub fn parse_keys(spec: &str) -> Vec<u8> {
             "tab" => b'\t',
             "backtab" | "shift-tab" => kbd::KEY_BACKTAB,
             "alttab" | "alt-tab" => kbd::KEY_ALTTAB,
+            "alttab-back" | "alt-shift-tab" => kbd::KEY_ALTTAB_BACK,
             "sysmenu" | "alt-space" => kbd::KEY_SYSMENU,
             "menu" | "alt" => kbd::KEY_MENU,
             "taskbar" | "ctrl-esc" => kbd::KEY_TASKBAR,
@@ -975,9 +976,13 @@ fn hardware_rows() -> Vec<Widget> {
     }
     let mut out = Vec::new();
     for h in &hw {
-        let (value, tone) = match h.driver {
-            Some(d) => (alloc::format!("{}  ({})", h.what, d), Tone::Ok),
-            None => (alloc::format!("{}  no driver", h.what), Tone::Warn),
+        let (value, tone) = match (h.driver, h.gap) {
+            (Some(d), None) => (alloc::format!("{}  ({})", h.what, d), Tone::Ok),
+            (Some(d), Some(why)) => (alloc::format!("{}  ({}, {})", h.what, d, why), Tone::Warn),
+            (None, why) => (
+                alloc::format!("{}  {}", h.what, why.unwrap_or("no driver")),
+                Tone::Warn,
+            ),
         };
         out.push(Widget::Status {
             name: alloc::format!("{} {:04x}:{:04x}", h.bus, h.vendor, h.device),
@@ -1705,9 +1710,10 @@ pub fn program_manager() -> Panel {
         run("System status", "win open status"),
         run("Memory", "win open memory"),
         run("Tasks", "win open tasks"),
-        run("Network", "win open network"),
+        run("Network", "network"),
         run("Storage", "win open storage"),
         run("Files", "win open files"),
+        run("Mind (workspace)", "mind open"),
         run("Attention", "win open attention"),
         (String::from("Model"), Action::Run(String::from("win open model"))),
         run("ToDo list", "todo"),

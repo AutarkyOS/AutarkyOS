@@ -1,9 +1,11 @@
 //! Physical memory and address translation.
 
 pub mod census;
+pub mod fixed;
 pub mod frame;
 pub mod heap;
 pub mod paging;
+pub mod space;
 
 pub const PAGE_SIZE: u64 = 4096;
 pub const LARGE_PAGE_SIZE: u64 = 2 * 1024 * 1024;

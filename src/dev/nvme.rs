@@ -343,13 +343,13 @@ impl Nvme {
     /// Windows, and there is no undo for a misplaced LBA.
     pub fn write(&mut self, lba: u64, count: u16, buf: *const u8) -> Result<(), u16> {
         if !writes_unlocked() {
-            return Err(0xFFFC);
+            return Err(ERR_LOCKED);
         }
         // Outside the claimed region is refused, and this is the check the
         // gate was missing. `store` unlocks for its own region; without this
         // the unlock was a licence to write the partition table.
         if !may_write(lba, count as u32) {
-            return Err(0xFFFB);
+            return Err(ERR_OUTSIDE);
         }
         let bytes = count as usize * self.block_size as usize;
         if count as u32 > self.max_transfer_blocks {
@@ -407,6 +407,12 @@ pub fn write_window() -> Option<(u64, u64)> {
 
 /// Would this write be allowed?
 ///
+/// Writes have never been unlocked. The ordinary state of a boot that only
+/// mounted a store, since mounting one deliberately does not unlock it.
+pub const ERR_LOCKED: u16 = 0xFFFC;
+/// Unlocked, but this write falls outside the region that was claimed.
+pub const ERR_OUTSIDE: u16 = 0xFFFB;
+
 /// Separated from `write` so the gate can be checked without a device and
 /// without writing anything -- the property is arithmetic, and a safety gate
 /// nobody can test is a safety gate nobody has tested.
@@ -520,14 +526,11 @@ pub enum InitError {
 
 /// Find and bring up the first NVMe controller.
 pub fn init(ecam: u64) -> Result<(), InitError> {
-    // Class 01h subclass 08h: NVM Express.
-    let mut found: Option<pci::Device> = None;
-    pci::scan(ecam, 255, |d| {
-        if d.class == 0x01 && d.subclass == 0x08 && found.is_none() {
-            found = Some(d);
-        }
-    });
-    let dev = found.ok_or(InitError::NoController)?;
+    // Class 01h subclass 08h prog-if 02h: NVM Express. Matched by programming
+    // interface rather than by id, which is why an SSD nobody here has heard
+    // of still works -- and the reason the registry keeps three kinds of rule
+    // rather than one.
+    let dev = super::registry::claimed_by(ecam, "nvme").ok_or(InitError::NoController)?;
 
     let bar = pci::bar(ecam, &dev, 0).ok_or(InitError::NoBar)?;
     if bar == 0 {

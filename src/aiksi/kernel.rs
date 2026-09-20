@@ -215,25 +215,219 @@ pub fn call(it: &mut Interp, name: &str, args: &[Value]) -> Result<Value, String
         }
 
         // --- numbers ---------------------------------------------------
-        "abs" => Ok(Value::Int(int(args, 0)?.saturating_abs())),
-        "min" => Ok(Value::Int(int(args, 0)?.min(int(args, 1)?))),
-        "max" => Ok(Value::Int(int(args, 0)?.max(int(args, 1)?))),
-        "clamp" => Ok(Value::Int(int(args, 0)?.clamp(int(args, 1)?, int(args, 2)?))),
+        // Both kinds in one arm, because this one sits above the guarded
+        // arms further down and a guard added there would never be reached --
+        // the compiler said so, which is the warning `shell::execute` records
+        // nobody reading.
+        "abs" => match &args[0] {
+            Value::Approx(x) => Ok(Value::Approx(if *x < 0.0 { -*x } else { *x })),
+            // A fraction and a quantity both have an absolute value and
+            // neither could say so: this went through `as_int`, which refuses
+            // both. `/lib/geom` carries an `absv` for exactly that reason.
+            Value::Rat(n, d) => Value::rational(n.saturating_abs(), *d),
+            // A unit is not a sign, so it survives: `abs(qty(-5, "m"))` is 5 m.
+            Value::Qty(n, d, k) => super::eval::quantity(n.saturating_abs(), *d, *k),
+            _ => Ok(Value::Int(int(args, 0)?.saturating_abs())),
+        },
+        // Ordered by value rather than by whole number, so these agree with
+        // `<`. All three went through `as_int`, which refuses a fraction, a
+        // quantity and an approximation -- so the three kinds the numeric
+        // tower exists for could not be handled by the three builtins whose
+        // whole job is comparing. They answer the *value*, not an `Int`, so
+        // `min(rat(1,2), rat(1,3))` is a third and not an error.
+        "min" => {
+            let (a, b) = (&args[0], &args[1]);
+            Ok(if super::eval::num_cmp(b, a)?.is_lt() { b.clone() } else { a.clone() })
+        }
+        "max" => {
+            let (a, b) = (&args[0], &args[1]);
+            Ok(if super::eval::num_cmp(b, a)?.is_gt() { b.clone() } else { a.clone() })
+        }
+        "clamp" => {
+            let (x, lo, hi) = (&args[0], &args[1], &args[2]);
+            if super::eval::num_cmp(x, lo)?.is_lt() {
+                return Ok(lo.clone());
+            }
+            if super::eval::num_cmp(x, hi)?.is_gt() {
+                return Ok(hi.clone());
+            }
+            Ok(x.clone())
+        }
+        // Exact fractions. `rat(n)` is n over one, which is an `Int`; the
+        // two-argument form is the only way a fraction is built, and it
+        // reduces on the way in so `rat(2,4)` and `rat(1,2)` are one value.
+        // `rat(a, b)` is **exact division**, not merely a fraction built from
+        // two whole numbers, and the difference is what makes it usable inside
+        // a library. A running total that has already become a fraction still
+        // has to be divisible by a count -- `mean` over a list of fractions is
+        // the ordinary case, not the exotic one -- and a `rat` that only took
+        // integers would force every caller to multiply by a reciprocal
+        // instead, which is the same operation written less clearly.
+        //
+        // `rat(a)` is a with nothing done to it, which is what makes it read
+        // as "as a number" at a call site.
+        "rat" => {
+            let a = args[0].as_rat()?;
+            if args.len() < 2 {
+                return Value::rational(a.0, a.1);
+            }
+            super::eval::rat_binary("/", a, args[1].as_rat()?)
+        }
+        // A whole number is itself over one, so these answer for both kinds
+        // rather than refusing an `Int` -- a caller that has to ask which it
+        // holds before asking for a numerator has been given two types where
+        // the maths has one.
+        "num" => Ok(Value::Int(args[0].as_rat()?.0)),
+        "den" => Ok(Value::Int(args[0].as_rat()?.1)),
+        // Rounding is where a fraction becomes a whole number, and the three
+        // of them disagree -- which is exactly why `as_int` refuses to pick
+        // one silently. `-7/2` is -4, -3 and -4 respectively.
+        // All three are built from `div_euclid`/`rem_euclid` on `i64` and
+        // never from negation or a widened intermediate. `-n` has no answer
+        // for `i64::MIN`, and 128-bit division does not return on this target
+        // at all -- see `eval::rat_binary`. The denominator is positive by
+        // invariant, so `div_euclid` is the floor and the remainder is in
+        // `0..d`, which is what lets the other two be stated as offsets from
+        // it rather than as separate arithmetic.
+        // Guarded arms first. A guarded arm placed *after* the bare one it
+        // guards is unreachable, which this tree has already paid for once in
+        // `shell::execute` and which the compiler only mentions in a warning.
+        //
+        // These are where an approximation stops being one: rounding is the
+        // operation that turns an inexact number into an exact whole one, so
+        // it is the honest exit from the type rather than a way around it.
+        "floor" if matches!(args[0], Value::Approx(_)) => Ok(Value::Int(
+            crate::ai::tensor::floorf(super::eval::approximate(&args[0])?) as i64,
+        )),
+        "ceil" if matches!(args[0], Value::Approx(_)) => {
+            let x = super::eval::approximate(&args[0])?;
+            Ok(Value::Int(-(crate::ai::tensor::floorf(-x) as i64)))
+        }
+        "round" if matches!(args[0], Value::Approx(_)) => Ok(Value::Int(
+            crate::ai::tensor::roundf(super::eval::approximate(&args[0])?) as i64,
+        )),
+        "floor" => {
+            let (n, d) = args[0].as_rat()?;
+            Ok(Value::Int(n.div_euclid(d)))
+        }
+        "ceil" => {
+            let (n, d) = args[0].as_rat()?;
+            let q = n.div_euclid(d);
+            let up = n.rem_euclid(d) != 0;
+            Ok(Value::Int(if up {
+                q.checked_add(1).ok_or("number too large to round")?
+            } else {
+                q
+            }))
+        }
+        // Half away from zero, the convention a person means by "round" and
+        // the one competition answers are written in. Computed on doubled
+        // numerators so it needs no division that could round the wrong way
+        // first.
+        // Half away from zero, which is what a person means by "round" and
+        // what a competition answer is written in.
+        //
+        // Stated as an offset from the floor, and the comparison is `r` against
+        // `d - r` rather than `2r` against `d`, because doubling a remainder
+        // near `i64::MAX` overflows while the difference cannot -- `r` is in
+        // `0..d` by `rem_euclid`, so `d - r` is positive and fits.
+        //
+        // The two directions differ at exactly the half, and that is the whole
+        // of "away from zero": 7/2 goes up to 4, -7/2 goes down to -4, and the
+        // floor is 3 and -4 respectively. So a positive takes the step when
+        // the halves are equal and a negative does not.
+        "round" => {
+            let (n, d) = args[0].as_rat()?;
+            let q = n.div_euclid(d);
+            let r = n.rem_euclid(d);
+            let up = if n >= 0 { r >= d - r } else { r > d - r };
+            Ok(Value::Int(if up {
+                q.checked_add(1).ok_or("number too large to round")?
+            } else {
+                q
+            }))
+        }
+        // A magnitude and what it is a quantity of. The unit is written the
+        // way it is spoken -- `m`, `m/s^2`, `kg*m/s^2` -- and a name the table
+        // does not know is refused rather than ignored, because a typo that
+        // silently produced a dimensionless number would defeat the entire
+        // point of carrying one.
+        "qty" => {
+            let (n, d) = args[0].as_rat()?;
+            let dim = super::eval::parse_dim(&text(args, 1))?;
+            super::eval::quantity(n, d, dim)
+        }
+        // What it is a quantity of, as text. A plain number answers `1`, which
+        // is what dimensionless is called and is the same thing `render_dim`
+        // prints inside a quantity.
+        "unit" => {
+            let d = match &args[0] {
+                Value::Qty(_, _, k) => *k,
+                _ => super::eval::DIMLESS,
+            };
+            Ok(Value::Str(super::eval::render_dim(&d)))
+        }
+        // The magnitude with the unit dropped. Deliberately explicit: `as_int`
+        // refuses a quantity outright, so the only way to get a bare number
+        // out of one is to say that is what you meant.
+        // Matched on the variant rather than taken through `as_rat`, which
+        // refuses a quantity on purpose. If it did not, every builtin taking a
+        // number would strip units silently -- `floor(qty(7, "m"))` would
+        // answer 7 and the unit would be gone with nothing said. Those refuse
+        // instead, and name this as the way to ask.
+        "mag" => match &args[0] {
+            Value::Qty(n, d, _) => Value::rational(*n, *d),
+            other => {
+                let (n, d) = other.as_rat()?;
+                Value::rational(n, d)
+            }
+        },
+        // --- approximation, opt-in ------------------------------------
+        //
+        // Every one of these answers `Approx`, and that is the contract: they
+        // are the operations with no exact answer, so the value they hand back
+        // says it is inexact and goes on saying so.
+        //
+        // The implementations are `ai::tensor`'s, and not a second set written
+        // here. That module is `f32` because the model's forward pass is, it
+        // is the code the model's own correctness already depends on, and a
+        // parallel `f64` tower would be numerics nothing in this tree checks.
+        // What it is *not* is general-purpose: its own header says these are
+        // "accurate enough for inference, where a 1e-6 error in a logit
+        // changes nothing". `diag lib` measures what that means in digits
+        // rather than repeating the sentence.
+        "real" => Ok(Value::Approx(super::eval::approximate(&args[0])?)),
+        "exp" => Ok(Value::Approx(crate::ai::tensor::expf(
+            super::eval::approximate(&args[0])?,
+        ))),
+        "ln" => Ok(Value::Approx(crate::ai::tensor::lnf(
+            super::eval::approximate(&args[0])?,
+        ))),
+        "sin" => Ok(Value::Approx(crate::ai::tensor::sinf(
+            super::eval::approximate(&args[0])?,
+        ))),
+        "cos" => Ok(Value::Approx(crate::ai::tensor::cosf(
+            super::eval::approximate(&args[0])?,
+        ))),
+        // Not a literal, because there is no float literal to write it as --
+        // which is the property that keeps `.` unambiguously field access.
+        "pi" => Ok(Value::Approx(core::f32::consts::PI)),
         // Integer square root, by the same Newton iteration `gfx` uses for
-        // circles. There are no floats in this language and adding them for
-        // one builtin would change every arithmetic path.
+        // circles, **and still integer for a whole number**. Changing that
+        // would alter what every program written before this answered, so
+        // `sqrt(2)` is still 1 and `sqrt(real(2))` is the irrational one.
+        // Inexactness is opt-in here exactly as it is everywhere else.
+        "sqrt" if matches!(args[0], Value::Approx(_)) => Ok(Value::Approx(
+            crate::ai::tensor::sqrtf(super::eval::approximate(&args[0])?),
+        )),
         "sqrt" => {
             let n = int(args, 0)?;
             Ok(Value::Int(if n <= 0 { 0 } else { isqrt(n as u64) as i64 }))
         }
-        "pow" => {
-            let (b, e) = (int(args, 0)?, int(args, 1)?);
-            let mut acc: i64 = 1;
-            for _ in 0..e.clamp(0, 62) {
-                acc = acc.saturating_mul(b);
-            }
-            Ok(Value::Int(acc))
-        }
+        // The exponent is whole whatever the base is, which is the one thing
+        // this cannot generalise: a fractional power is irrational for almost
+        // every base and there is no exact value to answer with.
+        "pow" => super::eval::num_pow(&args[0], int(args, 1)?),
 
         // --- lists -----------------------------------------------------
         "sort" => match &args[0] {
@@ -243,9 +437,19 @@ pub fn call(it: &mut Interp, name: &str, args: &[Value]) -> Result<Value, String
                 // of mixed kinds sorts stably rather than refusing: a program
                 // sorting rows it read from a file should not have to prove
                 // they are homogeneous first.
-                out.sort_by(|a, b| match (a.as_int(), b.as_int()) {
-                    (Ok(x), Ok(y)) => x.cmp(&y),
-                    _ => a.render().cmp(&b.render()),
+                // `as_int` was the test for "is this a number", and it is
+                // false for every fraction -- so a list of them fell through
+                // to the rendering, where "19/2" sorts before "9" and the
+                // list comes back wrong while looking sorted. `num_cmp` is
+                // the same ordering `<` answers, so a sorted list and a
+                // comparison cannot now disagree about it.
+                out.sort_by(|a, b| {
+                    if a.is_num() && b.is_num() {
+                        if let Ok(o) = super::eval::num_cmp(a, b) {
+                            return o;
+                        }
+                    }
+                    a.render().cmp(&b.render())
                 });
                 Ok(Value::List(out))
             }

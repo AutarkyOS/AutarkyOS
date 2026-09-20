@@ -213,7 +213,7 @@ pub const RADIOA_INIT: &[(u16, u32)] = &[
     (0x01f, 0x80000), (0x000, 0x33e60),
 ];
 
-// --- RF serial interface, path A -------------------------------------
+// --- RF serial interface, path A --------------------
 //
 // Same provenance as the tables above: Linux, rtl8xxxu, regs.h and
 // rtl8xxxu.h, extracted by tools/rtlconv.py rather than retyped.
@@ -232,6 +232,39 @@ pub const FPGA0_HSSI_PARM2_ADDR_MASK: u32 = 0x7F800000;
 pub const FPGA0_HSSI_PARM2_EDGE_READ: u32 = 0x80000000;
 pub const FPGA0_LSSI_PARM_ADDR_SHIFT: u32 = 0x14;
 pub const FPGA0_LSSI_PARM_DATA_MASK: u32 = 0xFFFFF;
+pub const REG_LLT_INIT: u32 = 0x1E0;
+pub const LLT_OP_INACTIVE: u32 = 0x0;
+pub const LLT_OP_WRITE: u32 = 0x40000000;
+pub const LLT_OP_READ: u32 = 0x80000000;
+pub const LLT_OP_MASK: u32 = 0xC0000000;
+pub const REG_AUTO_LLT: u32 = 0x224;
+pub const AUTO_LLT_INIT_LLT: u32 = 0x10000;
+pub const REG_TRXFF_BNDY: u32 = 0x114;
+pub const REG_RQPN: u32 = 0x200;
+pub const REG_RQPN_NPQ: u32 = 0x214;
+pub const REG_FIFOPAGE: u32 = 0x204;
+pub const REG_TXPKTBUF_BCNQ_BDNY: u32 = 0x424;
+pub const REG_TXPKTBUF_MGQ_BDNY: u32 = 0x425;
+pub const REG_PBP: u32 = 0x104;
+pub const REG_TDECTRL: u32 = 0x208;
+pub const REG_TXDMA_OFFSET_CHK: u32 = 0x20C;
+pub const REG_RD_CTRL: u32 = 0x524;
+pub const REG_CR: u32 = 0x100;
+pub const CR_SCHEDULE_ENABLE: u32 = 0x20;
+pub const CR_MAC_TX_ENABLE: u32 = 0x40;
+pub const CR_MAC_RX_ENABLE: u32 = 0x80;
+pub const REG_EFUSE_CTRL: u32 = 0x30;
+pub const REG_EFUSE_TEST: u32 = 0x34;
+pub const REG_MCU_FW_DL: u32 = 0x80;
+pub const MCU_FW_DL_ENABLE: u32 = 0x1;
+pub const MCU_FW_DL_READY: u32 = 0x2;
+pub const MCU_FW_DL_CSUM_REPORT: u32 = 0x4;
+pub const MCU_WINT_INIT_READY: u32 = 0x40;
+pub const MCU_FW_RAM_SEL: u32 = 0x80;
+pub const REG_FW_START_ADDRESS: u32 = 0x1000;
+pub const REG_RCR: u32 = 0x608;
+pub const REG_MACID: u32 = 0x610;
+pub const REG_RXFLTMAP2: u32 = 0x6A4;
 
 // --- TX descriptor ---------------------------------------------------
 //

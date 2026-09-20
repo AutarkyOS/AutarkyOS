@@ -60,9 +60,9 @@ use core::ptr::read_volatile;
 /// specifically. The earlier interfaces (0x00 UHCI, 0x10 OHCI, 0x20 EHCI) are
 /// different controllers entirely and are not driven here -- on this laptop
 /// everything is routed through xHCI anyway, which is what USB 3 requires.
-const CLASS_SERIAL_BUS: u8 = 0x0C;
-const SUBCLASS_USB: u8 = 0x03;
-const PROGIF_XHCI: u8 = 0x30;
+// Class 0c, subclass 03, programming interface 30 is xHCI, and that triple
+// now lives as a row in `dev::registry` rather than as three constants beside
+// a private bus sweep.
 
 /// Capability register offsets, from the base of the MMIO block.
 const CAPLENGTH: u64 = 0x00;
@@ -111,17 +111,7 @@ pub enum InitError {
 
 /// Find the first xHCI controller and read what it says about itself.
 pub fn probe(ecam: u64) -> Result<Caps, InitError> {
-    let mut found: Option<pci::Device> = None;
-    pci::scan(ecam, 255, |d| {
-        if d.class == CLASS_SERIAL_BUS
-            && d.subclass == SUBCLASS_USB
-            && d.prog_if == PROGIF_XHCI
-            && found.is_none()
-        {
-            found = Some(d);
-        }
-    });
-    let dev = found.ok_or(InitError::NotFound)?;
+    let dev = super::registry::claimed_by(ecam, "xhci").ok_or(InitError::NotFound)?;
 
     let bar = pci::bar(ecam, &dev, 0).ok_or(InitError::NoBar)?;
     if bar == 0 {
@@ -228,6 +218,27 @@ fn usb_note(vid: u16, pid: u16) {
     }
 }
 
+/// Tell the device registry about an enumerated USB device.
+///
+/// The class triple comes from an *interface* descriptor rather than from the
+/// device one, and enumeration finishes before any configuration is read -- so
+/// the first call for a device passes zeros, which is exactly what a device
+/// that defers to its interfaces reports and which deliberately matches no
+/// class rule. Whoever parses a configuration afterwards calls again with what
+/// it found, and the registry replaces the entry for that port and slot.
+///
+/// This is the whole of USB's side of the registry, and it is *pushed* rather
+/// than swept for a reason with teeth: enumerating the bus resets the
+/// controller and drops whatever link is on it. A registry that went and
+/// looked would take the network down to find out what the network is.
+pub fn note_device(dev: &Device, class: (u8, u8, u8)) {
+    crate::dev::registry::note_usb(
+        dev.port,
+        dev.slot,
+        crate::dev::registry::Ident::of_usb(dev.vid, dev.pid, class.0, class.1, class.2),
+    );
+}
+
 /// What `usb` prints.
 pub fn report(ecam: u64) {
     use crate::gfx::console::{self, LTGRAY, LTGREEN, LTRED, WHITE, YELLOW};
@@ -327,6 +338,7 @@ pub fn report(ecam: u64) {
                 // A vendor-specific interface has no class code to key off, so
                 // the id list is the whole of the detection.
                 usb_note(dev.vid, dev.pid);
+                note_device(&dev, (0, 0, 0));
                 if let Some(name) = super::rtl8188eu::identify(dev.vid, dev.pid) {
                     kprintln!("    {} -- wireless", name);
                     // One register read is the whole point of getting this far:
@@ -1364,6 +1376,59 @@ impl Controller {
     }
 
     /// The adapter's MAC, from the string the ECM descriptor points at.
+    /// `SEND_ENCAPSULATED_COMMAND`: an RNDIS message, down the control pipe.
+    ///
+    /// A class request addressed to an *interface*, which is why the interface
+    /// number has to be carried around rather than assumed to be zero: a phone
+    /// commonly puts RNDIS on interface 0 and a second function after it, and
+    /// a tethering dongle may do the reverse.
+    pub fn rndis_command(
+        &mut self,
+        dev: &mut Device,
+        iface: u8,
+        msg: &[u8],
+        buf: u64,
+    ) -> Result<(), &'static str> {
+        if msg.len() > 512 {
+            return Err("rndis message too long");
+        }
+        for (i, b) in msg.iter().enumerate() {
+            unsafe { core::ptr::write_volatile((buf + i as u64) as *mut u8, *b) };
+        }
+        self.control(dev, 0x21, 0x00, 0, iface as u16, buf, msg.len() as u16)
+            .map(|_| ())
+    }
+
+    /// `GET_ENCAPSULATED_RESPONSE`, with patience.
+    ///
+    /// **The device does not answer instantly and there is no error for "not
+    /// yet".** RNDIS signals a waiting response on an interrupt endpoint, and
+    /// reading that would mean a third transfer ring for one bit; polling the
+    /// control pipe instead costs a few round trips on a path that runs three
+    /// times at bring-up and never again. A response that has not arrived
+    /// reads back as a zero message type, which is not a type any completion
+    /// has, so it is told apart from a real answer without a second mechanism.
+    pub fn rndis_response(
+        &mut self,
+        dev: &mut Device,
+        iface: u8,
+        buf: u64,
+        len: u16,
+    ) -> Result<usize, &'static str> {
+        for _ in 0..50 {
+            for i in 0..len as u64 {
+                unsafe { core::ptr::write_volatile((buf + i) as *mut u8, 0) };
+            }
+            let n = self.control(dev, 0xA1, 0x01, 0, iface as u16, buf, len)?;
+            let ty = unsafe { read_volatile(buf as *const u32) };
+            if n > 0 && ty != 0 {
+                return Ok(n as usize);
+            }
+            delay_us(1000);
+        }
+        Err("the device never answered an rndis message")
+    }
+
     pub fn ecm_mac(&mut self, dev: &mut Device, imac: u8) -> Result<[u8; 6], &'static str> {
         let s = self.string(dev, imac)?;
         let b = s.as_bytes();
@@ -1498,6 +1563,13 @@ pub struct UsbNet {
     rx: u64,
     tx: u64,
     armed: bool,
+    /// Whether every frame is wrapped in an RNDIS packet header.
+    ///
+    /// One flag rather than two `Nic` implementations: the two protocols
+    /// differ by 44 bytes at the front of a bulk transfer and by nothing else,
+    /// and a second type would duplicate the arming, the polling and the
+    /// re-arm -- which is where the bugs in this file have actually been.
+    rndis: bool,
     /// DCI of the bulk IN endpoint, so its completions can be told apart from
     /// the transmit side's on the shared event ring.
     rx_dci: u32,
@@ -1507,13 +1579,72 @@ pub struct UsbNet {
 const RX_LEN: u32 = 1600;
 
 impl UsbNet {
-    pub fn new(mut dev: Device, mac: [u8; 6]) -> Option<UsbNet> {
+    /// Which of the two protocols this adapter came up on.
+    ///
+    /// Reported rather than assumed, because `net` printed "usb-ecm" for an
+    /// RNDIS device for as long as the label was a constant at the call site --
+    /// a driver name that is wrong is worse than none, since it is the first
+    /// thing anybody reads when a network does not work.
+    pub fn protocol(&self) -> &'static str {
+        if self.rndis { "usb-rndis" } else { "usb-ecm" }
+    }
+
+    pub fn new(mut dev: Device, mac: [u8; 6], rndis: bool) -> Option<UsbNet> {
         let rx = dma(RX_LEN as usize, 16)?;
         let tx = dma(RX_LEN as usize, 16)?;
         let rx_dci = dev.bulk_in.as_ref().map(|(a, _)| dci(*a))?;
         let armed = with_ctl(|c| c.arm_rx(&mut dev, rx, RX_LEN)).unwrap_or(false);
-        Some(UsbNet { dev, mac, rx, tx, armed, rx_dci })
+        Some(UsbNet { dev, mac, rx, tx, armed, rx_dci, rndis })
     }
+}
+
+/// Speak RNDIS until the device will carry frames, and answer its address.
+///
+/// Three messages, in this order and no other: initialise, ask what the
+/// address is, then say which frames to pass up. **The last is the one that is
+/// easy to leave out and impossible to notice**, because a device that has
+/// initialised answers queries perfectly and delivers nothing at all -- which
+/// looks exactly like a network with no traffic on it.
+fn rndis_bring_up(dev: &mut Device, iface: u8) -> Result<[u8; 6], &'static str> {
+    use crate::dev::rndis;
+    let buf = dma(512, 16).ok_or("no dma for rndis")?;
+
+    let msg = rndis::initialize(1);
+    with_ctl(|c| c.rndis_command(dev, iface, &msg, buf)).unwrap_or(Err("gone"))?;
+    let n = with_ctl(|c| c.rndis_response(dev, iface, buf, 512)).unwrap_or(Err("gone"))?;
+    let mut resp = alloc::vec![0u8; n];
+    for (i, b) in resp.iter_mut().enumerate() {
+        *b = unsafe { read_volatile((buf + i as u64) as *const u8) };
+    }
+    match rndis::completion(&resp, rndis::CMPLT_INITIALIZE, 1) {
+        Some(rndis::STATUS_SUCCESS) => {}
+        Some(_) => return Err("the device refused to initialise"),
+        None => return Err("the device answered something that is not an initialise completion"),
+    }
+
+    let msg = rndis::query(2, rndis::OID_802_3_PERMANENT_ADDRESS);
+    with_ctl(|c| c.rndis_command(dev, iface, &msg, buf)).unwrap_or(Err("gone"))?;
+    let n = with_ctl(|c| c.rndis_response(dev, iface, buf, 512)).unwrap_or(Err("gone"))?;
+    let mut resp = alloc::vec![0u8; n];
+    for (i, b) in resp.iter_mut().enumerate() {
+        *b = unsafe { read_volatile((buf + i as u64) as *const u8) };
+    }
+    if rndis::completion(&resp, rndis::CMPLT_QUERY, 2) != Some(rndis::STATUS_SUCCESS) {
+        return Err("the device would not say what its address is");
+    }
+    let mac = rndis::mac_of(&resp).ok_or("the address the device gave is not one")?;
+
+    let msg = rndis::set_u32(3, rndis::OID_GEN_CURRENT_PACKET_FILTER, rndis::FILTER_NORMAL);
+    with_ctl(|c| c.rndis_command(dev, iface, &msg, buf)).unwrap_or(Err("gone"))?;
+    let n = with_ctl(|c| c.rndis_response(dev, iface, buf, 512)).unwrap_or(Err("gone"))?;
+    let mut resp = alloc::vec![0u8; n];
+    for (i, b) in resp.iter_mut().enumerate() {
+        *b = unsafe { read_volatile((buf + i as u64) as *const u8) };
+    }
+    if rndis::completion(&resp, rndis::CMPLT_SET, 3) != Some(rndis::STATUS_SUCCESS) {
+        return Err("the device would not accept a packet filter, so it will pass nothing");
+    }
+    Ok(mac)
 }
 
 impl crate::net::iface::Nic for UsbNet {
@@ -1532,10 +1663,26 @@ impl crate::net::iface::Nic for UsbNet {
         if frame.len() > RX_LEN as usize {
             return false;
         }
-        unsafe {
-            core::ptr::copy_nonoverlapping(frame.as_ptr(), self.tx as *mut u8, frame.len());
-        }
-        with_ctl(|c| c.bulk_out(&mut self.dev, self.tx, frame.len() as u32))
+        let n = if self.rndis {
+            // Built in a stack buffer and copied, rather than written through
+            // the DMA pointer: `wrap` takes a slice, and handing it one made
+            // from a raw address would put a `&mut [u8]` over memory the
+            // controller may also be reading.
+            let mut staged = [0u8; RX_LEN as usize];
+            let Some(n) = crate::dev::rndis::wrap(frame, &mut staged) else {
+                return false;
+            };
+            unsafe {
+                core::ptr::copy_nonoverlapping(staged.as_ptr(), self.tx as *mut u8, n);
+            }
+            n
+        } else {
+            unsafe {
+                core::ptr::copy_nonoverlapping(frame.as_ptr(), self.tx as *mut u8, frame.len());
+            }
+            frame.len()
+        };
+        with_ctl(|c| c.bulk_out(&mut self.dev, self.tx, n as u32))
             .map(|r| r.is_ok())
             .unwrap_or(false)
     }
@@ -1555,6 +1702,21 @@ impl crate::net::iface::Nic for UsbNet {
         }
         for i in 0..n as u64 {
             out.push(unsafe { read_volatile((self.rx + i) as *const u8) });
+        }
+        if self.rndis {
+            // A transfer that will not unwrap is dropped rather than passed up
+            // as a frame. RNDIS carries keepalives and status indications on
+            // this same endpoint, so a bulk IN that is not a packet message is
+            // ordinary rather than an error -- handing one to the IP stack
+            // would be handing it 44 bytes of header as an Ethernet frame.
+            match crate::dev::rndis::unwrap(&out) {
+                Some(f) => out = f.to_vec(),
+                None => {
+                    self.armed =
+                        with_ctl(|c| c.arm_rx(&mut self.dev, self.rx, RX_LEN)).unwrap_or(false);
+                    return None;
+                }
+            }
         }
         // Re-arm immediately: a receiver that only listens after being asked
         // drops everything that arrives between polls.
@@ -1576,27 +1738,78 @@ pub fn probe_net(ecam: u64) -> Result<UsbNet, &'static str> {
         // This walk already visits every attached device, so noting the
         // wireless ones costs a comparison and saves a second bus reset.
         usb_note(dev.vid, dev.pid);
+        note_device(&dev, (0, 0, 0));
         let mut kept = false;
+        // **Two passes, because the preference is between configurations and
+        // not inside one.** A first version chose within a configuration and
+        // its comment claimed to prefer ECM; QEMU's usb-net puts RNDIS in
+        // configuration 1 and ECM in configuration 2, so the first usable one
+        // won and the comment described something the code never did. Found by
+        // restoring the preference after a test and watching RNDIS come up
+        // anyway.
+        //
+        // ECM is preferred where a device offers both. It carries bare frames
+        // and needs no control protocol, so it has no state to be left half
+        // in; RNDIS can initialise, answer queries and still deliver nothing
+        // if its packet filter was refused.
+        let mut want = None;
         for i in 0..dev.num_configs {
             let Some(Ok((buf, total))) = with_ctl(|c| c.config_descriptor(&mut dev, i)) else {
                 break;
             };
             let c = parse_config(buf, total);
+            if c.bulk_in.is_none() || c.bulk_out.is_none() {
+                continue;
+            }
+            if c.ecm {
+                want = Some(i);
+                break;
+            }
+            if c.rndis.is_some() && want.is_none() {
+                want = Some(i);
+            }
+        }
+        let order: Vec<u8> = match want {
+            // The chosen one first, then everything else: a chosen RNDIS
+            // configuration can still fail its bring-up, and the fallback that
+            // finds an ECM one after it is the reason `Err` there is a
+            // `continue`.
+            Some(w) => core::iter::once(w).chain((0..dev.num_configs).filter(|x| *x != w)).collect(),
+            None => (0..dev.num_configs).collect(),
+        };
+        for i in order {
+            let Some(Ok((buf, total))) = with_ctl(|c| c.config_descriptor(&mut dev, i)) else {
+                break;
+            };
+            let c = parse_config(buf, total);
             let (Some(ep_in), Some(ep_out)) = (c.bulk_in, c.bulk_out) else { continue };
-            if !c.ecm {
+            // Which protocol *this* configuration is. The preference between
+            // configurations was settled above; a configuration declaring both
+            // is answered by ECM, which needs nothing negotiated.
+            let rndis_iface = if c.ecm { None } else { c.rndis };
+            if !c.ecm && rndis_iface.is_none() {
                 continue;
             }
             kept = true;
-            let mac = match with_ctl(|c2| c2.ecm_mac(&mut dev, c.imac)).unwrap_or(Err("gone")) {
-                Ok(m) => m,
-                Err(e) => {
-                    // Locally-administered and deliberately odd, so it is never
-                    // mistaken for a real address in a capture -- and so a boot
-                    // log distinguishes "read the descriptor" from "made one
-                    // up", which an invented 02:00:00:00:00:01 did not.
-                    crate::kprintln!("  eth0   MAC string unreadable ({}), inventing one", e);
-                    [0x02, 0x47, 0x4C, 0x41, 0x44, 0x53]
-                }
+            // ECM's address is in a string descriptor and can be read before
+            // the configuration is set. RNDIS's arrives in an answer to a
+            // message, which cannot be sent until it is -- so this reads the
+            // one that is available now and defers the other.
+            let ecm_mac = if c.ecm {
+                Some(match with_ctl(|c2| c2.ecm_mac(&mut dev, c.imac)).unwrap_or(Err("gone")) {
+                    Ok(m) => m,
+                    Err(e) => {
+                        // Locally-administered and deliberately odd, so it is
+                        // never mistaken for a real address in a capture -- and
+                        // so a boot log distinguishes "read the descriptor"
+                        // from "made one up", which an invented
+                        // 02:00:00:00:00:01 did not.
+                        crate::kprintln!("  eth0   MAC string unreadable ({}), inventing one", e);
+                        [0x02, 0x47, 0x4C, 0x41, 0x44, 0x53]
+                    }
+                })
+            } else {
+                None
             };
             with_ctl(|c2| c2.set_configuration(&mut dev, c.value)).unwrap_or(Err("gone"))?;
             if let Some((iface, alt)) = c.data_iface {
@@ -1605,9 +1818,40 @@ pub fn probe_net(ecam: u64) -> Result<UsbNet, &'static str> {
                 }
             }
             with_ctl(|c2| c2.configure_bulk(&mut dev, ep_in, ep_out)).unwrap_or(Err("gone"))?;
+            let mac = match (ecm_mac, rndis_iface) {
+                (Some(m), _) => m,
+                (None, Some(iface)) => {
+                    // A failure here releases the device rather than keeping a
+                    // half-configured one: an RNDIS device that initialised and
+                    // never got a packet filter accepts writes and delivers
+                    // nothing, which is the worst of the three outcomes.
+                    match rndis_bring_up(&mut dev, iface) {
+                        Ok(m) => {
+                            crate::kprintln!("  eth0   rndis on interface {iface}");
+                            m
+                        }
+                        Err(e) => {
+                            // **Skipped, not fatal.** `02/02/FF` is also what
+                            // a vendor-specific modem looks like, and this
+                            // device may well carry a perfectly good ECM
+                            // configuration after the one that just failed --
+                            // QEMU's usb-net is exactly that shape. Returning
+                            // here would refuse a working adapter because its
+                            // first configuration was something else.
+                            crate::kprintln!("  eth0   config {} is not rndis: {e}", c.value);
+                            continue;
+                        }
+                    }
+                }
+                (None, None) => unreachable!("neither ecm nor rndis, and both were checked above"),
+            };
+            // The triple this configuration actually turned out to be. Said now
+            // rather than at enumeration because this is the first moment
+            // anything has read a descriptor that says so.
+            note_device(&dev, if rndis_iface.is_some() { (0xE0, 0x01, 0x03) } else { (0x02, 0x06, 0x00) });
             let (vid, pid) = (dev.vid, dev.pid);
             claim_port(dev.port);
-            let nic = UsbNet::new(dev, mac).ok_or("out of memory")?;
+            let nic = UsbNet::new(dev, mac, rndis_iface.is_some()).ok_or("out of memory")?;
             unsafe { *CLAIMED.get() = true };
             unsafe { *USB_ETHERNET.get() = Some((vid, pid)) };
             return Ok(nic);
@@ -1618,7 +1862,7 @@ pub fn probe_net(ecam: u64) -> Result<UsbNet, &'static str> {
             with_ctl(|c| c.release(dev));
         }
     }
-    Err("no CDC Ethernet adapter found")
+    Err("no USB ethernet adapter found: neither CDC Ethernet nor RNDIS")
 }
 
 /// One addressed device: its slot, its default endpoint, and what it is.
@@ -2001,6 +2245,13 @@ pub struct Config {
     pub bulk_out: Option<Endpoint>,
     /// True when this looks like CDC Ethernet rather than RNDIS.
     pub ecm: bool,
+    /// The RNDIS control interface's number, when this configuration has one.
+    ///
+    /// An `Option<u8>` rather than a bool beside a number, so "this is RNDIS"
+    /// and "this is the interface to talk to" cannot disagree -- the class
+    /// requests are addressed to an interface, and sending them to the wrong
+    /// one is a stall rather than an answer.
+    pub rndis: Option<u8>,
     /// Every boot-protocol HID interface in this configuration. A plural,
     /// because one dongle commonly presents a keyboard and a mouse.
     pub hids: Vec<HidIface>,
@@ -2029,6 +2280,7 @@ pub fn parse_config(buf: u64, total: usize) -> Config {
         bulk_in: None,
         bulk_out: None,
         ecm: false,
+        rndis: None,
         hids: Vec::new(),
         imac: 0,
     };
@@ -2039,6 +2291,12 @@ pub fn parse_config(buf: u64, total: usize) -> Config {
         cfg.value = at(5);
     }
 
+    const CLASS_WIRELESS: u8 = 0xE0;
+    const SUBCLASS_RNDIS: u8 = 0x01;
+    const PROTOCOL_RNDIS: u8 = 0x03;
+    const CLASS_CDC_COMM: u8 = 0x02;
+    const SUBCLASS_ACM: u8 = 0x02;
+    const PROTOCOL_VENDOR: u8 = 0xFF;
     const CLASS_HID: u8 = 0x03;
     const SUBCLASS_BOOT: u8 = 0x01;
 
@@ -2059,6 +2317,34 @@ pub fn parse_config(buf: u64, total: usize) -> Config {
                 let class = at(o + 5);
                 in_data_iface = class == CLASS_CDC_DATA;
                 hid_at = None;
+                // Wireless controller / RNDIS / Ethernet -- which is not a
+                // wireless anything, and is the class Microsoft put remote
+                // NDIS behind. Almost every Android phone in USB tethering
+                // mode presents exactly this triple.
+                // **RNDIS has two encodings, and a driver that knows one of
+                // them works on half the hardware.** Found by dumping what
+                // QEMU's usb-net actually declares: it is the second form, so
+                // the first version of this detected nothing at all on the one
+                // device available to test against.
+                //
+                //   E0/01/03  wireless controller / RNDIS / Ethernet, which is
+                //             not a wireless anything. Android tethering.
+                //   02/02/FF  CDC / ACM / vendor-specific. Microsoft's
+                //             original, and what QEMU and many dongles use.
+                //
+                // The second is indistinguishable by descriptor from a
+                // vendor-specific modem, which also pairs an ACM interface
+                // with bulk endpoints. Nothing here can tell them apart and
+                // nothing tries: the bring-up is the discriminator, since a
+                // modem does not complete an RNDIS INITIALIZE, and a
+                // configuration that fails it is skipped rather than fatal.
+                let isub = at(o + 6);
+                let iproto = at(o + 7);
+                if (class == CLASS_WIRELESS && isub == SUBCLASS_RNDIS && iproto == PROTOCOL_RNDIS)
+                    || (class == CLASS_CDC_COMM && isub == SUBCLASS_ACM && iproto == PROTOCOL_VENDOR)
+                {
+                    cfg.rndis = Some(at(o + 2));
+                }
                 if class == CLASS_HID && at(o + 6) == SUBCLASS_BOOT {
                     let protocol = at(o + 7);
                     // Anything that is not a keyboard or a mouse claims the

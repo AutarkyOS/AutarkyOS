@@ -77,6 +77,14 @@ def value_of(tok):
     m = re.fullmatch(r'\d+', tok)
     if m:
         return int(tok)
+    # `(0x1 << 30)`, which is how regs.h writes the LLT opcodes and the RQPN
+    # field positions. Added rather than the values being typed in here: a
+    # shift is exactly the form somebody miscounts, and the whole point of this
+    # file is that nothing is written from memory.
+    m = re.fullmatch(r'\(\s*(0x[0-9a-fA-F]+|\d+)\s*<<\s*(\d+)\s*\)', tok)
+    if m:
+        base = int(m.group(1), 16) if m.group(1).startswith('0x') else int(m.group(1))
+        return base << int(m.group(2))
     return None
 
 
@@ -141,6 +149,27 @@ REGS = [
     'FPGA0_HSSI_PARM2_ADDR_SHIFT', 'FPGA0_HSSI_PARM2_ADDR_MASK',
     'FPGA0_HSSI_PARM2_EDGE_READ',
     'FPGA0_LSSI_PARM_ADDR_SHIFT', 'FPGA0_LSSI_PARM_DATA_MASK',
+
+    # The transport. Everything below this line is what stands between a
+    # configured chip and one that can carry a frame: the page table, the
+    # boundary that gates the MAC enables, the enables themselves, the efuse
+    # the MAC address comes out of, and the firmware download window.
+    #
+    # These are addresses of registers on a radio. A wrong one does not fail
+    # loudly -- it configures something else and every write returns success --
+    # which is the whole reason they are extracted rather than typed.
+    'REG_LLT_INIT', 'LLT_OP_INACTIVE', 'LLT_OP_WRITE', 'LLT_OP_READ',
+    'LLT_OP_MASK',
+    'REG_AUTO_LLT', 'AUTO_LLT_INIT_LLT',
+    'REG_TRXFF_BNDY', 'REG_RQPN', 'REG_RQPN_NPQ', 'REG_FIFOPAGE',
+    'REG_TXPKTBUF_BCNQ_BDNY', 'REG_TXPKTBUF_MGQ_BDNY',
+    'REG_PBP', 'REG_TDECTRL', 'REG_TXDMA_OFFSET_CHK', 'REG_RD_CTRL',
+    'REG_CR', 'CR_SCHEDULE_ENABLE', 'CR_MAC_TX_ENABLE', 'CR_MAC_RX_ENABLE',
+    'REG_EFUSE_CTRL', 'REG_EFUSE_TEST',
+    'REG_MCU_FW_DL', 'MCU_FW_DL_ENABLE', 'MCU_FW_DL_READY',
+    'MCU_FW_DL_CSUM_REPORT', 'MCU_WINT_INIT_READY', 'MCU_FW_RAM_SEL',
+    'REG_FW_START_ADDRESS',
+    'REG_RCR', 'REG_MACID', 'REG_RXFLTMAP2',
 ]
 
 TXD = [
@@ -199,15 +228,30 @@ def main():
     print('\nboth cross-checks pass')
 
     if emit:
-        write_rust(emit, regs, txd, rxf)
-        print('appended to %s' % emit)
+        replaced = write_rust(emit, regs, txd, rxf)
+        print('%s %s' % ('rewrote the generated half of' if replaced else 'appended to', emit))
+
+
+MARKER = '// --- RF serial interface, path A ' + '-' * 20
 
 
 def write_rust(path, regs, txd, rxf):
+    """Replace the generated half, or append it if there is not one yet.
+
+    **Appending was a bug and it took a compile error to find.** Running this
+    twice emitted the same constants a second time, and a re-run is exactly
+    what somebody does to check that the file still matches the source it
+    claims to come from -- so the one operation that verifies provenance was
+    the one that broke the build.
+
+    The marker is the first line this function writes. Everything from it to
+    the end of the file is this generator's output by construction, so cutting
+    there is safe without needing an end marker somebody could delete.
+    """
     L = []
     a = L.append
     a('')
-    a('// --- RF serial interface, path A -------------------------------------')
+    a(MARKER)
     a('//')
     a('// Same provenance as the tables above: Linux, rtl8xxxu, regs.h and')
     a('// rtl8xxxu.h, extracted by tools/rtlconv.py rather than retyped.')
@@ -243,8 +287,19 @@ def write_rust(path, regs, txd, rxf):
     a('/// eight-byte units and `shift` is a byte count, both added on top.')
     a('pub const RXDESC16_SIZE: usize = 24;')
     a('')
-    with open(path, 'a', encoding='utf-8', newline='\n') as f:
-        f.write('\n'.join(L))
+    body = '\n'.join(L)
+    with open(path, encoding='utf-8') as f:
+        existing = f.read()
+    at = existing.find(MARKER)
+    replaced = at >= 0
+    if replaced:
+        # Everything from the marker on is this generator's, by
+        # construction. Cut back to the text before it and strip the
+        # trailing blank lines so a re-run does not accumulate them.
+        existing = existing[:at].rstrip('\n') + '\n'
+    with open(path, 'w', encoding='utf-8', newline='\n') as f:
+        f.write(existing + body)
+    return replaced
 
 
 if __name__ == '__main__':

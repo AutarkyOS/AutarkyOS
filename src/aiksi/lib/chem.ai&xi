@@ -1,0 +1,291 @@
+// Chemistry: formulas, molar masses and what follows from them.
+//
+//   use "/lib/chem"
+//
+// `molar("Ca(OH)2")` parses the formula and answers 18523/250 g/mol, which is
+// 74.092 -- exactly, as a fraction, because a molar mass is a sum of table
+// values and every one of those is a terminating decimal. A stoichiometry
+// worked in floating point accumulates a little error per term and then gets
+// rounded for the answer; here the rounding happens once, when somebody asks
+// to read it, and `real` is where that is spelled.
+//
+// ### The table is partial, deliberately, and says so by refusing
+//
+// Elements 1 to 36, plus the heavy ones a person actually weighs out: silver,
+// tin, iodine, barium, platinum, gold, mercury, lead and uranium. Forty-five
+// rows against a hundred and eighteen.
+//
+// **Not because the rest are hard, but because a mass written from memory is a
+// mass nobody checked.** This repository's rule for reference data is that it
+// comes from a tool with its provenance stated -- `doominfo.py` emits DOOM's
+// state table, `rtlconv.py` the wireless registers -- and forty-five values
+// typed by hand already stretches that. The rest belong in a generator reading
+// a cited source, and until there is one they are absent.
+//
+// Absent and **loud**: `el` answers nothing for a symbol it does not carry and
+// `molar` refuses the whole formula rather than skipping the term. That is the
+// difference between this and the hand-written sprite table this project
+// records as a mistake -- there, a missing row meant an object silently did not
+// appear, and here it means the answer does not come back at all.
+//
+// ### Masses are IUPAC conventional atomic weights, to the digits given
+//
+// So `molar("H2SO4")` is 98.072 with H at 1.008 and S at 32.06. A table quoting
+// S as 32.065 gives 98.077 for the same compound, and both are right about
+// their own inputs. The value here is exactly what these rows sum to, which is
+// the only claim a library can make about a number somebody else measured.
+
+rec El { z, sym, name, mass }
+
+// A parse position: what was accumulated, and where reading stopped.
+rec Parse { mass, at }
+
+// The table. One function, so the data exists once -- `el` and `mass` both
+// read it rather than carrying a faster private copy that could drift.
+fn elements() {
+  t = list()
+  t = push(t, El(1, "H", "hydrogen", rat(1008, 1000)))
+  t = push(t, El(2, "He", "helium", rat(40026, 10000)))
+  t = push(t, El(3, "Li", "lithium", rat(694, 100)))
+  t = push(t, El(4, "Be", "beryllium", rat(90122, 10000)))
+  t = push(t, El(5, "B", "boron", rat(1081, 100)))
+  t = push(t, El(6, "C", "carbon", rat(12011, 1000)))
+  t = push(t, El(7, "N", "nitrogen", rat(14007, 1000)))
+  t = push(t, El(8, "O", "oxygen", rat(15999, 1000)))
+  t = push(t, El(9, "F", "fluorine", rat(18998, 1000)))
+  t = push(t, El(10, "Ne", "neon", rat(20180, 1000)))
+  t = push(t, El(11, "Na", "sodium", rat(22990, 1000)))
+  t = push(t, El(12, "Mg", "magnesium", rat(24305, 1000)))
+  t = push(t, El(13, "Al", "aluminium", rat(26982, 1000)))
+  t = push(t, El(14, "Si", "silicon", rat(28085, 1000)))
+  t = push(t, El(15, "P", "phosphorus", rat(30974, 1000)))
+  t = push(t, El(16, "S", "sulfur", rat(3206, 100)))
+  t = push(t, El(17, "Cl", "chlorine", rat(3545, 100)))
+  t = push(t, El(18, "Ar", "argon", rat(3995, 100)))
+  t = push(t, El(19, "K", "potassium", rat(39098, 1000)))
+  t = push(t, El(20, "Ca", "calcium", rat(40078, 1000)))
+  t = push(t, El(21, "Sc", "scandium", rat(44956, 1000)))
+  t = push(t, El(22, "Ti", "titanium", rat(47867, 1000)))
+  t = push(t, El(23, "V", "vanadium", rat(50942, 1000)))
+  t = push(t, El(24, "Cr", "chromium", rat(51996, 1000)))
+  t = push(t, El(25, "Mn", "manganese", rat(54938, 1000)))
+  t = push(t, El(26, "Fe", "iron", rat(55845, 1000)))
+  t = push(t, El(27, "Co", "cobalt", rat(58933, 1000)))
+  t = push(t, El(28, "Ni", "nickel", rat(58693, 1000)))
+  t = push(t, El(29, "Cu", "copper", rat(63546, 1000)))
+  t = push(t, El(30, "Zn", "zinc", rat(6538, 100)))
+  t = push(t, El(31, "Ga", "gallium", rat(69723, 1000)))
+  t = push(t, El(32, "Ge", "germanium", rat(72630, 1000)))
+  t = push(t, El(33, "As", "arsenic", rat(74922, 1000)))
+  t = push(t, El(34, "Se", "selenium", rat(78971, 1000)))
+  t = push(t, El(35, "Br", "bromine", rat(79904, 1000)))
+  t = push(t, El(36, "Kr", "krypton", rat(83798, 1000)))
+  t = push(t, El(47, "Ag", "silver", rat(1078682, 10000)))
+  t = push(t, El(50, "Sn", "tin", rat(118710, 1000)))
+  t = push(t, El(53, "I", "iodine", rat(126904, 1000)))
+  t = push(t, El(56, "Ba", "barium", rat(137327, 1000)))
+  t = push(t, El(78, "Pt", "platinum", rat(195084, 1000)))
+  t = push(t, El(79, "Au", "gold", rat(196967, 1000)))
+  t = push(t, El(80, "Hg", "mercury", rat(200592, 1000)))
+  t = push(t, El(82, "Pb", "lead", rat(2072, 10)))
+  t = push(t, El(92, "U", "uranium", rat(238029, 1000)))
+  return t
+}
+
+// One element by symbol, or nothing.
+//
+// Case matters, because it is what tells `Co` (cobalt) from `CO` (carbon
+// monoxide) and there is no way to be helpful about that without being wrong
+// about one of them.
+fn el(sym) {
+  t = elements()
+  i = 0
+  while (i < len(t)) {
+    e = get(t, i)
+    if (e.sym == sym) { return e }
+    i = i + 1
+  }
+  return
+}
+
+// The molar mass of one element in g/mol, or -1 for a symbol not carried.
+fn mass(sym) {
+  e = el(sym)
+  if (!e) { return -1 }
+  return e.mass
+}
+
+fn byz(z: int) {
+  t = elements()
+  i = 0
+  while (i < len(t)) {
+    e = get(t, i)
+    if (e.z == z) { return e }
+    i = i + 1
+  }
+  return
+}
+
+// --- reading a formula --------------------------------------------------
+
+fn isupper(c): int {
+  o = ord(c)
+  return o >= 65 && o <= 90
+}
+
+fn islower(c): int {
+  o = ord(c)
+  return o >= 97 && o <= 122
+}
+
+fn isdigit(c): int {
+  o = ord(c)
+  return o >= 48 && o <= 57
+}
+
+// A subscript, or 1 when there is none. `H2O` has one after H and none after
+// O, and the absent one is a 1 rather than an error.
+fn pnum(f, i: int) {
+  n = 0
+  seen = 0
+  while (i < len(f) && isdigit(get(f, i))) {
+    n = n * 10 + (ord(get(f, i)) - 48)
+    seen = 1
+    i = i + 1
+  }
+  if (seen == 0) { return Parse(1, i) }
+  return Parse(n, i)
+}
+
+// Where an element symbol ends: one capital, then any lowercase.
+fn psym(f, i: int): int {
+  if (i >= len(f)) { return i }
+  if (!isupper(get(f, i))) { return i }
+  i = i + 1
+  while (i < len(f) && islower(get(f, i))) { i = i + 1 }
+  return i
+}
+
+// One group, up to the end of the string or an unmatched `)`.
+//
+// Recursive, so `Ca(OH)2` and `K4[Fe(CN)6]` -- were brackets spelled with
+// parentheses -- both work, and so does nesting. A mass of -1 is the refusal,
+// which is safe because no group has a negative mass.
+fn pgroup(f, i: int) {
+  total = 0
+  while (i < len(f)) {
+    c = get(f, i)
+    if (c == ")") { return Parse(total, i) }
+    if (c == "(") {
+      inner = pgroup(f, i + 1)
+      if (inner.mass < 0) { return Parse(-1, len(f)) }
+      // An unclosed group is refused rather than treated as if it ended at the
+      // end of the string, which would silently accept `Ca(OH2`.
+      if (inner.at >= len(f)) { return Parse(-1, len(f)) }
+      n = pnum(f, inner.at + 1)
+      total = total + inner.mass * n.mass
+      i = n.at
+    } else {
+      e = psym(f, i)
+      if (e == i) { return Parse(-1, len(f)) }
+      m = mass(substr(f, i, e - i))
+      if (m < 0) { return Parse(-1, len(f)) }
+      n = pnum(f, e)
+      total = total + m * n.mass
+      i = n.at
+    }
+  }
+  return Parse(total, i)
+}
+
+// The molar mass of a formula in g/mol, exactly, or -1 if it cannot be read.
+//
+// One refusal covers three failures on purpose -- an unknown element, an
+// unbalanced parenthesis and a character that is not part of a formula -- and
+// they are one because the caller's next move is the same for all three. What
+// matters is that none of them is a *number*.
+fn molar(f) {
+  r = pgroup(f, 0)
+  if (r.mass < 0) { return -1 }
+  // A trailing `)` means the parentheses did not balance the other way.
+  if (r.at != len(f)) { return -1 }
+  return r.mass
+}
+
+// --- what a mass is for -------------------------------------------------
+
+// Moles in a given mass of a compound. Named for the singular so it does not
+// collide with `/lib/phys`'s `moles`, which takes a molar mass rather than a
+// formula -- `use` is textual, so two libraries sharing a name means whichever
+// was imported second wins with nothing said.
+fn mole(grams, f) {
+  m = molar(f)
+  if (m < 0) { return -1 }
+  return rat(grams, m)
+}
+
+fn gram(moles, f) {
+  m = molar(f)
+  if (m < 0) { return -1 }
+  return moles * m
+}
+
+// What fraction of a compound's mass is one element, exactly.
+//
+// The fraction is the answer and the percentage is a reading of it: iron in
+// haematite is 12410/17743, and `real` or `/lib/prob`'s `pct` is where that
+// becomes 69.94.
+fn fracmass(f, sym) {
+  whole = molar(f)
+  if (whole < 0) { return -1 }
+  n = countof(f, sym)
+  if (n < 0) { return -1 }
+  return rat(n * mass(sym), whole)
+}
+
+// How many atoms of one element a formula contains, counting through groups.
+// A second walk of the same shape as `pgroup`, summing subscripts instead of
+// masses. Two walks rather than one returning both, because a group's
+// multiplier applies to each differently and folding them together was harder
+// to read than writing the loop twice.
+fn countof(f, sym): int {
+  if (mass(sym) < 0) { return -1 }
+  return cgroup(f, 0, sym).mass
+}
+
+fn cgroup(f, i: int, sym) {
+  total = 0
+  while (i < len(f)) {
+    c = get(f, i)
+    if (c == ")") { return Parse(total, i) }
+    if (c == "(") {
+      inner = cgroup(f, i + 1, sym)
+      if (inner.at >= len(f)) { return Parse(0, len(f)) }
+      n = pnum(f, inner.at + 1)
+      total = total + inner.mass * n.mass
+      i = n.at
+    } else {
+      e = psym(f, i)
+      if (e == i) { return Parse(0, len(f)) }
+      n = pnum(f, e)
+      if (substr(f, i, e - i) == sym) { total = total + n.mass }
+      i = n.at
+    }
+  }
+  return Parse(total, i)
+}
+
+// The limiting reagent of two, given how much of each there is and how many
+// of each the equation calls for. Answers 0 for the first and 1 for the
+// second, which is what a caller branches on.
+//
+// Exact, and that is the point: the comparison is between two fractions, and
+// two reagents that are *exactly* stoichiometric compare equal here where in
+// floating point one of them wins by a rounding error.
+fn limiting(g1, f1, n1: int, g2, f2, n2: int): int {
+  a = mole(g1, f1)
+  b = mole(g2, f2)
+  if (a < 0 || b < 0) { return -1 }
+  if (rat(a, n1) <= rat(b, n2)) { return 0 }
+  return 1
+}

@@ -9,6 +9,7 @@ pub mod browse;
 pub mod compose;
 pub mod console;
 pub mod mines;
+pub mod netman;
 pub mod oracle;
 pub mod paint;
 pub mod write;
@@ -21,6 +22,7 @@ pub mod uidoc;
 pub mod desk;
 pub mod agentwin;
 pub mod convwin;
+pub mod mindwin;
 
 /// A program that owns a window's client area.
 ///
@@ -80,6 +82,32 @@ static PRIMARY: Racy<Option<Framebuffer>> = Racy::new(None);
 
 pub fn set_primary(fb: Framebuffer) {
     unsafe { *PRIMARY.get() = Some(fb) };
+}
+
+/// Whether something owns the whole screen right now.
+///
+/// A full-screen program does not get the machine to itself just by drawing
+/// over it: `desk::paint_clock` runs on the clock task at 10 Hz and
+/// `desk::move_cursor` runs on whichever task is generating, and both write
+/// the framebuffer. So a game frame is stamped over ten times a second, and
+/// the pointer leaves an arrow in the middle of it.
+///
+/// Both of those take a paint claim, which is private to `desk.rs`, so an
+/// exclusive painter cannot serialise against them the way they serialise
+/// against each other. This is the other half of that arrangement: instead of
+/// contending for the claim, the periodic painters stand down entirely.
+///
+/// `edit::run` has owned the screen this way since it was written and has the
+/// defect today -- the clock paints over the editor. It is fixed by the same
+/// flag.
+static EXCLUSIVE: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+pub fn set_exclusive(on: bool) {
+    EXCLUSIVE.store(on, core::sync::atomic::Ordering::Release);
+}
+
+pub fn exclusive() -> bool {
+    EXCLUSIVE.load(core::sync::atomic::Ordering::Acquire)
 }
 
 pub fn primary() -> Option<Framebuffer> {
@@ -572,6 +600,18 @@ impl Framebuffer {
 
     /// Pixels per scan line, which is often greater than `width()`.
     #[inline]
+    /// Where the aperture is.
+    ///
+    /// Exposed for exactly one caller: `/dev/fb0` hands a Linux guest the real
+    /// framebuffer rather than a shadow, and `smem_start` in
+    /// `fb_fix_screeninfo` is that address. Nothing above the compositor
+    /// should want this -- every drawing path in this tree goes through the
+    /// back buffer, and a second writer to the aperture is the bug
+    /// `paint_clock` was fixed for.
+    pub fn addr(&self) -> u64 {
+        self.base as u64
+    }
+
     pub const fn stride(&self) -> u32 {
         self.stride
     }

@@ -134,6 +134,9 @@ pub enum Error {
     Refused,
     Reset,
     NotConnected,
+    /// Every connection slot is taken. Its own variant rather than `NoNic`,
+    /// because the two say opposite things about the machine.
+    NoSlot,
 }
 
 impl Error {
@@ -144,6 +147,7 @@ impl Error {
             Error::Refused => "connection refused",
             Error::Reset => "connection reset",
             Error::NotConnected => "not connected",
+            Error::NoSlot => "no free connection slot",
         }
     }
 }
@@ -237,8 +241,68 @@ struct Tcb {
     tarpit_drips: u32,
 }
 
-static TCB: Racy<Option<Tcb>> = Racy::new(None);
-static INBOX: Racy<Vec<(Ipv4, Vec<u8>)>> = Racy::new(Vec::new());
+/// How many connections can be open at once.
+///
+/// **This was one, and the one was the obstacle.** `connect` aborted whatever
+/// was open before it, so the whole stack could hold a single conversation and
+/// every layer above inherited that: `https_fetch` could not keep a session
+/// while resolving a name, and a guest at ring 3 could not have two sockets,
+/// which is most of what a socket is for.
+///
+/// Sixteen because a connection costs its two buffers and nothing else, and
+/// because the thing that runs out first on this machine is heap rather than
+/// slots. It is a table rather than a list so a handle is an index and stays
+/// valid while its neighbours come and go.
+pub const MAX_CONNS: usize = 16;
+
+/// A connection's handle. An index into `TCBS`, and the only thing that
+/// crosses out of this module to name one.
+pub type Handle = usize;
+
+static TCBS: Racy<Option<Vec<Option<Tcb>>>> = Racy::new(None);
+
+/// The connection the single-connection API acts on.
+///
+/// Kept so `connect`, `send`, `recv` and `close` mean exactly what they meant
+/// before the table existed. Every caller in the tree -- `https_fetch`, the
+/// updater, the Aiksi builtins, the `tcp` verb -- speaks that API and none of
+/// them wanted rewriting to prove the table works.
+static CURRENT: Racy<Option<Handle>> = Racy::new(None);
+
+static INBOX: Racy<Vec<(Ipv4, Ipv4, Vec<u8>)>> = Racy::new(Vec::new());
+
+fn table() -> &'static mut Vec<Option<Tcb>> {
+    let slot = unsafe { &mut *TCBS.get() };
+    slot.get_or_insert_with(|| {
+        let mut v = Vec::new();
+        v.resize_with(MAX_CONNS, || None);
+        v
+    })
+}
+
+/// The lowest free slot, or nothing when every one is taken.
+fn alloc_slot() -> Option<Handle> {
+    table().iter().position(|t| t.is_none())
+}
+
+/// Which connection a segment belongs to, by its four-tuple.
+///
+/// Exact rather than "the only one there is": with a table, a segment for a
+/// connection that has closed must not be handed to whoever took its slot, and
+/// the four-tuple is what tells them apart. The local address is checked too,
+/// because two interfaces can carry the same remote pair.
+fn route(src: Ipv4, dst: Ipv4, seg: &[u8]) -> Option<Handle> {
+    let sport = u16::from_be_bytes([seg[0], seg[1]]);
+    let dport = u16::from_be_bytes([seg[2], seg[3]]);
+    table().iter().position(|t| {
+        t.as_ref().is_some_and(|t| {
+            t.local_port == dport
+                && t.remote_port == sport
+                && t.remote == src
+                && t.local_ip == dst
+        })
+    })
+}
 
 fn ticks() -> u64 {
     crate::dev::lapic::ticks()
@@ -364,8 +428,47 @@ fn flush(remote: Ipv4, out: Outbox) {
     }
 }
 
+/// Borrow one control block, with interrupts masked for the length of it.
+///
+/// `StackGuard` keeps two tasks out of `poll` and `pump`, which is where the
+/// stack is *entered*. It does not cover this, and this is where the `&mut`
+/// actually lives: `recv_at` calls `at` after `wait_until` has returned, so a
+/// timer tick landing inside the closure lets the shell's idle loop run `pump`,
+/// reach its reap loop, and free the very `Tcb` being written through.
+///
+/// Masking rather than locking, for the reason the guard is not a lock either:
+/// the borrow is short and bounded, and a task that spun here would be spinning
+/// on one it has preempted. `without_interrupts` restores rather than enabling,
+/// so nesting inside the heap's `lock_irq` is safe, and `pump` nesting `at`
+/// inside its own masked reap block is safe for the same reason.
+///
+/// **This is sufficient because every task is pinned to core 0.** Interrupts
+/// off stops preemption, and preemption is the only way a second task can start
+/// on one core. `task::unpin` exists and nothing calls it; the day something
+/// does, this has to become a real lock, and so does the guard.
+fn at<R>(h: Handle, f: impl FnOnce(&mut Tcb) -> R) -> Option<R> {
+    crate::cpu::without_interrupts(|| table().get_mut(h)?.as_mut().map(f))
+}
+
+/// The current connection, for the single-connection API.
 fn with_tcb<R>(f: impl FnOnce(&mut Tcb) -> R) -> Option<R> {
-    unsafe { TCB.get().as_mut().map(f) }
+    let h = unsafe { *CURRENT.get() }?;
+    at(h, f)
+}
+
+/// Whether a handle still names a live connection.
+pub fn alive(h: Handle) -> bool {
+    at(h, |t| t.state != State::Closed).unwrap_or(false)
+}
+
+/// What a given connection is doing.
+pub fn state_of(h: Handle) -> State {
+    at(h, |t| t.state).unwrap_or(State::Closed)
+}
+
+/// How many connections are open, for a report.
+pub fn open_count() -> usize {
+    table().iter().filter(|t| t.is_some()).count()
 }
 
 // --- inbound -------------------------------------------------------------
@@ -386,7 +489,9 @@ pub fn deliver(src: Ipv4, dst: Ipv4, segment: &[u8]) {
     }
     let inbox = unsafe { &mut *INBOX.get() };
     if inbox.len() < MAX_INBOX {
-        inbox.push((src, segment.to_vec()));
+        // The destination is carried too, because routing needs the local
+        // address and the header on the wire is the only place it is true.
+        inbox.push((src, dst, segment.to_vec()));
     }
 }
 
@@ -417,57 +522,91 @@ pub fn service() {
 /// Drain the inbox and run the timers. Every blocking operation calls this in
 /// its wait loop, and `service` calls it when the shell is idle.
 pub fn pump() {
+    // One task in the stack at a time. The reap loop below frees `Tcb`s, and
+    // `at()` hands out `&mut Tcb` -- a preemption inside one of those closures
+    // would otherwise let a second task drop what this one is writing through.
+    // Reentrant within a task, because the transitions below reach `poll`.
+    let Some(_guard) = super::StackGuard::take() else {
+        return;
+    };
     // Take the queue before processing so that a `send_ipv4` triggered from
     // inside a transition -- which may poll, which may enqueue -- is writing
     // to an empty inbox rather than the one being iterated.
     let batch = core::mem::take(unsafe { &mut *INBOX.get() });
-    for (src, seg) in batch {
-        let (remote, out) = match with_tcb(|t| (t.remote, on_segment(t, src, &seg))) {
-            Some(v) => v,
-            None => {
-                // No active connection. If a honeypot is listening on this
-                // port and this is a fresh SYN, open passively and answer with
-                // a SYN-ACK; otherwise tell the peer nothing is here rather
-                // than making it wait for a timeout.
-                if let Some(out) = passive_open(src, &seg) {
-                    flush(src, out);
-                } else {
-                    reject(src, &seg);
-                }
-                continue;
+    for (src, dst, seg) in batch {
+        let Some(h) = route(src, dst, &seg) else {
+            // Nothing is listening on that four-tuple. If a honeypot is
+            // listening on the port and this is a fresh SYN, open passively and
+            // answer with a SYN-ACK; otherwise tell the peer nothing is here
+            // rather than making it wait for a timeout -- but never answer a
+            // reset with a reset.
+            if let Some(out) = passive_open(src, &seg) {
+                flush(src, out);
+            } else {
+                reject(src, &seg);
             }
+            continue;
+        };
+        let Some((remote, out)) = at(h, |t| (t.remote, on_segment(t, src, &seg))) else {
+            continue;
         };
         flush(remote, out);
     }
 
-    let (remote, out) = match with_tcb(|t| (t.remote, on_tick(t))) {
-        Some(v) => v,
-        None => return,
-    };
-    flush(remote, out);
-
-    // A finished connection is dropped here rather than inside the borrow.
-    let done = with_tcb(|t| t.state == State::Closed).unwrap_or(false);
-    if done {
-        let keep = with_tcb(|t| core::mem::take(&mut t.recv_buf)).unwrap_or_default();
-        let info = with_tcb(|t| (t.reset, t.honeypot, t.tarpit, t.tarpit_drips, t.remote));
-        if let Some((reset, honeypot, tarpit, drips, remote)) = info {
-            unsafe { *TCB.get() = None };
-            LAST_RESET.set(reset);
-            if tarpit {
-                // A released tarpit logs the cost it imposed -- how many drips
-                // the peer waited through -- rather than captured bytes.
-                super::honeypot::log_tarpit(remote, drips);
-            } else if honeypot {
-                // A honeypot session has no caller waiting on `recv`; its sink
-                // is the log. Recorded outside the borrow, since logging writes
-                // the namespace.
-                super::honeypot::log_session(remote, &keep);
-            } else {
-                LAST_DATA.set(keep);
-            }
+    // Timers run for every connection, not just the one somebody is watching.
+    // A retransmission missed because its connection was not the current one
+    // is a stall that looks like the peer went quiet.
+    for h in 0..MAX_CONNS {
+        if let Some((remote, out)) = at(h, on_tick_pair) {
+            flush(remote, out);
         }
     }
+
+    // A finished connection is dropped here rather than inside the borrow.
+    for h in 0..MAX_CONNS {
+        if !at(h, |t| t.state == State::Closed).unwrap_or(false) {
+            continue;
+        }
+        // Reads and the free are one masked block, not three separate ones.
+        // Between them the slot is a connection somebody else can still borrow,
+        // and `table()[h] = None` drops its buffers -- so a tick landing after
+        // the reads and before the free lets another task take a `&mut` into
+        // memory this loop is one instruction from returning to the allocator.
+        let (keep, reset, honeypot, tarpit, drips, remote, was_current) =
+            crate::cpu::without_interrupts(|| {
+                let keep = at(h, |t| core::mem::take(&mut t.recv_buf)).unwrap_or_default();
+                let (reset, honeypot, tarpit, drips, remote) = at(h, |t| {
+                    (t.reset, t.honeypot, t.tarpit, t.tarpit_drips, t.remote)
+                })
+                .unwrap_or((false, false, false, 0, [0, 0, 0, 0]));
+                let was_current = unsafe { *CURRENT.get() } == Some(h);
+                table()[h] = None;
+                if was_current {
+                    unsafe { *CURRENT.get() = None };
+                }
+                (keep, reset, honeypot, tarpit, drips, remote, was_current)
+            });
+        // A honeypot or tarpit connection has no caller waiting on `recv`; its
+        // sink is the log. Recorded outside the borrow, since logging writes the
+        // namespace. A tarpit logs the cost it imposed -- the drips the peer
+        // waited through -- rather than captured bytes.
+        if tarpit {
+            super::honeypot::log_tarpit(remote, drips);
+        } else if honeypot {
+            super::honeypot::log_session(remote, &keep);
+        } else if was_current {
+            // The last words of the *current* connection are what `recv` and the
+            // shell read after it ends. Another connection closing does not
+            // overwrite them, which it would if this were unconditional.
+            LAST_RESET.set(reset);
+            LAST_DATA.set(keep);
+        }
+    }
+}
+
+/// `on_tick` with the remote address, so the borrow ends before the send.
+fn on_tick_pair(t: &mut Tcb) -> (Ipv4, Outbox) {
+    (t.remote, on_tick(t))
 }
 
 /// Carried across the drop of a control block so `recv` and the shell can
@@ -583,9 +722,13 @@ fn passive_open(src: Ipv4, seg: &[u8]) -> Option<Outbox> {
         tarpit_next: 0,
         tarpit_drips: 0,
     };
-    unsafe { *TCB.get() = Some(tcb) };
+    // A passive open takes its own slot in the table like any other connection,
+    // so several honeypot victims can be held at once and each routes by its own
+    // four-tuple. A full table simply declines the SYN.
+    let h = alloc_slot()?;
+    table()[h] = Some(tcb);
     let mut out = Outbox::new();
-    with_tcb(|t| {
+    at(h, |t| {
         t.arm_retx();
         out.push(t.segment(SYN | ACK, t.iss, &[], true));
     });
@@ -954,20 +1097,36 @@ pub fn state() -> State {
     with_tcb(|t| t.state).unwrap_or(State::Closed)
 }
 
-/// Open a connection, replacing any existing one.
+/// Open a connection and make it the current one.
+///
+/// The single-connection API, kept exactly as it was so every caller in the
+/// tree still means what it meant: `https_fetch`, the updater, the Aiksi
+/// builtins and the `tcp` verb all speak this and none of them wanted
+/// rewriting to prove a table works.
 pub fn connect(dst: Ipv4, port: u16, timeout_ms: u64) -> Result<(), Error> {
-    if !super::ready() {
-        return Err(Error::NoNic);
-    }
     abort();
     LAST_DATA.take();
     LAST_RESET.take();
+    let h = open(dst, port, timeout_ms)?;
+    unsafe { *CURRENT.get() = Some(h) };
+    Ok(())
+}
 
+/// Open a connection and answer its handle, disturbing nothing else.
+///
+/// What a socket calls. It does not touch `CURRENT`, so a guest opening four
+/// of these leaves the shell's own connection alone -- which is the whole
+/// point of the table and the thing one control block could not do.
+pub fn open(dst: Ipv4, port: u16, timeout_ms: u64) -> Result<Handle, Error> {
+    if !super::ready() {
+        return Err(Error::NoNic);
+    }
     let iss = entropy();
     // Ephemeral range. Drawn fresh each time so a new connection almost never
     // reuses a four-tuple a previous one has just finished with.
     let local_port = 49152 + (entropy() % 16384) as u16;
 
+    let Some(h) = alloc_slot() else { return Err(Error::NoSlot) };
     let tcb = Tcb {
         state: State::SynSent,
         remote: dst,
@@ -1000,23 +1159,21 @@ pub fn connect(dst: Ipv4, port: u16, timeout_ms: u64) -> Result<(), Error> {
         tarpit_next: 0,
         tarpit_drips: 0,
     };
-    unsafe { *TCB.get() = Some(tcb) };
+    table()[h] = Some(tcb);
 
-    let (remote, syn) = with_tcb(|t| {
+    let (remote, syn) = at(h, |t| {
         t.arm_retx();
         (t.remote, t.segment(SYN, t.iss, &[], true))
     })
     .ok_or(Error::NotConnected)?;
     send_ipv4(remote, PROTO_TCP, &syn);
 
-    let ok = wait_until(timeout_ms, || {
-        !matches!(state(), State::SynSent)
-    });
+    let ok = wait_until(timeout_ms, || !matches!(state_of(h), State::SynSent));
 
-    match state() {
-        State::Established => Ok(()),
+    match state_of(h) {
+        State::Established => Ok(h),
         _ if !ok => {
-            abort();
+            abort_at(h);
             Err(Error::Timeout)
         }
         // A RST in response to a SYN is a refusal, which is worth
@@ -1024,13 +1181,59 @@ pub fn connect(dst: Ipv4, port: u16, timeout_ms: u64) -> Result<(), Error> {
         // port, the other means nothing is there at all.
         _ => {
             let refused = LAST_RESET.take().unwrap_or(false);
-            abort();
+            abort_at(h);
             Err(if refused { Error::Refused } else { Error::Reset })
         }
     }
 }
 
 /// Queue bytes and push them out, waiting for the window if it is closed.
+/// Send on one connection by handle.
+pub fn send_at(h: Handle, data: &[u8], timeout_ms: u64) -> Result<(), Error> {
+    if !matches!(state_of(h), State::Established | State::CloseWait) {
+        return Err(Error::NotConnected);
+    }
+    let (remote, out) = at(h, |t| {
+        t.send_buf.extend_from_slice(data);
+        let mut out = Outbox::new();
+        queue_pending(t, &mut out);
+        (t.remote, out)
+    })
+    .ok_or(Error::NotConnected)?;
+    flush(remote, out);
+    let done = wait_until(timeout_ms, || {
+        at(h, |t| t.send_buf.is_empty()).unwrap_or(true)
+    });
+    match state_of(h) {
+        State::Closed => Err(Error::NotConnected),
+        _ if !done => Err(Error::Timeout),
+        _ => Ok(()),
+    }
+}
+
+/// Read whatever has arrived on one connection, waiting up to `timeout_ms`.
+///
+/// Answers an empty vector at end of file *and* when nothing arrived in time,
+/// which a socket has to tell apart -- so callers ask `state_of` rather than
+/// reading a length. That is the same distinction `recv` has always blurred by
+/// having `LAST_DATA` to fall back on, and a handle has no such cushion.
+pub fn recv_at(h: Handle, timeout_ms: u64) -> Vec<u8> {
+    wait_until(timeout_ms, || {
+        at(h, |t| !t.recv_buf.is_empty() || t.peer_fin).unwrap_or(true)
+    });
+    at(h, |t| core::mem::take(&mut t.recv_buf)).unwrap_or_default()
+}
+
+/// Whether the peer has finished sending on one connection.
+pub fn peer_done(h: Handle) -> bool {
+    at(h, |t| t.peer_fin).unwrap_or(true)
+}
+
+/// How many bytes are waiting to be read, without waiting for any.
+pub fn pending(h: Handle) -> usize {
+    at(h, |t| t.recv_buf.len()).unwrap_or(0)
+}
+
 pub fn send(data: &[u8], timeout_ms: u64) -> Result<(), Error> {
     if !matches!(state(), State::Established | State::CloseWait) {
         return Err(Error::NotConnected);
@@ -1100,30 +1303,246 @@ pub fn recv_to_end(timeout_ms: u64) -> Vec<u8> {
     all
 }
 
+/// Where a close moves the machine to.
+///
+/// Pure, so the transition can be asserted without a peer -- the reason
+/// `update::decide` and `code::locate` are pure. It has to happen at the close
+/// rather than in `queue_pending`, which sends the FIN and leaves the state
+/// where it was: `close_at` did not do it, so a connection sat in Established,
+/// `on_segment`'s FinWait1 arm was unreachable, and every close ran its full
+/// timeout before `abort_at` tore it down regardless. A polite close that was
+/// neither polite nor a close, and from the outside indistinguishable from a
+/// peer that never answered.
+///
+/// Anything else is returned unchanged: closing a connection that is already
+/// closing is not an error and must not move it backwards.
+fn closing_state(s: State) -> State {
+    match s {
+        State::Established => State::FinWait1,
+        State::CloseWait => State::LastAck,
+        other => other,
+    }
+}
+
 /// Close politely: FIN, and wait for the exchange to finish.
-pub fn close(timeout_ms: u64) {
-    let Some((remote, out)) = with_tcb(|t| {
+/// Close one connection by handle, with the handshake.
+pub fn close_at(h: Handle, timeout_ms: u64) {
+    if !alive(h) {
+        abort_at(h);
+        return;
+    }
+    let out = at(h, |t| {
         t.closing = true;
-        if t.state == State::Established {
-            t.state = State::FinWait1;
-        } else if t.state == State::CloseWait {
-            t.state = State::LastAck;
-        }
+        t.state = closing_state(t.state);
         let mut out = Outbox::new();
         queue_pending(t, &mut out);
         (t.remote, out)
-    }) else {
-        return;
-    };
-    flush(remote, out);
-    wait_until(timeout_ms, || matches!(state(), State::Closed));
-    abort();
+    });
+    if let Some((remote, out)) = out {
+        flush(remote, out);
+    }
+    wait_until(timeout_ms, || !alive(h));
+    abort_at(h);
 }
 
-/// Drop the connection without ceremony.
+/// Close the current connection.
+///
+/// Delegates rather than repeating the sequence. It used to be a second copy
+/// that had the state transition `close_at` was missing, which is the shape
+/// this kind of duplication always takes: two functions doing one job, and the
+/// one nobody exercised was the broken one. `abort_at(h)` and the old `abort()`
+/// do the same thing when `h` is current, and `!alive(h)` and
+/// `matches!(state(), Closed)` are the same predicate for it.
+pub fn close(timeout_ms: u64) {
+    let Some(h) = (unsafe { *CURRENT.get() }) else {
+        return;
+    };
+    close_at(h, timeout_ms);
+}
+
+/// Drop the current connection without ceremony.
+///
+/// **It no longer clears the inbox**, and that is the table's doing: the inbox
+/// carries segments for every connection, so throwing it away because one of
+/// them gave up would silently drop another's data. Segments for a slot that
+/// is now empty are rejected by `route`, which is the right outcome for the
+/// connection being abandoned and for its neighbours both.
 fn abort() {
-    unsafe { *TCB.get() = None };
-    unsafe { (*INBOX.get()).clear() };
+    if let Some(h) = unsafe { CURRENT.get().take() } {
+        table()[h] = None;
+    }
+}
+
+/// Drop one connection by handle, whichever it is.
+pub fn abort_at(h: Handle) {
+    if h < MAX_CONNS {
+        table()[h] = None;
+    }
+    if unsafe { *CURRENT.get() } == Some(h) {
+        unsafe { *CURRENT.get() = None };
+    }
+}
+
+/// What `diag sockets` asks of the connection table.
+///
+/// Against synthetic control blocks rather than real connections, for the
+/// reason `mem::fixed` gives about its own map: a claim needing a peer would
+/// be asserting something about whatever is on the other end of the cable, and
+/// the routing arithmetic is the same everywhere. Nothing here sends a packet.
+pub fn checks() -> Vec<(&'static str, bool)> {
+    let mut out = Vec::new();
+    let saved = core::mem::take(table());
+    table().resize_with(MAX_CONNS, || None);
+
+    let mk = |remote: Ipv4, rport: u16, lport: u16| Tcb {
+        state: State::Established,
+        remote,
+        remote_port: rport,
+        local_ip: [10, 0, 2, 15],
+        local_port: lport,
+        snd_una: 0, snd_nxt: 0, snd_wnd: 0, iss: 0, rcv_nxt: 0,
+        send_buf: Vec::new(), recv_buf: Vec::new(),
+        closing: false, fin_sent: false, fin_seq: 0, peer_fin: false,
+        retx_deadline: 0, rto: RTO_MIN_TICKS, retries: 0,
+        srtt: 0, rttvar: 0, timing: false, timed_seq: 0, timed_at: 0,
+        reset: false, deadline_wait: 0,
+        honeypot: false, tarpit: false, tarpit_next: 0, tarpit_drips: 0,
+    };
+    // A segment header is enough to route: source port, destination port.
+    let seg = |sport: u16, dport: u16| {
+        let mut v = alloc::vec![0u8; 20];
+        v[0..2].copy_from_slice(&sport.to_be_bytes());
+        v[2..4].copy_from_slice(&dport.to_be_bytes());
+        v
+    };
+
+    let a = alloc_slot();
+    out.push(("an empty table hands out the first slot", a == Some(0)));
+    table()[0] = Some(mk([93, 184, 216, 34], 80, 50000));
+    let b = alloc_slot();
+    out.push(("and the next request gets a different one", b == Some(1)));
+    table()[1] = Some(mk([93, 184, 216, 34], 443, 50001));
+
+    // Two connections to the *same host*, differing only in port. This is the
+    // case one control block could not represent at all, and the one a browser
+    // makes constantly.
+    out.push((
+        "two connections to one host are told apart by port",
+        route([93, 184, 216, 34], [10, 0, 2, 15], &seg(80, 50000)) == Some(0)
+            && route([93, 184, 216, 34], [10, 0, 2, 15], &seg(443, 50001)) == Some(1),
+    ));
+    out.push((
+        "a segment for a four-tuple nobody holds is routed nowhere",
+        route([93, 184, 216, 34], [10, 0, 2, 15], &seg(80, 50002)).is_none()
+            && route([1, 2, 3, 4], [10, 0, 2, 15], &seg(80, 50000)).is_none(),
+    ));
+    out.push((
+        "and the local address is part of it, since two interfaces can carry one pair",
+        route([93, 184, 216, 34], [192, 168, 1, 2], &seg(80, 50000)).is_none(),
+    ));
+
+    // The slot a closed connection leaves must not answer for it.
+    table()[0] = None;
+    out.push((
+        "a closed connection's segments stop being routed to its slot",
+        route([93, 184, 216, 34], [10, 0, 2, 15], &seg(80, 50000)).is_none(),
+    ));
+    out.push(("and the slot is offered again", alloc_slot() == Some(0)));
+
+    for i in 0..MAX_CONNS {
+        table()[i] = Some(mk([10, 0, 0, 1], 9000 + i as u16, 40000 + i as u16));
+    }
+    out.push(("a full table hands out nothing", alloc_slot().is_none()));
+    out.push(("and reports itself full", open_count() == MAX_CONNS));
+    out.push((
+        "every one of them is still told apart",
+        (0..MAX_CONNS).all(|i| {
+            route([10, 0, 0, 1], [10, 0, 2, 15], &seg(9000 + i as u16, 40000 + i as u16))
+                == Some(i)
+        }),
+    ));
+
+    // --- the close transition ---
+    //
+    // Asserted through the pure function rather than by closing a connection,
+    // because a real close sends a FIN and waits for a peer. What broke was
+    // exactly this mapping, and it is the whole of what `close_at` was missing.
+    out.push((
+        "a close moves Established to FinWait1",
+        closing_state(State::Established) == State::FinWait1,
+    ));
+    out.push((
+        "and CloseWait to LastAck",
+        closing_state(State::CloseWait) == State::LastAck,
+    ));
+    out.push((
+        "and leaves a connection already closing where it is",
+        closing_state(State::FinWait1) == State::FinWait1
+            && closing_state(State::LastAck) == State::LastAck
+            && closing_state(State::Closed) == State::Closed,
+    ));
+
+    // --- the borrow is masked ---
+    //
+    // Asserted by reading RFLAGS from inside the closure, because the property
+    // is not "at() calls without_interrupts" -- that is visible in the source
+    // and could stop being true through an inlining or a refactor without
+    // anybody noticing. What has to hold is that no tick can land while a
+    // `&mut Tcb` is live, and the only witness to that is the flag itself.
+    let read_if = || -> bool {
+        let f: u64;
+        unsafe { core::arch::asm!("pushfq; pop {}", out(reg) f, options(preserves_flags)) };
+        f & (1 << 9) != 0
+    };
+    let before = read_if();
+    table()[0] = Some(mk([93, 184, 216, 34], 80, 50000));
+    let masked = at(0, |_| !read_if()).unwrap_or(false);
+    out.push(("a borrow of a control block runs with interrupts masked", masked));
+    // Restored rather than unconditionally enabled: `pump` nests `at` inside
+    // its own masked reap block, and an `sti` on the way out of the inner one
+    // would unmask in the middle of the outer.
+    out.push(("and puts them back the way it found them", read_if() == before));
+    table()[0] = None;
+
+    // --- the stack guard ---
+    //
+    // One task at a time inside `poll` and `pump`, reentrant within that task.
+    // The nesting case is not a nicety: `pump` reaches `poll` through
+    // `send_ipv4` -> `resolve`, so a guard refusing its own holder would turn
+    // ARP resolution inside `pump` into a silent early return.
+    let me = crate::task::current();
+    out.push(("the stack is free before the guard is taken", super::stack_holder().is_none()));
+    {
+        let outer = super::StackGuard::take();
+        out.push(("a free stack hands out a guard", outer.is_some()));
+        out.push(("and records who took it", super::stack_holder() == Some(me)));
+        {
+            let inner = super::StackGuard::take();
+            out.push(("the holder's own nested call is admitted", inner.is_some()));
+        }
+        out.push((
+            "and dropping the inner one releases nothing",
+            super::stack_holder() == Some(me),
+        ));
+    }
+    out.push((
+        "the outermost guard is what releases",
+        super::stack_holder().is_none(),
+    ));
+
+    super::force_stack_holder(Some(me.wrapping_add(1)));
+    out.push((
+        "a stack held by another task is refused",
+        super::StackGuard::take().is_none(),
+    ));
+    super::force_stack_holder(None);
+    out.push((
+        "and is free again once that task leaves",
+        super::StackGuard::take().is_some() && super::stack_holder().is_none(),
+    ));
+
+    *table() = saved;
+    out
 }
 
 pub fn report() {

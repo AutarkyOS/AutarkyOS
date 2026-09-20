@@ -228,6 +228,10 @@ pub const BAD_TEXT: Color = Color::new(0xA0, 0x1C, 0x1C);
 
 pub const SIGNAL: Color = Color::new(0xC8, 0x20, 0x1C);
 pub const SIGNAL_DEEP: Color = Color::new(0x76, 0x10, 0x12);
+/// The Aperture orange the upstream icon set is drawn in -- warmer than
+/// `SIGNAL`'s red, and kept distinct because the wall's pictograms are toned
+/// against it rather than against the accent.
+pub const APERTURE: Color = Color::new(0xF2, 0x8C, 0x1E);
 pub const TITLE_TEXT: Color = Color::new(0xFF, 0xFF, 0xFF);
 /// Caption text on an unfocused bar. Near-white rather than grey: Luna dims
 /// the *bar* and leaves its title readable, so "which window has the
@@ -352,6 +356,17 @@ pub const TASK_EDGE: Color = Color::new(0xBE, 0xBE, 0xB6);
 /// coloured surface reads by being darker and not by being outlined.
 pub const TRAY: Color = Color::new(0x12, 0x12, 0x11);
 pub const TRAY_EDGE: Color = Color::new(0x8E, 0x8E, 0x88);
+
+/// The terminal's status strip, which is the tray's colour given a ramp.
+///
+/// Dark rather than the pale window face, because it is read against the
+/// console above it and a light strip there reads as a second window rather
+/// than as the foot of this one.
+pub const STATUS_BAR: [(u8, Color); 3] = [
+    (0, Color::new(0x0D, 0x39, 0x4E)),
+    (128, Color::new(0x07, 0x2A, 0x3C)),
+    (255, Color::new(0x05, 0x1F, 0x2D)),
+];
 
 /// Start. Green in every real XP scheme, including the blue one, which is why
 /// it stays green here rather than following the accent.
@@ -898,31 +913,68 @@ pub fn title_bar(
 /// under an icon label. `text` fills the cell behind each glyph, which on a
 /// gradient stamps a rectangle of the wrong colour around every letter.
 pub fn text_over(fb: &Framebuffer, x: u32, y: u32, s: &str, fg: Color) {
+    text_over_at(fb, x, y, s, fg, CHROME_SCALE);
+}
+
+/// The same, at a chosen scale.
+///
+/// Chrome is drawn at `CHROME_SCALE` because it is read at arm's length and a
+/// title bar has room to spare. A window that reports on the machine does not:
+/// it is a dense list of facts in a quarter of a screen, and at scale two a
+/// pane fits nine rows. At scale one it fits nineteen, and the glyphs are a
+/// crisp bitmap rather than a shrunk one, because the font *is* eight pixels
+/// and two was always a doubling.
+pub fn text_over_at(fb: &Framebuffer, x: u32, y: u32, s: &str, fg: Color, scale: u32) {
+    let scale = scale.max(1);
     let mut cx = x;
     for b in s.chars() {
         let rows = font::rows(font::index_of(b));
         for (gy, bits) in rows.iter().enumerate() {
             for gx in 0..font::GLYPH_W {
                 if bits & (0x80 >> gx) != 0 {
-                    for dy in 0..CHROME_SCALE {
-                        for dx in 0..CHROME_SCALE {
-                            fb.put(
-                                cx + gx * CHROME_SCALE + dx,
-                                y + gy as u32 * CHROME_SCALE + dy,
-                                fb.raw(fg),
-                            );
+                    for dy in 0..scale {
+                        for dx in 0..scale {
+                            fb.put(cx + gx * scale + dx, y + gy as u32 * scale + dy, fb.raw(fg));
                         }
                     }
                 }
             }
         }
-        cx += font::GLYPH_W * CHROME_SCALE;
+        cx += font::GLYPH_W * scale;
     }
+}
+
+/// Row height and column width at a chosen scale, the companions to
+/// `text_h` and `text_w`.
+pub fn text_h_at(scale: u32) -> u32 {
+    font::GLYPH_H * scale.max(1)
+}
+
+pub fn text_w_at(len: usize, scale: u32) -> u32 {
+    len as u32 * font::GLYPH_W * scale.max(1)
 }
 
 /// A button. `focused` draws the keyboard focus; `default` marks the one Enter
 /// would press if focus were elsewhere.
 pub fn button(fb: &Framebuffer, r: Rect, label: &str, focused: bool, pressed: bool) {
+    button_at(fb, r, label, focused, pressed, CHROME_SCALE);
+}
+
+/// The same, at a chosen text scale, and with the label truncated to fit.
+///
+/// Both halves of that matter for a dense window. `button` centres its label
+/// and clips nothing, which is correct where a button is laid out to suit its
+/// text; in a rail a quarter of the screen wide the row is laid out first and
+/// the labels have to live inside it. Two full-size labels in a 300-pixel rail
+/// ran into each other and read as one word.
+pub fn button_at(
+    fb: &Framebuffer,
+    r: Rect,
+    label: &str,
+    focused: bool,
+    pressed: bool,
+    scale: u32,
+) {
     control(
         fb,
         r,
@@ -940,16 +992,30 @@ pub fn button(fb: &Framebuffer, r: Rect, label: &str, focused: bool, pressed: bo
         }
     }
 
-    let tw = text_w_of(label);
+    let room = (r.w.saturating_sub(6) / (font::GLYPH_W * scale.max(1))) as usize;
+    let label = head_chars(label, room);
+    let tw = text_w_at(label.chars().count(), scale);
     let tx = r.x + (r.w.saturating_sub(tw)) / 2 + u32::from(pressed);
-    let ty = r.y + (r.h.saturating_sub(font::GLYPH_H * CHROME_SCALE)) / 2 + u32::from(pressed);
+    let ty = r.y + (r.h.saturating_sub(text_h_at(scale))) / 2 + u32::from(pressed);
     // `text_over` rather than `text`: the face is a ramp now, so stamping one
     // background colour behind every glyph would print a flat block across it.
-    text_over(fb, tx, ty, label, TEXT);
+    text_over_at(fb, tx, ty, label, TEXT, scale);
 }
 
 /// One row of a list box. Selected rows invert to the Aperture bar.
 pub fn list_row(fb: &Framebuffer, r: Rect, label: &str, selected: bool, focused: bool) {
+    list_row_at(fb, r, label, selected, focused, CHROME_SCALE);
+}
+
+/// The same, at a chosen text scale.
+pub fn list_row_at(
+    fb: &Framebuffer,
+    r: Rect,
+    label: &str,
+    selected: bool,
+    focused: bool,
+    scale: u32,
+) {
     let (fg, bg) = if selected && focused {
         (SELECT_TEXT, SELECT)
     } else if selected {
@@ -960,10 +1026,10 @@ pub fn list_row(fb: &Framebuffer, r: Rect, label: &str, selected: bool, focused:
         (TEXT, MENU_BG)
     };
     fb.rect(r.x, r.y, r.w, r.h, bg);
-    let ty = r.y + (r.h.saturating_sub(font::GLYPH_H * CHROME_SCALE)) / 2;
-    let room = (r.w / (font::GLYPH_W * CHROME_SCALE)).saturating_sub(1) as usize;
+    let ty = r.y + (r.h.saturating_sub(text_h_at(scale))) / 2;
+    let room = (r.w / (font::GLYPH_W * scale.max(1))).saturating_sub(1) as usize;
     let shown = head_chars(label, room);
-    text(fb, r.x + 6, ty, shown, fg, bg);
+    text_over_at(fb, r.x + 4, ty, shown, fg, scale);
 }
 
 /// A vertical groove, for dividing a bar into sections.
@@ -971,6 +1037,82 @@ pub fn separator_v(fb: &Framebuffer, x: u32, y: u32, h: u32) {
     fb.rect(x, y, 1, h, EDGE);
     fb.rect(x + 1, y, 1, h, EDGE_LIGHT);
 }
+
+// --- icon bodies ----------------------------------------------------------
+//
+// One light source for the whole set, which is the entire point of putting
+// these here rather than letting each drawing carry its own gradient. Ten
+// private ramps is ten chances for one icon to be lit from the left while its
+// neighbour is lit from above, and nothing catches that but an eye.
+//
+// Every ramp runs light at the top to dark at the bottom, matching `SUN` and
+// `TITLE_ON` and the wallpaper's own horizon. The hard step at 128/129 that
+// the chrome ramps use is deliberately absent: a caption is a plate and takes
+// a gloss break, a solid object is a solid object.
+
+/// Cool aqua, for glass and water-like bodies -- the globe, the sliders.
+pub const ICON_GLASS: [(u8, Color); 4] = [
+    (0, Color::new(0x9C, 0xDD, 0xF2)),
+    (90, Color::new(0x4F, 0xA8, 0xCE)),
+    (180, Color::new(0x2A, 0x74, 0x9C)),
+    (255, Color::new(0x18, 0x4C, 0x6C)),
+];
+
+/// The warm half of the palette, for anything the machine speaks through.
+pub const ICON_WARM: [(u8, Color); 4] = [
+    (0, Color::new(0xFF, 0xD8, 0x8E)),
+    (90, Color::new(0xF7, 0xA8, 0x33)),
+    (180, Color::new(0xDC, 0x7E, 0x14)),
+    (255, Color::new(0xA8, 0x58, 0x0C)),
+];
+
+/// Paper, which is not flat white: a page lit from above has a shadow side.
+pub const ICON_PAPER: [(u8, Color); 4] = [
+    (0, Color::new(0xFF, 0xFF, 0xFF)),
+    (110, Color::new(0xF4, 0xF8, 0xFA)),
+    (200, Color::new(0xDD, 0xE7, 0xEC)),
+    (255, Color::new(0xC4, 0xD3, 0xDA)),
+];
+
+/// A dark body -- a screen, a mine. Never pure black; a black object in a lit
+/// scene still catches the sky.
+pub const ICON_DARK: [(u8, Color); 4] = [
+    (0, Color::new(0x3A, 0x4A, 0x56)),
+    (70, Color::new(0x1C, 0x26, 0x30)),
+    (180, Color::new(0x10, 0x16, 0x1E)),
+    (255, Color::new(0x06, 0x0A, 0x10)),
+];
+
+/// The paint palette's board.
+pub const ICON_WOOD: [(u8, Color); 3] = [
+    (0, Color::new(0xD8, 0xAE, 0x74)),
+    (140, Color::new(0xB0, 0x86, 0x50)),
+    (255, Color::new(0x7E, 0x5C, 0x33)),
+];
+
+/// The thin edge every icon body carries, and the specular that sits on top
+/// of it. One pixel each: an icon is 40 across and a two-pixel outline is a
+/// fifth of its face.
+pub const ICON_EDGE: Color = Color::new(0x2E, 0x4A, 0x5A);
+pub const ICON_SPEC: Color = HILIGHT;
+
+/// How much white the gloss band carries, out of 256, and how far down the
+/// body it reaches, out of 256.
+pub const ICON_GLOSS_NUM: u32 = 64;
+pub const ICON_GLOSS_SPAN: u32 = 110;
+
+/// How much a base shadow keeps of what is under it, out of 256. Higher is
+/// fainter; `SHADOW_NUM` is 214 for a window and an icon wants less weight
+/// than a window.
+pub const ICON_SHADE_NUM: u32 = 224;
+
+// The three ink wells on the paint palette, and the globe's water. These were
+// `Color::new` literals inside `pictogram` and belonged to no palette, so a
+// reskin moved the whole interface and left the icons behind -- which is
+// exactly what happened when the desktop went Aero and nine drawings did not.
+pub const INK_BLUE: Color = Color::new(0x30, 0x70, 0xC0);
+pub const INK_GREEN: Color = Color::new(0x30, 0xA0, 0x40);
+pub const INK_RED: Color = Color::new(0xC0, 0x30, 0x30);
 
 /// The Aperture mark at button size, on a raised face.
 ///
@@ -981,6 +1123,187 @@ pub fn separator_v(fb: &Framebuffer, x: u32, y: u32, h: u32) {
 /// green now, and a deep orange on that green reads as mud.
 pub fn mark_dot(fb: &Framebuffer, cx: u32, cy: u32, r: i32) {
     mark(fb, cx as i32, cy as i32, r.max(3), HILIGHT);
+}
+
+// --- dashboard painters ---------------------------------------------------
+//
+// A window that reports on the machine wants shapes `ui::Panel` has no variant
+// for: a filled proportion, a row of chips, a name against a value. These live
+// here for the same reason `button` and `list_row` do -- the look is this
+// file's business and the layout is the caller's -- and they are span-based,
+// so a window full of them costs what a window full of rectangles costs.
+
+/// A filled proportion, `frac` out of 256, in a sunken track.
+///
+/// The ramp is clipped to the filled part rather than being drawn across the
+/// whole track and covered, so an empty gauge costs one `rect` and a full one
+/// costs a `vgrad`. Neither costs a per-pixel loop.
+pub fn gauge(fb: &Framebuffer, r: Rect, frac: u32, stops: &[(u8, Color)]) {
+    if r.w < 3 || r.h < 3 {
+        return;
+    }
+    fb.rect(r.x, r.y, r.w, r.h, SCREEN);
+    let inner = r.shrink(1);
+    if !inner.is_empty() {
+        let w = inner.w * frac.min(256) / 256;
+        if w > 0 {
+            fb.vgrad(inner.x, inner.y, w, inner.h, stops);
+        }
+    }
+    outline(fb, r, WELL_EDGE);
+}
+
+/// The same shape in one colour, for a bar that is a quantity rather than a
+/// surface -- a memory figure, a step count.
+pub fn bar(fb: &Framebuffer, r: Rect, frac: u32, fill: Color) {
+    if r.w < 3 || r.h < 3 {
+        return;
+    }
+    fb.rect(r.x, r.y, r.w, r.h, SCREEN);
+    let inner = r.shrink(1);
+    if !inner.is_empty() {
+        let w = inner.w * frac.min(256) / 256;
+        if w > 0 {
+            fb.rect(inner.x, inner.y, w, inner.h, fill);
+        }
+    }
+    outline(fb, r, WELL_EDGE);
+}
+
+/// A strip of tabs across `r`, and **where each one landed**.
+///
+/// Returning the rectangles is the whole point. A tab strip drawn in one place
+/// and hit-tested in another is the bug this desktop forbids, and every other
+/// control here that has two halves -- `caption_buttons`, `Popup::row`,
+/// `menu_labels` -- is arranged the same way for the same reason.
+pub fn tabs(fb: &Framebuffer, r: Rect, labels: &[&str], sel: usize) -> alloc::vec::Vec<Rect> {
+    let mut out = alloc::vec::Vec::with_capacity(labels.len());
+    if labels.is_empty() || r.w == 0 {
+        return out;
+    }
+    let n = labels.len() as u32;
+    for (i, label) in labels.iter().enumerate() {
+        // Divided by position rather than by accumulating a width, so rounding
+        // cannot leave a gap or an overlap between two tabs.
+        let x0 = r.x + r.w * i as u32 / n;
+        let x1 = r.x + r.w * (i as u32 + 1) / n;
+        let t = Rect::new(x0, r.y, x1.saturating_sub(x0), r.h);
+        let on = i == sel;
+        control(
+            fb,
+            t,
+            if on { &TITLE_ON } else { &BTN },
+            if on { BTN_EDGE_HOT } else { BTN_EDGE },
+        );
+        let room = (t.w / text_w(1)).saturating_sub(1) as usize;
+        let shown = head_chars(label, room);
+        let tx = t.x + (t.w.saturating_sub(text_w_of(shown))) / 2;
+        let ty = t.y + (t.h.saturating_sub(text_h())) / 2;
+        text_over(fb, tx, ty, shown, if on { TITLE_TEXT } else { TEXT });
+        out.push(t);
+    }
+    out
+}
+
+/// A small chip that is either good or not. J1 through J4, pass or fail.
+pub fn pill(fb: &Framebuffer, r: Rect, label: &str, ok: bool) {
+    if r.w < 3 || r.h < 3 {
+        return;
+    }
+    control(
+        fb,
+        r,
+        if ok { &START } else { &CAP_CLOSE },
+        if ok { START_EDGE } else { CAP_EDGE },
+    );
+    let room = (r.w / text_w(1)).saturating_sub(1) as usize;
+    let shown = head_chars(label, room);
+    let tx = r.x + (r.w.saturating_sub(text_w_of(shown))) / 2;
+    let ty = r.y + (r.h.saturating_sub(text_h())) / 2;
+    text_over(fb, tx, ty, shown, CAP_INK);
+}
+
+/// A name against a value, on one line.
+///
+/// `ui::Status` is this widget and cannot be used here, because a `Panel` is a
+/// vertical stack rebuilt after a command and these windows are neither. Same
+/// fourteen-column gutter, so a dashboard row and a settings row line up.
+pub fn kv(fb: &Framebuffer, r: Rect, name: &str, value: &str, tone: Color) {
+    if r.h < text_h() {
+        return;
+    }
+    let gutter = text_w(14);
+    let room = (r.w / text_w(1)) as usize;
+    text_over(fb, r.x, r.y, head_chars(name, room.min(13)), TEXT_DIM);
+    if r.w > gutter {
+        let vroom = ((r.w - gutter) / text_w(1)) as usize;
+        text_over(fb, r.x + gutter, r.y, head_chars(value, vroom), tone);
+    }
+}
+
+/// One turn of a conversation.
+///
+/// The machine's turns and the operator's are told apart by ground and by
+/// which edge they sit against, which is how every chat since has done it and
+/// costs nothing here: two fills and an outline.
+pub fn bubble(fb: &Framebuffer, r: Rect, lines: &[alloc::string::String], from_machine: bool) {
+    if r.w < 8 || r.h < 8 {
+        return;
+    }
+    if from_machine {
+        control(fb, r, &TITLE_ON, CAP_EDGE);
+    } else {
+        control(fb, r, &BTN, BTN_EDGE);
+    }
+    let ink = if from_machine { TITLE_TEXT } else { TEXT };
+    let inner = r.shrink(4);
+    let room = (inner.w / text_w(1)) as usize;
+    for (i, line) in lines.iter().enumerate() {
+        let y = inner.y + i as u32 * text_h();
+        if y + text_h() > inner.y + inner.h {
+            break;
+        }
+        text_over(fb, inner.x, y, head_chars(line, room), ink);
+    }
+}
+
+/// How many lines `bubble` will show `text` as, wrapped to `cols`.
+///
+/// Wrapped by the caller and not by the painter, because a bubble's height has
+/// to be known before it is placed -- the same order `ui::note` works in and
+/// for the same reason.
+pub fn wrap(text: &str, cols: usize) -> alloc::vec::Vec<alloc::string::String> {
+    let mut out = alloc::vec::Vec::new();
+    if cols == 0 {
+        return out;
+    }
+    let mut line = alloc::string::String::new();
+    for word in text.split_whitespace() {
+        let need = if line.is_empty() { word.chars().count() } else { line.chars().count() + 1 + word.chars().count() };
+        if need > cols && !line.is_empty() {
+            out.push(core::mem::take(&mut line));
+        }
+        if word.chars().count() > cols {
+            // A word longer than the line is cut rather than allowed to push
+            // everything after it off the edge.
+            let mut rest = word;
+            while rest.chars().count() > cols {
+                let head = head_chars(rest, cols);
+                out.push(alloc::string::String::from(head));
+                rest = &rest[head.len()..];
+            }
+            line.push_str(rest);
+            continue;
+        }
+        if !line.is_empty() {
+            line.push(' ');
+        }
+        line.push_str(word);
+    }
+    if !line.is_empty() {
+        out.push(line);
+    }
+    out
 }
 
 /// A horizontal rule, drawn as a groove. The 3.1 separator.

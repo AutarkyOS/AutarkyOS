@@ -1,0 +1,196 @@
+// Probability, combinatorics and the exact half of statistics.
+//
+//   use "/lib/prob"
+//
+// A probability *is* a fraction -- favourable over total -- so this is the one
+// domain where exact numbers are the natural representation rather than a
+// refinement of floating point. Nothing here approximates and nothing here
+// needs to: every answer is a whole number or a ratio of two, and
+// `binom(5, 3, 1, 2)` is 5/16 rather than 0.3125.
+//
+// Written in Aiksi rather than as kernel builtins on purpose. A function here
+// can be read by anyone, imported by a stored program under the same jail as
+// any other `/lib` file, mined by `abstraction.rs` like any other source, and
+// carried as the `method` of a forest node -- where it is verified by being
+// *run*. A Rust builtin is none of those things and costs a kernel rebuild.
+//
+// Refusals answer -1 where a whole number is expected, which is `find`'s own
+// convention. Every count below is non-negative for admissible input, so -1
+// cannot be mistaken for an answer.
+
+// n!, refused past 20.
+//
+// 21! is 5.1e19 and does not fit a 64-bit integer. A wrapped factorial is a
+// confidently wrong answer rather than an obviously wrong one, and every
+// function below that needs one avoids it anyway -- see `comb`.
+fn fact(n: int): int {
+  if (n < 0) { return -1 }
+  if (n > 20) { return -1 }
+  r = 1
+  i = 2
+  while (i <= n) {
+    r = r * i
+    i = i + 1
+  }
+  return r
+}
+
+// Permutations: n!/(n-k)!, built by multiplying rather than by dividing two
+// factorials, so it answers for n far past the point where n! overflows.
+// perm(50, 3) is 117600 and 50! is not a number this machine holds.
+fn perm(n: int, k: int): int {
+  if (k < 0) { return -1 }
+  if (k > n) { return 0 }
+  r = 1
+  i = 0
+  while (i < k) {
+    r = r * (n - i)
+    i = i + 1
+  }
+  return r
+}
+
+// Combinations, C(n,k).
+//
+// Two things keep this exact and in range where n!/(k!(n-k)!) would not.
+//
+// The loop multiplies then divides, in that order, and the division is always
+// whole: after step i the running value is C(n-k+i, i), because a product of i
+// consecutive integers is divisible by i!. So integer division loses nothing
+// here, and no factorial is ever formed.
+//
+// And C(n,k) = C(n,n-k), so taking the smaller k halves the loop and keeps the
+// intermediates at their smallest. comb(50,25) is 126410606437752, which fits;
+// computed through 50! it could not be computed at all.
+fn comb(n: int, k: int): int {
+  if (k < 0) { return 0 }
+  if (k > n) { return 0 }
+  if (k > n - k) { k = n - k }
+  r = 1
+  i = 1
+  while (i <= k) {
+    r = r * (n - k + i) / i
+    i = i + 1
+  }
+  return r
+}
+
+// P(exactly k successes in n independent trials), each with probability p/q.
+//
+// Exact: C(n,k) * p^k * (1-p)^(n-k) with p a fraction, so the answer is a
+// fraction. Five fair tosses landing three heads is 5/16, and that is the
+// value -- not a decimal that happens to round to it.
+fn binom(n: int, k: int, p: int, q: int) {
+  if (k < 0) { return 0 }
+  if (k > n) { return 0 }
+  pr = rat(p, q)
+  qr = 1 - pr
+  r = comb(n, k)
+  i = 0
+  while (i < k) {
+    r = r * pr
+    i = i + 1
+  }
+  i = 0
+  while (i < n - k) {
+    r = r * qr
+    i = i + 1
+  }
+  return r
+}
+
+// P(at least k successes), summed exactly rather than approximated by a tail.
+fn atleast(n: int, k: int, p: int, q: int) {
+  r = 0
+  i = k
+  while (i <= n) {
+    r = r + binom(n, i, p, q)
+    i = i + 1
+  }
+  return r
+}
+
+// Hypergeometric: drawing d items from a population of N containing K
+// successes, the probability of exactly k of them. Sampling without
+// replacement, which is what a deck of cards and an urn both are.
+fn hyper(N: int, K: int, d: int, k: int) {
+  if (k > K) { return 0 }
+  if (d - k > N - K) { return 0 }
+  return rat(comb(K, k) * comb(N - K, d - k), comb(N, d))
+}
+
+// The exact total of a list. Works whether the items are whole numbers or
+// fractions, because addition promotes.
+fn total(xs) {
+  s = 0
+  i = 0
+  while (i < len(xs)) {
+    s = s + get(xs, i)
+    i = i + 1
+  }
+  return s
+}
+
+// The arithmetic mean, exactly. The mean of 1, 2 is 3/2 and not 1.
+//
+// `rat` is exact division rather than a fraction constructor, which is what
+// lets this divide a running total that has already become a fraction.
+fn mean(xs) {
+  n = len(xs)
+  if (n == 0) { return 0 }
+  return rat(total(xs), n)
+}
+
+// Ascending order, by value.
+//
+// This was a hand-written selection sort, and the note on it said why: `sort`
+// tested "is this a number" with `as_int`, which is false for every fraction,
+// so a list of them fell through to comparing *renderings* -- where "19/2"
+// sorts before "9" and 2/3 sorts below 1/2. The builtin reads the same
+// ordering `<` does now, so the workaround came out and this is what is left.
+//
+// Kept as a name rather than deleted: it says what it sorts by, where `sort`
+// alone leaves a reader to wonder whether a list of fractions is safe.
+fn ordered(xs) {
+  return sort(xs)
+}
+
+// The middle value, or the exact mean of the middle two.
+//
+// An even-length median is a fraction, which is the ordinary case and not an
+// edge one: the median of 1, 2, 3, 4 is 5/2. Answering 2 there -- what integer
+// division would give -- is wrong by half and looks entirely reasonable.
+fn median(xs) {
+  n = len(xs)
+  if (n == 0) { return 0 }
+  s = ordered(xs)
+  h = n / 2
+  if (n - h - h == 1) { return get(s, h) }
+  return rat(get(s, h - 1) + get(s, h), 2)
+}
+
+// Population variance, exactly: the mean of the squared deviations.
+//
+// The two-pass form rather than E[x^2] - E[x]^2. They agree in exact
+// arithmetic, so the usual floating-point argument for the one-pass version
+// does not apply -- and this one reads as its own definition.
+fn variance(xs) {
+  n = len(xs)
+  if (n == 0) { return 0 }
+  m = mean(xs)
+  s = 0
+  i = 0
+  while (i < n) {
+    d = get(xs, i) - m
+    s = s + d * d
+    i = i + 1
+  }
+  return rat(s, n)
+}
+
+// A fraction as whole percent, rounded half away from zero. For reading only:
+// it throws away exactly what the rest of this file exists to keep, so it
+// belongs at the point something is printed and nowhere earlier.
+fn pct(x): int {
+  return round(x * 100)
+}

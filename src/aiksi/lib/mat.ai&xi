@@ -1,0 +1,429 @@
+// Linear algebra over exact numbers.
+//
+//   use "/lib/mat"
+//
+// A matrix is a list of rows and a row is a list of numbers. No new type: the
+// list builtins already index, replace and grow one, and a `rec` wrapper would
+// buy a cached row count in exchange for every operation having to unwrap it.
+//
+// **Gaussian elimination is the algorithm that most wants exact arithmetic,
+// and it is the reason this file exists.** Every decision it makes is "is this
+// pivot zero", and in floating point that question has no honest answer:
+// a singular matrix eliminates to something like 1e-17 rather than 0, so it
+// reads as invertible and `solve` returns a confident vector of nonsense. The
+// usual defence is a tolerance, which is a second wrong answer wearing a
+// parameter. Here the pivot is either zero or it is not, `det` of a singular
+// matrix is exactly 0, and `solve` says there is no unique solution by
+// answering nothing.
+//
+// The demonstration is `hilb`. The Hilbert matrix is the standard
+// ill-conditioned example -- its inverse has *integer* entries, and no
+// floating-point library recovers them. This one does, because 1/3 is 1/3
+// here rather than 0.3333333.
+//
+// ### What is deliberately absent
+//
+// Eigenvalues, singular values, and any decomposition that needs them. The
+// eigenvalues of a rational matrix are algebraic numbers and almost never
+// rational, so there is nothing exact to answer with -- the same refusal
+// `/lib/geom` makes about angles and side lengths. `dist` below is the one
+// approximate function here, and it says so in its answer.
+//
+// ### The cost of being exact, stated rather than discovered
+//
+// Entries grow during elimination. Every intermediate is reduced by `gcd`, so
+// they stay in lowest terms, but a numerator or denominator that outgrows an
+// `i64` is an **error** rather than a wrapped value -- `rat_binary` refuses,
+// and a program stops with "numerator overflowed" instead of carrying on with
+// a confidently wrong exact answer. Roughly: whole entries up to four digits
+// and a matrix up to about 8x8 are comfortable, and past that it depends on
+// the numbers. Bareiss elimination keeps every intermediate a whole number
+// (each is a minor of the original) and would push that ceiling a long way
+// out; it is not here because it complicates `solve` and `inv`, which share
+// this one routine, and nothing has needed it yet.
+
+// The reduced matrix, the determinant of its leading block, and the rank. One
+// record because `gauss` answers three things and the language has one return.
+rec Elim { m, det, rank }
+
+// --- shape --------------------------------------------------------------
+
+fn rows(m): int { return len(m) }
+
+fn cols(m): int {
+  if (len(m) == 0) { return 0 }
+  return len(get(m, 0))
+}
+
+fn at(m, i: int, j: int) { return get(get(m, i), j) }
+
+// Lists are values here, so this answers a new matrix and leaves the old one
+// alone. Nothing in this file mutates, which is why `gauss` can hand back the
+// reduced form without the caller's matrix having moved underneath it.
+fn put(m, i: int, j: int, v) {
+  return set(m, i, set(get(m, i), j, v))
+}
+
+fn fill(r: int, c: int, v) {
+  m = list()
+  i = 0
+  while (i < r) {
+    w = list()
+    j = 0
+    while (j < c) {
+      w = push(w, v)
+      j = j + 1
+    }
+    m = push(m, w)
+    i = i + 1
+  }
+  return m
+}
+
+fn ident(n: int) {
+  m = fill(n, n, 0)
+  i = 0
+  while (i < n) {
+    m = put(m, i, i, 1)
+    i = i + 1
+  }
+  return m
+}
+
+// The Hilbert matrix, H[i][j] = 1/(i+j+1).
+//
+// A test matrix rather than a general-purpose one, and it earns three lines
+// because it is *the* demonstration of what exactness buys. Its condition
+// number grows like 10^n, so at 4x4 a single-precision solve has already lost
+// every digit it had -- and its inverse is a matrix of whole numbers, which is
+// a fact a reader can check against a table rather than against this code.
+fn hilb(n: int) {
+  m = list()
+  i = 0
+  while (i < n) {
+    w = list()
+    j = 0
+    while (j < n) {
+      w = push(w, rat(1, i + j + 1))
+      j = j + 1
+    }
+    m = push(m, w)
+    i = i + 1
+  }
+  return m
+}
+
+fn row(m, i: int) { return get(m, i) }
+
+fn col(m, j: int) {
+  out = list()
+  i = 0
+  while (i < len(m)) {
+    out = push(out, at(m, i, j))
+    i = i + 1
+  }
+  return out
+}
+
+fn tpose(m) {
+  r = rows(m)
+  c = cols(m)
+  out = list()
+  j = 0
+  while (j < c) {
+    w = list()
+    i = 0
+    while (i < r) {
+      w = push(w, at(m, i, j))
+      i = i + 1
+    }
+    out = push(out, w)
+    j = j + 1
+  }
+  return out
+}
+
+// --- vectors ------------------------------------------------------------
+
+fn vadd(u, v) {
+  if (len(u) != len(v)) { return }
+  out = list()
+  i = 0
+  while (i < len(u)) {
+    out = push(out, get(u, i) + get(v, i))
+    i = i + 1
+  }
+  return out
+}
+
+fn vsub(u, v) {
+  if (len(u) != len(v)) { return }
+  out = list()
+  i = 0
+  while (i < len(u)) {
+    out = push(out, get(u, i) - get(v, i))
+    i = i + 1
+  }
+  return out
+}
+
+fn vscale(v, k) {
+  out = list()
+  i = 0
+  while (i < len(v)) {
+    out = push(out, get(v, i) * k)
+    i = i + 1
+  }
+  return out
+}
+
+fn dot(u, v) {
+  if (len(u) != len(v)) { return }
+  s = 0
+  i = 0
+  while (i < len(u)) {
+    s = s + get(u, i) * get(v, i)
+    i = i + 1
+  }
+  return s
+}
+
+// The *square* of the length. `/lib/geom` makes the argument in full: the
+// length of (1,1) is not a rational, so a library holding only rationals must
+// either refuse or lie. Squared lengths compare, sort and test for equality
+// exactly as lengths do, and this one is exact.
+fn norm2(v) { return dot(v, v) }
+
+// And the length itself, which is approximate and says so.
+//
+// This is the function `/lib/geom` declined to write, and the tower is what
+// changed: an `Approx` renders with a leading `~`, so the answer carries the
+// warning rather than the documentation having to. `dist(list(0,0),
+// list(1,1))` is `~1.414214` and can never be mistaken for a number that is
+// exactly anything.
+fn dist(u, v) {
+  return sqrt(real(norm2(vsub(u, v))))
+}
+
+// --- matrix arithmetic --------------------------------------------------
+
+fn add(a, b) {
+  if (rows(a) != rows(b) || cols(a) != cols(b)) { return }
+  out = list()
+  i = 0
+  while (i < rows(a)) {
+    out = push(out, vadd(row(a, i), row(b, i)))
+    i = i + 1
+  }
+  return out
+}
+
+fn sub(a, b) {
+  if (rows(a) != rows(b) || cols(a) != cols(b)) { return }
+  out = list()
+  i = 0
+  while (i < rows(a)) {
+    out = push(out, vsub(row(a, i), row(b, i)))
+    i = i + 1
+  }
+  return out
+}
+
+fn scale(m, k) {
+  out = list()
+  i = 0
+  while (i < rows(m)) {
+    out = push(out, vscale(row(m, i), k))
+    i = i + 1
+  }
+  return out
+}
+
+// Matrix times vector, which is what a layer of a network is.
+//
+// Answers nothing on a shape mismatch rather than a shorter vector. A product
+// of the wrong shape is the mistake that survives longest, because the next
+// operation usually accepts it.
+fn mv(m, v) {
+  if (cols(m) != len(v)) { return }
+  out = list()
+  i = 0
+  while (i < rows(m)) {
+    out = push(out, dot(row(m, i), v))
+    i = i + 1
+  }
+  return out
+}
+
+fn mul(a, b) {
+  if (cols(a) != rows(b)) { return }
+  t = tpose(b)
+  out = list()
+  i = 0
+  while (i < rows(a)) {
+    w = list()
+    j = 0
+    while (j < len(t)) {
+      w = push(w, dot(row(a, i), get(t, j)))
+      j = j + 1
+    }
+    out = push(out, w)
+    i = i + 1
+  }
+  return out
+}
+
+fn trace(m) {
+  n = min(rows(m), cols(m))
+  s = 0
+  i = 0
+  while (i < n) {
+    s = s + at(m, i, i)
+    i = i + 1
+  }
+  return s
+}
+
+// --- elimination --------------------------------------------------------
+
+// Is this nonzero? Written as an ordering and not as `x != 0`.
+//
+// `==` compares values structurally, and an approximation is never
+// structurally an exact zero -- `real(0) == 0` is **false**, which is correct
+// (they are different kinds of number) and is exactly the wrong test for a
+// pivot. An ordering goes through the numeric comparison instead, which knows
+// about every rung of the tower. The same trap is waiting for anybody who
+// writes `if (x == 0)` about a value that might have been through `real`.
+fn nz(x): int { return x < 0 || x > 0 }
+
+fn swap(m, i: int, j: int) {
+  t = get(m, i)
+  m = set(m, i, get(m, j))
+  return set(m, j, t)
+}
+
+// Gauss-Jordan over the first `n` columns, carrying any columns beyond them
+// along for the ride. One routine, because `det`, `rank`, `solve` and `inv`
+// are the same elimination read four ways, and four copies of a pivot search
+// is four places to get the sign of a row swap wrong.
+//
+// **The pivot search is looking for a nonzero entry and nothing else.**
+// Partial pivoting -- taking the largest available -- is a floating-point
+// remedy for a floating-point disease: dividing by a small pivot amplifies the
+// error already in the matrix. There is no error here to amplify, so any
+// nonzero pivot gives the identical answer and the first one found is as good
+// as the best one.
+//
+// The determinant comes out of the same walk for free. Every operation used
+// has a known effect on it: a row swap flips the sign, adding a multiple of
+// one row to another changes nothing, and dividing a row by its pivot divides
+// it by that pivot. So the product of the pivots, signed by the swaps, is the
+// determinant of the leading block -- and a column with no pivot at all makes
+// it exactly zero, which is the same fact as the block being singular.
+fn gauss(a, n: int) {
+  m = a
+  nr = rows(m)
+  d = 1
+  r = 0
+  j = 0
+  while (j < n) {
+    p = -1
+    i = r
+    while (i < nr) {
+      if (p < 0 && nz(at(m, i, j))) { p = i }
+      i = i + 1
+    }
+    if (p < 0) {
+      // A free column: no pivot exists at or below the current row, so the
+      // block is singular and the rank does not grow.
+      d = 0
+    } else {
+      if (p != r) {
+        m = swap(m, p, r)
+        d = -d
+      }
+      pv = at(m, r, j)
+      d = d * pv
+      // The reciprocal is `pow(x, -1)`, which is the one spelling that works
+      // on every rung: `1 / pv` is *integer* division when the pivot happens
+      // to be whole, so it would answer 0 for every pivot but 1 and -1.
+      m = set(m, r, vscale(get(m, r), pow(pv, -1)))
+      i = 0
+      while (i < nr) {
+        if (i != r) {
+          f = at(m, i, j)
+          if (nz(f)) {
+            m = set(m, i, vsub(get(m, i), vscale(get(m, r), f)))
+          }
+        }
+        i = i + 1
+      }
+      r = r + 1
+    }
+    j = j + 1
+  }
+  return Elim(m, d, r)
+}
+
+// The determinant, exactly.
+//
+// A whole-number matrix has a whole-number determinant, and this comes back as
+// one *by construction* rather than by rounding: elimination goes through
+// fractions to get there, and a fraction whose denominator reduces to one is
+// an `Int`. So `det` answering `-3` rather than `-3/1` is itself the evidence
+// that the arithmetic stayed exact all the way through.
+fn det(a) {
+  if (rows(a) != cols(a)) { return }
+  return gauss(a, rows(a)).det
+}
+
+fn rank(a): int { return gauss(a, cols(a)).rank }
+
+// Solve A x = b, or answer nothing when there is no unique solution.
+//
+// Nothing covers both failures deliberately. A singular system either has no
+// solution or has infinitely many, and neither is a vector -- so returning one
+// would mean inventing a number. That is the case floating point cannot
+// detect at all.
+fn solve(a, b) {
+  n = rows(a)
+  if (n != cols(a)) { return }
+  if (n != len(b)) { return }
+  aug = list()
+  i = 0
+  while (i < n) {
+    aug = push(aug, push(get(a, i), get(b, i)))
+    i = i + 1
+  }
+  e = gauss(aug, n)
+  if (e.rank < n) { return }
+  return col(e.m, n)
+}
+
+// The inverse, by reducing [A | I] and reading off the right half.
+fn inv(a) {
+  n = rows(a)
+  if (n != cols(a)) { return }
+  id = ident(n)
+  aug = list()
+  i = 0
+  while (i < n) {
+    w = get(a, i)
+    j = 0
+    while (j < n) {
+      w = push(w, at(id, i, j))
+      j = j + 1
+    }
+    aug = push(aug, w)
+    i = i + 1
+  }
+  e = gauss(aug, n)
+  if (e.rank < n) { return }
+  out = list()
+  i = 0
+  while (i < n) {
+    out = push(out, slice(get(e.m, i), n, n))
+    i = i + 1
+  }
+  return out
+}

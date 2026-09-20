@@ -69,14 +69,18 @@ pub fn deliver(src: Ipv4, dst: Ipv4, segment: &[u8]) {
     if dst_port != port {
         return;
     }
-    let inbox = unsafe { &mut *INBOX.get() };
-    if inbox.len() < MAX_QUEUED {
-        inbox.push(Datagram {
-            src,
-            src_port,
-            data: segment[8..].to_vec(),
-        });
-    }
+    // Masked, and paired with the take in `recv`. This runs inside `poll`, so
+    // `StackGuard` keeps another task out of *the stack* -- but `recv` reads
+    // this same vector without entering the stack at all, so the guard does not
+    // separate them. A tick landing mid-push, with `recv` then removing an
+    // element, is two tasks in one `Vec`. Same argument as `tcp::at`.
+    let data = segment[8..].to_vec();
+    crate::cpu::without_interrupts(|| {
+        let inbox = unsafe { &mut *INBOX.get() };
+        if inbox.len() < MAX_QUEUED {
+            inbox.push(Datagram { src, src_port, data });
+        }
+    });
 }
 
 fn datagram(src: Ipv4, dst: Ipv4, src_port: u16, dst_port: u16, payload: &[u8]) -> Vec<u8> {
@@ -126,9 +130,19 @@ pub fn recv(timeout_ms: u64) -> Option<Datagram> {
                 break;
             }
         }
-        let inbox = unsafe { &mut *INBOX.get() };
-        if !inbox.is_empty() {
-            return Some(inbox.remove(0));
+        // The other half of the pair in `deliver`. `remove(0)` shifts the whole
+        // vector, which is the worst possible thing to be interrupted in the
+        // middle of while another task is pushing to it.
+        let got = crate::cpu::without_interrupts(|| {
+            let inbox = unsafe { &mut *INBOX.get() };
+            if inbox.is_empty() {
+                None
+            } else {
+                Some(inbox.remove(0))
+            }
+        });
+        if got.is_some() {
+            return got;
         }
         if crate::dev::lapic::ticks() >= deadline {
             return None;

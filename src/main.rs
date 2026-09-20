@@ -16,6 +16,8 @@
 extern crate alloc;
 
 mod acpi;
+mod boot_report;
+mod repair;
 mod ai;
 mod app;
 mod cpu;
@@ -28,14 +30,18 @@ mod gfx;
 mod gpu;
 mod json;
 mod aiksi;
+mod linux;
 mod log;
 mod mem;
 mod net;
 mod pkg;
+/// What a program written somewhere else may ask of this machine.
+mod port;
 mod recovery;
 mod rng;
 mod serial;
 mod shell;
+mod sky;
 mod smp;
 mod store;
 mod sync;
@@ -256,6 +262,39 @@ pub extern "efiapi" fn efi_main(image: Handle, st: *mut SystemTable) -> Status {
 ");
     }
 
+    // --- repairs this machine decided for itself on an earlier boot ---
+    //
+    // Here because it is the earliest point there is: the ESP is readable, and
+    // every subsystem a repair could be protecting initialises later. A repair
+    // adopted after `power` has already faulted is a repair that arrives one
+    // boot late, which is exactly what persisting it is for.
+    //
+    // Nothing the file says is executed. Two words are resolved against
+    // `repair::ACTIONS`, the row is what runs, and a line naming an action that
+    // does not exist -- or aiming a narrow one at a subsystem it was never
+    // offered for -- gets nothing.
+    let (persisted, repair_note) = update::repairs::at_boot(bs, image);
+    if let Some(line) = &repair_note {
+        serial_println!("glados: {}", line);
+        con_out(st, "glados: ");
+        con_out(st, line);
+        con_out(st, "
+");
+    }
+    for e in &persisted {
+        match repair::apply_named(&e.subsystem, &e.action) {
+            Some((sub, act)) => {
+                repair::note_from_disk(sub, act);
+                serial_println!("glados: repair '{}' for {}", act, sub);
+            }
+            None => serial_println!(
+                "glados: the boot volume asks for '{}' for {}, which is not a repair this kernel has",
+                e.action,
+                e.subsystem
+            ),
+        }
+    }
+
     let model = uefi::read_file(bs, image, MODEL_PATH);
     let tokenizer = uefi::read_file(bs, image, TOKENIZER_PATH);
     // The root bundle comes off the same volume for the same reason: this is
@@ -395,6 +434,28 @@ pub extern "efiapi" fn efi_main(image: Handle, st: *mut SystemTable) -> Status {
     install_paging(&boot, &mut frames);
     init_heap(&mut frames);
 
+    // Record what is left, while the firmware's map is still readable and
+    // while the one allocator that took anything from it is still in scope.
+    // After this the map is never consulted again, and `mem::fixed` is the
+    // only thing that can say whether a fixed-address image is placeable.
+    //
+    // Refused rather than approximated when the allocator lost a handout: a
+    // free set that is missing a taken range would place a guest on top of the
+    // page tables, and the symptom would be the machine rewriting its own
+    // translations while a program runs.
+    match frames.handouts() {
+        Some(taken) => unsafe {
+            mem::fixed::snapshot(boot.mmap, boot.mmap_size, boot.desc_size, taken)
+        },
+        None => kprintln!("[boot] placement table skipped: the early allocator lost a handout"),
+    }
+    let (free, run) = mem::fixed::totals();
+    kprintln!(
+        "[boot] placeable  {} MiB free below the heap and above it, largest run {} MiB",
+        free / 1024 / 1024,
+        run / 1024 / 1024,
+    );
+
     let acpi = unsafe { acpi::parse(boot.rsdp) };
 
     banner(&boot, &acpi);
@@ -403,7 +464,14 @@ pub extern "efiapi" fn efi_main(image: Handle, st: *mut SystemTable) -> Status {
     init_smp(&acpi);
     init_keyboard(&acpi);
     gfx::splash::stage("self-test");
+    // **The window in which a panicking selftest is survivable**, opened here
+    // and shut on the next line. A check that asserts its way out has said its
+    // subsystem is broken, which is information; a panic anywhere else in this
+    // kernel still halts, which is why the window is two lines wide and not a
+    // policy.
+    cpu::recover::selftest_window(true);
     selftest(&acpi);
+    cpu::recover::selftest_window(false);
 
     // Adopt the current thread of execution as task 0, then give it company.
     gfx::splash::stage("scheduler");
@@ -508,6 +576,27 @@ pub extern "efiapi" fn efi_main(image: Handle, st: *mut SystemTable) -> Status {
         kprintln!("  initiative resident -- the machine thinks between your commands");
     }
 
+    // Try to fix what broke, before saying what is missing -- so the summary
+    // reports the state the machine is actually in rather than the one it was
+    // in a moment ago.
+    repair::attempt_all();
+
+    // And the other direction: a repair still applied to a subsystem that has
+    // started passing without it is a workaround that outlived its bug.
+    repair::recheck_persisted();
+
+    // Said here rather than only where it happened: by now the fault itself
+    // has scrolled past a hundred ok lines, and the line that matters is
+    // "this machine is running without X".
+    boot_report::report();
+
+    // The repairs applied at the hook did not stop this boot, which is the
+    // whole of what the trial flag asks. Deliberately here rather than beside
+    // `update::mark_healthy`: that one is bounded by `ExitBootServices` because
+    // it guards a boot image, and this one is not, so it covers the selftests,
+    // storage, the model and the desktop instead of none of them.
+    update::repairs::survived();
+
     gfx::splash::stage("ready");
     gfx::splash::finish();
 
@@ -554,6 +643,11 @@ fn init_storage(acpi: &Option<acpi::Acpi>) -> bool {
             return false;
         }
     }
+
+    // Late on purpose: `repair::attempt_all` decided this before the
+    // controller existed, because the boot summary has to describe the machine
+    // as it now is. This is the first moment there is anywhere to write.
+    repair::persist_adopted();
 
     // The store's location is derived, not remembered: a partition tagged with
     // the AUTARK type GUID if one exists, otherwise unclaimed space. So
@@ -612,6 +706,12 @@ fn clock_task() {
         // `sysbox::autosnap_poll` for why it cannot happen here.
         sysbox::autosnap_tick();
 
+        // The wireless state machine, so a scan keeps moving while the shell
+        // is inside a long command. `wifi_poll` and not `wifi_service`: the
+        // second one draws, and the compositor's back buffer belongs to the
+        // shell's task. Claimed against the idle loop, which calls it too.
+        net::wifi_poll();
+
         let tenths = dev::lapic::ticks() * 10 / TIMER_HZ as u64;
         if tenths != last {
             let crossed_second = tenths / 10 != last / 10;
@@ -637,6 +737,27 @@ fn clock_task() {
             // counter in the corner of a splash is the tell that something is
             // drawing behind the curtain.
             if let (Some(fb), false) = (gfx::primary(), gfx::splash::active()) {
+                // **The pointer is pumped from here, not only from a
+                // generation.** `pump_cursor` had exactly one caller, inside
+                // `generate`, so it answered the freeze during `ask` and no
+                // other. Every long foreground command has the same shape --
+                // `recon` waits whole seconds per host on the shell task,
+                // and the shell's idle loop is the only thing that reads the
+                // mouse -- so on the GF63 a sweep froze the pointer for half an
+                // hour with the uptime still counting beside it. That is the
+                // same symptom `pump_cursor` documents, arriving by a command
+                // nobody had added a call to.
+                //
+                // Here rather than in the sweep, because a list of long
+                // commands that remember to pump is the stale-call-site failure
+                // `with_engine` records: correct the day it is written and
+                // wrong the next time somebody adds a command. This task wakes
+                // on its own quantum whatever the shell is doing, which is
+                // precisely what the moving clock proved.
+                //
+                // Still motion only -- `pump_cursor` dispatches no presses, so
+                // nothing here can re-enter the desktop or the engine.
+                gfx::desk::pump_cursor();
                 // Short, because the taskbar reserves a fixed well for it and
                 // every character of that well is a character the task buttons
                 // do not get. The switch counter moved to `tasks`, which is
@@ -1067,10 +1188,28 @@ fn install_paging(boot: &BootInfo, frames: &mut mem::frame::EarlyFrames) {
             // Reaching this line means the map covered our code, our stack and
             // the framebuffer -- if it had not, we would already be gone.
             kprintln!(
-                "[boot] paging active  cr3={:#x}  mapped {} MiB  ({} frames)",
+                "[boot] paging active  cr3={:#x}  mapped {} MiB  ({} frames, 1 GiB pages {})",
                 cpu::read_cr3(),
                 limit / (1024 * 1024),
-                frames.allocated_frames()
+                frames.allocated_frames(),
+                if cpu::gib_pages_supported() { "yes" } else { "no" }
+            );
+            // Both change what a page table entry *means*, so they go on
+            // immediately after the map this kernel built becomes the map the
+            // processor is using, and before anything has a chance to rely on
+            // a permission that was not being enforced.
+            //
+            // Neither changes anything today. Everything is mapped writable
+            // and nothing has ever set bit 63, so the map means exactly what
+            // it meant a moment earlier. What they buy is that read-only and
+            // no-execute stop being decorative the first time anything asks
+            // for them.
+            cpu::enable_wp();
+            let nx = cpu::enable_nx();
+            kprintln!(
+                "[boot] page rights  wp={}  nx={}",
+                if cpu::wp_on() { 1 } else { 0 },
+                if nx { 1 } else { 0 }
             );
         }
         None => {
@@ -1082,6 +1221,61 @@ fn install_paging(boot: &BootInfo, frames: &mut mem::frame::EarlyFrames) {
 }
 
 /// Prove the exception path works while we are still expecting it to.
+/// Run one boot selftest under a guard, and decide what its failure means.
+///
+/// **This is the line between "a thermometer broke" and "the machine is
+/// gone".** Before it, any fault inside any selftest halted the boot before
+/// the shell existed -- which is exactly what a `#GP` in `dev::power` did on
+/// the first bare-metal run, costing storage, the namespace and the model to a
+/// register nobody needs.
+///
+/// `Unguarded` is not treated as a pass and not treated as a failure: it means
+/// the closure ran with no landing pad, so nothing was proven either way. It
+/// cannot happen here -- `percpu::arm` runs at `init_smp`, one step before the
+/// selftests -- and is matched explicitly so that if the boot order ever
+/// changes, this reads as the open question it is rather than as success.
+/// Note the  rather than a closure: a check has to be **re-runnable**,
+/// because re-running it is how a repair is judged. Every section here
+/// captures nothing, so this costs nothing and buys the whole repair loop.
+fn section(name: &'static str, need: boot_report::Need, f: fn()) {
+    use cpu::recover::Caught;
+    // Recorded whether it passes or not, because a repair already applied to
+    // this subsystem has to be re-testable: passing with a repair holding it up
+    // and passing because the bug was fixed look the same from anywhere else.
+    boot_report::note_check(name, f);
+    match cpu::recover::guarded(f) {
+        Caught::Ran => {}
+        Caught::Unguarded(_) => {
+            console::set_color(LTRED);
+            kprintln!("[selftest] {} ran with no landing pad, so it proved nothing", name);
+            console::set_color(LTGRAY_IDX);
+        }
+        Caught::Faulted(why) => {
+            boot_report::record(name, need, why, f);
+            console::set_color(LTRED);
+            kprintln!(
+                "[selftest] {} {} -- {}",
+                name,
+                why,
+                match need {
+                    boot_report::Need::Vital => "and this machine needs it",
+                    boot_report::Need::Optional => "this subsystem is unavailable",
+                }
+            );
+            console::set_color(LTGRAY_IDX);
+            if need == boot_report::Need::Vital {
+                // Nothing after this line can be trusted, so the honest thing
+                // is to stop here rather than to boot something that will fail
+                // somewhere less legible.
+                boot_report::report();
+                console::set_color(LTRED);
+                kprintln!("\n[boot] {} is vital, so this machine will not continue.", name);
+                halt();
+            }
+        }
+    }
+}
+
 fn selftest(acpi_ref: &Option<acpi::Acpi>) {
     console::set_color(LTGREEN);
     kprintln!("\n[selftest] heap:");
@@ -1142,8 +1336,15 @@ fn selftest(acpi_ref: &Option<acpi::Acpi>) {
     console::set_color(LTGREEN);
     kprintln!("\n[selftest] timer:");
     console::set_color(LTGRAY_IDX);
+    // Timed against the TSC rather than labelled. This printed "N ticks in
+    // ~0.5 s" for a long time, where the 0.5 was a constant in the format
+    // string and not a measurement -- so it read identically however fast the
+    // counter was really advancing, and could not see that every core's timer
+    // ISR was incrementing one global `TICKS`. Two clocks that are supposed to
+    // agree do not stay agreeing on their own.
+    let t0 = time::rdtsc();
     let start = dev::lapic::ticks();
-    let want = start + TIMER_HZ as u64 / 2; // half a second
+    let want = start + TIMER_HZ as u64 / 2; // half a second, if ticks are honest
     let mut spins: u64 = 0;
     while dev::lapic::ticks() < want {
         spins += 1;
@@ -1153,12 +1354,34 @@ fn selftest(acpi_ref: &Option<acpi::Acpi>) {
         core::hint::spin_loop();
     }
     let elapsed = dev::lapic::ticks() - start;
-    if elapsed >= TIMER_HZ as u64 / 2 {
-        console::set_color(LTGREEN);
-        kprintln!("  {} ticks in ~0.5 s -- interrupts are firing", elapsed);
+    let mhz = time::tsc_mhz();
+    let real_ms = if mhz > 0 {
+        (time::rdtsc() - t0) / (mhz * 1000)
     } else {
+        0
+    };
+    if elapsed < TIMER_HZ as u64 / 2 {
         console::set_color(LTRED);
         kprintln!("  only {} ticks -- timer is not delivering", elapsed);
+    } else if mhz == 0 {
+        kprintln!("  {} ticks -- firing, but the TSC is uncalibrated", elapsed);
+    } else {
+        // 500 ms expected. Allow a wide band: this is a spin loop on an
+        // emulator and the point is to catch a rate wrong by a whole core
+        // count, not to measure the crystal.
+        let ok = (350..=750).contains(&real_ms);
+        console::set_color(if ok { LTGREEN } else { LTRED });
+        kprintln!(
+            "  {} {} ticks in {} ms of TSC time -- {}",
+            if ok { "ok  " } else { "FAIL" },
+            elapsed,
+            real_ms,
+            if ok {
+                "the two clocks agree"
+            } else {
+                "ticks() disagrees with the TSC; is every core incrementing it?"
+            }
+        );
     }
 
     console::set_color(LTGREEN);
@@ -1183,7 +1406,7 @@ fn selftest(acpi_ref: &Option<acpi::Acpi>) {
     console::set_color(LTGREEN);
     kprintln!("\n[selftest] sysbox namespace:");
     console::set_color(LTGRAY_IDX);
-    sysbox::selftest();
+    section("sysbox", boot_report::Need::Vital, || { sysbox::selftest(); });
 
     // The invariant, at every boot, before anything has had a chance to write.
     // A pure function over (path, stored bytes, change), so all seven of its
@@ -1203,7 +1426,10 @@ fn selftest(acpi_ref: &Option<acpi::Acpi>) {
     // between a broken field arithmetic and a TLS handshake that fails with
     // nothing to point at -- crypto is the one place where wrong code still
     // produces perfectly plausible output.
-    crypto::selftest();
+    // Vital: a cipher that is quietly wrong produces output that works
+    // perfectly and is not secure, which is the failure `crypto` opens by
+    // warning about. Absent is safer than subtly broken.
+    section("crypto", boot_report::Need::Vital, || { crypto::selftest(); });
 
     // Straight after the ciphers, and deliberately so: the generator is a
     // construction over the ChaCha20 checked one line above, so its claims
@@ -1211,11 +1437,11 @@ fn selftest(acpi_ref: &Option<acpi::Acpi>) {
     console::set_color(LTGREEN);
     kprintln!("\n[selftest] random:");
     console::set_color(LTGRAY_IDX);
-    if !rng::selftest() {
+    section("rng", boot_report::Need::Vital, || if !rng::selftest() {
         console::set_color(LTRED);
         kprintln!("  FAIL -- key material would look fine and be predictable");
         console::set_color(LTGRAY_IDX);
-    }
+    });
 
     if json::selftest() {
         console::set_color(LTGREEN);
@@ -1289,18 +1515,23 @@ fn selftest(acpi_ref: &Option<acpi::Acpi>) {
     // the first time anything here fetches an instruction from the heap. A
     // wrong answer is a halted machine, so it runs early and under QEMU
     // before it ever runs on the GF63.
-    dev::power::probe();
-    kprintln!("
+    // **The one that has actually faulted on real hardware.** Optional by
+    // any reading: nothing downstream needs a temperature, and the first
+    // bare-metal boot lost the entire machine to it.
+    section("power", boot_report::Need::Optional, || {
+        dev::power::probe();
+        kprintln!("
 [power]");
-    dev::power::report();
+        dev::power::report();
+    });
 
     kprintln!("
 [selftest] file formats:");
-    if !fmt::selftest() {
+    section("fmt", boot_report::Need::Optional, || if !fmt::selftest() {
         console::set_color(LTRED);
         kprintln!("[selftest] file type handling is unsound");
         console::set_color(LTGRAY_IDX);
-    }
+    });
 
     kprintln!("
 [selftest] acpi tables:");
@@ -1320,11 +1551,11 @@ fn selftest(acpi_ref: &Option<acpi::Acpi>) {
 
     kprintln!("
 [selftest] usb input:");
-    if !dev::usbhid::selftest() {
+    section("usbhid", boot_report::Need::Optional, || if !dev::usbhid::selftest() {
         console::set_color(LTRED);
         kprintln!("[selftest] a USB keyboard would type the wrong characters");
         console::set_color(LTGRAY_IDX);
-    }
+    });
 
     kprintln!("
 [selftest] text:");
@@ -1336,11 +1567,11 @@ fn selftest(acpi_ref: &Option<acpi::Acpi>) {
 
     kprintln!("
 [selftest] generated code:");
-    if !cpu::code::selftest() {
+    section("code", boot_report::Need::Optional, || if !cpu::code::selftest() {
         console::set_color(LTRED);
         kprintln!("[selftest] the code substrate is not sound -- do not generate any");
         console::set_color(LTGRAY_IDX);
-    }
+    });
 
     // The deliberate null dereference now lives behind the shell's `fault`
     // command. It is fatal by design, so running it during boot would mean the
@@ -1529,6 +1760,27 @@ fn halt() -> ! {
 
 #[panic_handler]
 fn panic(info: &PanicInfo) -> ! {
+    // **A panic during a boot selftest is survivable; everywhere else it is
+    // not.** A check that asserts its way out has said its subsystem is
+    // broken, which is information rather than a reason to stop the machine --
+    // and an `assert!` is how most selftests fail, so catching only hardware
+    // exceptions would cover far less than it appears to.
+    //
+    // The window is opened around the selftest block and closed immediately
+    // after, so this consults a pad for one stretch of boot and never again. A
+    // panic means a Rust invariant broke, which is a weaker thing to survive
+    // than a #GP, and that narrowness is the whole of what makes it
+    // defensible.
+    //
+    // Serial and not the console, because the console lock may be exactly what
+    // the panicking code was holding; `guard` releases it after landing, which
+    // has not happened yet.
+    if crate::cpu::recover::in_selftest() {
+        serial_println!("\n*** PANIC (inside a selftest, recovering) *** {}", info);
+        if let Some(pad) = crate::cpu::recover::take_panic() {
+            unsafe { crate::cpu::recover::land(pad) }
+        }
+    }
     serial_println!("\n*** PANIC *** {}", info);
     if console::is_ready() {
         // A panic behind a progress bar helps nobody, and on the GF63 the

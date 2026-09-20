@@ -47,9 +47,9 @@
 <div id="body">
 <!--sidebar-->
 <div id="sidebar">
-<div class="box"><div class="t">Latest release</div><div class="bd"><table class="facts"><tr><td>Version</td><td>1.3.0</td></tr><tr><td>Released</td><td>2026-09-02</td></tr><tr><td>Images</td><td>3</td></tr></table><ul><li><a href="../download/">Download</a></li><li><a href="https://github.com/IlumCI/GLaDOS/releases/tag/v1.3.0">Release notes</a></li></ul></div></div>
+<div class="box"><div class="t">Latest release</div><div class="bd"><table class="facts"><tr><td>Version</td><td>1.3.7</td></tr><tr><td>Released</td><td>2026-09-16</td></tr><tr><td>Images</td><td>3</td></tr></table><ul><li><a href="../download/">Download</a></li><li><a href="https://github.com/IlumCI/GLaDOS/releases/tag/v1.3.7">Release notes</a></li></ul></div></div>
 <div class="box"><div class="t">Project information</div><div class="bd"><table class="facts"><tr><td>Development status</td><td>3 - Alpha</td></tr><tr><td>Environment</td><td>Console, framebuffer</td></tr><tr><td>Intended audience</td><td>Developers, science/research</td></tr><tr><td>Licence</td><td>Other/proprietary, all rights reserved</td></tr><tr><td>Natural language</td><td>English</td></tr><tr><td>Operating system</td><td>x86-64 UEFI, bare metal</td></tr><tr><td>Programming language</td><td>Rust, Python</td></tr><tr><td>Topic</td><td>Operating systems, kernels, artificial intelligence</td></tr></table></div></div>
-<div class="box"><div class="t">Statistics</div><div class="bd"><table class="facts"><tr><td>Registered</td><td>2026-08-14</td></tr><tr><td>Releases</td><td>10</td></tr><tr><td>Downloads</td><td>471</td></tr><tr><td>Source</td><td>108 files, ~50,000 lines</td></tr></table></div></div>
+<div class="box"><div class="t">Statistics</div><div class="bd"><table class="facts"><tr><td>Registered</td><td>2026-08-14</td></tr><tr><td>Releases</td><td>17</td></tr><tr><td>Downloads</td><td>802</td></tr><tr><td>Source</td><td>198 files, ~132,000 lines</td></tr></table></div></div>
 <div class="box"><div class="t">Developers</div><div class="bd"><table class="facts"><tr><td>IlumCI</td><td>project admin, developer</td></tr></table></div></div>
 <div class="box"><div class="t">Documentation</div><div class="bd"><ul><li><a href="../wiki/glados-os.html">GLaDOS OS</a></li><li><a href="../wiki/kernel.html">The kernel</a></li><li><a href="../wiki/model.html">The model</a></li><li><a href="../wiki/agent.html">The agent</a></li><li><a href="../wiki/rsi.html">Self-improvement</a></li><li><a href="../wiki/aiksi.html">Aiksi, the language</a></li><li><a href="../wiki/">All 18 articles</a></li></ul></div></div>
 </div>
@@ -61,11 +61,13 @@
 <p>How the model decides what to do, how invalid decisions are made unreachable, and what happens when it is handed a goal.</p>
 
 <h2 id="routing">When a method from 1960 beats the transformer</h2>
+<figure class="fig"><img src="../img/wm/linear-regression.svg" alt="Linear regression.svg" width="350" height="231" loading="lazy" decoding="async"><figcaption>Least squares, which is what the router underneath all of this turns out to be. Twelve thousand parameters, solved in closed form by Cholesky in about 1.6 ms, with no transformer forward pass anywhere in it. It beats the decoder it replaced on held-out accuracy.<span class="credit">Linear regression.svg. Sewaqu, Public domain, via <a href="https://commons.wikimedia.org/wiki/File:Linear_regression.svg" rel="noopener">Wikimedia Commons</a>.</span></figcaption></figure>
 <p>There are two ways to choose a tool here, and the interesting result is that the older one wins.</p>
 <p>The first decodes the applet's name token by token under a grammar. The second reads a single hidden state and hands it to a closed-form ridge regression (Widrow-Hoff, 1960) solved by Cholesky decomposition in the kernel. Twelve thousand parameters, about 1.6 ms, <strong>no transformer forward pass at all</strong>, and better held-out accuracy than decoding the name.</p>
 <p>That is worth sitting with. The task is choosing one of a few dozen labels from a sentence, which is a job a linear classifier over a good representation has always been able to do. The transformer's contribution is the representation; asking it to also spell the answer adds a decode loop and a chance to spell it wrong.</p>
 
 <h2 id="grammar">Making invalid output unreachable</h2>
+<figure class="fig"><img src="../img/wm/dfa.svg" alt="DFA example multiplies of 3.svg" width="358" height="158" loading="lazy" decoding="async"><figcaption>A finite automaton accepts some strings and has no way to express the rest. The grammar over applet names is one of these, rebuilt from the live table at every decode, which is why an applet that does not exist is unreachable rather than merely improbable.<span class="credit">DFA example multiplies of 3.svg. Self-made, Public domain, via <a href="https://commons.wikimedia.org/wiki/File:DFA_example_multiplies_of_3.svg" rel="noopener">Wikimedia Commons</a>.</span></figcaption></figure>
 <p>Constrained decoding makes invalid output impossible to produce, where merely making it improbable leaves it reachable. The grammar is built from the live applet table, so a name that does not exist cannot be spelled.</p>
 <p>The read-only mode is the clearest illustration of why that framing matters. It works by <strong>removing mutating applets from the reachable set before sampling</strong>, never by checking afterwards. A check after the fact is a check somebody can forget, and it fails open. Removing the tokens from the candidate set means the sampler could not have produced them however the probabilities fell.</p>
 <p>The same reasoning was applied to <code>run</code>'s argument, later than it should have been. The applet <em>name</em> was always decoded under the grammar, but its arguments were free text, which is right for a filename to be written and wrong for <code>run</code>, where the whole space of valid answers is enumerable. The model had to spell a learned skill's full path exactly, so a skill it could not spell was a skill it could not use however good the judges said it was: adoption that put a tool in the toolkit that nothing could pick up.</p>
@@ -96,7 +98,7 @@
 <div id="footer">
   <p>GLaDOS, Aperture Science and Portal are properties of Valve Corporation. This project is independent and is not affiliated with, endorsed by, or connected to Valve in any way.</p>
   <p>Copyright 2026. All rights reserved. The source is published so it can be read; redistribution and derivatives need asking. One file (<code>src/dev/rtl8188eu_tables.rs</code>) is GPL-2.0 from the Linux kernel and carries its own terms; the diagrams are other people's and are listed on <a href="../credits.html">the credits page</a>.</p>
-  <p>No cookies, no analytics, no telemetry of any kind. Last updated 2026-09-02.</p>
+  <p>No cookies, no analytics, no telemetry of any kind. Last updated 2026-09-16.</p>
 </div>
 <!--/footer-->
 

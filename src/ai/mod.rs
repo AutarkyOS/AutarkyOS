@@ -16,7 +16,9 @@ pub mod initiative;
 pub mod train;
 pub mod deliberate;
 pub mod corpus;
+pub mod forest;
 pub mod futures;
+pub mod glance;
 pub mod godel;
 pub mod godbits;
 pub mod companion;
@@ -25,6 +27,11 @@ pub mod voter;
 pub mod harness;
 pub mod model;
 pub mod probe;
+pub mod problem;
+pub mod lex;
+pub mod recall;
+pub mod redqueen;
+pub mod route;
 pub mod sample;
 pub mod skill;
 pub mod study;
@@ -813,7 +820,35 @@ pub fn engine_refusal() -> alloc::string::String {
     if let Some(what) = agent::doing() {
         return alloc::format!("the model is busy {} -- 'agent stop' cancels it", what);
     }
-    alloc::string::String::from("another task holds the model")
+    // **Ask the holder rather than the flags.** Everything above this line
+    // consults a flag, which is the exact question `with_engine` was changed to
+    // stop asking: "is somebody's *job* running" answers no for any holder that
+    // was never given a flag, and the nightly `godel` trial and `work`'s two
+    // claims are all flagless. So the fallback used to name nobody, and on the
+    // GF63 it did -- `ask` answered "another task holds the model" while
+    // `mind_busy` was false and `agent::doing` was `None`, leaving an operator
+    // with a machine that refused every model command and no way to find out
+    // which task to chase.
+    //
+    // The holder is an id and the id is enough: `snapshot` turns it into the
+    // name the task was spawned with, and a holder whose slot has gone is worth
+    // saying out loud rather than smoothing over.
+    match engine_holder() {
+        Some(id) => match crate::task::snapshot(id) {
+            Some(t) => alloc::format!(
+                "task {} ('{}') holds the model, and neither the mind nor the agent knows about it",
+                id,
+                t.name
+            ),
+            None => alloc::format!(
+                "task {} holds the model and no longer exists -- the claim outlived its holder",
+                id
+            ),
+        },
+        None => alloc::string::String::from(
+            "the model is free; whatever refused did so for another reason",
+        ),
+    }
 }
 
 /// Which task holds the engine, for diagnostics. `None` when it is free.
@@ -1081,6 +1116,15 @@ pub fn init(model_blob: Option<Blob>, tok_blob: Option<Blob>) {
         );
     }
 
+    // Problems, the other corpus. Seeded the same way and for the same
+    // reason: they live in the namespace, so a snapshot carries them.
+    let (fresh, total) = problem::seed();
+    if fresh > 0 {
+        kprintln!("  {} problem(s) seeded at {}", fresh, problem::ROOT);
+    } else if total > 0 {
+        kprintln!("  {} problem(s) at {}", total, problem::ROOT);
+    }
+
     console::set_color(LTGREEN);
     // Pick the conversation back up, if there was one. A machine that has
     // never been spoken to should not announce that, so silence is the
@@ -1261,18 +1305,55 @@ pub fn init(model_blob: Option<Blob>, tok_blob: Option<Blob>) {
     console::set_color(LTGRAY);
 }
 
+/// A copy of what `emit` is printing, when somebody asked for one.
+///
+/// A tee rather than `console::begin_capture`, and the difference is the
+/// point: a capture takes the output *away* from the terminal, which is right
+/// for an applet whose result is being fed to a program and wrong for `ask`,
+/// where the operator is reading the answer as it arrives. This leaves the
+/// printing exactly as it was and keeps a second copy for whoever armed it.
+///
+/// Bounded, because a `-n 4096` answer would otherwise sit in the heap
+/// forever; past the cap the tail is dropped and the transcript is short by
+/// the end of one turn rather than the machine being short of memory.
+static ECHO: Racy<Option<alloc::string::String>> = Racy::new(None);
+
+const ECHO_CAP: usize = 4096;
+
+/// Start keeping a copy of generated text. Returns whatever the last arming
+/// left behind, which is always `None` in practice and is discarded here
+/// rather than being appended to somebody else's turn.
+pub fn echo_begin() {
+    unsafe { *ECHO.get() = Some(alloc::string::String::new()) };
+}
+
+/// Stop, and take the copy.
+pub fn echo_end() -> Option<alloc::string::String> {
+    unsafe { (*ECHO.get()).take() }
+}
+
+fn echo(s: &str) {
+    if let Some(buf) = unsafe { (*ECHO.get()).as_mut() } {
+        if buf.len() + s.len() <= ECHO_CAP {
+            buf.push_str(s);
+        }
+    }
+}
+
 /// Write raw token bytes to the console.
 ///
 /// Pieces are not individually valid UTF-8: a byte-fallback token is one
 /// arbitrary byte, and a multi-byte character can straddle two tokens. So this
 /// buffers and only prints what is currently decodable, keeping any trailing
 /// partial sequence for the next call.
+///
 /// Both sinks are fed here rather than in two places, and that is the point:
 /// the console and the conversation window are not two renderings of what the
 /// model said, they are one string written twice. Teeing at the token level
 /// instead would hand `convo` invalid UTF-8 fragments and make it solve the
 /// boundary problem a second time, differently -- which is how two views of one
-/// answer come to disagree about it.
+/// answer come to disagree about it. `echo` keeps a third, bounded copy for
+/// whoever armed one.
 ///
 /// `convo::feed` is a single atomic load when no conversation turn is open,
 /// which is every decode except the ones that belong to one.
@@ -1285,6 +1366,7 @@ fn emit(pending: &mut Vec<u8>) {
             Ok(s) => {
                 kprint!("{}", s);
                 convo::feed(s);
+                echo(s);
                 pending.clear();
                 return;
             }
@@ -1294,6 +1376,7 @@ fn emit(pending: &mut Vec<u8>) {
                     if let Ok(s) = core::str::from_utf8(&pending[..good]) {
                         kprint!("{}", s);
                         convo::feed(s);
+                        echo(s);
                     }
                     pending.drain(..good);
                     continue;

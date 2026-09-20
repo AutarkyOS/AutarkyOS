@@ -152,14 +152,32 @@ impl<'a> KeyFrame<'a> {
     }
 }
 
+/// The fixed part of a Key Descriptor: everything up to the key-data length.
+///
+/// Named because two different checks in `parse` have to be this same number,
+/// and they were not.
+const DESC_LEN: usize = 95;
+
 /// Parse an EAPOL-Key packet.
 pub fn parse(pkt: &[u8]) -> Option<KeyFrame<'_>> {
     // EAPOL header: version, type, length. Then the Key Descriptor.
-    if pkt.len() < 4 + 95 || pkt[1] != EAPOL_TYPE_KEY {
+    if pkt.len() < 4 + DESC_LEN || pkt[1] != EAPOL_TYPE_KEY {
         return None;
     }
     let body_len = u16::from_be_bytes([pkt[2], pkt[3]]) as usize;
-    if 4 + body_len > pkt.len() {
+    // **Both directions, and only one of them was here.** The buffer has to
+    // hold what the frame declares -- and the frame has to declare at least
+    // the fields read below. Without the second, a packet long enough to pass
+    // the length check above but declaring a shorter body sliced `b` down to
+    // nothing and then indexed it: `index out of bounds: the len is 0 but the
+    // index is 0`, in ring 0, with no unwinder.
+    //
+    // That was reachable from the air by anybody. EAPOL crosses an
+    // unencrypted link *by design*, because it is what makes the link
+    // encrypted, so this parser reads frames from strangers before there is
+    // any key to refuse one with -- a hundred bytes and the machine stops.
+    // Found by `net::hostile`, case 763.
+    if body_len < DESC_LEN || 4 + body_len > pkt.len() {
         return None;
     }
     let b = &pkt[4..4 + body_len];
@@ -173,7 +191,7 @@ pub fn parse(pkt: &[u8]) -> Option<KeyFrame<'_>> {
     let mut mic = [0u8; 16];
     mic.copy_from_slice(&b[77..93]);
     let data_len = u16::from_be_bytes([b[93], b[94]]) as usize;
-    if 95 + data_len > b.len() {
+    if DESC_LEN + data_len > b.len() {
         return None;
     }
     Some(KeyFrame {
@@ -181,7 +199,7 @@ pub fn parse(pkt: &[u8]) -> Option<KeyFrame<'_>> {
         replay,
         nonce,
         mic,
-        key_data: &b[95..95 + data_len],
+        key_data: &b[DESC_LEN..DESC_LEN + data_len],
         raw: &pkt[..4 + body_len],
     })
 }
@@ -205,6 +223,46 @@ pub fn verify_mic(kck: &[u8], frame: &KeyFrame) -> bool {
     diff == 0
 }
 
+/// One EAPOL-Key packet, whichever of the four it is.
+///
+/// Both ends build these and the four messages differ only in the key-info
+/// bits, the replay counter, the nonce and whether there is a MIC -- so there
+/// is one builder and the differences are arguments. Message 1 passes `None`
+/// for the KCK, because there is no key yet to compute a MIC with, which is
+/// exactly the property that lets anybody force a handshake and capture it.
+fn build_key(
+    info: u16,
+    replay: u64,
+    nonce: &[u8; 32],
+    key_data: &[u8],
+    kck: Option<&[u8]>,
+) -> Vec<u8> {
+    let body_len = DESC_LEN + key_data.len();
+    let mut p = Vec::with_capacity(4 + body_len);
+    p.push(EAPOL_VERSION);
+    p.push(EAPOL_TYPE_KEY);
+    p.extend_from_slice(&(body_len as u16).to_be_bytes());
+
+    p.push(KEY_TYPE_RSN);
+    p.extend_from_slice(&info.to_be_bytes());
+    p.extend_from_slice(&16u16.to_be_bytes()); // key length
+    p.extend_from_slice(&replay.to_be_bytes());
+    p.extend_from_slice(nonce);
+    p.extend_from_slice(&[0u8; 16]); // key IV
+    p.extend_from_slice(&[0u8; 8]); // key RSC
+    p.extend_from_slice(&[0u8; 8]); // reserved
+    let mic_at = p.len();
+    p.extend_from_slice(&[0u8; 16]); // MIC, filled below when there is a key
+    p.extend_from_slice(&(key_data.len() as u16).to_be_bytes());
+    p.extend_from_slice(key_data);
+
+    if let Some(kck) = kck {
+        let mic = sha1::hmac(kck, &p);
+        p[mic_at..mic_at + 16].copy_from_slice(&mic[..16]);
+    }
+    p
+}
+
 /// Build message 2 or 4: the supplicant's replies, both MIC-protected.
 pub fn build_reply(
     kck: &[u8],
@@ -213,35 +271,133 @@ pub fn build_reply(
     key_data: &[u8],
     secure: bool,
 ) -> Vec<u8> {
-    let body_len = 95 + key_data.len();
-    let mut p = Vec::with_capacity(4 + body_len);
-    p.push(EAPOL_VERSION);
-    p.push(EAPOL_TYPE_KEY);
-    p.extend_from_slice(&(body_len as u16).to_be_bytes());
-
-    p.push(KEY_TYPE_RSN);
     let mut info = KEY_INFO_PAIRWISE | KEY_INFO_MIC | 2; // 2 = HMAC-SHA1 AKM
     if secure {
         info |= KEY_INFO_SECURE;
     }
-    p.extend_from_slice(&info.to_be_bytes());
-    p.extend_from_slice(&16u16.to_be_bytes()); // key length
-    p.extend_from_slice(&replay.to_be_bytes());
-    match snonce {
-        Some(n) => p.extend_from_slice(n),
-        None => p.extend_from_slice(&[0u8; 32]),
-    }
-    p.extend_from_slice(&[0u8; 16]); // key IV
-    p.extend_from_slice(&[0u8; 8]); // key RSC
-    p.extend_from_slice(&[0u8; 8]); // reserved
-    let mic_at = p.len();
-    p.extend_from_slice(&[0u8; 16]); // MIC, filled below
-    p.extend_from_slice(&(key_data.len() as u16).to_be_bytes());
-    p.extend_from_slice(key_data);
+    build_key(info, replay, snonce.unwrap_or(&[0u8; 32]), key_data, Some(kck))
+}
 
-    let mic = sha1::hmac(kck, &p);
-    p[mic_at..mic_at + 16].copy_from_slice(&mic[..16]);
-    p
+/// The access point's half of the four-way handshake.
+///
+/// **It is here because the supplicant had never been run.** `wpa2::selftest`
+/// checked the PMK against Annex H.4 and the PTK against its own symmetry, and
+/// `Supplicant::on_frame` -- the state machine that actually gets a key
+/// installed -- had no frames to be fed and was executed by nothing, on a
+/// machine with no wireless driver. An authenticator is the only thing that
+/// can drive it without an access point in the room.
+///
+/// It is not a wireless access point and does not pretend to be one: no
+/// beacons, no association, no group rekeying on a timer. It is the four
+/// messages, built from the same `ptk` and the same `sha1::hmac` the
+/// supplicant verifies with -- deliberately, because an authenticator carrying
+/// its own arithmetic would agree with a supplicant that had the same bug.
+pub struct Authenticator {
+    pub pmk: Vec<u8>,
+    pub anonce: [u8; 32],
+    pub ptk: Option<Vec<u8>>,
+    pub gtk: [u8; 16],
+    pub aa: [u8; 6],
+    pub spa: [u8; 6],
+    replay: u64,
+    pub done: bool,
+}
+
+impl Authenticator {
+    pub fn new(passphrase: &str, ssid: &[u8], aa: [u8; 6], spa: [u8; 6]) -> Self {
+        let mut anonce = [0u8; 32];
+        for i in 0..4 {
+            let t = crate::time::rdtsc().rotate_left((i * 7 + 3) as u32);
+            anonce[i * 8..i * 8 + 8].copy_from_slice(&t.to_le_bytes());
+        }
+        Authenticator {
+            pmk: pmk(passphrase, ssid),
+            anonce,
+            ptk: None,
+            gtk: [0x47; 16],
+            aa,
+            spa,
+            replay: 0,
+            done: false,
+        }
+    }
+
+    /// Message 1: the ANonce, in the clear and unauthenticated.
+    pub fn message1(&mut self) -> Vec<u8> {
+        self.replay += 1;
+        let anonce = self.anonce;
+        build_key(KEY_INFO_PAIRWISE | KEY_INFO_ACK | 2, self.replay, &anonce, &[], None)
+    }
+
+    /// Feed message 2 or 4. Answers message 3 after the second, nothing after
+    /// the fourth -- at which point `tk` is what the link encrypts with.
+    ///
+    /// The two are told apart by the Secure bit rather than by a counter, for
+    /// the reason the supplicant tells 1 from 3 the same way: a state machine
+    /// that trusted its own idea of which message should arrive next would be
+    /// driven by whatever arrived out of order.
+    pub fn on_frame(&mut self, pkt: &[u8]) -> Option<Vec<u8>> {
+        let f = parse(pkt)?;
+        if !f.has(KEY_INFO_MIC) || f.has(KEY_INFO_ACK) {
+            return None;
+        }
+
+        if !f.has(KEY_INFO_SECURE) {
+            // Message 2 carries the SNonce, which is the last thing needed to
+            // derive the PTK -- so the MIC on it can only be checked *after*
+            // deriving one from the very nonce the frame is carrying.
+            let ptk = ptk(&self.pmk, &self.aa, &self.spa, &self.anonce, &f.nonce);
+            if !verify_mic(Ptk(&ptk).kck(), &f) {
+                return None;
+            }
+            let k = Ptk(&ptk);
+            // The group key travels wrapped under the KEK, which is what makes
+            // message 3 worth encrypting at all: the pairwise key is derived at
+            // both ends and never sent, and the group key is sent.
+            let wrapped = aes::key_wrap(k.kek(), &gtk_kde(&self.gtk))?;
+            self.replay += 1;
+            let info = KEY_INFO_PAIRWISE
+                | KEY_INFO_ACK
+                | KEY_INFO_MIC
+                | KEY_INFO_SECURE
+                | KEY_INFO_INSTALL
+                | KEY_INFO_ENCRYPTED
+                | 2;
+            let anonce = self.anonce;
+            let m3 = build_key(info, self.replay, &anonce, &wrapped, Some(k.kck()));
+            self.ptk = Some(ptk);
+            return Some(m3);
+        }
+
+        // Message 4 is an acknowledgement and carries nothing but its MIC.
+        let ptk = self.ptk.clone()?;
+        if !verify_mic(Ptk(&ptk).kck(), &f) {
+            return None;
+        }
+        self.done = true;
+        None
+    }
+
+    /// The temporal key, once the handshake has finished.
+    pub fn tk(&self) -> Option<Vec<u8>> {
+        self.ptk.as_ref().map(|p| Ptk(p).tk().to_vec())
+    }
+}
+
+/// Wrap a group key in the encapsulation `group_key` reads back: the RSN OUI,
+/// data type 1, a key id, then the key, padded to a multiple of eight because
+/// RFC 3394 wraps nothing else.
+fn gtk_kde(gtk: &[u8; 16]) -> Vec<u8> {
+    let mut d = Vec::with_capacity(24);
+    d.push(0xDD); // vendor-specific KDE
+    d.push(6 + gtk.len() as u8);
+    d.extend_from_slice(&[0x00, 0x0F, 0xAC, 0x01]); // RSN OUI, data type 1 (GTK)
+    d.extend_from_slice(&[0x01, 0x00]); // key id 1, reserved
+    d.extend_from_slice(gtk);
+    while d.len() % 8 != 0 {
+        d.push(0xDD); // the padding RFC 4017 specifies, and it is not zero
+    }
+    d
 }
 
 /// Pull the group key out of message 3's encrypted key data.
@@ -331,6 +487,47 @@ impl Supplicant {
         }
 
         None
+    }
+}
+
+/// The four handshake messages at fixed nonces, for `tools/dot11check.py`.
+///
+/// The key descriptor is 95 bytes of fields in a fixed order and **nothing in
+/// this tree reads one that this tree did not write**, so the layout has
+/// exactly as much evidence behind it as one person's reading of the standard.
+/// Scapy's `EAPOL_KEY` is a second reading.
+///
+/// The nonces are overwritten with constants after construction, because they
+/// come from `rdtsc` and a dump nobody can reproduce is not a fixture.
+pub fn dump() {
+    use crate::kprintln;
+    let aa: [u8; 6] = [0x02, 0, 0, 0, 0, 0xAA];
+    let spa: [u8; 6] = [0x02, 0, 0, 0, 0, 0x11];
+
+    let line = |name: &str, f: &[u8]| {
+        let mut hex = alloc::string::String::with_capacity(f.len() * 2);
+        for b in f {
+            hex.push(char::from_digit((b >> 4) as u32, 16).unwrap_or('0'));
+            hex.push(char::from_digit((b & 0xF) as u32, 16).unwrap_or('0'));
+        }
+        kprintln!("frame {} {}", name, hex);
+    };
+
+    let mut auth = Authenticator::new("correct horse", b"glados", aa, spa);
+    auth.anonce = [0x11; 32];
+    let m1 = auth.message1();
+    line("eapol_m1", &m1);
+
+    let mut sup = Supplicant::new("correct horse", b"glados", aa, spa);
+    sup.snonce = [0x22; 32];
+    if let Some(m2) = sup.on_frame(&m1) {
+        line("eapol_m2", &m2);
+        if let Some(m3) = auth.on_frame(&m2) {
+            line("eapol_m3", &m3);
+            if let Some(m4) = sup.on_frame(&m3) {
+                line("eapol_m4", &m4);
+            }
+        }
     }
 }
 

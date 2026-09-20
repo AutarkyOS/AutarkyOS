@@ -56,6 +56,34 @@ const ARGS_TOKEN_BUDGET: usize = 16;
 /// answer; the probe ranks, so the budget buys selection rather than noise.
 const DELIBERATE_FORKS: usize = 3;
 
+/// How many identical actions an episode tolerates before it stops
+/// dispatching them.
+///
+/// The count is over the whole action, arguments included, so `write a 1` and
+/// `write b 2` are different and three identical writes really is going in
+/// circles.
+///
+/// Two occurrences is a coincidence and is left alone: the world moves between
+/// steps, and re-reading a path after writing it is how anything checks its own
+/// work. Three in one episode is a loop.
+///
+/// **Refusing is not the point and would not on its own break anything.** The
+/// step is already spent, because the decode that chose the action has already
+/// happened -- what is saved is one applet dispatch, which is cheap. The thing
+/// that can actually change the next decode is the *observation*, and this
+/// module's own rule is that a refusal is an observation the model reads and
+/// reacts to rather than an error. So the notice below is the mechanism and
+/// not-dispatching is a side benefit, worth having only because a third
+/// identical call to a mutating applet is the one that does damage.
+///
+/// The stronger rule was available and costs too much. `sysbox::hash_of("/")`
+/// would say whether the namespace actually moved between two identical
+/// actions, which would make the refusal provable rather than heuristic --
+/// but `tree::content_hash` is a full recursive walk that SHA-256s every blob,
+/// so asking it per step would re-hash the whole corpus at every step of every
+/// episode. Recorded here so the next person to want it knows what it costs.
+const LOOP_LIMIT: usize = 3;
+
 // --- shared episode log ---------------------------------------------------
 //
 // The console transcript is the serial channel's view. The desktop window
@@ -375,6 +403,13 @@ struct Step {
     /// prompt both show.
     action: String,
     ok: bool,
+    /// Refused as a loop rather than dispatched. A third reason for `!ok`,
+    /// beside bad arguments and an unreachable name, and it is its own field
+    /// because the other two are the model asking for something impossible
+    /// while this one is the model asking for something it already has. The
+    /// score weighs them differently and `Outcome::observe` would otherwise
+    /// have to guess from the observation text.
+    looped: bool,
     observation: String,
 }
 
@@ -782,6 +817,13 @@ pub struct Outcome {
     /// Identical to an action earlier in the same episode. The cheapest
     /// available signal that a loop is going in circles.
     pub repeated: usize,
+    /// Of those repeats, the ones the loop refused to dispatch because they
+    /// had reached `LOOP_LIMIT`. A subset of `repeated` and never scored on
+    /// its own: what is worth penalising is the model going round in circles,
+    /// which `repeated` already counts, and this is the kernel's response to
+    /// it rather than a further thing the model did. Reported so a run can be
+    /// asked whether the loop-breaker ever fired.
+    pub looped: usize,
     pub end: End,
 }
 
@@ -795,7 +837,7 @@ pub const OUTCOMES: &str = "/ai/episodes/outcomes.txt";
 impl Outcome {
     fn observe(goal: &str, budget: usize, outcome: &str, steps: &[Step]) -> Outcome {
         let mut seen: Vec<&str> = Vec::new();
-        let (mut dispatched, mut rejected, mut barren, mut repeated) = (0, 0, 0, 0);
+        let (mut dispatched, mut rejected, mut barren, mut repeated, mut looped) = (0, 0, 0, 0, 0);
         for s in steps {
             if s.ok {
                 dispatched += 1;
@@ -804,6 +846,13 @@ impl Outcome {
                 if s.observation.trim().is_empty() || s.observation.starts_with("(applet did not run)") {
                     barren += 1;
                 }
+            } else if s.looped {
+                // Deliberately not a rejection. `rejected` means the model
+                // asked for something impossible -- bad arguments, or a name
+                // its trust level cannot reach -- and a loop-break is the
+                // opposite, an action that was perfectly legal and whose
+                // answer the model already holds.
+                looped += 1;
             } else {
                 rejected += 1;
             }
@@ -820,6 +869,7 @@ impl Outcome {
             rejected,
             barren,
             repeated,
+            looped,
             end: End::from_outcome(outcome),
         }
     }
@@ -861,7 +911,7 @@ impl Outcome {
     /// One line, appended to `OUTCOMES`.
     pub fn render(&self) -> String {
         format!(
-            "{} steps={}/{} ok={} rej={} barren={} rep={} score={:+.2} goal={}",
+            "{} steps={}/{} ok={} rej={} barren={} rep={} loop={} score={:+.2} goal={}",
             self.end.tag(),
             self.steps,
             self.budget,
@@ -869,6 +919,7 @@ impl Outcome {
             self.rejected,
             self.barren,
             self.repeated,
+            self.looped,
             self.score(),
             clip(&self.goal, 60)
         )
@@ -961,6 +1012,20 @@ fn episode(
             break;
         }
 
+        // Built before dispatch now, because the loop check compares against
+        // it and has to run before anything is spent on the action.
+        let action = if args.is_empty() {
+            String::from(&name)
+        } else {
+            format!("{} {}", name, args)
+        };
+
+        // Occurrences of this exact action earlier in the episode, and where
+        // the first one was, so the notice can point at a step the model can
+        // still see in its own transcript.
+        let prior = steps.iter().filter(|s| s.action == action).count();
+        let first_at = steps.iter().position(|s| s.action == action).map(|i| i + 1);
+
         // Shape-check before dispatch. Rejection is an observation, not an
         // error: the model gets to read why and choose differently.
         let admitted = script.is_none()
@@ -973,23 +1038,33 @@ fn episode(
         } else {
             sysbox::check_args(&name, &args)
         };
-        let (ok, observation) = match checked {
-            Err(why) => (false, format!("invalid arguments: {}", why)),
-            Ok(()) => {
-                console::begin_capture();
-                let ran = sysbox::dispatch(&name, &args);
-                let mut obs = console::end_capture().unwrap_or_default();
-                if !ran && obs.is_empty() {
-                    obs = String::from("(applet did not run)");
-                }
-                (true, obs)
-            }
-        };
-
-        let action = if args.is_empty() {
-            String::from(name)
+        let looped = prior + 1 >= LOOP_LIMIT;
+        let (ok, observation) = if looped {
+            (
+                false,
+                match first_at {
+                    Some(n) => format!(
+                        "(not run: attempt {} at the same action, first taken at step {}. \
+                         Its observation is above. Try something else, or call done.)",
+                        prior + 1,
+                        n
+                    ),
+                    None => String::from("(not run: repeated action)"),
+                },
+            )
         } else {
-            format!("{} {}", name, args)
+            match checked {
+                Err(why) => (false, format!("invalid arguments: {}", why)),
+                Ok(()) => {
+                    console::begin_capture();
+                    let ran = sysbox::dispatch(&name, &args);
+                    let mut obs = console::end_capture().unwrap_or_default();
+                    if !ran && obs.is_empty() {
+                        obs = String::from("(applet did not run)");
+                    }
+                    (true, obs)
+                }
+            }
         };
         if !quiet {
             console::set_color(if ok { LTCYAN } else { LTRED });
@@ -1010,6 +1085,7 @@ fn episode(
         steps.push(Step {
             action,
             ok,
+            looped,
             observation: clip(&observation, OBS_CLIP),
         });
     }
@@ -1063,14 +1139,54 @@ pub fn selftest() -> bool {
 
     // Repetition is the cheapest signal that a loop is going in circles, and
     // it has to count the second occurrence rather than both.
-    let looped = alloc::vec![
-        Step { action: String::from("ls /sys"), ok: true, observation: String::from("x") },
-        Step { action: String::from("ls /sys"), ok: true, observation: String::from("x") },
-        Step { action: String::from("ls /sys"), ok: true, observation: String::from("x") },
+    let spinning = alloc::vec![
+        Step { action: String::from("ls /sys"), ok: true, looped: false, observation: String::from("x") },
+        Step { action: String::from("ls /sys"), ok: true, looped: false, observation: String::from("x") },
+        Step { action: String::from("ls /sys"), ok: true, looped: false, observation: String::from("x") },
     ];
-    let spin = Outcome::observe("spin", 8, "step budget reached", &looped);
+    let spin = Outcome::observe("spin", 8, "step budget reached", &spinning);
     check("going in circles is counted, and the first time is not circling", {
         spin.repeated == 2 && spin.end == End::Budget
+    });
+
+    // --- the loop-breaker, driven through the real loop ---------------
+    //
+    // Through `episode` and not through `Outcome::observe`, because the
+    // counter counting is the easy half. What this asserts is that the check
+    // runs *before* dispatch inside the loop, which is the only place it can
+    // save anything, and that `LOOP_LIMIT` is where it fires.
+    //
+    // `ls /sys` four times: the first two dispatch, the third and fourth are
+    // refused. Read-only and idempotent on purpose, so a broken check that
+    // dispatched anyway would still leave the machine exactly as it found it.
+    let circles = alloc::vec![
+        String::from("ls /sys"),
+        String::from("ls /sys"),
+        String::from("ls /sys"),
+        String::from("ls /sys"),
+    ];
+    let (spun_end, spun) = episode("boot selftest", Trust::ReadOnly, 8, Some(&circles), true);
+    let spun_signal = Outcome::observe("circles", 8, &spun_end, &spun);
+    check("the loop stops dispatching an action at the third identical try", {
+        spun.len() == 4
+            && spun[0].ok
+            && spun[1].ok
+            && !spun[2].ok
+            && spun[2].looped
+            && !spun[3].ok
+            && spun[3].looped
+    });
+    // The notice is the mechanism, so it has to be readable and it has to
+    // point somewhere the model can still see. A refusal that said only "no"
+    // gives the next decode nothing to go on.
+    check("the refusal names the step it repeats, so the model can act on it", {
+        spun[2].observation.contains("first taken at step 1")
+            && spun[2].observation.contains("done")
+    });
+    // A loop-break is not a rejection, and conflating them would make an
+    // episode that went in circles read as one that asked for the impossible.
+    check("a loop-break counts as looped and never as rejected", {
+        spun_signal.looped == 2 && spun_signal.rejected == 0 && spun_signal.dispatched == 2
     });
 
     // An applet that runs and says nothing is legal and uninformative, which
@@ -1078,6 +1194,7 @@ pub fn selftest() -> bool {
     let quiet_step = alloc::vec![Step {
         action: String::from("ls /empty"),
         ok: true,
+        looped: false,
         observation: String::from("(applet did not run)"),
     }];
     let barren = Outcome::observe("quiet", 8, "step budget reached", &quiet_step);

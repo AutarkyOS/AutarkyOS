@@ -12,7 +12,7 @@ datasets.
 | Rail | SmolLM2-135M (dense) | Qwen3.5-0.8B (hybrid) | **Qwen3.5-2B distill (hybrid)** | Chance |
 |---|---|---|---|---|
 | MMLU, 0-shot letter-logprob | 20.0% (n=50) | 30.0% (n=30) | **43.3%** (n=30) | 25% |
-| GSM8K, 5-shot greedy | 0.0% (n=15) | 0.0% (n=8) | **0.0%** (n=8) | ~0 |
+| GSM8K, 5-shot greedy | ~~0.0%~~ *re-run owed* | ~~0.0%~~ *re-run owed* | ~~0.0%~~ *re-run owed* | ~0 |
 | NIAH, 512/1024 | 0/7 | 6/6 | **6/6** | -- |
 | Route, constrained decode, 78 actions | 0.0% (n=50) | 33.3% (n=30) | **40.0%** (n=30) | ~1.3% |
 
@@ -27,6 +27,75 @@ serial-input stall (see runbook) and is a GF63 formality at native speed.
 Host-side, NumPy, int8 checkpoints dequantised block-wise exactly as the
 kernel does. Timing reference: SmolLM2 ~4-8 s/question, q35 ~20-40 s/question
 on the development machine.
+
+## The GSM8K row is withdrawn, and it was never about the models
+
+Three faults in `tools/lm_eval.py`, each on its own enough to produce a zero,
+and all three applied to every run in that row whatever else was passed:
+
+- **The budget was 64 new tokens.** A GSM8K answer is 133 tokens on average and
+  213 at worst, measured over the test slice with the harness's own tokeniser.
+  Two thirds of every completion was cut off before the line the score is read
+  from, and the extractor then returned a number out of the middle of the
+  reasoning.
+- **Nothing told it to stop.** A base model carries on past its answer into a
+  fabricated next question, and the last number in the text came from there.
+- **The dense runner could not run Qwen3.** Head width derived rather than
+  stated, RoPE pairing `2i` with `2i+1`, no QK-Norm. It raises
+  `operands could not be broadcast` on a Qwen3 checkpoint, so it never produced
+  a figure for one at all.
+
+And a fourth that taints more than this row: `--hf-tokenizer` defaults to
+`tools/hf/tokenizer.json`, which is **SmolLM2's 49,152-token vocabulary**. That
+is correct for the SmolLM2 column and wrong for every Qwen checkpoint, whose
+vocabularies are 151,669 and 248,320. Handed the wrong one a model receives ids
+belonging to another vocabulary and answers with a degenerate run of one token
+-- observed, at 0.0%. Whether the q35 columns above were taken with the flag
+passed is not recorded, so **those figures cannot be relied on without a
+re-run**; the SmolLM2 column is unaffected.
+
+`lm_eval.py` refuses a vocabulary mismatch now and `--show N` prints the raw
+completion, whose absence is what let all of this hide.
+
+**Nothing in the GSM8K row should be quoted**, and it is left struck through
+rather than deleted because it has been cited, in this file and elsewhere, as
+evidence that small models cannot do arithmetic -- a conclusion drawn from a
+harness that was not asking them. The three columns are *owed a re-run* rather
+than withdrawn forever; what was missing was a dense runner that is fast and
+right, and there is one now.
+
+### The first GSM8K figure this project has that measures a model
+
+    Qwen3-0.6B, GSM8K 5-shot greedy, n=25, <= 256 new tokens
+
+    28.0%
+
+Dense, int8, its own tokenizer, through the fixed harness and
+`tools/fastdense.py`. Chance on this task is about zero, so 28% is the model
+doing the arithmetic rather than the harness finding a number somewhere.
+
+The transcripts are the point and are printed by `--show`:
+
+    Janet's ducks lay 16 eggs per day. She eats 3 eggs for breakfast and 4
+    eggs for baking muffins. So she eats 3 + 4 = <<3+4=7>>7 eggs per day.
+    The remaining eggs are 16 - 7 = <<16-7=9>>9 eggs.
+    She sells the remaining eggs at $2 per egg, so she makes 9 * 2 =
+    <<9*2=18>>18 dollars.
+    #### 18                                            (gold 18 -- right)
+
+Well-formed reasoning, the `####` the format asks for, the stop cutting
+cleanly, and a budget the answer fits inside. Every one of those was broken
+before, and each on its own reads as a model that cannot do arithmetic.
+
+**n=25 is a small sample and the figure is quoted as one.** The 95% interval on
+25 items is roughly plus or minus 18 points, so this establishes that the task
+measures the model and does not establish where between 10% and 46% the model
+sits. What it also is not, is a number about the three checkpoints in the table
+above: Qwen3-0.6B is a fourth, and the dense runner that made it affordable
+does not run the hybrids.
+
+Cost, since that is what was blocking: **26.1 s/question**, so a 25-question
+5-shot run is about eleven minutes where `reference.py` was about ninety.
 
 ## What the numbers say
 
@@ -66,6 +135,11 @@ the architecture is a GF63 measurement (host NumPy attention is quadratic;
 tracking trick, not the official harness; a 135M model below chance and an
 0.8B a little above it is the expected picture. This rail exists to catch
 regressions from quantisation or format changes, not to quote.
+
+**This paragraph is wrong and is kept for the record.** The 0.0 it reasons
+from was a harness fault -- see the withdrawal above -- so whatever is true
+about small models and arithmetic, none of it was established here. What
+follows is the reasoning as it stood.
 
 **GSM8K is 0.0 for both and that is the honest reading.** Small models do not
 do multi-digit arithmetic through greedy 64-token chains. The rail stays --
@@ -131,7 +205,9 @@ that improves. In order of expected yield, all measurable on these rails:
    spends tokens on a split. The 33.3% constrained-decode figure is the
    *floor* for loop steps; agreement-routed steps run at 90.3%-class
    accuracy for microseconds.
-2. **Tool-augmented arithmetic.** GSM8K is 0.0 because tokens cannot do
+2. **Tool-augmented arithmetic.** (The premise is withdrawn: GSM8K's 0.0 was
+   the harness, not the model. The idea may still be worth having; the evidence
+   offered for it is gone.) GSM8K is 0.0 because tokens cannot do
    arithmetic; the loop's `run` applet can, exactly. The bottleneck becomes
    number extraction, not computation.
 3. **The ratchet.** Episodes that succeed write skills; skills are reused

@@ -39,6 +39,16 @@ const FLAG: &str = "/AUTARK/UPDATE.FLG";
 /// merely a FAT partition.
 const MARKER: &str = "/EFI/BOOT/BOOTX64.EFI";
 
+/// What makes a boot volume *this* machine's rather than one it can merely see.
+///
+/// A Windows ESP carries the same marker as its fallback path, so the marker
+/// alone matches it perfectly -- and `block::scan` reads NVMe and nothing else,
+/// so a machine booted from the USB stick walks the internal disk here and
+/// finds exactly that. Everything downstream would then read one volume and
+/// write another, since `repairs::at_boot` goes through the firmware, which
+/// reads the medium the image was actually loaded from.
+const PAYLOAD: &str = "/GLADOS";
+
 /// The magic `unlock_writes` wants, so a stray call cannot open the gate.
 const CONFIRM: u64 = 0xD15EA5E;
 
@@ -59,12 +69,34 @@ pub fn find_esp() -> Result<Esp, String> {
     let layout = block::scan().map_err(|e| format!("cannot read the partition table: {:?}", e))?;
 
     let mut saw_fat = false;
+    let mut not_ours: Option<u32> = None;
     for p in layout.partitions.iter() {
         let Ok(v) = fat::Volume::mount(p.start_lba) else {
             continue;
         };
         saw_fat = true;
-        if v.find(MARKER).is_err() {
+        let Ok(marker) = v.find(MARKER) else {
+            continue;
+        };
+        // **Is this the volume we actually booted from?**
+        //
+        // `block::scan` reads NVMe and nothing else, so on a machine booted
+        // from removable media this loop walks the *internal* disk -- and a
+        // Windows ESP carries `\EFI\BOOT\BOOTX64.EFI` as its fallback path,
+        // so it matches the marker perfectly. Everything downstream then reads
+        // one volume and writes another: `repairs::at_boot` goes through the
+        // firmware, which reads the medium the image was loaded from, while
+        // `record` would write here. Split-brain, on somebody else's ESP.
+        //
+        // The payload directory settles it, and comparing sizes does not.
+        // `LoadedImage::ImageSize` is the image *in memory*, sections expanded
+        // and aligned, where a directory entry is the file on disk -- 6,356,992
+        // against 5,119,488 for one build, which is not a mismatch but two
+        // different quantities. A GLaDOS boot volume carries the payload beside
+        // the loader; a Windows ESP does not.
+        let _ = marker;
+        if !v.find(PAYLOAD).map(|e| e.is_dir).unwrap_or(false) {
+            not_ours = Some(p.index);
             continue;
         }
         // Refused with the reason rather than attempted: FAT16 keeps its root
@@ -83,6 +115,17 @@ pub fn find_esp() -> Result<Esp, String> {
             blocks: p.block_count,
             volume: v,
         });
+    }
+
+    // Named rather than folded into "no boot volume", because the two have
+    // completely different fixes and this one is the ordinary consequence of
+    // booting the USB stick: nothing is wrong with the machine, the writable
+    // ESP is simply not on the disk this layer can see.
+    if let Some(idx) = not_ours {
+        return Err(format!(
+            "partition {} is a boot volume carrying no {} directory, so it is somebody else's ESP rather than this machine's -- writing to it would be writing to theirs. Booted from removable media? block::scan reads NVMe and nothing else, so the volume this image came from is not visible from here at all",
+            idx, PAYLOAD
+        ));
     }
 
     Err(String::from(if saw_fat {
@@ -125,6 +168,47 @@ fn put_verified(esp: &Esp, path: &str, data: &[u8]) -> Result<(), String> {
         return Err(format!("{} read back as the right length of different bytes", path));
     }
     Ok(())
+}
+
+/// Write one file to the boot volume, verified, over the ranged gate.
+///
+/// Exposed because `repairs` needs exactly this and nothing else about
+/// staging. Keeping the gate here rather than letting a second module claim its
+/// own is the point: there is one place that opens the write window on this
+/// disk, and one place that closes it on every path out.
+pub fn put_one(esp: &Esp, path: &str, data: &[u8]) -> Result<String, String> {
+    if !nvme::unlock_writes(CONFIRM, esp.start_lba, esp.blocks) {
+        return Err(String::from(
+            "the write gate refused the claim -- no NVMe controller, or no such range",
+        ));
+    }
+    let outcome = put_verified(esp, path, data);
+    nvme::lock_writes();
+    outcome?;
+    Ok(format!("wrote {} B to {}", data.len(), path))
+}
+
+/// Remove files that are there, quietly ignoring the ones that are not.
+///
+/// Order is the caller's and it matters: `unstage` and `repairs::clear` both
+/// pass the arming flag first, so an interrupted removal leaves a machine that
+/// does what it already did rather than a half-disarmed one.
+pub fn remove_some(esp: &Esp, paths: &[&str]) -> Result<String, String> {
+    if !nvme::unlock_writes(CONFIRM, esp.start_lba, esp.blocks) {
+        return Err(String::from("the write gate refused the claim"));
+    }
+    let mut gone: Vec<String> = Vec::new();
+    for path in paths {
+        if esp.volume.find(path).is_ok() && fatw::remove(&esp.volume, path).is_ok() {
+            gone.push(String::from(*path));
+        }
+    }
+    nvme::lock_writes();
+
+    if gone.is_empty() {
+        return Ok(String::from("there was nothing to remove"));
+    }
+    Ok(format!("removed {}", gone.join(", ")))
 }
 
 fn write_all(esp: &Esp, image: &[u8], sig: &[u8]) -> Result<(), String> {

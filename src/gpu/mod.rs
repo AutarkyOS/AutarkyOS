@@ -253,6 +253,250 @@ pub fn record(gpu: Option<&Gpu>, chip: Option<&str>) {
     }
 }
 
+
+// ---------------------------------------------------------------------------
+// Waking it
+// ---------------------------------------------------------------------------
+//
+// A muxless laptop parks its discrete GPU in D3cold, where it vanishes from
+// config space entirely. Getting it back is ACPI's own mechanism and not a
+// register poke: the device's `_PR0` names the power resources it needs in D0,
+// and each of those has an `_ON` method the firmware wrote for this board.
+//
+// **None of it is written down here.** `\_SB.PC00.PEG1.PEGP` is this laptop's
+// path and not the next one's, so the device is found by matching the PCI
+// address the bus reports against `Interp::pci_location` -- the same walk that
+// resolves a `PCI_Config` region, run the other way round.
+
+/// What waking it would involve, read out of the firmware.
+pub struct Plan {
+    /// Namespace path of the ACPI device for the GPU.
+    pub device: String,
+    /// Where it is, or where it will be when it answers.
+    pub at: (u8, u8, u8),
+    /// The power resources `_PR0` names, in the order it names them. ACPI
+    /// requires that order to be honoured: they are listed in the sequence the
+    /// firmware wants them turned on.
+    pub resources: Vec<String>,
+    /// Which of those have an `_ON` this can call.
+    pub with_on: usize,
+    /// The device's own `_PS0`, which ACPI says to call after the resources.
+    pub has_ps0: bool,
+}
+
+/// One direct child by name, which is not `resolve`: an ancestor's `_PR0` is a
+/// different device's power and calling it would turn on something else.
+fn kid(ns: &crate::acpi::aml::Namespace, n: usize, seg: [u8; 4]) -> Option<usize> {
+    ns.node(n).children.iter().copied().find(|&c| ns.node(c).name == seg)
+}
+
+/// The namespace node describing the device at this PCI address.
+///
+/// Every `Device` carrying an `_ADR` is asked where it lives and the answers
+/// are compared. Linear, and cheap enough: the candidates are the few hundred
+/// nodes with an address, not the six thousand in the table.
+fn node_at(ns: &crate::acpi::aml::Namespace, at: (u8, u8, u8)) -> Option<usize> {
+    let mut it = crate::acpi::eval::Interp::new(ns);
+    for i in 0..ns.len() {
+        if !matches!(ns.node(i).kind, crate::acpi::aml::Kind::Device) {
+            continue;
+        }
+        if kid(ns, i, *b"_ADR").is_none() {
+            continue;
+        }
+        if it.pci_location(i) == Ok(at) {
+            return Some(i);
+        }
+    }
+    None
+}
+
+/// Where to look: the NVIDIA part if it is answering, otherwise whatever sits
+/// behind a bridge forwarding an empty bus.
+///
+/// The second case is the one that matters, and it is why this cannot simply
+/// use `find`: a GPU in D3cold is not on the bus to be found. The bridge is,
+/// and the device is at function zero of the bus it forwards -- which is an
+/// address even when nothing answers at it.
+pub fn target(ecam: u64) -> Option<(u8, u8, u8)> {
+    if let Some(g) = find(ecam) {
+        if g.is_nvidia() {
+            return Some((g.dev.bus, g.dev.dev, g.dev.func));
+        }
+    }
+    empty_bridges(ecam).first().map(|(_, secondary)| (*secondary, 0, 0))
+}
+
+/// Read the plan out of the firmware without running any of it.
+pub fn plan(a: &crate::acpi::Acpi, at: (u8, u8, u8)) -> Option<Plan> {
+    crate::acpi::with_namespace(a, |ns| {
+        let node = node_at(ns, at)?;
+        let mut it = crate::acpi::eval::Interp::new(ns);
+        let mut resources = Vec::new();
+        let mut with_on = 0;
+        if let Some(pr0) = kid(ns, node, *b"_PR0") {
+            if let Ok(crate::acpi::eval::Value::Pkg(items)) = it.eval_node(pr0, &[]) {
+                for e in items {
+                    // A `_PR0` element is a reference to a PowerResource. An
+                    // element that is anything else is firmware this does not
+                    // understand, and is listed rather than skipped silently.
+                    match e {
+                        crate::acpi::eval::Value::Node(r) => {
+                            if kid(ns, r, *b"_ON_").is_some() {
+                                with_on += 1;
+                            }
+                            resources.push(ns.path(r));
+                        }
+                        other => resources.push(alloc::format!("<{}>", other.type_name())),
+                    }
+                }
+            }
+        }
+        Some(Plan {
+            device: ns.path(node),
+            at,
+            resources,
+            with_on,
+            has_ps0: kid(ns, node, *b"_PS0").is_some(),
+        })
+    })
+    .flatten()
+}
+
+/// What one step of the wake did.
+pub struct Step {
+    pub what: String,
+    pub ok: bool,
+    pub why: String,
+}
+
+/// Call `_ON` on each power resource `_PR0` names, then the device's `_PS0`.
+///
+/// **In the order `_PR0` gave them**, which ACPI requires and which is not
+/// cosmetic: a board that powers a rail before the reset that depends on it is
+/// a board whose device comes up wrong.
+///
+/// This runs the vendor's own AML with region writes enabled, which is why the
+/// caller has to have unlocked them. What it writes is whatever the firmware
+/// writes to turn this device on -- the same sequence every other operating
+/// system on this laptop performs -- and it is still somebody else's code
+/// touching real registers.
+pub fn wake(a: &crate::acpi::Acpi, at: (u8, u8, u8)) -> Vec<Step> {
+    let mut out = Vec::new();
+    let done = crate::acpi::with_namespace(a, |ns| {
+        let Some(node) = node_at(ns, at) else {
+            return Vec::new();
+        };
+        let mut steps: Vec<Step> = Vec::new();
+        let mut it = crate::acpi::eval::Interp::new(ns);
+
+        let mut list: Vec<usize> = Vec::new();
+        if let Some(pr0) = kid(ns, node, *b"_PR0") {
+            if let Ok(crate::acpi::eval::Value::Pkg(items)) = it.eval_node(pr0, &[]) {
+                for e in items {
+                    if let crate::acpi::eval::Value::Node(r) = e {
+                        list.push(r);
+                    }
+                }
+            }
+        }
+
+        for r in list {
+            let path = ns.path(r);
+            match kid(ns, r, *b"_ON_") {
+                None => steps.push(Step {
+                    what: alloc::format!("{}._ON", path),
+                    ok: false,
+                    why: String::from("the power resource has no _ON"),
+                }),
+                Some(on) => steps.push(call(ns, on, &alloc::format!("{}._ON", path))),
+            }
+        }
+
+        // `_PS0` after the resources, which is the order ACPI states: the
+        // rails come up, then the device is told it is in D0.
+        if let Some(ps0) = kid(ns, node, *b"_PS0") {
+            let path = ns.path(node);
+            steps.push(call(ns, ps0, &alloc::format!("{}._PS0", path)));
+        }
+        steps
+    });
+    if let Some(v) = done {
+        out = v;
+    }
+    out
+}
+
+/// Run one firmware method under a landing pad.
+///
+/// **This is somebody else's code touching real registers**, and every
+/// exception vector in this kernel but `#BP` diverges. A `_ON` that faults
+/// without a pad is a machine that stops with a register dump, which tells an
+/// operator far less than "that method faulted and here is which".
+///
+/// A fresh interpreter each time, so one method running away cannot spend the
+/// step budget the next one needs.
+///
+/// What this cannot undo is a sequence that faulted halfway: the rails it had
+/// already brought up stay up. Reporting and stopping is still better than
+/// halting, because the operator can then read `_STA` and decide.
+fn call(ns: &crate::acpi::aml::Namespace, node: usize, what: &str) -> Step {
+    use crate::cpu::recover::{self, Caught};
+    let mut m = crate::acpi::eval::Interp::new(ns);
+    let mut got: Option<Result<(), String>> = None;
+    let was = recover::in_selftest();
+    recover::selftest_window(true);
+    let caught = recover::guarded(|| {
+        got = Some(match m.eval_node(node, &[]) {
+            Ok(_) => Ok(()),
+            Err(e) => Err(crate::acpi::fault_text(&e)),
+        });
+    });
+    recover::selftest_window(was);
+
+    match (caught, got) {
+        (Caught::Faulted(why), _) => Step {
+            what: String::from(what),
+            ok: false,
+            why: alloc::format!("the method faulted: {}", why),
+        },
+        (_, Some(Ok(()))) => Step {
+            what: String::from(what),
+            ok: true,
+            why: alloc::format!("{} step(s)", m.steps()),
+        },
+        (_, Some(Err(why))) => Step { what: String::from(what), ok: false, why },
+        (_, None) => Step {
+            what: String::from(what),
+            ok: false,
+            why: String::from("it did not run"),
+        },
+    }
+}
+
+/// Is the device answering config space now?
+///
+/// The only answer that settles whether any of it worked. A vendor id that is
+/// neither all-ones nor zero means something is there and decoding.
+pub fn answers(ecam: u64, at: (u8, u8, u8)) -> Option<u32> {
+    let d = Device {
+        bus: at.0,
+        dev: at.1,
+        func: at.2,
+        vendor: 0,
+        device: 0,
+        class: 0,
+        subclass: 0,
+        prog_if: 0,
+        header_type: 0,
+    };
+    let v = pci::cfg_read32(ecam, &d, 0x00);
+    if v == 0xFFFF_FFFF || v == 0 {
+        return None;
+    }
+    Some(v)
+}
+
 /// The decoder, against values built from the documented field layout.
 ///
 /// Deliberately hardware-free. There is no NVIDIA GPU under QEMU and there is
